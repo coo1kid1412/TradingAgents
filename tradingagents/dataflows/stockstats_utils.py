@@ -44,6 +44,31 @@ def _clean_dataframe(data: pd.DataFrame) -> pd.DataFrame:
     return data
 
 
+def calculate_indicator_from_ohlcv(ohlcv_df: pd.DataFrame, indicator: str) -> dict:
+    """从标准 OHLCV DataFrame 计算技术指标（供 AKShare/Tushare vendor 复用）。
+
+    参数:
+        ohlcv_df: 包含 Date, Open, High, Low, Close, Volume 列的 DataFrame
+        indicator: stockstats 格式的技术指标名称
+
+    返回:
+        dict: {日期字符串: 指标值字符串} 映射
+    """
+    data = _clean_dataframe(ohlcv_df.copy())
+    df = wrap(data)
+    df["Date"] = df["Date"].dt.strftime("%Y-%m-%d")
+
+    df[indicator]  # trigger stockstats calculation
+
+    result_dict = {}
+    for _, row in df.iterrows():
+        date_str = row["Date"]
+        val = row[indicator]
+        result_dict[date_str] = "N/A" if pd.isna(val) else str(val)
+
+    return result_dict
+
+
 class StockstatsUtils:
     @staticmethod
     def get_stock_stats(

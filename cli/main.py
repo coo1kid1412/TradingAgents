@@ -1,4 +1,5 @@
 from typing import Optional
+import os
 import datetime
 import typer
 from pathlib import Path
@@ -8,6 +9,16 @@ from dotenv import load_dotenv
 
 # Load environment variables from .env file
 load_dotenv()
+
+# 确保代理可用（Google Gemini 等国际 API 需要代理）
+os.environ.setdefault("HTTP_PROXY", "http://127.0.0.1:7890")
+os.environ.setdefault("HTTPS_PROXY", "http://127.0.0.1:7890")
+
+# 国内数据源绕过代理（AKShare/Tushare/公告 API 等）
+os.environ.setdefault(
+    "NO_PROXY",
+    "*.eastmoney.com,*.sina.com.cn,*.tushare.pro,*.baidu.com,api.tauric.ai,*.akshare.xyz"
+)
 from rich.panel import Panel
 from rich.spinner import Spinner
 from rich.live import Live

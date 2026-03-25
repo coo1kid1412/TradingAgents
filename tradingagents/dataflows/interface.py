@@ -22,7 +22,36 @@ from .alpha_vantage import (
     get_news as get_alpha_vantage_news,
     get_global_news as get_alpha_vantage_global_news,
 )
+from .akshare_vendor import (
+    get_stock as get_akshare_stock,
+    get_indicator as get_akshare_indicator,
+    get_fundamentals as get_akshare_fundamentals,
+    get_balance_sheet as get_akshare_balance_sheet,
+    get_cashflow as get_akshare_cashflow,
+    get_income_statement as get_akshare_income_statement,
+    get_news as get_akshare_news,
+    get_global_news as get_akshare_global_news,
+    get_insider_transactions as get_akshare_insider_transactions,
+)
+from .tushare_vendor import (
+    get_stock as get_tushare_stock,
+    get_indicator as get_tushare_indicator,
+    get_fundamentals as get_tushare_fundamentals,
+    get_balance_sheet as get_tushare_balance_sheet,
+    get_cashflow as get_tushare_cashflow,
+    get_income_statement as get_tushare_income_statement,
+    get_news as get_tushare_news,
+    get_global_news as get_tushare_global_news,
+    get_insider_transactions as get_tushare_insider_transactions,
+)
 from .alpha_vantage_common import AlphaVantageRateLimitError
+from .vendor_errors import VendorRateLimitError, VendorUnavailableError
+from .ticker_utils import is_a_share
+
+try:
+    from yfinance.exceptions import YFRateLimitError
+except ImportError:
+    YFRateLimitError = type(None)  # 如果 yfinance 未安装，不会匹配任何异常
 
 # Configuration and routing logic
 from .config import get_config
@@ -61,49 +90,72 @@ TOOLS_CATEGORIES = {
 }
 
 VENDOR_LIST = [
+    "akshare",
+    "tushare",
     "yfinance",
     "alpha_vantage",
 ]
+
+# A股代码自动路由顺序：akshare（免费） → tushare → yfinance
+_A_SHARE_VENDOR_ORDER = ["akshare", "tushare", "yfinance"]
 
 # Mapping of methods to their vendor-specific implementations
 VENDOR_METHODS = {
     # core_stock_apis
     "get_stock_data": {
+        "akshare": get_akshare_stock,
+        "tushare": get_tushare_stock,
         "alpha_vantage": get_alpha_vantage_stock,
         "yfinance": get_YFin_data_online,
     },
     # technical_indicators
     "get_indicators": {
+        "akshare": get_akshare_indicator,
+        "tushare": get_tushare_indicator,
         "alpha_vantage": get_alpha_vantage_indicator,
         "yfinance": get_stock_stats_indicators_window,
     },
     # fundamental_data
     "get_fundamentals": {
+        "akshare": get_akshare_fundamentals,
+        "tushare": get_tushare_fundamentals,
         "alpha_vantage": get_alpha_vantage_fundamentals,
         "yfinance": get_yfinance_fundamentals,
     },
     "get_balance_sheet": {
+        "akshare": get_akshare_balance_sheet,
+        "tushare": get_tushare_balance_sheet,
         "alpha_vantage": get_alpha_vantage_balance_sheet,
         "yfinance": get_yfinance_balance_sheet,
     },
     "get_cashflow": {
+        "akshare": get_akshare_cashflow,
+        "tushare": get_tushare_cashflow,
         "alpha_vantage": get_alpha_vantage_cashflow,
         "yfinance": get_yfinance_cashflow,
     },
     "get_income_statement": {
+        "akshare": get_akshare_income_statement,
+        "tushare": get_tushare_income_statement,
         "alpha_vantage": get_alpha_vantage_income_statement,
         "yfinance": get_yfinance_income_statement,
     },
     # news_data
     "get_news": {
+        "akshare": get_akshare_news,
+        "tushare": get_tushare_news,
         "alpha_vantage": get_alpha_vantage_news,
         "yfinance": get_news_yfinance,
     },
     "get_global_news": {
+        "akshare": get_akshare_global_news,
+        "tushare": get_tushare_global_news,
         "yfinance": get_global_news_yfinance,
         "alpha_vantage": get_alpha_vantage_global_news,
     },
     "get_insider_transactions": {
+        "akshare": get_akshare_insider_transactions,
+        "tushare": get_tushare_insider_transactions,
         "alpha_vantage": get_alpha_vantage_insider_transactions,
         "yfinance": get_yfinance_insider_transactions,
     },
@@ -132,21 +184,37 @@ def get_vendor(category: str, method: str = None) -> str:
     return config.get("data_vendors", {}).get(category, "default")
 
 def route_to_vendor(method: str, *args, **kwargs):
-    """Route method calls to appropriate vendor implementation with fallback support."""
-    category = get_category_for_method(method)
-    vendor_config = get_vendor(category, method)
-    primary_vendors = [v.strip() for v in vendor_config.split(',')]
+    """Route method calls to appropriate vendor implementation with fallback support.
 
+    A股代码（如 600519、000858.SZ）会自动路由到 akshare → tushare → yfinance 链。
+    非A股代码按配置文件的 vendor 顺序路由。
+    """
     if method not in VENDOR_METHODS:
         raise ValueError(f"Method '{method}' not supported")
 
-    # Build fallback chain: primary vendors first, then remaining available vendors
-    all_available_vendors = list(VENDOR_METHODS[method].keys())
-    fallback_vendors = primary_vendors.copy()
-    for vendor in all_available_vendors:
-        if vendor not in fallback_vendors:
-            fallback_vendors.append(vendor)
+    # 检测第一个参数是否为 A 股代码
+    symbol = args[0] if args else kwargs.get("symbol", kwargs.get("ticker", ""))
+    a_share_detected = is_a_share(symbol) if symbol else False
 
+    if a_share_detected:
+        # A股：强制使用 akshare → tushare → yfinance 顺序
+        fallback_vendors = [
+            v for v in _A_SHARE_VENDOR_ORDER
+            if v in VENDOR_METHODS[method]
+        ]
+    else:
+        # 非A股：按配置路由
+        category = get_category_for_method(method)
+        vendor_config = get_vendor(category, method)
+        primary_vendors = [v.strip() for v in vendor_config.split(',')]
+
+        all_available_vendors = list(VENDOR_METHODS[method].keys())
+        fallback_vendors = primary_vendors.copy()
+        for vendor in all_available_vendors:
+            if vendor not in fallback_vendors:
+                fallback_vendors.append(vendor)
+
+    last_error = None
     for vendor in fallback_vendors:
         if vendor not in VENDOR_METHODS[method]:
             continue
@@ -156,7 +224,12 @@ def route_to_vendor(method: str, *args, **kwargs):
 
         try:
             return impl_func(*args, **kwargs)
-        except AlphaVantageRateLimitError:
-            continue  # Only rate limits trigger fallback
+        except (AlphaVantageRateLimitError, VendorRateLimitError,
+                VendorUnavailableError, YFRateLimitError) as e:
+            last_error = e
+            continue  # 限流或不可用时 fallback 到下一个供应商
 
-    raise RuntimeError(f"方法 '{method}' 没有可用的数据供应商")
+    raise RuntimeError(
+        f"方法 '{method}' 所有数据供应商均失败"
+        + (f"（最后一个错误：{last_error}）" if last_error else "")
+    )

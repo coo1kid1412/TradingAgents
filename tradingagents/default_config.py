@@ -22,11 +22,13 @@ DEFAULT_CONFIG = {
     "max_recur_limit": 100,
     # Data vendor configuration
     # Category-level configuration (default for all tools in category)
+    # A股代码（如 600519）会自动路由到 akshare → tushare → yfinance
+    # 以下配置仅影响非A股代码的供应商选择
     "data_vendors": {
-        "core_stock_apis": "yfinance",       # Options: alpha_vantage, yfinance
-        "technical_indicators": "yfinance",  # Options: alpha_vantage, yfinance
-        "fundamental_data": "yfinance",      # Options: alpha_vantage, yfinance
-        "news_data": "yfinance",             # Options: alpha_vantage, yfinance
+        "core_stock_apis": "yfinance",       # Options: akshare, tushare, alpha_vantage, yfinance
+        "technical_indicators": "yfinance",  # Options: akshare, tushare, alpha_vantage, yfinance
+        "fundamental_data": "yfinance",      # Options: akshare, tushare, alpha_vantage, yfinance
+        "news_data": "yfinance",             # Options: akshare, tushare, alpha_vantage, yfinance
     },
     # Tool-level configuration (takes precedence over category-level)
     "tool_vendors": {
