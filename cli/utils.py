@@ -7,21 +7,21 @@ from cli.models import AnalystType
 
 console = Console()
 
-TICKER_INPUT_EXAMPLES = "Examples: SPY, CNC.TO, 7203.T, 0700.HK"
+TICKER_INPUT_EXAMPLES = "例: SPY, CNC.TO, 7203.T, 0700.HK"
 
 ANALYST_ORDER = [
-    ("Market Analyst", AnalystType.MARKET),
-    ("Social Media Analyst", AnalystType.SOCIAL),
-    ("News Analyst", AnalystType.NEWS),
-    ("Fundamentals Analyst", AnalystType.FUNDAMENTALS),
+    ("市场分析师", AnalystType.MARKET),
+    ("舆情分析师", AnalystType.SOCIAL),
+    ("新闻分析师", AnalystType.NEWS),
+    ("基本面分析师", AnalystType.FUNDAMENTALS),
 ]
 
 
 def get_ticker() -> str:
     """Prompt the user to enter a ticker symbol."""
     ticker = questionary.text(
-        f"Enter the exact ticker symbol to analyze ({TICKER_INPUT_EXAMPLES}):",
-        validate=lambda x: len(x.strip()) > 0 or "Please enter a valid ticker symbol.",
+        f"请输入要分析的股票代码（{TICKER_INPUT_EXAMPLES}）:",
+        validate=lambda x: len(x.strip()) > 0 or "请输入有效的股票代码。",
         style=questionary.Style(
             [
                 ("text", "fg:green"),
@@ -31,7 +31,7 @@ def get_ticker() -> str:
     ).ask()
 
     if not ticker:
-        console.print("\n[red]No ticker symbol provided. Exiting...[/red]")
+        console.print("\n[red]未输入股票代码，退出中...[/red]")
         exit(1)
 
     return normalize_ticker_symbol(ticker)
@@ -57,9 +57,9 @@ def get_analysis_date() -> str:
             return False
 
     date = questionary.text(
-        "Enter the analysis date (YYYY-MM-DD):",
+        "请输入分析日期（YYYY-MM-DD）:",
         validate=lambda x: validate_date(x.strip())
-        or "Please enter a valid date in YYYY-MM-DD format.",
+        or "请输入有效的日期（YYYY-MM-DD 格式）。",
         style=questionary.Style(
             [
                 ("text", "fg:green"),
@@ -69,7 +69,7 @@ def get_analysis_date() -> str:
     ).ask()
 
     if not date:
-        console.print("\n[red]No date provided. Exiting...[/red]")
+        console.print("\n[red]未输入日期，退出中...[/red]")
         exit(1)
 
     return date.strip()
@@ -78,12 +78,12 @@ def get_analysis_date() -> str:
 def select_analysts() -> List[AnalystType]:
     """Select analysts using an interactive checkbox."""
     choices = questionary.checkbox(
-        "Select Your [Analysts Team]:",
+        "选择分析师团队:",
         choices=[
             questionary.Choice(display, value=value) for display, value in ANALYST_ORDER
         ],
-        instruction="\n- Press Space to select/unselect analysts\n- Press 'a' to select/unselect all\n- Press Enter when done",
-        validate=lambda x: len(x) > 0 or "You must select at least one analyst.",
+        instruction="\n- 按空格选择/取消，按 'a' 全选/取消全选，按回车确认",
+        validate=lambda x: len(x) > 0 or "至少选择一名分析师。",
         style=questionary.Style(
             [
                 ("checkbox-selected", "fg:green"),
@@ -95,7 +95,7 @@ def select_analysts() -> List[AnalystType]:
     ).ask()
 
     if not choices:
-        console.print("\n[red]No analysts selected. Exiting...[/red]")
+        console.print("\n[red]未选择分析师，退出中...[/red]")
         exit(1)
 
     return choices
@@ -106,17 +106,17 @@ def select_research_depth() -> int:
 
     # Define research depth options with their corresponding values
     DEPTH_OPTIONS = [
-        ("Shallow - Quick research, few debate and strategy discussion rounds", 1),
-        ("Medium - Middle ground, moderate debate rounds and strategy discussion", 3),
-        ("Deep - Comprehensive research, in depth debate and strategy discussion", 5),
+        ("浅层 - 快速研究，少量辩论轮次", 1),
+        ("中等 - 适度研究，中等辩论轮次", 3),
+        ("深度 - 全面研究，深入辩论与策略讨论", 5),
     ]
 
     choice = questionary.select(
-        "Select Your [Research Depth]:",
+        "选择研究深度:",
         choices=[
             questionary.Choice(display, value=value) for display, value in DEPTH_OPTIONS
         ],
-        instruction="\n- Use arrow keys to navigate\n- Press Enter to select",
+        instruction="\n- 使用方向键导航\n- 按回车选择",
         style=questionary.Style(
             [
                 ("selected", "fg:yellow noinherit"),
@@ -127,7 +127,7 @@ def select_research_depth() -> int:
     ).ask()
 
     if choice is None:
-        console.print("\n[red]No research depth selected. Exiting...[/red]")
+        console.print("\n[red]未选择研究深度，退出中...[/red]")
         exit(1)
 
     return choice
@@ -137,7 +137,7 @@ def select_shallow_thinking_agent(provider) -> str:
     """Select shallow thinking llm engine using an interactive selection."""
 
     # Define shallow thinking llm engine options with their corresponding model names
-    # Ordering: medium → light → heavy (balanced first for quick tasks)
+    # Ordering: medium -> light -> heavy (balanced first for quick tasks)
     # Within same tier, newer models first
     SHALLOW_AGENT_OPTIONS = {
         "openai": [
@@ -174,12 +174,12 @@ def select_shallow_thinking_agent(provider) -> str:
     }
 
     choice = questionary.select(
-        "Select Your [Quick-Thinking LLM Engine]:",
+        "选择快速思考模型:",
         choices=[
             questionary.Choice(display, value=value)
             for display, value in SHALLOW_AGENT_OPTIONS[provider.lower()]
         ],
-        instruction="\n- Use arrow keys to navigate\n- Press Enter to select",
+        instruction="\n- 使用方向键导航\n- 按回车选择",
         style=questionary.Style(
             [
                 ("selected", "fg:magenta noinherit"),
@@ -191,7 +191,7 @@ def select_shallow_thinking_agent(provider) -> str:
 
     if choice is None:
         console.print(
-            "\n[red]No shallow thinking llm engine selected. Exiting...[/red]"
+            "\n[red]未选择快速思考模型，退出中...[/red]"
         )
         exit(1)
 
@@ -202,7 +202,7 @@ def select_deep_thinking_agent(provider) -> str:
     """Select deep thinking llm engine using an interactive selection."""
 
     # Define deep thinking llm engine options with their corresponding model names
-    # Ordering: heavy → medium → light (most capable first for deep tasks)
+    # Ordering: heavy -> medium -> light (most capable first for deep tasks)
     # Within same tier, newer models first
     DEEP_AGENT_OPTIONS = {
         "openai": [
@@ -241,12 +241,12 @@ def select_deep_thinking_agent(provider) -> str:
     }
 
     choice = questionary.select(
-        "Select Your [Deep-Thinking LLM Engine]:",
+        "选择深度思考模型:",
         choices=[
             questionary.Choice(display, value=value)
             for display, value in DEEP_AGENT_OPTIONS[provider.lower()]
         ],
-        instruction="\n- Use arrow keys to navigate\n- Press Enter to select",
+        instruction="\n- 使用方向键导航\n- 按回车选择",
         style=questionary.Style(
             [
                 ("selected", "fg:magenta noinherit"),
@@ -257,14 +257,13 @@ def select_deep_thinking_agent(provider) -> str:
     ).ask()
 
     if choice is None:
-        console.print("\n[red]No deep thinking llm engine selected. Exiting...[/red]")
+        console.print("\n[red]未选择深度思考模型，退出中...[/red]")
         exit(1)
 
     return choice
 
 def select_llm_provider() -> tuple[str, str]:
-    """Select the OpenAI api url using interactive selection."""
-    # Define OpenAI api options with their corresponding endpoints
+    """Select the LLM provider using interactive selection."""
     BASE_URLS = [
         ("OpenAI", "https://api.openai.com/v1"),
         ("Google", "https://generativelanguage.googleapis.com/v1"),
@@ -275,12 +274,12 @@ def select_llm_provider() -> tuple[str, str]:
     ]
     
     choice = questionary.select(
-        "Select your LLM Provider:",
+        "选择大模型服务商:",
         choices=[
             questionary.Choice(display, value=(display, value))
             for display, value in BASE_URLS
         ],
-        instruction="\n- Use arrow keys to navigate\n- Press Enter to select",
+        instruction="\n- 使用方向键导航\n- 按回车选择",
         style=questionary.Style(
             [
                 ("selected", "fg:magenta noinherit"),
@@ -291,11 +290,11 @@ def select_llm_provider() -> tuple[str, str]:
     ).ask()
     
     if choice is None:
-        console.print("\n[red]no OpenAI backend selected. Exiting...[/red]")
+        console.print("\n[red]未选择大模型服务商，退出中...[/red]")
         exit(1)
     
     display_name, url = choice
-    print(f"You selected: {display_name}\tURL: {url}")
+    print(f"已选择: {display_name}\t接口地址: {url}")
 
     return display_name, url
 
@@ -303,12 +302,12 @@ def select_llm_provider() -> tuple[str, str]:
 def ask_openai_reasoning_effort() -> str:
     """Ask for OpenAI reasoning effort level."""
     choices = [
-        questionary.Choice("Medium (Default)", "medium"),
-        questionary.Choice("High (More thorough)", "high"),
-        questionary.Choice("Low (Faster)", "low"),
+        questionary.Choice("中等（默认）", "medium"),
+        questionary.Choice("高（更深入）", "high"),
+        questionary.Choice("低（更快速）", "low"),
     ]
     return questionary.select(
-        "Select Reasoning Effort:",
+        "选择推理强度:",
         choices=choices,
         style=questionary.Style([
             ("selected", "fg:cyan noinherit"),
@@ -324,11 +323,11 @@ def ask_anthropic_effort() -> str | None:
     Controls token usage and response thoroughness on Claude 4.5+ and 4.6 models.
     """
     return questionary.select(
-        "Select Effort Level:",
+        "选择推理等级:",
         choices=[
-            questionary.Choice("High (recommended)", "high"),
-            questionary.Choice("Medium (balanced)", "medium"),
-            questionary.Choice("Low (faster, cheaper)", "low"),
+            questionary.Choice("高（推荐）", "high"),
+            questionary.Choice("中等（平衡）", "medium"),
+            questionary.Choice("低（更快更省）", "low"),
         ],
         style=questionary.Style([
             ("selected", "fg:cyan noinherit"),
@@ -345,10 +344,10 @@ def ask_gemini_thinking_config() -> str | None:
     Client maps to appropriate API param based on model series.
     """
     return questionary.select(
-        "Select Thinking Mode:",
+        "选择思考模式:",
         choices=[
-            questionary.Choice("Enable Thinking (recommended)", "high"),
-            questionary.Choice("Minimal/Disable Thinking", "minimal"),
+            questionary.Choice("启用思考模式（推荐）", "high"),
+            questionary.Choice("最小化/关闭思考模式", "minimal"),
         ],
         style=questionary.Style([
             ("selected", "fg:green noinherit"),

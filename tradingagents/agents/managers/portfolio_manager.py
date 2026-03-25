@@ -50,7 +50,9 @@ def create_portfolio_manager(llm, memory):
 
 ---
 
-Be decisive and ground every conclusion in specific evidence from the analysts."""
+Be decisive and ground every conclusion in specific evidence from the analysts.
+
+**重要：请用中文撰写你的最终交易决策报告。** 评级关键词（Buy/Overweight/Hold/Underweight/Sell）和股票代码请保留英文原文。请以中文阐述你的投资论点和执行摘要，使用专业的投资组合管理术语。"""
 
         response = llm.invoke(prompt)
 

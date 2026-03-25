@@ -94,7 +94,7 @@ def get_news_yfinance(
             filtered_count += 1
 
         if filtered_count == 0:
-            return f"No news found for {ticker} between {start_date} and {end_date}"
+            return f"未找到 {ticker} 在 {start_date} 至 {end_date} 期间的新闻"
 
         return f"## {ticker} News, from {start_date} to {end_date}:\n\n{news_str}"
 
@@ -187,4 +187,4 @@ def get_global_news_yfinance(
         return f"## Global Market News, from {start_date} to {curr_date}:\n\n{news_str}"
 
     except Exception as e:
-        return f"Error fetching global news: {str(e)}"
+        return f"获取全球新闻出错：{str(e)}"

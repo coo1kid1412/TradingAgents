@@ -40,7 +40,9 @@ Here are your past reflections on mistakes:
 
 Here is the debate:
 Debate History:
-{history}"""
+{history}
+
+**重要：请用中文撰写你的投资决策和分析报告。** 评级关键词（Buy/Sell/Hold）和股票代码请保留英文原文。请以中文口语化方式阐述你的决策理由和详细投资计划。"""
         response = llm.invoke(prompt)
 
         new_investment_debate_state = {

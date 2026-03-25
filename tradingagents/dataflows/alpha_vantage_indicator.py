@@ -59,7 +59,7 @@ def get_indicator(
 
     if indicator not in supported_indicators:
         raise ValueError(
-            f"Indicator {indicator} is not supported. Please choose from: {list(supported_indicators.keys())}"
+            f"不支持指标 {indicator}，请从以下列表中选择：{list(supported_indicators.keys())}"
         )
 
     curr_date_dt = datetime.strptime(curr_date, "%Y-%m-%d")
@@ -152,7 +152,7 @@ def get_indicator(
         # Parse CSV data and extract values for the date range
         lines = data.strip().split('\n')
         if len(lines) < 2:
-            return f"Error: No data returned for {indicator}"
+            return f"错误：指标 {indicator} 未返回数据"
 
         # Parse header and data
         header = [col.strip() for col in lines[0].split(',')]
@@ -218,5 +218,5 @@ def get_indicator(
         return result_str
 
     except Exception as e:
-        print(f"Error getting Alpha Vantage indicator data for {indicator}: {e}")
-        return f"Error retrieving {indicator} data: {str(e)}"
+        print(f"获取 Alpha Vantage 指标 {indicator} 数据出错：{e}")
+        return f"获取 {indicator} 数据出错：{str(e)}"

@@ -29,7 +29,7 @@ def format_datetime_for_api(date_input) -> str:
                 dt = datetime.strptime(date_input, "%Y-%m-%d %H:%M")
                 return dt.strftime("%Y%m%dT%H%M")
             except ValueError:
-                raise ValueError(f"Unsupported date format: {date_input}")
+                raise ValueError(f"不支持的日期格式：{date_input}")
     elif isinstance(date_input, datetime):
         return date_input.strftime("%Y%m%dT%H%M")
     else:
@@ -118,5 +118,5 @@ def _filter_csv_by_date_range(csv_data: str, start_date: str, end_date: str) -> 
 
     except Exception as e:
         # If filtering fails, return original data with a warning
-        print(f"Warning: Failed to filter CSV data by date range: {e}")
+        print(f"警告：按日期范围过滤 CSV 数据失败：{e}")
         return csv_data

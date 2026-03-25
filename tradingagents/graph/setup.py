@@ -50,7 +50,7 @@ class GraphSetup:
                 - "fundamentals": Fundamentals analyst
         """
         if len(selected_analysts) == 0:
-            raise ValueError("Trading Agents Graph Setup Error: no analysts selected!")
+            raise ValueError("TradingAgents 图构建错误：未选择任何分析师！")
 
         # Create analyst nodes
         analyst_nodes = {}

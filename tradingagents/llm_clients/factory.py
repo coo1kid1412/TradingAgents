@@ -46,4 +46,4 @@ def create_llm_client(
     if provider_lower == "google":
         return GoogleClient(model, base_url, **kwargs)
 
-    raise ValueError(f"Unsupported LLM provider: {provider}")
+    raise ValueError(f"不支持的大模型服务商：{provider}")

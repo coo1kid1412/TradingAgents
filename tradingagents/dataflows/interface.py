@@ -114,7 +114,7 @@ def get_category_for_method(method: str) -> str:
     for category, info in TOOLS_CATEGORIES.items():
         if method in info["tools"]:
             return category
-    raise ValueError(f"Method '{method}' not found in any category")
+    raise ValueError(f"方法 '{method}' 未在任何类别中找到")
 
 def get_vendor(category: str, method: str = None) -> str:
     """Get the configured vendor for a data category or specific tool method.
@@ -159,4 +159,4 @@ def route_to_vendor(method: str, *args, **kwargs):
         except AlphaVantageRateLimitError:
             continue  # Only rate limits trigger fallback
 
-    raise RuntimeError(f"No available vendor for '{method}'")
+    raise RuntimeError(f"方法 '{method}' 没有可用的数据供应商")

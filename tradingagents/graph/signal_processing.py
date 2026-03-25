@@ -24,6 +24,7 @@ class SignalProcessor:
             (
                 "system",
                 "You are an efficient assistant that extracts the trading decision from analyst reports. "
+                "The report may be written in Chinese or English. Extract the rating regardless of the report language. "
                 "Extract the rating as exactly one of: BUY, OVERWEIGHT, HOLD, UNDERWEIGHT, SELL. "
                 "Output only the single rating word, nothing else.",
             ),

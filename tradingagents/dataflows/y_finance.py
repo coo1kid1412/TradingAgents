@@ -23,7 +23,7 @@ def get_YFin_data_online(
     # Check if data is empty
     if data.empty:
         return (
-            f"No data found for symbol '{symbol}' between {start_date} and {end_date}"
+            f"未找到股票 '{symbol}' 在 {start_date} 至 {end_date} 期间的数据"
         )
 
     # Remove timezone info from index for cleaner output
@@ -163,7 +163,7 @@ def get_stock_stats_indicators_window(
             ind_string += f"{date_str}: {value}\n"
         
     except Exception as e:
-        print(f"Error getting bulk stockstats data: {e}")
+        print(f"批量获取 stockstats 数据出错：{e}")
         # Fallback to original implementation if bulk method fails
         ind_string = ""
         curr_date_dt = datetime.strptime(curr_date, "%Y-%m-%d")
@@ -213,7 +213,7 @@ def _get_stock_stats_bulk(
                 on_bad_lines="skip",
             )
         except FileNotFoundError:
-            raise Exception("Stockstats fail: Yahoo Finance data not fetched yet!")
+            raise Exception("Stockstats 失败：Yahoo Finance 数据尚未获取！")
     else:
         # Online data fetching with caching
         today_date = pd.Timestamp.today()
@@ -377,7 +377,7 @@ def get_balance_sheet(
         return header + csv_string
         
     except Exception as e:
-        return f"Error retrieving balance sheet for {ticker}: {str(e)}"
+        return f"获取 {ticker} 资产负债表数据出错：{str(e)}"
 
 
 def get_cashflow(
@@ -407,7 +407,7 @@ def get_cashflow(
         return header + csv_string
         
     except Exception as e:
-        return f"Error retrieving cash flow for {ticker}: {str(e)}"
+        return f"获取 {ticker} 现金流量表数据出错：{str(e)}"
 
 
 def get_income_statement(
@@ -461,4 +461,4 @@ def get_insider_transactions(
         return header + csv_string
         
     except Exception as e:
-        return f"Error retrieving insider transactions for {ticker}: {str(e)}"
+        return f"获取 {ticker} 内部交易数据出错：{str(e)}"
