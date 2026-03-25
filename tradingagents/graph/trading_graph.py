@@ -153,6 +153,11 @@ class TradingAgentsGraph:
             if effort:
                 kwargs["effort"] = effort
 
+        elif provider == "minimax":
+            max_tokens = self.config.get("minimax_max_tokens")
+            if max_tokens:
+                kwargs["max_tokens"] = max_tokens
+
         return kwargs
 
     def _create_tool_nodes(self) -> Dict[str, ToolNode]:

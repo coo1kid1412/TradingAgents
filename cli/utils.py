@@ -171,6 +171,11 @@ def select_shallow_thinking_agent(provider) -> str:
             ("GPT-OSS:latest (20B, local)", "gpt-oss:latest"),
             ("GLM-4.7-Flash:latest (30B, local)", "glm-4.7-flash:latest"),
         ],
+        "minimax": [
+            ("MiniMax-M2.7-highspeed - 高速版旗舰", "MiniMax-M2.7-highspeed"),
+            ("MiniMax-M2.5-highspeed - 高速版均衡", "MiniMax-M2.5-highspeed"),
+            ("MiniMax-M2.1-highspeed - 高速版经济", "MiniMax-M2.1-highspeed"),
+        ],
     }
 
     choice = questionary.select(
@@ -238,6 +243,12 @@ def select_deep_thinking_agent(provider) -> str:
             ("GPT-OSS:latest (20B, local)", "gpt-oss:latest"),
             ("Qwen3:latest (8B, local)", "qwen3:latest"),
         ],
+        "minimax": [
+            ("MiniMax-M2.7 - 旗舰模型，最强能力", "MiniMax-M2.7"),
+            ("MiniMax-M2.5 - 均衡型号，性价比高", "MiniMax-M2.5"),
+            ("MiniMax-M2.1 - 经济型号", "MiniMax-M2.1"),
+            ("MiniMax-M2 - 基础模型", "MiniMax-M2"),
+        ],
     }
 
     choice = questionary.select(
@@ -269,6 +280,7 @@ def select_llm_provider() -> tuple[str, str]:
         ("Google", "https://generativelanguage.googleapis.com/v1"),
         ("Anthropic", "https://api.anthropic.com/"),
         ("xAI", "https://api.x.ai/v1"),
+        ("MiniMax", "https://api.minimaxi.com/v1"),
         ("Openrouter", "https://openrouter.ai/api/v1"),
         ("Ollama", "http://localhost:11434/v1"),
     ]

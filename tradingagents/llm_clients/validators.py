@@ -48,6 +48,19 @@ VALID_MODELS = {
         "grok-4-fast-reasoning",
         "grok-4-fast-non-reasoning",
     ],
+    "minimax": [
+        # MiniMax M2.7 series (latest)
+        "MiniMax-M2.7",
+        "MiniMax-M2.7-highspeed",
+        # MiniMax M2.5 series
+        "MiniMax-M2.5",
+        "MiniMax-M2.5-highspeed",
+        # MiniMax M2.1 series
+        "MiniMax-M2.1",
+        "MiniMax-M2.1-highspeed",
+        # MiniMax M2
+        "MiniMax-M2",
+    ],
 }
 
 

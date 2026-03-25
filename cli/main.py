@@ -17,7 +17,7 @@ os.environ.setdefault("HTTPS_PROXY", "http://127.0.0.1:7890")
 # 国内数据源绕过代理（AKShare/Tushare/公告 API 等）
 os.environ.setdefault(
     "NO_PROXY",
-    "*.eastmoney.com,*.sina.com.cn,*.tushare.pro,*.baidu.com,api.tauric.ai,*.akshare.xyz"
+    "*.eastmoney.com,*.sina.com.cn,*.tushare.pro,*.baidu.com,api.tauric.ai,*.akshare.xyz,*.minimaxi.com"
 )
 from rich.panel import Panel
 from rich.spinner import Spinner
