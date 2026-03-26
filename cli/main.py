@@ -4,7 +4,8 @@ import datetime
 import typer
 from pathlib import Path
 from functools import wraps
-from rich.console import Console
+from rich.console import Console, Group
+from rich.progress_bar import ProgressBar
 from dotenv import load_dotenv
 
 # Load environment variables from .env file (use project root, not CWD)
@@ -30,6 +31,7 @@ from rich.text import Text
 from rich.table import Table
 from collections import deque
 import time
+import threading
 from rich.tree import Tree
 from rich import box
 from rich.align import Align
@@ -93,12 +95,23 @@ class MessageBuffer:
         self.report_sections = {}
         self.selected_analysts = []
         self._last_message_id = None
+        # Progress tracking
+        self._agent_start_times = {}
+        self._investment_debate_count = 0
+        self._risk_debate_count = 0
+        self._max_debate_rounds = 1
+        self._max_risk_rounds = 1
+        self._streaming_complete = False
+        self._streaming_error = None
+        self._trace = []
 
-    def init_for_analysis(self, selected_analysts):
+    def init_for_analysis(self, selected_analysts, max_debate_rounds=1, max_risk_rounds=1):
         """Initialize agent status and report sections based on selected analysts.
 
         Args:
             selected_analysts: List of analyst type strings (e.g., ["market", "news"])
+            max_debate_rounds: Maximum investment debate rounds
+            max_risk_rounds: Maximum risk discussion rounds
         """
         self.selected_analysts = [a.lower() for a in selected_analysts]
 
@@ -128,6 +141,15 @@ class MessageBuffer:
         self.messages.clear()
         self.tool_calls.clear()
         self._last_message_id = None
+        # Reset progress tracking
+        self._agent_start_times = {}
+        self._investment_debate_count = 0
+        self._risk_debate_count = 0
+        self._max_debate_rounds = max_debate_rounds
+        self._max_risk_rounds = max_risk_rounds
+        self._streaming_complete = False
+        self._streaming_error = None
+        self._trace = []
 
     def get_completed_reports_count(self):
         """Count reports that are finalized (their finalizing agent is completed)."""
@@ -152,8 +174,14 @@ class MessageBuffer:
 
     def update_agent_status(self, agent, status):
         if agent in self.agent_status:
+            old_status = self.agent_status.get(agent)
             self.agent_status[agent] = status
             self.current_agent = agent
+            # Track timing for progress display
+            if status == "in_progress" and old_status != "in_progress":
+                self._agent_start_times[agent] = time.time()
+            elif status == "completed":
+                self._agent_start_times.pop(agent, None)
 
     def update_report_section(self, section_name, content):
         if section_name in self.report_sections:
@@ -212,6 +240,78 @@ class MessageBuffer:
 
         self.final_report = "\n\n".join(report_parts) if report_parts else None
 
+    def update_debate_count(self, count):
+        """Update the investment debate round counter."""
+        self._investment_debate_count = count
+
+    def update_risk_count(self, count):
+        """Update the risk discussion round counter."""
+        self._risk_debate_count = count
+
+    def get_progress_info(self):
+        """Return (percentage, phase_text, thinking_text) for display."""
+        agents_completed = sum(1 for s in self.agent_status.values() if s == "completed")
+        agents_total = len(self.agent_status)
+        percentage = int(agents_completed / agents_total * 100) if agents_total > 0 else 0
+        phase = self._get_current_phase()
+        thinking = self._get_thinking_info()
+        return percentage, phase, thinking
+
+    def _get_current_phase(self):
+        """Determine the current analysis phase with round info."""
+        # Phase 1: Analysts
+        analyst_statuses = [
+            self.agent_status.get(self.ANALYST_MAPPING[k])
+            for k in self.selected_analysts
+            if k in self.ANALYST_MAPPING
+        ]
+        if analyst_statuses and any(s != "completed" for s in analyst_statuses):
+            active = [
+                k for k in self.selected_analysts
+                if self.agent_status.get(self.ANALYST_MAPPING[k]) == "in_progress"
+            ]
+            if active:
+                agent_cn = AGENT_NAMES.get(self.ANALYST_MAPPING[active[0]], active[0])
+                return f"\u4e00\u3001\u5206\u6790\u5e08\u56e2\u961f - {agent_cn}"
+            return "\u4e00\u3001\u5206\u6790\u5e08\u56e2\u961f"
+
+        # Phase 2: Research debate
+        if self.agent_status.get("Research Manager") != "completed":
+            cnt = self._investment_debate_count
+            max_r = self._max_debate_rounds
+            if cnt >= 2 * max_r:
+                return "\u4e8c\u3001\u7814\u7a76\u56e2\u961f - \u7814\u7a76\u4e3b\u7ba1\u51b3\u7b56"
+            if cnt > 0 or self.agent_status.get("Bull Researcher") == "in_progress":
+                current_round = min(cnt // 2 + 1, max_r)
+                return f"\u4e8c\u3001\u7814\u7a76\u8fa9\u8bba \u7b2c{current_round}\u8f6e/\u5171{max_r}\u8f6e"
+            return "\u4e8c\u3001\u7814\u7a76\u56e2\u961f"
+
+        # Phase 3: Trader
+        if self.agent_status.get("Trader") != "completed":
+            return "\u4e09\u3001\u4ea4\u6613\u56e2\u961f"
+
+        # Phase 4: Risk discussion
+        if self.agent_status.get("Portfolio Manager") != "completed":
+            cnt = self._risk_debate_count
+            max_r = self._max_risk_rounds
+            if cnt >= 3 * max_r:
+                return "\u56db\u3001\u98ce\u9669\u7ba1\u7406 - \u6295\u8d44\u7ec4\u5408\u7ecf\u7406\u51b3\u7b56"
+            if cnt > 0 or self.agent_status.get("Aggressive Analyst") == "in_progress":
+                current_round = min(cnt // 3 + 1, max_r)
+                return f"\u56db\u3001\u98ce\u63a7\u8ba8\u8bba \u7b2c{current_round}\u8f6e/\u5171{max_r}\u8f6e"
+            return "\u56db\u3001\u98ce\u9669\u7ba1\u7406\u56e2\u961f"
+
+        return "\u2713 \u5206\u6790\u5b8c\u6210"
+
+    def _get_thinking_info(self):
+        """Get info about currently thinking agent with elapsed time."""
+        for agent, status in self.agent_status.items():
+            if status == "in_progress" and agent in self._agent_start_times:
+                elapsed = int(time.time() - self._agent_start_times[agent])
+                agent_cn = AGENT_NAMES.get(agent, agent)
+                return f"{agent_cn} \u601d\u8003\u4e2d ({elapsed}s)"
+        return None
+
 
 message_buffer = MessageBuffer()
 
@@ -221,7 +321,7 @@ def create_layout():
     layout.split_column(
         Layout(name="header", size=3),
         Layout(name="main"),
-        Layout(name="footer", size=3),
+        Layout(name="footer", size=5),
     )
     layout["main"].split_column(
         Layout(name="upper", ratio=3), Layout(name="analysis", ratio=5)
@@ -239,11 +339,15 @@ def format_tokens(n):
     return str(n)
 
 
-def _render_status_cell(status):
+def _render_status_cell(status, agent_name=None):
     """Render a status cell with Chinese text and color."""
     status_cn = t(status, STATUS_TEXT)
     if status == "in_progress":
-        return Spinner("dots", text=f"[blue]{status_cn}[/blue]", style="bold cyan")
+        elapsed_str = ""
+        if agent_name and agent_name in message_buffer._agent_start_times:
+            elapsed = int(time.time() - message_buffer._agent_start_times[agent_name])
+            elapsed_str = f" ({elapsed}s)"
+        return Spinner("dots", text=f"[blue]{status_cn}{elapsed_str}[/blue]", style="bold cyan")
     color = STATUS_COLORS.get(status, "white")
     return f"[{color}]{status_cn}[/{color}]"
 
@@ -301,20 +405,36 @@ def update_display(layout, spinner_text=None, stats_handler=None, start_time=Non
         # Add first agent with team name
         first_agent = agents[0]
         status = message_buffer.agent_status.get(first_agent, "pending")
-        status_cell = _render_status_cell(status)
+        status_cell = _render_status_cell(status, first_agent)
         progress_table.add_row(team_cn, t(first_agent, AGENT_NAMES), status_cell)
 
         # Add remaining agents in team
         for agent in agents[1:]:
             status = message_buffer.agent_status.get(agent, "pending")
-            status_cell = _render_status_cell(status)
+            status_cell = _render_status_cell(status, agent)
             progress_table.add_row("", t(agent, AGENT_NAMES), status_cell)
 
         # Add horizontal line after each team
         progress_table.add_row("─" * 20, "─" * 20, "─" * 20, style="dim")
 
+    # Get progress info for panel title and progress bar
+    percentage, phase_text, thinking_text = message_buffer.get_progress_info()
+    progress_title = f"分析进度 -- {phase_text}" if phase_text else "分析进度"
+
+    # Build progress panel with bar + table
+    agents_completed = sum(
+        1 for status in message_buffer.agent_status.values() if status == "completed"
+    )
+    agents_total = len(message_buffer.agent_status)
+    progress_content = Group(
+        Text(f"总进度: {percentage}% ({agents_completed}/{agents_total} 步)", justify="center"),
+        ProgressBar(completed=agents_completed, total=max(agents_total, 1), width=None),
+        Text(""),  # spacer
+        progress_table,
+    )
+
     layout["progress"].update(
-        Panel(progress_table, title="分析进度", border_style="cyan", padding=(1, 2))
+        Panel(progress_content, title=progress_title, border_style="cyan", padding=(1, 2))
     )
 
     # Messages panel showing recent messages and tool calls
@@ -393,42 +513,50 @@ def update_display(layout, spinner_text=None, stats_handler=None, start_time=Non
             )
         )
 
-    # Footer with statistics
-    agents_completed = sum(
-        1 for status in message_buffer.agent_status.values() if status == "completed"
-    )
-    agents_total = len(message_buffer.agent_status)
-
+    # Footer with progress and statistics
     reports_completed = message_buffer.get_completed_reports_count()
     reports_total = len(message_buffer.report_sections)
 
-    # Build stats parts
-    stats_parts = [f"智能体: {agents_completed}/{agents_total}"]
+    # Progress bar characters
+    bar_width = 20
+    filled = int(bar_width * percentage / 100)
+    progress_bar = "\u2501" * filled + "\u2500" * (bar_width - filled)
+
+    # Row 1: Progress + Phase + Thinking agent
+    row1_parts = [f"\u8fdb\u5ea6: {percentage}% {progress_bar}"]
+    if phase_text:
+        row1_parts.append(f"\u9636\u6bb5: {phase_text}")
+    if thinking_text:
+        row1_parts.append(thinking_text)
+
+    # Row 2: Detailed stats
+    row2_parts = [f"\u667a\u80fd\u4f53: {agents_completed}/{agents_total}"]
 
     # LLM and tool stats from callback handler
     if stats_handler:
         stats = stats_handler.get_stats()
-        stats_parts.append(f"大模型: {stats['llm_calls']}")
-        stats_parts.append(f"工具: {stats['tool_calls']}")
+        row2_parts.append(f"\u5927\u6a21\u578b: {stats['llm_calls']}")
+        row2_parts.append(f"\u5de5\u5177: {stats['tool_calls']}")
 
         # Token display with graceful fallback
         if stats["tokens_in"] > 0 or stats["tokens_out"] > 0:
-            tokens_str = f"令牌: {format_tokens(stats['tokens_in'])}\u2191 {format_tokens(stats['tokens_out'])}\u2193"
+            tokens_str = f"\u4ee4\u724c: {format_tokens(stats['tokens_in'])}\u2191 {format_tokens(stats['tokens_out'])}\u2193"
         else:
-            tokens_str = "令牌: --"
-        stats_parts.append(tokens_str)
+            tokens_str = "\u4ee4\u724c: --"
+        row2_parts.append(tokens_str)
 
-    stats_parts.append(f"报告: {reports_completed}/{reports_total}")
+    row2_parts.append(f"\u62a5\u544a: {reports_completed}/{reports_total}")
 
     # Elapsed time
     if start_time:
         elapsed = time.time() - start_time
         elapsed_str = f"\u23f1 {int(elapsed // 60):02d}:{int(elapsed % 60):02d}"
-        stats_parts.append(elapsed_str)
+        row2_parts.append(elapsed_str)
 
     stats_table = Table(show_header=False, box=None, padding=(0, 2), expand=True)
     stats_table.add_column("Stats", justify="center")
-    stats_table.add_row(" | ".join(stats_parts))
+    stats_table.add_row(" | ".join(row1_parts))
+    stats_table.add_row(" | ".join(row2_parts))
 
     layout["footer"].update(Panel(stats_table, border_style="grey50"))
 
@@ -875,6 +1003,121 @@ def format_tool_args(args, max_length=80) -> str:
         return result[:max_length - 3] + "..."
     return result
 
+
+def _streaming_worker(graph, init_agent_state, args, message_buffer, selections):
+    """Background thread: process LangGraph streaming chunks.
+
+    Updates message_buffer state but never touches Rich layout objects.
+    """
+    try:
+        for chunk in graph.graph.stream(init_agent_state, **args):
+            # Process messages if present (skip duplicates via message ID)
+            if len(chunk["messages"]) > 0:
+                last_message = chunk["messages"][-1]
+                msg_id = getattr(last_message, "id", None)
+
+                if msg_id != message_buffer._last_message_id:
+                    message_buffer._last_message_id = msg_id
+
+                    # Add message to buffer
+                    msg_type, content = classify_message_type(last_message)
+                    if content and content.strip():
+                        message_buffer.add_message(msg_type, content)
+
+                    # Handle tool calls
+                    if hasattr(last_message, "tool_calls") and last_message.tool_calls:
+                        for tool_call in last_message.tool_calls:
+                            if isinstance(tool_call, dict):
+                                message_buffer.add_tool_call(
+                                    tool_call["name"], tool_call["args"]
+                                )
+                            else:
+                                message_buffer.add_tool_call(tool_call.name, tool_call.args)
+
+            # Update analyst statuses based on report state (runs on every chunk)
+            update_analyst_statuses(message_buffer, chunk)
+
+            # Research Team - Handle Investment Debate State
+            if chunk.get("investment_debate_state"):
+                debate_state = chunk["investment_debate_state"]
+                message_buffer.update_debate_count(debate_state.get("count", 0))
+                bull_hist = debate_state.get("bull_history", "").strip()
+                bear_hist = debate_state.get("bear_history", "").strip()
+                judge = debate_state.get("judge_decision", "").strip()
+
+                # Only update status when there's actual content
+                if bull_hist or bear_hist:
+                    update_research_team_status("in_progress")
+                if bull_hist:
+                    message_buffer.update_report_section(
+                        "investment_plan", f"### {t('Bull Researcher', AGENT_NAMES)}\u5206\u6790\n{bull_hist}"
+                    )
+                if bear_hist:
+                    message_buffer.update_report_section(
+                        "investment_plan", f"### {t('Bear Researcher', AGENT_NAMES)}\u5206\u6790\n{bear_hist}"
+                    )
+                if judge:
+                    message_buffer.update_report_section(
+                        "investment_plan", f"### {t('Research Manager', AGENT_NAMES)}\u51b3\u7b56\n{judge}"
+                    )
+                    update_research_team_status("completed")
+                    message_buffer.update_agent_status("Trader", "in_progress")
+
+            # Trading Team
+            if chunk.get("trader_investment_plan"):
+                message_buffer.update_report_section(
+                    "trader_investment_plan", chunk["trader_investment_plan"]
+                )
+                if message_buffer.agent_status.get("Trader") != "completed":
+                    message_buffer.update_agent_status("Trader", "completed")
+                    message_buffer.update_agent_status("Aggressive Analyst", "in_progress")
+
+            # Risk Management Team - Handle Risk Debate State
+            if chunk.get("risk_debate_state"):
+                risk_state = chunk["risk_debate_state"]
+                message_buffer.update_risk_count(risk_state.get("count", 0))
+                agg_hist = risk_state.get("aggressive_history", "").strip()
+                con_hist = risk_state.get("conservative_history", "").strip()
+                neu_hist = risk_state.get("neutral_history", "").strip()
+                judge = risk_state.get("judge_decision", "").strip()
+
+                if agg_hist:
+                    if message_buffer.agent_status.get("Aggressive Analyst") != "completed":
+                        message_buffer.update_agent_status("Aggressive Analyst", "in_progress")
+                    message_buffer.update_report_section(
+                        "final_trade_decision", f"### {t('Aggressive Analyst', AGENT_NAMES)}\u5206\u6790\n{agg_hist}"
+                    )
+                if con_hist:
+                    if message_buffer.agent_status.get("Conservative Analyst") != "completed":
+                        message_buffer.update_agent_status("Conservative Analyst", "in_progress")
+                    message_buffer.update_report_section(
+                        "final_trade_decision", f"### {t('Conservative Analyst', AGENT_NAMES)}\u5206\u6790\n{con_hist}"
+                    )
+                if neu_hist:
+                    if message_buffer.agent_status.get("Neutral Analyst") != "completed":
+                        message_buffer.update_agent_status("Neutral Analyst", "in_progress")
+                    message_buffer.update_report_section(
+                        "final_trade_decision", f"### {t('Neutral Analyst', AGENT_NAMES)}\u5206\u6790\n{neu_hist}"
+                    )
+                if judge:
+                    if message_buffer.agent_status.get("Portfolio Manager") != "completed":
+                        message_buffer.update_agent_status("Portfolio Manager", "in_progress")
+                        message_buffer.update_report_section(
+                            "final_trade_decision", f"### {t('Portfolio Manager', AGENT_NAMES)}\u51b3\u7b56\n{judge}"
+                        )
+                        message_buffer.update_agent_status("Aggressive Analyst", "completed")
+                        message_buffer.update_agent_status("Conservative Analyst", "completed")
+                        message_buffer.update_agent_status("Neutral Analyst", "completed")
+                        message_buffer.update_agent_status("Portfolio Manager", "completed")
+
+            message_buffer._trace.append(chunk)
+
+    except Exception as e:
+        message_buffer._streaming_error = e
+    finally:
+        message_buffer._streaming_complete = True
+
+
 def run_analysis():
     # First get all user selections
     selections = get_user_selections()
@@ -907,8 +1150,12 @@ def run_analysis():
         callbacks=[stats_handler],
     )
 
-    # Initialize message buffer with selected analysts
-    message_buffer.init_for_analysis(selected_analyst_keys)
+    # Initialize message buffer with selected analysts and debate config
+    message_buffer.init_for_analysis(
+        selected_analyst_keys,
+        max_debate_rounds=config["max_debate_rounds"],
+        max_risk_rounds=config["max_risk_discuss_rounds"],
+    )
 
     # Track start time for elapsed display
     start_time = time.time()
@@ -998,110 +1245,32 @@ def run_analysis():
         # (LLM tracking is handled separately via LLM constructor)
         args = graph.propagator.get_graph_args(callbacks=[stats_handler])
 
-        # Stream the analysis
-        trace = []
-        for chunk in graph.graph.stream(init_agent_state, **args):
-            # Process messages if present (skip duplicates via message ID)
-            if len(chunk["messages"]) > 0:
-                last_message = chunk["messages"][-1]
-                msg_id = getattr(last_message, "id", None)
+        # Stream the analysis in a background thread so the main thread
+        # can keep refreshing the display (elapsed time, progress, etc.)
+        worker = threading.Thread(
+            target=_streaming_worker,
+            args=(graph, init_agent_state, args, message_buffer, selections),
+            daemon=True,
+        )
+        worker.start()
 
-                if msg_id != message_buffer._last_message_id:
-                    message_buffer._last_message_id = msg_id
-
-                    # Add message to buffer
-                    msg_type, content = classify_message_type(last_message)
-                    if content and content.strip():
-                        message_buffer.add_message(msg_type, content)
-
-                    # Handle tool calls
-                    if hasattr(last_message, "tool_calls") and last_message.tool_calls:
-                        for tool_call in last_message.tool_calls:
-                            if isinstance(tool_call, dict):
-                                message_buffer.add_tool_call(
-                                    tool_call["name"], tool_call["args"]
-                                )
-                            else:
-                                message_buffer.add_tool_call(tool_call.name, tool_call.args)
-
-            # Update analyst statuses based on report state (runs on every chunk)
-            update_analyst_statuses(message_buffer, chunk)
-
-            # Research Team - Handle Investment Debate State
-            if chunk.get("investment_debate_state"):
-                debate_state = chunk["investment_debate_state"]
-                bull_hist = debate_state.get("bull_history", "").strip()
-                bear_hist = debate_state.get("bear_history", "").strip()
-                judge = debate_state.get("judge_decision", "").strip()
-
-                # Only update status when there's actual content
-                if bull_hist or bear_hist:
-                    update_research_team_status("in_progress")
-                if bull_hist:
-                    message_buffer.update_report_section(
-                        "investment_plan", f"### {t('Bull Researcher', AGENT_NAMES)}分析\n{bull_hist}"
-                    )
-                if bear_hist:
-                    message_buffer.update_report_section(
-                        "investment_plan", f"### {t('Bear Researcher', AGENT_NAMES)}分析\n{bear_hist}"
-                    )
-                if judge:
-                    message_buffer.update_report_section(
-                        "investment_plan", f"### {t('Research Manager', AGENT_NAMES)}决策\n{judge}"
-                    )
-                    update_research_team_status("completed")
-                    message_buffer.update_agent_status("Trader", "in_progress")
-
-            # Trading Team
-            if chunk.get("trader_investment_plan"):
-                message_buffer.update_report_section(
-                    "trader_investment_plan", chunk["trader_investment_plan"]
-                )
-                if message_buffer.agent_status.get("Trader") != "completed":
-                    message_buffer.update_agent_status("Trader", "completed")
-                    message_buffer.update_agent_status("Aggressive Analyst", "in_progress")
-
-            # Risk Management Team - Handle Risk Debate State
-            if chunk.get("risk_debate_state"):
-                risk_state = chunk["risk_debate_state"]
-                agg_hist = risk_state.get("aggressive_history", "").strip()
-                con_hist = risk_state.get("conservative_history", "").strip()
-                neu_hist = risk_state.get("neutral_history", "").strip()
-                judge = risk_state.get("judge_decision", "").strip()
-
-                if agg_hist:
-                    if message_buffer.agent_status.get("Aggressive Analyst") != "completed":
-                        message_buffer.update_agent_status("Aggressive Analyst", "in_progress")
-                    message_buffer.update_report_section(
-                        "final_trade_decision", f"### {t('Aggressive Analyst', AGENT_NAMES)}分析\n{agg_hist}"
-                    )
-                if con_hist:
-                    if message_buffer.agent_status.get("Conservative Analyst") != "completed":
-                        message_buffer.update_agent_status("Conservative Analyst", "in_progress")
-                    message_buffer.update_report_section(
-                        "final_trade_decision", f"### {t('Conservative Analyst', AGENT_NAMES)}分析\n{con_hist}"
-                    )
-                if neu_hist:
-                    if message_buffer.agent_status.get("Neutral Analyst") != "completed":
-                        message_buffer.update_agent_status("Neutral Analyst", "in_progress")
-                    message_buffer.update_report_section(
-                        "final_trade_decision", f"### {t('Neutral Analyst', AGENT_NAMES)}分析\n{neu_hist}"
-                    )
-                if judge:
-                    if message_buffer.agent_status.get("Portfolio Manager") != "completed":
-                        message_buffer.update_agent_status("Portfolio Manager", "in_progress")
-                        message_buffer.update_report_section(
-                            "final_trade_decision", f"### {t('Portfolio Manager', AGENT_NAMES)}决策\n{judge}"
-                        )
-                        message_buffer.update_agent_status("Aggressive Analyst", "completed")
-                        message_buffer.update_agent_status("Conservative Analyst", "completed")
-                        message_buffer.update_agent_status("Neutral Analyst", "completed")
-                        message_buffer.update_agent_status("Portfolio Manager", "completed")
-
-            # Update the display
+        # Main thread: refresh display until streaming completes
+        while not message_buffer._streaming_complete:
             update_display(layout, stats_handler=stats_handler, start_time=start_time)
+            time.sleep(0.25)
 
-            trace.append(chunk)
+        # Final display update after stream completes
+        update_display(layout, stats_handler=stats_handler, start_time=start_time)
+        worker.join(timeout=5.0)
+
+        # Propagate any streaming errors
+        if message_buffer._streaming_error:
+            raise message_buffer._streaming_error
+
+        trace = message_buffer._trace
+        if not trace:
+            console.print("[red]\u5206\u6790\u672a\u4ea7\u751f\u4efb\u4f55\u7ed3\u679c[/red]")
+            return
 
         # Get final state and decision
         final_state = trace[-1]

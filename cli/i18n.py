@@ -47,6 +47,7 @@ STATUS_TEXT = {
     "in_progress": "进行中",
     "completed": "已完成",
     "error": "错误",
+    "thinking": "思考中",
 }
 
 # 状态颜色映射（用于 Rich 渲染）
@@ -54,6 +55,15 @@ STATUS_COLORS = {
     "pending": "yellow",
     "completed": "green",
     "error": "red",
+}
+
+# 阶段名称映射（用于进度面板标题）
+PHASE_NAMES = {
+    "analyst": "分析师研究",
+    "research_debate": "研究辩论",
+    "trading": "交易决策",
+    "risk_discussion": "风控讨论",
+    "portfolio": "投资组合决策",
 }
 
 # 消息类型映射
@@ -75,7 +85,7 @@ def t(key: str, mapping: dict = None) -> str:
     if mapping is not None:
         return mapping.get(key, key)
 
-    for m in (AGENT_NAMES, TEAM_NAMES, REPORT_TITLES, STATUS_TEXT, MESSAGE_TYPES):
+    for m in (AGENT_NAMES, TEAM_NAMES, REPORT_TITLES, STATUS_TEXT, PHASE_NAMES, MESSAGE_TYPES):
         if key in m:
             return m[key]
     return key

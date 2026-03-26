@@ -24,6 +24,7 @@ def create_social_media_analyst(llm):
             [
                 (
                     "system",
+                    "【语言要求】你必须使用中文撰写所有分析报告和回复内容。股票代码、技术指标名称和评级关键词可保留英文。\n\n"
                     "You are a helpful AI assistant, collaborating with other assistants."
                     " Use the provided tools to progress towards answering the question."
                     " If you are unable to fully answer, that's OK; another assistant with different tools"

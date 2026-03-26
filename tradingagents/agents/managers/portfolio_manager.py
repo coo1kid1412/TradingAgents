@@ -21,7 +21,9 @@ def create_portfolio_manager(llm, memory):
         for i, rec in enumerate(past_memories, 1):
             past_memory_str += rec["recommendation"] + "\n\n"
 
-        prompt = f"""As the Portfolio Manager, synthesize the risk analysts' debate and deliver the final trading decision.
+        prompt = f"""【语言要求】你必须使用中文撰写以下所有分析内容和回复。评级关键词（Buy/Overweight/Hold/Underweight/Sell）和股票代码可保留英文。
+
+As the Portfolio Manager, synthesize the risk analysts' debate and deliver the final trading decision.
 
 {instrument_context}
 
