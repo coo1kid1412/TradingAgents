@@ -7,8 +7,9 @@ from functools import wraps
 from rich.console import Console
 from dotenv import load_dotenv
 
-# Load environment variables from .env file
-load_dotenv()
+# Load environment variables from .env file (use project root, not CWD)
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+load_dotenv(os.path.join(_PROJECT_ROOT, ".env"))
 
 # 确保代理可用（Google Gemini 等国际 API 需要代理）
 os.environ.setdefault("HTTP_PROXY", "http://127.0.0.1:7890")

@@ -264,14 +264,12 @@ class TradingAgentsGraph:
         }
 
         # Save to file
-        directory = Path(f"eval_results/{self.ticker}/TradingAgentsStrategy_logs/")
+        eval_base = self.config.get("eval_results_dir", "eval_results")
+        directory = Path(eval_base) / self.ticker / "TradingAgentsStrategy_logs"
         directory.mkdir(parents=True, exist_ok=True)
 
-        with open(
-            f"eval_results/{self.ticker}/TradingAgentsStrategy_logs/full_states_log_{trade_date}.json",
-            "w",
-            encoding="utf-8",
-        ) as f:
+        log_file = directory / f"full_states_log_{trade_date}.json"
+        with open(log_file, "w", encoding="utf-8") as f:
             json.dump(self.log_states_dict, f, indent=4)
 
     def reflect_and_remember(self, returns_losses):

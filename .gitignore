@@ -217,3 +217,8 @@ __marimo__/
 
 # Cache
 **/data_cache/
+
+# Generated output directories
+results/
+reports/
+eval_results/

@@ -1,8 +1,17 @@
 import os
 
+_PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+
 DEFAULT_CONFIG = {
     "project_dir": os.path.abspath(os.path.join(os.path.dirname(__file__), ".")),
-    "results_dir": os.getenv("TRADINGAGENTS_RESULTS_DIR", "./results"),
+    "results_dir": os.getenv(
+        "TRADINGAGENTS_RESULTS_DIR",
+        os.path.join(_PROJECT_ROOT, "results"),
+    ),
+    "eval_results_dir": os.getenv(
+        "TRADINGAGENTS_EVAL_DIR",
+        os.path.join(_PROJECT_ROOT, "eval_results"),
+    ),
     "data_cache_dir": os.path.join(
         os.path.abspath(os.path.join(os.path.dirname(__file__), ".")),
         "dataflows/data_cache",
