@@ -14,7 +14,8 @@ class Reflector:
 
     def _get_reflection_prompt(self) -> str:
         """Get the system prompt for reflection."""
-        return """
+        return """【语言要求】你必须使用中文撰写以下所有反思分析内容。股票代码和技术指标名称可保留英文。
+
 You are an expert financial analyst tasked with reviewing trading decisions/analysis and providing a comprehensive, step-by-step analysis. 
 Your goal is to deliver detailed insights into investment decisions and highlight opportunities for improvement, adhering strictly to the following guidelines:
 

@@ -30,7 +30,12 @@ from tradingagents.agents.utils.agent_utils import (
     get_income_statement,
     get_news,
     get_insider_transactions,
-    get_global_news
+    get_global_news,
+    get_announcements,
+    get_cls_telegraph,
+    get_research_reports,
+    get_news_from_search,
+    get_xueqiu_posts,
 )
 
 from .conditional_logic import ConditionalLogic
@@ -175,6 +180,8 @@ class TradingAgentsGraph:
                 [
                     # News tools for social media analysis
                     get_news,
+                    # Xueqiu (雪球) social media sentiment
+                    get_xueqiu_posts,
                 ]
             ),
             "news": ToolNode(
@@ -183,6 +190,14 @@ class TradingAgentsGraph:
                     get_news,
                     get_global_news,
                     get_insider_transactions,
+                    # Company announcements (公告)
+                    get_announcements,
+                    # CLS telegraph (财联社电报)
+                    get_cls_telegraph,
+                    # Research reports (个股研报)
+                    get_research_reports,
+                    # Brave Search real-time web news
+                    get_news_from_search,
                 ]
             ),
             "fundamentals": ToolNode(

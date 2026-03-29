@@ -23,9 +23,12 @@ def get_indicators(
     # LLMs sometimes pass multiple indicators as a comma-separated string;
     # split and process each individually.
     indicators = [i.strip() for i in indicator.split(",") if i.strip()]
-    if len(indicators) > 1:
-        results = []
-        for ind in indicators:
-            results.append(route_to_vendor("get_indicators", symbol, ind, curr_date, look_back_days))
-        return "\n\n".join(results)
-    return route_to_vendor("get_indicators", symbol, indicator.strip(), curr_date, look_back_days)
+    try:
+        if len(indicators) > 1:
+            results = []
+            for ind in indicators:
+                results.append(route_to_vendor("get_indicators", symbol, ind, curr_date, look_back_days))
+            return "\n\n".join(results)
+        return route_to_vendor("get_indicators", symbol, indicator.strip(), curr_date, look_back_days)
+    except Exception as e:
+        return f"获取技术指标数据失败 ({symbol}, {indicator}): {e}"

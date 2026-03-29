@@ -172,8 +172,10 @@ def select_shallow_thinking_agent(provider) -> str:
             ("GLM-4.7-Flash:latest (30B, local)", "glm-4.7-flash:latest"),
         ],
         "minimax": [
-            ("MiniMax-M2.7-highspeed - 高速版旗舰", "MiniMax-M2.7-highspeed"),
-            ("MiniMax-M2.5-highspeed - 高速版均衡", "MiniMax-M2.5-highspeed"),
+            ("MiniMax-M2.7-highspeed - 高速版旗舰 (需极速版订阅)", "MiniMax-M2.7-highspeed"),
+            ("MiniMax-M2.5-highspeed - 高速版均衡 (需极速版订阅)", "MiniMax-M2.5-highspeed"),
+            ("MiniMax-M2.7 - 标准版旗舰 (所有套餐可用)", "MiniMax-M2.7"),
+            ("MiniMax-M2.5 - 标准版均衡 (所有套餐可用)", "MiniMax-M2.5"),
             ("MiniMax-M2.1-highspeed - 高速版经济", "MiniMax-M2.1-highspeed"),
         ],
     }
@@ -244,8 +246,8 @@ def select_deep_thinking_agent(provider) -> str:
             ("Qwen3:latest (8B, local)", "qwen3:latest"),
         ],
         "minimax": [
-            ("MiniMax-M2.7 - 旗舰模型，最强能力", "MiniMax-M2.7"),
-            ("MiniMax-M2.5 - 均衡型号，性价比高", "MiniMax-M2.5"),
+            ("MiniMax-M2.7 - 旗舰模型，最强能力 (所有套餐可用)", "MiniMax-M2.7"),
+            ("MiniMax-M2.5 - 均衡型号，性价比高 (所有套餐可用)", "MiniMax-M2.5"),
             ("MiniMax-M2.1 - 经济型号", "MiniMax-M2.1"),
             ("MiniMax-M2 - 基础模型", "MiniMax-M2"),
         ],

@@ -9,7 +9,7 @@ from datetime import datetime, timedelta
 
 import pandas as pd
 
-from .ticker_utils import to_akshare_format, to_akshare_report_format, to_akshare_date, to_standard_date
+from .ticker_utils import to_akshare_format, to_akshare_report_format, to_akshare_date, to_standard_date, is_etf_or_lof
 from .vendor_errors import AKShareError
 
 
@@ -33,6 +33,54 @@ _OHLCV_COL_MAP = {
 }
 
 
+def _get_ohlcv(ak, code: str, start_date: str, end_date: str) -> pd.DataFrame:
+    """获取 A 股 OHLCV 数据，自动适配股票和 ETF/LOF。
+
+    尝试顺序：
+      1. stock_zh_a_hist — 覆盖股票（6/0/3/688 等）
+      2. fund_etf_hist_em — 覆盖 ETF（5xxxxx, 159xxx 等）
+
+    Args:
+        ak: akshare 模块
+        code: 纯6位数字代码
+        start_date: YYYYMMDD
+        end_date: YYYYMMDD
+
+    Returns:
+        DataFrame with 标准英文列名 (Date, Open, High, Low, Close, Volume)，
+        如果所有接口均无数据则返回空 DataFrame。
+    """
+    # 1. 先尝试股票行情接口（覆盖大部分标的）
+    try:
+        df = ak.stock_zh_a_hist(
+            symbol=code,
+            period="daily",
+            start_date=start_date,
+            end_date=end_date,
+            adjust="qfq",
+        )
+        if df is not None and not df.empty:
+            return df.rename(columns=_OHLCV_COL_MAP)
+    except Exception:
+        pass
+
+    # 2. ETF 行情接口 — stock_zh_a_hist 对 ETF 常返回空
+    try:
+        df = ak.fund_etf_hist_em(
+            symbol=code,
+            period="daily",
+            start_date=start_date,
+            end_date=end_date,
+            adjust="qfq",
+        )
+        if df is not None and not df.empty:
+            return df.rename(columns=_OHLCV_COL_MAP)
+    except Exception:
+        pass
+
+    return pd.DataFrame()
+
+
 # ---------------------------------------------------------------------------
 # 1. get_stock
 # ---------------------------------------------------------------------------
@@ -41,25 +89,15 @@ def get_stock(
     start_date: Annotated[str, "Start date in yyyy-mm-dd format"],
     end_date: Annotated[str, "End date in yyyy-mm-dd format"],
 ) -> str:
-    """获取 A 股 OHLCV 日线数据（前复权）。"""
+    """获取 A 股 OHLCV 日线数据（前复权），支持股票和 ETF/LOF。"""
     ak = _import_akshare()
     code = to_akshare_format(symbol)
 
-    try:
-        df = ak.stock_zh_a_hist(
-            symbol=code,
-            period="daily",
-            start_date=to_akshare_date(start_date),
-            end_date=to_akshare_date(end_date),
-            adjust="qfq",
-        )
-    except Exception as e:
-        raise AKShareError(f"AKShare 获取 {symbol} 行情数据失败：{e}")
+    df = _get_ohlcv(ak, code, to_akshare_date(start_date), to_akshare_date(end_date))
 
-    if df is None or df.empty:
+    if df.empty:
         return f"未找到股票 '{symbol}' 在 {start_date} 至 {end_date} 期间的数据"
 
-    df = df.rename(columns=_OHLCV_COL_MAP)
     keep = [c for c in ("Date", "Open", "High", "Low", "Close", "Volume") if c in df.columns]
     df = df[keep]
 
@@ -87,7 +125,7 @@ def get_indicator(
     curr_date: Annotated[str, "current trading date YYYY-mm-dd"],
     look_back_days: Annotated[int, "how many days to look back"],
 ) -> str:
-    """使用 AKShare OHLCV 数据 + stockstats 计算技术指标。"""
+    """使用 AKShare OHLCV 数据 + stockstats 计算技术指标，支持股票和 ETF/LOF。"""
     from .stockstats_utils import calculate_indicator_from_ohlcv
 
     ak = _import_akshare()
@@ -96,21 +134,14 @@ def get_indicator(
     curr_dt = datetime.strptime(curr_date, "%Y-%m-%d")
     hist_start = curr_dt - timedelta(days=365)
 
-    try:
-        df = ak.stock_zh_a_hist(
-            symbol=code,
-            period="daily",
-            start_date=to_akshare_date(hist_start.strftime("%Y-%m-%d")),
-            end_date=to_akshare_date(curr_date),
-            adjust="qfq",
-        )
-    except Exception as e:
-        raise AKShareError(f"AKShare 获取 {symbol} 指标数据失败：{e}")
+    df = _get_ohlcv(
+        ak, code,
+        to_akshare_date(hist_start.strftime("%Y-%m-%d")),
+        to_akshare_date(curr_date),
+    )
 
-    if df is None or df.empty:
+    if df.empty:
         return f"未找到股票 '{symbol}' 的历史行情数据，无法计算指标"
-
-    df = df.rename(columns=_OHLCV_COL_MAP)
     indicator_data = calculate_indicator_from_ohlcv(df, indicator)
 
     before = curr_dt - timedelta(days=look_back_days)
@@ -137,9 +168,13 @@ def get_fundamentals(
     ticker: Annotated[str, "ticker symbol of the company"],
     curr_date: Annotated[str, "current date"] = None,
 ) -> str:
-    """获取 A 股公司基本面信息。"""
+    """获取 A 股公司基本面信息。ETF/LOF 走专属数据路径。"""
     ak = _import_akshare()
     code = to_akshare_format(ticker)
+
+    if is_etf_or_lof(ticker):
+        return _get_etf_fundamentals(ak, code, ticker)
+
     sections: list[str] = []
 
     # 公司基本信息
@@ -172,6 +207,78 @@ def get_fundamentals(
     return header + "\n".join(sections)
 
 
+def _get_etf_fundamentals(ak, code: str, ticker: str) -> str:
+    """获取 ETF/LOF 基金基本面信息（fund_etf_spot_em 实时数据）。"""
+    sections: list[str] = []
+
+    try:
+        spot_df = ak.fund_etf_spot_em()
+        row = spot_df[spot_df["代码"] == code]
+        if row.empty:
+            # 尝试 LOF
+            try:
+                lof_df = ak.fund_lof_spot_em()
+                row = lof_df[lof_df["代码"] == code]
+            except Exception:
+                pass
+
+        if not row.empty:
+            r = row.iloc[0]
+            sections.append("## 基金实时行情")
+            field_map = [
+                ("名称", "名称"),
+                ("最新价(元)", "最新价"),
+                ("IOPV实时估值", "IOPV实时估值"),
+                ("基金折价率(%)", "基金折价率"),
+                ("涨跌额", "涨跌额"),
+                ("涨跌幅(%)", "涨跌幅"),
+                ("成交量(手)", "成交量"),
+                ("成交额(元)", "成交额"),
+                ("开盘价", "开盘价"),
+                ("最高价", "最高价"),
+                ("最低价", "最低价"),
+                ("昨收", "昨收"),
+                ("振幅(%)", "振幅"),
+                ("换手率(%)", "换手率"),
+                ("最新份额", "最新份额"),
+                ("流通市值(元)", "流通市值"),
+                ("总市值(元)", "总市值"),
+            ]
+            for label, col in field_map:
+                if col in r.index and pd.notna(r[col]):
+                    sections.append(f"{label}: {r[col]}")
+
+            sections.append("")
+            sections.append("## 资金流向")
+            flow_fields = [
+                ("主力净流入-净额", "主力净流入-净额"),
+                ("主力净流入-净占比(%)", "主力净流入-净占比"),
+                ("超大单净流入-净额", "超大单净流入-净额"),
+                ("超大单净流入-净占比(%)", "超大单净流入-净占比"),
+                ("大单净流入-净额", "大单净流入-净额"),
+                ("大单净流入-净占比(%)", "大单净流入-净占比"),
+                ("中单净流入-净额", "中单净流入-净额"),
+                ("中单净流入-净占比(%)", "中单净流入-净占比"),
+                ("小单净流入-净额", "小单净流入-净额"),
+                ("小单净流入-净占比(%)", "小单净流入-净占比"),
+            ]
+            for label, col in flow_fields:
+                if col in r.index and pd.notna(r[col]):
+                    sections.append(f"{label}: {r[col]}")
+        else:
+            sections.append("未在 ETF/LOF 实时行情中找到该基金")
+    except Exception as e:
+        sections.append(f"# 获取 ETF 实时行情出错：{e}\n")
+
+    header = (
+        f"# ETF/LOF Fund Fundamentals for {ticker}\n"
+        f"# Source: AKShare (东方财富 ETF 实时行情)\n"
+        f"# 注意：ETF/LOF 是被动跟踪指数的基金产品，没有传统上市公司的财务报表\n"
+        f"# Data retrieved on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+    )
+    return header + "\n".join(sections)
+
+
 # ---------------------------------------------------------------------------
 # 4. get_balance_sheet
 # ---------------------------------------------------------------------------
@@ -181,13 +288,20 @@ def get_balance_sheet(
     curr_date: Annotated[str, "current date"] = None,
 ) -> str:
     """获取 A 股资产负债表。"""
+    if is_etf_or_lof(ticker):
+        return (
+            f"# Balance Sheet for {ticker}\n\n"
+            f"{ticker} 是 ETF/LOF 基金，不是上市公司，没有资产负债表。\n"
+            f"如需了解该基金的基本信息，请使用 get_fundamentals 工具。"
+        )
+
     ak = _import_akshare()
     code = to_akshare_format(ticker)
 
     try:
         df = ak.stock_balance_sheet_by_report_em(symbol=code)
     except Exception as e:
-        raise AKShareError(f"AKShare 获取 {ticker} 资产负债表失败：{e}")
+        return f"# Balance Sheet for {ticker}\n\nAKShare 获取资产负债表失败：{e}"
 
     if df is None or df.empty:
         return f"未找到股票 '{ticker}' 的资产负债表数据"
@@ -212,13 +326,20 @@ def get_cashflow(
     curr_date: Annotated[str, "current date"] = None,
 ) -> str:
     """获取 A 股现金流量表。"""
+    if is_etf_or_lof(ticker):
+        return (
+            f"# Cash Flow for {ticker}\n\n"
+            f"{ticker} 是 ETF/LOF 基金，不是上市公司，没有现金流量表。\n"
+            f"如需了解该基金的基本信息，请使用 get_fundamentals 工具。"
+        )
+
     ak = _import_akshare()
     code = to_akshare_format(ticker)
 
     try:
         df = ak.stock_cash_flow_sheet_by_report_em(symbol=code)
     except Exception as e:
-        raise AKShareError(f"AKShare 获取 {ticker} 现金流量表失败：{e}")
+        return f"# Cash Flow for {ticker}\n\nAKShare 获取现金流量表失败：{e}"
 
     if df is None or df.empty:
         return f"未找到股票 '{ticker}' 的现金流量表数据"
@@ -243,13 +364,20 @@ def get_income_statement(
     curr_date: Annotated[str, "current date"] = None,
 ) -> str:
     """获取 A 股利润表。"""
+    if is_etf_or_lof(ticker):
+        return (
+            f"# Income Statement for {ticker}\n\n"
+            f"{ticker} 是 ETF/LOF 基金，不是上市公司，没有利润表。\n"
+            f"如需了解该基金的基本信息，请使用 get_fundamentals 工具。"
+        )
+
     ak = _import_akshare()
     code = to_akshare_report_format(ticker)
 
     try:
         df = ak.stock_profit_sheet_by_report_em(symbol=code)
     except Exception as e:
-        raise AKShareError(f"AKShare 获取 {ticker} 利润表失败：{e}")
+        return f"# Income Statement for {ticker}\n\nAKShare 获取利润表失败：{e}"
 
     if df is None or df.empty:
         return f"未找到股票 '{ticker}' 的利润表数据"
@@ -337,37 +465,180 @@ def get_insider_transactions(
     symbol: Annotated[str, "ticker symbol of the company"],
 ) -> str:
     """获取 A 股董监高/大股东持股变动。"""
+    if is_etf_or_lof(symbol):
+        return (
+            f"# Insider Transactions for {symbol}\n\n"
+            f"{symbol} 是 ETF/LOF 基金，没有董监高/内部交易数据。"
+        )
+
     ak = _import_akshare()
     code = to_akshare_format(symbol)
+    # 构建带交易所前缀的代码，用于匹配 stock_inner_trade_xq 返回的格式
+    from .ticker_utils import _get_exchange
+    prefixed_code = f"{_get_exchange(code)}{code}"
 
-    # 尝试多个可能的 AKShare 接口
+    # stock_inner_trade_xq() 返回全市场近期内部交易，按代码过滤
     df = None
-    tried_apis = []
-    for api_name in ("stock_gdfx_free_holding_change_em", "stock_inner_trade_xq"):
-        tried_apis.append(api_name)
-        try:
-            fn = getattr(ak, api_name, None)
-            if fn is None:
-                continue
-            df = fn(symbol=code)
-            if df is not None and not df.empty:
-                break
-        except Exception:
-            continue
+    try:
+        all_df = ak.stock_inner_trade_xq()
+        if all_df is not None and not all_df.empty and "股票代码" in all_df.columns:
+            df = all_df[all_df["股票代码"] == prefixed_code]
+    except Exception:
+        pass
 
     if df is None or df.empty:
         return (
             f"# Insider Transactions for {symbol}\n"
-            f"# Source: AKShare\n\n"
-            f"AKShare 暂无 {symbol} 的内部交易数据，"
-            f"建议通过 Tushare（stk_holdertrade 接口）获取。"
+            f"# Source: AKShare (雪球)\n\n"
+            f"近期暂无 {symbol} 的董监高/内部交易数据。"
         )
 
     csv_string = df.head(20).to_csv(index=False)
 
     header = (
         f"# Insider Transactions for {symbol}\n"
-        f"# Source: AKShare\n"
+        f"# Source: AKShare (雪球)\n"
+        f"# Data retrieved on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+    )
+    return header + csv_string
+    return header + csv_string
+
+
+# ---------------------------------------------------------------------------
+# 10. get_announcements
+# ---------------------------------------------------------------------------
+def get_announcements(
+    ticker: Annotated[str, "ticker symbol of the company"],
+    start_date: Annotated[str, "Start date yyyy-mm-dd"],
+    end_date: Annotated[str, "End date yyyy-mm-dd"],
+) -> str:
+    """获取 A 股公司公告（来源：巨潮资讯）。"""
+    if is_etf_or_lof(ticker):
+        return (
+            f"# Company Announcements for {ticker}\n\n"
+            f"{ticker} 是 ETF/LOF 基金，巨潮资讯暂不支持查询 ETF 公告。\n"
+            f"可通过 get_news 工具获取该基金的相关新闻。"
+        )
+
+    ak = _import_akshare()
+    code = to_akshare_format(ticker)
+
+    try:
+        df = ak.stock_zh_a_disclosure_report_cninfo(
+            symbol=code,
+            market="沪深京",
+            start_date=to_akshare_date(start_date),
+            end_date=to_akshare_date(end_date),
+        )
+    except Exception as e:
+        return (
+            f"# Company Announcements for {ticker}\n\n"
+            f"AKShare 获取公告数据失败：{e}"
+        )
+
+    if df is None or df.empty:
+        return (
+            f"# Company Announcements for {ticker}\n"
+            f"# Source: AKShare (巨潮资讯)\n\n"
+            f"未找到 {ticker} 在 {start_date} 至 {end_date} 期间的公告"
+        )
+
+    df = df.head(30)
+    csv_string = df.to_csv(index=False)
+
+    header = (
+        f"# Company Announcements for {ticker}\n"
+        f"# Source: AKShare (巨潮资讯)\n"
+        f"# Date range: {start_date} to {end_date}\n"
+        f"# Total results: {len(df)}\n"
+        f"# Data retrieved on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+    )
+    return header + csv_string
+
+
+# ---------------------------------------------------------------------------
+# 11. get_cls_telegraph
+# ---------------------------------------------------------------------------
+def get_cls_telegraph(
+    curr_date: Annotated[str, "current date yyyy-mm-dd"],
+    limit: Annotated[int, "max number of telegraphs"] = 30,
+) -> str:
+    """获取财联社电报快讯。"""
+    ak = _import_akshare()
+
+    try:
+        df = ak.stock_info_global_cls(symbol="全部")
+    except Exception as e:
+        raise AKShareError(f"AKShare 获取财联社电报失败：{e}")
+
+    if df is None or df.empty:
+        return (
+            f"# CLS Telegraph (财联社电报)\n"
+            f"# Date: {curr_date}\n\n"
+            f"暂无财联社电报数据"
+        )
+
+    df = df.head(limit)
+    csv_string = df.to_csv(index=False)
+
+    header = (
+        f"# CLS Telegraph (财联社电报)\n"
+        f"# Source: AKShare (财联社)\n"
+        f"# Total results: {len(df)}\n"
+        f"# Data retrieved on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+    )
+    return header + csv_string
+
+
+# ---------------------------------------------------------------------------
+# 12. get_research_reports
+# ---------------------------------------------------------------------------
+def get_research_reports(
+    ticker: Annotated[str, "ticker symbol of the company"],
+    limit: Annotated[int, "max number of reports"] = 20,
+) -> str:
+    """获取个股研报（来源：东方财富）。"""
+    if is_etf_or_lof(ticker):
+        return (
+            f"# Research Reports for {ticker}\n\n"
+            f"{ticker} 是 ETF/LOF 基金，东方财富暂不提供 ETF 个股研报。\n"
+            f"可通过 get_news 工具获取该基金的相关分析文章。"
+        )
+
+    ak = _import_akshare()
+    code = to_akshare_format(ticker)
+
+    try:
+        df = ak.stock_research_report_em(symbol=code)
+    except Exception as e:
+        return (
+            f"# Research Reports for {ticker}\n\n"
+            f"AKShare 获取研报数据失败：{e}"
+        )
+
+    if df is None or df.empty:
+        return (
+            f"# Research Reports for {ticker}\n"
+            f"# Source: AKShare (东方财富)\n\n"
+            f"未找到 {ticker} 的研报数据"
+        )
+
+    df = df.head(limit)
+    # 选择关键列，减少 token 消耗
+    keep_cols = [c for c in (
+        "股票代码", "股票简称", "报告名称", "东财评级", "机构",
+        "2025-盈利预测-收益", "2025-盈利预测-市盈率",
+        "2026-盈利预测-收益", "2026-盈利预测-市盈率",
+        "行业", "日期",
+    ) if c in df.columns]
+    if keep_cols:
+        df = df[keep_cols]
+    csv_string = df.to_csv(index=False)
+
+    header = (
+        f"# Research Reports for {ticker}\n"
+        f"# Source: AKShare (东方财富)\n"
+        f"# Total results: {len(df)}\n"
         f"# Data retrieved on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
     )
     return header + csv_string

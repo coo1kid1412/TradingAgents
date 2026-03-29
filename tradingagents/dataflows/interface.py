@@ -32,6 +32,9 @@ from .akshare_vendor import (
     get_news as get_akshare_news,
     get_global_news as get_akshare_global_news,
     get_insider_transactions as get_akshare_insider_transactions,
+    get_announcements as get_akshare_announcements,
+    get_cls_telegraph as get_akshare_cls_telegraph,
+    get_research_reports as get_akshare_research_reports,
 )
 from .tushare_vendor import (
     get_stock as get_tushare_stock,
@@ -85,6 +88,9 @@ TOOLS_CATEGORIES = {
             "get_news",
             "get_global_news",
             "get_insider_transactions",
+            "get_announcements",
+            "get_cls_telegraph",
+            "get_research_reports",
         ]
     }
 }
@@ -159,6 +165,18 @@ VENDOR_METHODS = {
         "alpha_vantage": get_alpha_vantage_insider_transactions,
         "yfinance": get_yfinance_insider_transactions,
     },
+    # announcements (A-share only, 巨潮资讯)
+    "get_announcements": {
+        "akshare": get_akshare_announcements,
+    },
+    # CLS telegraph (财联社电报)
+    "get_cls_telegraph": {
+        "akshare": get_akshare_cls_telegraph,
+    },
+    # research reports (个股研报)
+    "get_research_reports": {
+        "akshare": get_akshare_research_reports,
+    },
 }
 
 def get_category_for_method(method: str) -> str:
@@ -228,6 +246,9 @@ def route_to_vendor(method: str, *args, **kwargs):
                 VendorUnavailableError, YFRateLimitError) as e:
             last_error = e
             continue  # 限流或不可用时 fallback 到下一个供应商
+        except Exception as e:
+            last_error = e
+            continue  # 其他异常（参数错误、网络超时等）也 fallback
 
     raise RuntimeError(
         f"方法 '{method}' 所有数据供应商均失败"

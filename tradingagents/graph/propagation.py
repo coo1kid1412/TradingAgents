@@ -1,11 +1,15 @@
 # TradingAgents/graph/propagation.py
 
+import logging
 from typing import Dict, Any, List, Optional
 from tradingagents.agents.utils.agent_states import (
     AgentState,
     InvestDebateState,
     RiskDebateState,
 )
+from tradingagents.dataflows.ticker_resolver import resolve_ticker
+
+logger = logging.getLogger(__name__)
 
 
 class Propagator:
@@ -18,10 +22,34 @@ class Propagator:
     def create_initial_state(
         self, company_name: str, trade_date: str
     ) -> Dict[str, Any]:
-        """Create the initial state for the agent graph."""
+        """Create the initial state for the agent graph.
+
+        Resolves the ticker first via AKShare/Tushare/yfinance to validate
+        and retrieve the company/fund name. Raises TickerNotFoundError if
+        the ticker cannot be resolved by any data source.
+        """
+        resolved = resolve_ticker(company_name)
+
+        # 构建规范化 ticker —— 供所有 agent 工具调用使用
+        # A股用纯6位代码（is_a_share 可识别、各 vendor 可转换）
+        # 港股用 code.HK，美股用纯 ticker
+        if resolved.market == "a_share":
+            normalized_ticker = resolved.code
+        elif resolved.exchange:
+            normalized_ticker = f"{resolved.code}.{resolved.exchange}"
+        else:
+            normalized_ticker = resolved.original_input
+
+        logger.info(
+            "Ticker resolved: %s → %s (%s, market=%s, ticker=%s)",
+            company_name, resolved.name, resolved.code,
+            resolved.market, normalized_ticker,
+        )
+
         return {
             "messages": [("human", company_name)],
-            "company_of_interest": company_name,
+            "company_of_interest": normalized_ticker,
+            "company_name": resolved.name,
             "trade_date": str(trade_date),
             "investment_debate_state": InvestDebateState(
                 {

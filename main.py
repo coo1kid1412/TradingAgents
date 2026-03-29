@@ -20,10 +20,12 @@ from tradingagents.default_config import DEFAULT_CONFIG
 
 # Create a custom config
 config = DEFAULT_CONFIG.copy()
-config["llm_provider"] = "google"
-config["deep_think_llm"] = "gemini-2.5-pro"
-config["quick_think_llm"] = "gemini-2.5-flash"
-config["max_debate_rounds"] = 1
+config["llm_provider"] = "minimax"
+config["backend_url"] = "https://api.minimaxi.com/v1"
+config["deep_think_llm"] = "MiniMax-M2.7"
+config["quick_think_llm"] = "MiniMax-M2.7"
+config["max_debate_rounds"] = 3
+config["max_risk_discuss_rounds"] = 3
 
 # A股代码会自动路由到 akshare → tushare → yfinance
 # 以下配置仅影响非A股（美股等）的供应商选择
@@ -34,9 +36,13 @@ config["data_vendors"] = {
     "news_data": "yfinance",
 }
 
-# Initialize with custom config
-ta = TradingAgentsGraph(debug=True, config=config)
+# Initialize with custom config (全部 4 个分析师)
+ta = TradingAgentsGraph(
+    selected_analysts=["market", "social", "news", "fundamentals"],
+    debug=True,
+    config=config,
+)
 
-# A股测试：淳中科技 603516
-_, decision = ta.propagate("603516", "2025-03-21")
+# A股测试：顺灏股份 002565
+_, decision = ta.propagate("002565", "2026-03-27")
 print(decision)

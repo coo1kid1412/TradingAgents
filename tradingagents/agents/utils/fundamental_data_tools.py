@@ -3,6 +3,13 @@ from typing import Annotated
 from tradingagents.dataflows.interface import route_to_vendor
 
 
+def _safe_route(method: str, *args, **kwargs) -> str:
+    try:
+        return route_to_vendor(method, *args, **kwargs)
+    except Exception as e:
+        return f"获取数据失败 ({method}): {e}"
+
+
 @tool
 def get_fundamentals(
     ticker: Annotated[str, "ticker symbol"],
@@ -17,7 +24,7 @@ def get_fundamentals(
     Returns:
         str: A formatted report containing comprehensive fundamental data
     """
-    return route_to_vendor("get_fundamentals", ticker, curr_date)
+    return _safe_route("get_fundamentals", ticker, curr_date)
 
 
 @tool
@@ -36,7 +43,7 @@ def get_balance_sheet(
     Returns:
         str: A formatted report containing balance sheet data
     """
-    return route_to_vendor("get_balance_sheet", ticker, freq, curr_date)
+    return _safe_route("get_balance_sheet", ticker, freq, curr_date)
 
 
 @tool
@@ -55,7 +62,7 @@ def get_cashflow(
     Returns:
         str: A formatted report containing cash flow statement data
     """
-    return route_to_vendor("get_cashflow", ticker, freq, curr_date)
+    return _safe_route("get_cashflow", ticker, freq, curr_date)
 
 
 @tool
@@ -74,4 +81,4 @@ def get_income_statement(
     Returns:
         str: A formatted report containing income statement data
     """
-    return route_to_vendor("get_income_statement", ticker, freq, curr_date)
+    return _safe_route("get_income_statement", ticker, freq, curr_date)

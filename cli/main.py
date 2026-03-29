@@ -1,5 +1,6 @@
 from typing import Optional
 import os
+import re
 import datetime
 import typer
 from pathlib import Path
@@ -1129,7 +1130,13 @@ def run_analysis():
     save_choice = typer.prompt("是否保存报告？", default="Y").strip().upper()
     if save_choice in ("Y", "YES", ""):
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        default_path = Path.cwd() / "reports" / f"{selections['ticker']}_{timestamp}"
+        # 路径格式：股票代号_股票名称_日期_时间戳
+        company_name_safe = re.sub(r'[\\/:*?"<>|]', "", final_state.get("company_name", "")).strip()
+        if company_name_safe:
+            folder_name = f"{selections['ticker']}_{company_name_safe}_{timestamp}"
+        else:
+            folder_name = f"{selections['ticker']}_{timestamp}"
+        default_path = Path.cwd() / "reports" / folder_name
         save_path_str = typer.prompt(
             "保存路径（回车使用默认路径）",
             default=str(default_path)
