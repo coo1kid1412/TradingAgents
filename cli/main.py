@@ -16,11 +16,23 @@ load_dotenv(os.path.join(_PROJECT_ROOT, ".env"))
 os.environ.setdefault("HTTP_PROXY", "http://127.0.0.1:7890")
 os.environ.setdefault("HTTPS_PROXY", "http://127.0.0.1:7890")
 
-# 国内数据源绕过代理（AKShare/Tushare/公告 API 等）
-os.environ.setdefault(
-    "NO_PROXY",
-    "*.eastmoney.com,*.sina.com.cn,*.tushare.pro,*.baidu.com,api.tauric.ai,*.akshare.xyz,*.minimaxi.com"
-)
+# 国内数据源绕过代理（AKShare/Tushare/交易所/雪球 等）
+# 注意：Python urllib 不支持 *.domain 格式，必须用 .domain（POSIX 标准）
+_DOMESTIC_NO_PROXY = ",".join([
+    ".eastmoney.com",       # 东方财富 (push2/quote/emweb 等子域)
+    ".sina.com.cn",         # 新浪财经
+    ".sse.com.cn",          # 上交所
+    ".szse.cn",             # 深交所
+    ".bse.cn",              # 北交所
+    ".tushare.pro",         # Tushare
+    ".xueqiu.com",          # 雪球
+    ".baidu.com",           # 百度
+    ".akshare.xyz",         # AKShare
+    ".minimaxi.com",        # MiniMax (国内 LLM)
+    "api.tauric.ai",        # Tauric
+])
+_existing = os.environ.get("NO_PROXY", "")
+os.environ["NO_PROXY"] = f"{_existing},{_DOMESTIC_NO_PROXY}" if _existing else _DOMESTIC_NO_PROXY
 from rich.panel import Panel
 from rich.spinner import Spinner
 from rich.live import Live

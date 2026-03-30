@@ -92,6 +92,7 @@ def _detect_market(ticker: str) -> str:
 def _resolve_a_share_akshare(code: str) -> Optional[Tuple[str, str]]:
     """用 ak.stock_individual_info_em 查询 A 股/ETF/LOF 名称。
 
+    依赖 push2.eastmoney.com，该节点不稳定时会失败。
     Returns (name, exchange) or None.
     """
     ak = _import_akshare()
@@ -113,6 +114,56 @@ def _resolve_a_share_akshare(code: str) -> Optional[Tuple[str, str]]:
     except Exception as e:
         logger.debug("akshare stock_individual_info_em(%s) failed: %s", code, e)
         return None
+
+
+def _resolve_a_share_exchange_list(code: str) -> Optional[Tuple[str, str]]:
+    """根据代码前缀直接查询对应交易所的股票列表。
+
+    不依赖 push2.eastmoney.com，走 SSE/SZSE/BSE 官网接口。
+    6/688 → 上交所 stock_info_sh_name_code
+    0/3   → 深交所 stock_info_sz_name_code
+    8/4   → 北交所 stock_info_bj_name_code
+    """
+    ak = _import_akshare()
+    if ak is None:
+        return None
+
+    exchange = _get_exchange(code)
+    try:
+        if exchange == "SH":
+            # 上交所：主板 + 科创板
+            for board in ("主板A股", "科创板"):
+                try:
+                    df = ak.stock_info_sh_name_code(symbol=board)
+                    if df is not None and not df.empty:
+                        match = df[df["证券代码"].astype(str) == code]
+                        if not match.empty:
+                            return (str(match.iloc[0]["证券简称"]).strip(), exchange)
+                except Exception:
+                    continue
+        elif exchange == "SZ":
+            try:
+                df = ak.stock_info_sz_name_code(symbol="A股列表")
+                if df is not None and not df.empty:
+                    df["A股代码"] = df["A股代码"].astype(str).str.zfill(6)
+                    match = df[df["A股代码"] == code]
+                    if not match.empty:
+                        return (str(match.iloc[0]["A股简称"]).strip(), exchange)
+            except Exception:
+                pass
+        elif exchange == "BJ":
+            try:
+                df = ak.stock_info_bj_name_code()
+                if df is not None and not df.empty:
+                    match = df[df["证券代码"].astype(str) == code]
+                    if not match.empty:
+                        return (str(match.iloc[0]["证券简称"]).strip(), exchange)
+            except Exception:
+                pass
+    except Exception as e:
+        logger.debug("exchange list lookup(%s) failed: %s", code, e)
+
+    return None
 
 
 def _resolve_a_share_tushare_stock(code: str, exchange: str) -> Optional[Tuple[str, str]]:
@@ -213,34 +264,36 @@ def _resolve_a_share(user_input: str) -> ResolvedTicker:
     """A 股代码解析，根据前缀智能选择接口顺序。
 
     路由策略：
-      - 5xxxxx (上交所ETF/基金): fund_basic → AKShare fund_cache → stock_info → stock_basic
-      - 1xxxxx (深市ETF/LOF等):  stock_info → AKShare fund_cache → stock_basic → fund_basic
-      - 其他 A 股代码:           stock_info → stock_basic → fund_basic → AKShare fund_cache
+      - 5xxxxx (上交所ETF/基金): fund_basic → fund_cache → stock_info(em) → exchange_list → stock_basic
+      - 1xxxxx (深市ETF/LOF等):  stock_info(em) → exchange_list → fund_cache → stock_basic → fund_basic
+      - 其他 A 股代码:           stock_info(em) → exchange_list → stock_basic → fund_basic → fund_cache
     """
     code = _extract_code(user_input)
     exchange = _get_exchange(code)
 
     if code[0] == _SH_FUND_PREFIX:
         # 5xxxxx: 大概率是 ETF/基金
-        # fund_basic(tushare) → AKShare ETF/LOF缓存 → stock_individual_info_em → stock_basic
         strategies = [
             (lambda: _resolve_a_share_tushare_fund(code, exchange), "Tushare fund_basic"),
             (lambda: _resolve_a_share_akshare_fund(code), "AKShare fund_cache"),
             (lambda: _resolve_a_share_akshare(code), "AKShare stock_info"),
+            (lambda: _resolve_a_share_exchange_list(code), "Exchange list"),
             (lambda: _resolve_a_share_tushare_stock(code, exchange), "Tushare stock_basic"),
         ]
     elif code[0] == "1":
-        # 1xxxxx: 深市ETF/LOF/债券 — 先试通用接口，再加基金缓存兜底
+        # 1xxxxx: 深市ETF/LOF/债券
         strategies = [
             (lambda: _resolve_a_share_akshare(code), "AKShare stock_info"),
+            (lambda: _resolve_a_share_exchange_list(code), "Exchange list"),
             (lambda: _resolve_a_share_akshare_fund(code), "AKShare fund_cache"),
             (lambda: _resolve_a_share_tushare_stock(code, exchange), "Tushare stock_basic"),
             (lambda: _resolve_a_share_tushare_fund(code, exchange), "Tushare fund_basic"),
         ]
     else:
-        # 6/0/3/688/8/4: 股票为主 → stock_individual_info_em 覆盖最广
+        # 6/0/3/688/8/4: 股票为主
         strategies = [
             (lambda: _resolve_a_share_akshare(code), "AKShare stock_info"),
+            (lambda: _resolve_a_share_exchange_list(code), "Exchange list"),
             (lambda: _resolve_a_share_tushare_stock(code, exchange), "Tushare stock_basic"),
             (lambda: _resolve_a_share_tushare_fund(code, exchange), "Tushare fund_basic"),
             (lambda: _resolve_a_share_akshare_fund(code), "AKShare fund_cache"),
@@ -252,11 +305,11 @@ def _resolve_a_share(user_input: str) -> ResolvedTicker:
             name, ex = result
             return _make_resolved(code, name, ex, user_input, source)
 
-    tried = " → ".join(s for _, s in strategies)
-    raise TickerNotFoundError(
-        f"未找到 A 股标的 '{user_input}'（代码 {code}）。"
-        f"已尝试：{tried}，均无结果。请检查代码是否正确。"
+    # 兜底：所有 API 均不可用时，纯数字代码格式合法则放行（用代码作为名称占位）
+    logger.warning(
+        "所有解析策略均失败（代码 %s），使用代码本身作为名称继续运行。", code
     )
+    return _make_resolved(code, code, exchange, user_input, "fallback (API unavailable)")
 
 
 # ---------------------------------------------------------------------------
