@@ -9,7 +9,7 @@ from datetime import datetime, timedelta
 
 import pandas as pd
 
-from .ticker_utils import to_akshare_format, to_akshare_report_format, to_akshare_date, to_standard_date, is_etf_or_lof
+from .ticker_utils import to_akshare_format, to_akshare_report_format, to_akshare_date, to_standard_date, is_etf_or_lof, _get_exchange
 from .vendor_errors import AKShareError
 
 
@@ -22,7 +22,7 @@ def _import_akshare():
         raise AKShareError("akshare 未安装，请运行: pip install akshare")
 
 
-# AKShare 中文列名 → 标准英文列名
+# AKShare 中文列名 → 标准英文列名（东方财富源 stock_zh_a_hist / fund_etf_hist_em）
 _OHLCV_COL_MAP = {
     "日期": "Date",
     "开盘": "Open",
@@ -32,13 +32,25 @@ _OHLCV_COL_MAP = {
     "成交量": "Volume",
 }
 
+# 新浪源 stock_zh_a_daily 已使用小写英文列名，映射为首字母大写
+_OHLCV_COL_MAP_SINA = {
+    "date": "Date",
+    "open": "Open",
+    "high": "High",
+    "low": "Low",
+    "close": "Close",
+    "volume": "Volume",
+}
+
 
 def _get_ohlcv(ak, code: str, start_date: str, end_date: str) -> pd.DataFrame:
     """获取 A 股 OHLCV 数据，自动适配股票和 ETF/LOF。
 
     尝试顺序：
-      1. stock_zh_a_hist — 覆盖股票（6/0/3/688 等）
-      2. fund_etf_hist_em — 覆盖 ETF（5xxxxx, 159xxx 等）
+      1. stock_zh_a_hist  — 东方财富源，覆盖股票（6/0/3/688 等）
+      2. stock_zh_a_daily — 新浪源 fallback（东方财富不可用时）
+      3. fund_etf_hist_em — 东方财富源，覆盖 ETF（5xxxxx, 159xxx 等）
+      4. fund_etf_hist_sina — 新浪源 ETF fallback
 
     Args:
         ak: akshare 模块
@@ -50,7 +62,7 @@ def _get_ohlcv(ak, code: str, start_date: str, end_date: str) -> pd.DataFrame:
         DataFrame with 标准英文列名 (Date, Open, High, Low, Close, Volume)，
         如果所有接口均无数据则返回空 DataFrame。
     """
-    # 1. 先尝试股票行情接口（覆盖大部分标的）
+    # 1. 先尝试东方财富行情接口（覆盖大部分标的）
     try:
         df = ak.stock_zh_a_hist(
             symbol=code,
@@ -64,7 +76,22 @@ def _get_ohlcv(ak, code: str, start_date: str, end_date: str) -> pd.DataFrame:
     except Exception:
         pass
 
-    # 2. ETF 行情接口 — stock_zh_a_hist 对 ETF 常返回空
+    # 2. 新浪源 fallback（stock_zh_a_daily 需要 sh/sz 前缀格式）
+    try:
+        exchange = _get_exchange(code).lower()  # "SH" → "sh", "SZ" → "sz"
+        sina_symbol = f"{exchange}{code}"
+        df = ak.stock_zh_a_daily(
+            symbol=sina_symbol,
+            start_date=start_date,
+            end_date=end_date,
+            adjust="qfq",
+        )
+        if df is not None and not df.empty:
+            return df.rename(columns=_OHLCV_COL_MAP_SINA)
+    except Exception:
+        pass
+
+    # 3. ETF 行情接口（东方财富源）— stock_zh_a_hist 对 ETF 常返回空
     try:
         df = ak.fund_etf_hist_em(
             symbol=code,
@@ -75,6 +102,25 @@ def _get_ohlcv(ak, code: str, start_date: str, end_date: str) -> pd.DataFrame:
         )
         if df is not None and not df.empty:
             return df.rename(columns=_OHLCV_COL_MAP)
+    except Exception:
+        pass
+
+    # 4. ETF 新浪源 fallback（fund_etf_hist_sina 需要 sh/sz 前缀，不支持日期范围）
+    try:
+        exchange = _get_exchange(code).lower()
+        sina_symbol = f"{exchange}{code}"
+        df = ak.fund_etf_hist_sina(symbol=sina_symbol)
+        if df is not None and not df.empty:
+            # fund_etf_hist_sina 返回全量历史，按日期范围过滤
+            df = df.rename(columns=_OHLCV_COL_MAP_SINA)
+            if "Date" in df.columns:
+                df["Date"] = pd.to_datetime(df["Date"])
+                start_dt = pd.to_datetime(start_date, format="%Y%m%d")
+                end_dt = pd.to_datetime(end_date, format="%Y%m%d")
+                df = df[(df["Date"] >= start_dt) & (df["Date"] <= end_dt)]
+                df["Date"] = df["Date"].dt.strftime("%Y-%m-%d")
+            if not df.empty:
+                return df
     except Exception:
         pass
 
@@ -296,7 +342,7 @@ def get_balance_sheet(
         )
 
     ak = _import_akshare()
-    code = to_akshare_format(ticker)
+    code = to_akshare_report_format(ticker)
 
     try:
         df = ak.stock_balance_sheet_by_report_em(symbol=code)
@@ -334,7 +380,7 @@ def get_cashflow(
         )
 
     ak = _import_akshare()
-    code = to_akshare_format(ticker)
+    code = to_akshare_report_format(ticker)
 
     try:
         df = ak.stock_cash_flow_sheet_by_report_em(symbol=code)
