@@ -59,7 +59,7 @@ ta = TradingAgentsGraph(
 )
 
 # A股测试：淳中科技 002565
-_ticker = "002565"
+_ticker = "603516"
 final_state, decision = ta.propagate(_ticker, "2026-03-30")
 print(decision)
 
@@ -180,6 +180,9 @@ def _save_report(state, ticker: str, save_path: Path):
 _company_name_safe = re.sub(
     r'[\\/:*?"<>|]', "", final_state.get("company_name", "")
 ).strip()
+# fallback 时 name == code，不重复拼接
+if _company_name_safe and _company_name_safe == _ticker:
+    _company_name_safe = ""
 _timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
 if _company_name_safe:
     _folder = f"{_ticker}_{_company_name_safe}_{_timestamp}"

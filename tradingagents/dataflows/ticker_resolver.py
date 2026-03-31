@@ -260,50 +260,61 @@ def _make_resolved(code: str, name: str, exchange: str,
                           market="a_share", original_input=user_input)
 
 
+# 单渠道最大重试次数，连续失败达到此值后切换下一渠道
+_MAX_RETRIES_PER_SOURCE = 3
+
+
 def _resolve_a_share(user_input: str) -> ResolvedTicker:
     """A 股代码解析，根据前缀智能选择接口顺序。
 
-    路由策略：
-      - 5xxxxx (上交所ETF/基金): fund_basic → fund_cache → stock_info(em) → exchange_list → stock_basic
-      - 1xxxxx (深市ETF/LOF等):  stock_info(em) → exchange_list → fund_cache → stock_basic → fund_basic
-      - 其他 A 股代码:           stock_info(em) → exchange_list → stock_basic → fund_basic → fund_cache
+    每个渠道最多重试 _MAX_RETRIES_PER_SOURCE 次，全部失败后切换下一个。
+    路由策略（Tushare 优先于 AKShare）：
+      - 5xxxxx (上交所ETF/基金): Tushare fund → Tushare stock → Exchange list → AKShare stock_info → AKShare fund_cache
+      - 1xxxxx (深市ETF/LOF等):  Tushare stock → Tushare fund → Exchange list → AKShare stock_info → AKShare fund_cache
+      - 其他 A 股代码:           Tushare stock → Tushare fund → Exchange list → AKShare stock_info → AKShare fund_cache
     """
     code = _extract_code(user_input)
     exchange = _get_exchange(code)
 
     if code[0] == _SH_FUND_PREFIX:
-        # 5xxxxx: 大概率是 ETF/基金
+        # 5xxxxx: 大概率是 ETF/基金 → Tushare fund 优先
         strategies = [
             (lambda: _resolve_a_share_tushare_fund(code, exchange), "Tushare fund_basic"),
-            (lambda: _resolve_a_share_akshare_fund(code), "AKShare fund_cache"),
-            (lambda: _resolve_a_share_akshare(code), "AKShare stock_info"),
-            (lambda: _resolve_a_share_exchange_list(code), "Exchange list"),
             (lambda: _resolve_a_share_tushare_stock(code, exchange), "Tushare stock_basic"),
+            (lambda: _resolve_a_share_exchange_list(code), "Exchange list"),
+            (lambda: _resolve_a_share_akshare(code), "AKShare stock_info"),
+            (lambda: _resolve_a_share_akshare_fund(code), "AKShare fund_cache"),
         ]
     elif code[0] == "1":
-        # 1xxxxx: 深市ETF/LOF/债券
+        # 1xxxxx: 深市ETF/LOF/债券 → Tushare stock 优先，fund 次之
         strategies = [
-            (lambda: _resolve_a_share_akshare(code), "AKShare stock_info"),
-            (lambda: _resolve_a_share_exchange_list(code), "Exchange list"),
-            (lambda: _resolve_a_share_akshare_fund(code), "AKShare fund_cache"),
             (lambda: _resolve_a_share_tushare_stock(code, exchange), "Tushare stock_basic"),
             (lambda: _resolve_a_share_tushare_fund(code, exchange), "Tushare fund_basic"),
+            (lambda: _resolve_a_share_exchange_list(code), "Exchange list"),
+            (lambda: _resolve_a_share_akshare(code), "AKShare stock_info"),
+            (lambda: _resolve_a_share_akshare_fund(code), "AKShare fund_cache"),
         ]
     else:
-        # 6/0/3/688/8/4: 股票为主
+        # 6/0/3/688/8/4: 股票为主 → Tushare stock 优先
         strategies = [
-            (lambda: _resolve_a_share_akshare(code), "AKShare stock_info"),
-            (lambda: _resolve_a_share_exchange_list(code), "Exchange list"),
             (lambda: _resolve_a_share_tushare_stock(code, exchange), "Tushare stock_basic"),
             (lambda: _resolve_a_share_tushare_fund(code, exchange), "Tushare fund_basic"),
+            (lambda: _resolve_a_share_exchange_list(code), "Exchange list"),
+            (lambda: _resolve_a_share_akshare(code), "AKShare stock_info"),
             (lambda: _resolve_a_share_akshare_fund(code), "AKShare fund_cache"),
         ]
 
     for resolver, source in strategies:
-        result = resolver()
-        if result:
-            name, ex = result
-            return _make_resolved(code, name, ex, user_input, source)
+        for attempt in range(1, _MAX_RETRIES_PER_SOURCE + 1):
+            result = resolver()
+            if result:
+                name, ex = result
+                return _make_resolved(code, name, ex, user_input, source)
+            logger.debug(
+                "渠道 %s 第 %d/%d 次尝试未成功（代码 %s）",
+                source, attempt, _MAX_RETRIES_PER_SOURCE, code,
+            )
+        logger.info("渠道 %s 连续 %d 次失败，切换下一渠道", source, _MAX_RETRIES_PER_SOURCE)
 
     # 兜底：所有 API 均不可用时，纯数字代码格式合法则放行（用代码作为名称占位）
     logger.warning(

@@ -23,36 +23,50 @@ def create_portfolio_manager(llm, memory):
 
         prompt = f"""【语言要求】你必须使用中文撰写以下所有分析内容和回复。评级关键词（Buy/Overweight/Hold/Underweight/Sell）和股票代码可保留英文。
 
-As the Portfolio Manager, synthesize the risk analysts' debate and deliver the final trading decision.
+你是投资组合经理，负责综合风险分析团队的辩论，做出最终交易决策。
 
 {instrument_context}
 
 ---
 
-**Rating Scale** (use exactly one):
-- **Buy**: Strong conviction to enter or add to position
-- **Overweight**: Favorable outlook, gradually increase exposure
-- **Hold**: Maintain current position, no action needed
-- **Underweight**: Reduce exposure, take partial profits
-- **Sell**: Exit position or avoid entry
+## 决策流程（必须严格按顺序完成）
 
-**Context:**
-- Trader's proposed plan: **{trader_plan}**
-- Lessons from past decisions: **{past_memory_str}**
+### 第一步：方向判断
+根据风险团队辩论内容，先判断当前标的的整体方向：
+- **偏多 (Bullish)** — 上行风险回报比优于下行
+- **偏空 (Bearish)** — 下行风险大于上行空间
+- **中性 (Neutral)** — 多空完全均衡，无明确信号
 
-**Required Output Structure:**
-1. **Rating**: State one of Buy / Overweight / Hold / Underweight / Sell.
-2. **Executive Summary**: A concise action plan covering entry strategy, position sizing, key risk levels, and time horizon.
-3. **Investment Thesis**: Detailed reasoning anchored in the analysts' debate and past reflections.
+### 第二步：确定评级强度
+根据方向判断选择评级：
+
+| 方向 | 信号强 | 信号中等 |
+|------|--------|---------|
+| 偏多 | **Buy** — 强烈看多，建仓或加仓 | **Overweight** — 温和看多，逐步增加敞口 |
+| 偏空 | **Sell** — 强烈看空，离场或回避 | **Underweight** — 温和看空，减仓或部分止盈 |
+| 中性 | — | **Hold** — 维持现有仓位 |
+
+**重要约束**：
+- Hold 仅在方向判断为"中性"时允许使用
+- 如果方向偏多或偏空，**必须**选择对应方向的评级（Buy/Overweight 或 Sell/Underweight），不得选 Hold
+- 如果选择 Hold，必须明确说明为什么当前不存在任何可操作的方向性信号
+
+### 第三步：输出报告
+1. **方向判断**：偏多 / 偏空 / 中性，附简要理由
+2. **评级**：Buy / Overweight / Hold / Underweight / Sell
+3. **执行摘要**：入场策略、仓位比例、关键风险位、时间周期
+4. **投资论点**：基于辩论内容和历史教训的详细推理
 
 ---
 
-**Risk Analysts Debate History:**
+**交易员的初步方案：** {trader_plan}
+
+**历史教训：** {past_memory_str}
+
+**风险团队辩论记录：**
 {history}
 
 ---
-
-Be decisive and ground every conclusion in specific evidence from the analysts.
 
 **重要：请用中文撰写你的最终交易决策报告。** 评级关键词（Buy/Overweight/Hold/Underweight/Sell）和股票代码请保留英文原文。请以中文阐述你的投资论点和执行摘要，使用专业的投资组合管理术语。"""
 

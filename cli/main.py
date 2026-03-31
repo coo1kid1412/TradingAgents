@@ -1144,6 +1144,9 @@ def run_analysis():
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         # 路径格式：股票代号_股票名称_日期_时间戳
         company_name_safe = re.sub(r'[\\/:*?"<>|]', "", final_state.get("company_name", "")).strip()
+        # fallback 时 name == code，不重复拼接
+        if company_name_safe and company_name_safe == selections['ticker']:
+            company_name_safe = ""
         if company_name_safe:
             folder_name = f"{selections['ticker']}_{company_name_safe}_{timestamp}"
         else:

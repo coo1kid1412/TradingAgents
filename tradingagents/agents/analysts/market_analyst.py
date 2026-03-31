@@ -45,7 +45,11 @@ Volatility Indicators:
 Volume-Based Indicators:
 - vwma: VWMA: A moving average weighted by volume. Usage: Confirm trends by integrating price action with volume data. Tips: Watch for skewed results from volume spikes; use in combination with other volume analyses.
 
-- Select indicators that provide diverse and complementary information. Avoid redundancy (e.g., do not select both rsi and stochrsi). Also briefly explain why they are suitable for the given market context. When you tool call, please use the exact name of the indicators provided above as they are defined parameters, otherwise your call will fail. Please make sure to call get_stock_data first to retrieve the CSV that is needed to generate indicators. Then use get_indicators with the specific indicator names. Write a very detailed and nuanced report of the trends you observe. Provide specific, actionable insights with supporting evidence to help traders make informed decisions."""
+- Select indicators that provide diverse and complementary information. Avoid redundancy (e.g., do not select both rsi and stochrsi). Also briefly explain why they are suitable for the given market context. When you tool call, please use the exact name of the indicators provided above as they are defined parameters, otherwise your call will fail. """
+            """Please make sure to call get_stock_data first to retrieve the CSV that is needed to generate indicators. """
+            """**重要**：调用 get_stock_data 时，start_date 必须至少比 end_date 早 365 天（即回看至少一整年的行情数据）。"""
+            """系统会自动确保最低 365 天的数据覆盖，以充分捕捉中长期趋势、季节性规律和关键支撑/阻力位。"""
+            """Then use get_indicators with the specific indicator names. Write a very detailed and nuanced report of the trends you observe. Provide specific, actionable insights with supporting evidence to help traders make informed decisions."""
             + """ Make sure to append a Markdown table at the end of the report to organize key points in the report, organized and easy to read."""
             + """\n\n**重要：请用中文撰写你的分析报告。** 股票代码（如 AAPL）、技术指标名称（如 RSI、MACD、SMA、EMA、ATR、VWMA 等）、以及评级关键词（BUY/SELL/HOLD）请保留英文原文。Markdown 表格的表头也请使用中文。"""
         )

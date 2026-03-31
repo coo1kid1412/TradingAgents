@@ -102,8 +102,28 @@ VENDOR_LIST = [
     "alpha_vantage",
 ]
 
-# A股代码自动路由顺序：akshare（免费） → tushare → yfinance
-_A_SHARE_VENDOR_ORDER = ["akshare", "tushare", "yfinance"]
+# A股按接口类型分别设置优先级
+# 行情/财务类：Tushare 速度更快、数据更稳定 → tushare > akshare > yfinance
+# 新闻/公告类：AKShare 数据更丰富（东方财富个股新闻、公告、电报、研报） → akshare > tushare > yfinance
+_A_SHARE_MARKET_FINANCE_ORDER = ["tushare", "akshare", "yfinance"]
+_A_SHARE_NEWS_ORDER = ["akshare", "tushare", "yfinance"]
+
+_A_SHARE_METHOD_VENDOR_ORDER = {
+    # 行情/财务类
+    "get_stock_data": _A_SHARE_MARKET_FINANCE_ORDER,
+    "get_indicators": _A_SHARE_MARKET_FINANCE_ORDER,
+    "get_fundamentals": _A_SHARE_MARKET_FINANCE_ORDER,
+    "get_balance_sheet": _A_SHARE_MARKET_FINANCE_ORDER,
+    "get_cashflow": _A_SHARE_MARKET_FINANCE_ORDER,
+    "get_income_statement": _A_SHARE_MARKET_FINANCE_ORDER,
+    "get_insider_transactions": _A_SHARE_MARKET_FINANCE_ORDER,
+    # 新闻/公告类
+    "get_news": _A_SHARE_NEWS_ORDER,
+    "get_global_news": _A_SHARE_NEWS_ORDER,
+    "get_announcements": _A_SHARE_NEWS_ORDER,
+    "get_cls_telegraph": _A_SHARE_NEWS_ORDER,
+    "get_research_reports": _A_SHARE_NEWS_ORDER,
+}
 
 # Mapping of methods to their vendor-specific implementations
 VENDOR_METHODS = {
@@ -204,7 +224,9 @@ def get_vendor(category: str, method: str = None) -> str:
 def route_to_vendor(method: str, *args, **kwargs):
     """Route method calls to appropriate vendor implementation with fallback support.
 
-    A股代码（如 600519、000858.SZ）会自动路由到 akshare → tushare → yfinance 链。
+    A股代码会按接口类型自动路由：
+      - 行情/财务类：tushare → akshare → yfinance
+      - 新闻/公告类：akshare → tushare → yfinance
     非A股代码按配置文件的 vendor 顺序路由。
     """
     if method not in VENDOR_METHODS:
@@ -215,9 +237,12 @@ def route_to_vendor(method: str, *args, **kwargs):
     a_share_detected = is_a_share(symbol) if symbol else False
 
     if a_share_detected:
-        # A股：强制使用 akshare → tushare → yfinance 顺序
+        # A股：按接口类型选择对应优先级顺序
+        vendor_order = _A_SHARE_METHOD_VENDOR_ORDER.get(
+            method, _A_SHARE_MARKET_FINANCE_ORDER
+        )
         fallback_vendors = [
-            v for v in _A_SHARE_VENDOR_ORDER
+            v for v in vendor_order
             if v in VENDOR_METHODS[method]
         ]
     else:

@@ -24,7 +24,7 @@ def create_social_media_analyst(llm):
             "Your job is to gauge public sentiment, identify emerging narratives, and detect sentiment shifts for a specific stock.\n\n"
             "## Data Sources\n"
             "You have two tools:\n"
-            "1. **get_news(ticker, start_date, end_date)** — Fetches structured financial news (东方财富/新浪). Use the stock ticker as the query.\n"
+            "1. **get_news(ticker, curr_date)** — Fetches structured financial news (东方财富/新浪) from T-10 to T. Only pass the current analysis date; the date range is auto-calculated.\n"
             "2. **get_xueqiu_posts(query, start_date, end_date)** — Searches Xueqiu (雪球), China's largest investment community, for posts and comments. "
             "Use this for real social media sentiment. **Call it up to 3 times** with varied queries:\n"
             "   - Stock code (e.g. '600519')\n"

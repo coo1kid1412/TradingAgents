@@ -1,6 +1,9 @@
 # TradingAgents/graph/signal_processing.py
 
+import re
 from langchain_openai import ChatOpenAI
+
+_VALID_RATINGS = {"BUY", "OVERWEIGHT", "HOLD", "UNDERWEIGHT", "SELL"}
 
 
 class SignalProcessor:
@@ -31,4 +34,10 @@ class SignalProcessor:
             ("human", full_signal),
         ]
 
-        return self.quick_thinking_llm.invoke(messages).content
+        raw = self.quick_thinking_llm.invoke(messages).content.strip()
+        # 提取第一个有效评级单词，忽略任何多余输出
+        for word in raw.split():
+            upper = word.strip("*#.。，").upper()
+            if upper in _VALID_RATINGS:
+                return upper
+        return raw.upper().strip()
