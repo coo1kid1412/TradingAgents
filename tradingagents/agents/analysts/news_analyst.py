@@ -7,6 +7,7 @@ from tradingagents.agents.utils.agent_utils import (
     get_cls_telegraph,
     get_global_news,
     get_insider_transactions,
+    get_language_instruction,
     get_news,
     get_news_from_search,
     get_research_reports,
@@ -67,6 +68,7 @@ def create_news_analyst(llm):
             "请用中文撰写报告，按上述四个维度分节组织内容。在报告末尾附上一个 Markdown 汇总表格，包含以下列：\n"
             "| 信息来源 | 日期 | 分类 | 关键内容 | 可信度 | 对股价影响 |\n"
             "股票代码、专有名词和评级关键词（BUY/SELL/HOLD）请保留英文原文。"
+            + get_language_instruction()
         )
 
         prompt = ChatPromptTemplate.from_messages(

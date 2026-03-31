@@ -27,6 +27,20 @@ from tradingagents.agents.utils.xueqiu_data_tools import (
 )
 
 
+def get_language_instruction() -> str:
+    """Return a prompt instruction for the configured output language.
+
+    Returns empty string when English (default), so no extra tokens are used.
+    Only applied to user-facing agents (analysts, portfolio manager).
+    Internal debate agents stay in English for reasoning quality.
+    """
+    from tradingagents.dataflows.config import get_config
+    lang = get_config().get("output_language", "English")
+    if lang.strip().lower() == "english":
+        return ""
+    return f" Write your entire response in {lang}."
+
+
 def build_instrument_context(ticker: str, company_name: str = "") -> str:
     """Describe the exact instrument so agents preserve exchange-qualified tickers."""
     name_part = f" (**{company_name}**)" if company_name else ""
@@ -50,6 +64,3 @@ def create_msg_delete():
         return {"messages": removal_operations + [placeholder]}
 
     return delete_messages
-
-
-        

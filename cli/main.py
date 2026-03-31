@@ -506,10 +506,18 @@ def get_user_selections():
     )
     analysis_date = get_analysis_date()
 
-    # Step 3: Select analysts
+    # Step 3: Output language
     console.print(
         create_question_box(
-            "第三步：分析师团队", "选择参与分析的 LLM 分析师智能体"
+            "第三步：输出语言", "选择分析报告和最终决策的输出语言"
+        )
+    )
+    output_language = ask_output_language()
+
+    # Step 4: Select analysts
+    console.print(
+        create_question_box(
+            "第四步：分析师团队", "选择参与分析的 LLM 分析师智能体"
         )
     )
     selected_analysts = select_analysts()
@@ -517,32 +525,32 @@ def get_user_selections():
         f"[green]已选分析师:[/green] {', '.join(analyst.value for analyst in selected_analysts)}"
     )
 
-    # Step 4: Research depth
+    # Step 5: Research depth
     console.print(
         create_question_box(
-            "第四步：研究深度", "选择研究深度级别"
+            "第五步：研究深度", "选择研究深度级别"
         )
     )
     selected_research_depth = select_research_depth()
 
-    # Step 5: LLM provider
+    # Step 6: LLM provider
     console.print(
         create_question_box(
-            "第五步：大模型供应商", "选择 LLM 服务提供商"
+            "第六步：大模型供应商", "选择 LLM 服务提供商"
         )
     )
     selected_llm_provider, backend_url = select_llm_provider()
-    
-    # Step 6: Thinking agents
+
+    # Step 7: Thinking agents
     console.print(
         create_question_box(
-            "第六步：思考模型", "选择快速/深度思考模型"
+            "第七步：思考模型", "选择快速/深度思考模型"
         )
     )
     selected_shallow_thinker = select_shallow_thinking_agent(selected_llm_provider)
     selected_deep_thinker = select_deep_thinking_agent(selected_llm_provider)
 
-    # Step 7: Provider-specific thinking configuration
+    # Step 8: Provider-specific thinking configuration
     thinking_level = None
     reasoning_effort = None
     anthropic_effort = None
@@ -551,7 +559,7 @@ def get_user_selections():
     if provider_lower == "google":
         console.print(
             create_question_box(
-                "第七步：思考配置",
+                "第八步：思考配置",
                 "配置 Gemini 思考模式"
             )
         )
@@ -559,7 +567,7 @@ def get_user_selections():
     elif provider_lower == "openai":
         console.print(
             create_question_box(
-                "第七步：推理配置",
+                "第八步：推理配置",
                 "配置 OpenAI 推理强度"
             )
         )
@@ -567,7 +575,7 @@ def get_user_selections():
     elif provider_lower == "anthropic":
         console.print(
             create_question_box(
-                "第七步：推理配置",
+                "第八步：推理配置",
                 "配置 Claude 推理等级"
             )
         )
@@ -585,6 +593,7 @@ def get_user_selections():
         "google_thinking_level": thinking_level,
         "openai_reasoning_effort": reasoning_effort,
         "anthropic_effort": anthropic_effort,
+        "output_language": output_language,
     }
 
 
@@ -904,6 +913,7 @@ def run_analysis():
     config["google_thinking_level"] = selections.get("google_thinking_level")
     config["openai_reasoning_effort"] = selections.get("openai_reasoning_effort")
     config["anthropic_effort"] = selections.get("anthropic_effort")
+    config["output_language"] = selections.get("output_language", "English")
 
     # Create stats callback handler for tracking LLM/tool calls
     stats_handler = StatsCallbackHandler()

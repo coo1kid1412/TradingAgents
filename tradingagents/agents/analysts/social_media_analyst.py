@@ -3,6 +3,7 @@ import time
 import json
 from tradingagents.agents.utils.agent_utils import (
     build_instrument_context,
+    get_language_instruction,
     get_news,
     get_xueqiu_posts,
 )
@@ -40,6 +41,7 @@ def create_social_media_analyst(llm):
             "- **Actionable insights**: Specific takeaways for trading decisions\n\n"
             "Append a Markdown table at the end summarizing key points (sentiment, catalysts, risks)."
             "\n\n**重要：请用中文撰写你的分析报告。** 股票代码（如 AAPL）、技术指标名称请保留英文原文。Markdown 表格的表头也请使用中文。请使用专业的金融和舆情分析术语。"
+            + get_language_instruction()
         )
 
         prompt = ChatPromptTemplate.from_messages(

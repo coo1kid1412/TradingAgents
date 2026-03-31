@@ -4,6 +4,7 @@ import json
 from tradingagents.agents.utils.agent_utils import (
     build_instrument_context,
     get_indicators,
+    get_language_instruction,
     get_stock_data,
 )
 from tradingagents.dataflows.config import get_config
@@ -52,6 +53,7 @@ Volume-Based Indicators:
             """Then use get_indicators with the specific indicator names. Write a very detailed and nuanced report of the trends you observe. Provide specific, actionable insights with supporting evidence to help traders make informed decisions."""
             + """ Make sure to append a Markdown table at the end of the report to organize key points in the report, organized and easy to read."""
             + """\n\n**重要：请用中文撰写你的分析报告。** 股票代码（如 AAPL）、技术指标名称（如 RSI、MACD、SMA、EMA、ATR、VWMA 等）、以及评级关键词（BUY/SELL/HOLD）请保留英文原文。Markdown 表格的表头也请使用中文。"""
+            + get_language_instruction()
         )
 
         prompt = ChatPromptTemplate.from_messages(
