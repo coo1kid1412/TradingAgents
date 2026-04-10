@@ -126,5 +126,5 @@ def search_news(query: str, count: int = 20, freshness: str = "pw") -> str:
         lines.append(f"    摘要: {description}")
         lines.append("")
 
-    lines.append(f"共 {len(top_results)} 条新闻（已过滤百科类结果，仅保留7天内内容）")
+    lines.append(f"共 {len(top_results)} 条新闻（已过滤百科类结果，仅保留14天内内容）")
     return "\n".join(lines)

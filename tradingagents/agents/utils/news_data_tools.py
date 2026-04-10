@@ -35,7 +35,7 @@ _CN_ONLY_MSG = (
 )
 
 # 个股新闻固定回看天数
-_NEWS_LOOKBACK_DAYS = 10
+_NEWS_LOOKBACK_DAYS = 14
 
 @tool
 def get_news(
@@ -65,7 +65,7 @@ def get_news(
 def get_global_news(
     curr_date: Annotated[str, "Current date in yyyy-mm-dd format"],
     look_back_days: Annotated[int, "Number of days to look back"] = 7,
-    limit: Annotated[int, "Maximum number of articles to return"] = 5,
+    limit: Annotated[int, "Maximum number of articles to return"] = 10,
 ) -> str:
     """
     Retrieve global news data.
@@ -73,7 +73,7 @@ def get_global_news(
     Args:
         curr_date (str): Current date in yyyy-mm-dd format
         look_back_days (int): Number of days to look back (default 7)
-        limit (int): Maximum number of articles to return (default 5)
+        limit (int): Maximum number of articles to return (default 10)
     Returns:
         str: A formatted string containing global news data
     """
@@ -193,6 +193,6 @@ def get_news_from_search(
     parts.append("新闻")
     query = " ".join(parts)
     try:
-        return search_news(query, count=20, freshness="pw")
+        return search_news(query, count=20, freshness="pm")
     except Exception as e:
         return f"Brave Search 调用失败: {e}"

@@ -30,7 +30,7 @@ _XUEQIU_BASE = "https://xueqiu.com"
 _SEARCH_API = f"{_XUEQIU_BASE}/query/v1/search/status.json"
 _COMMENTS_API = f"{_XUEQIU_BASE}/statuses/comments.json"
 
-_MAX_POSTS = 15
+_MAX_POSTS = 30
 _MAX_COMMENTS = 20
 _POST_CONTENT_LIMIT = 650
 _COMMENT_CONTENT_LIMIT = 150
