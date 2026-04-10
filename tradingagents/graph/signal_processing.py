@@ -1,7 +1,7 @@
 # TradingAgents/graph/signal_processing.py
 
 import re
-from langchain_openai import ChatOpenAI
+from typing import Any
 
 _VALID_RATINGS = {"BUY", "OVERWEIGHT", "HOLD", "UNDERWEIGHT", "SELL"}
 
@@ -9,7 +9,7 @@ _VALID_RATINGS = {"BUY", "OVERWEIGHT", "HOLD", "UNDERWEIGHT", "SELL"}
 class SignalProcessor:
     """Processes trading signals to extract actionable decisions."""
 
-    def __init__(self, quick_thinking_llm: ChatOpenAI):
+    def __init__(self, quick_thinking_llm: Any):
         """Initialize with an LLM for processing."""
         self.quick_thinking_llm = quick_thinking_llm
 

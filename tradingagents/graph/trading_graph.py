@@ -284,7 +284,7 @@ class TradingAgentsGraph:
         }
 
         # Save to file
-        eval_base = self.config.get("eval_results_dir", "eval_results")
+        eval_base = self.config.get("eval_results_dir", self.config.get("results_dir", "eval_results"))
         directory = Path(eval_base) / self.ticker / "TradingAgentsStrategy_logs"
         directory.mkdir(parents=True, exist_ok=True)
 
