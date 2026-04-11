@@ -430,6 +430,13 @@ def _resolve_global(user_input: str) -> ResolvedTicker:
     # Build candidate list: original input + HK leading-zero variants
     candidates = [user_input]
     t = user_input.strip().upper()
+    
+    # Handle HK prefix format: HK2729 → 2729.HK
+    if t.startswith("HK") and t[2:].isdigit():
+        code_part = t[2:]
+        candidates.append(f"{code_part}.HK")
+        t = f"{code_part}.HK"
+    
     if t.endswith(".HK"):
         code_part = t.replace(".HK", "")
         # yfinance HK stocks may need leading zeros stripped: 00700.HK → 0700.HK
