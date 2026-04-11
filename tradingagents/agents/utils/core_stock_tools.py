@@ -4,7 +4,7 @@ from datetime import datetime, timedelta
 from tradingagents.dataflows.interface import route_to_vendor
 
 # 行情数据最低回看天数：确保覆盖中长期趋势
-_MIN_STOCK_LOOKBACK_DAYS = 730
+_MIN_STOCK_LOOKBACK_DAYS = 365
 
 
 @tool
