@@ -4,6 +4,7 @@
 返回格式化字符串供 LLM Agent 直接使用。
 """
 
+import logging
 from typing import Annotated
 from datetime import datetime, timedelta
 
@@ -11,6 +12,8 @@ import pandas as pd
 
 from .ticker_utils import to_akshare_format, to_akshare_report_format, to_akshare_date, to_standard_date, is_etf_or_lof, _get_exchange
 from .vendor_errors import AKShareError
+
+logger = logging.getLogger(__name__)
 
 
 def _import_akshare():
@@ -73,8 +76,10 @@ def _get_ohlcv(ak, code: str, start_date: str, end_date: str) -> pd.DataFrame:
         )
         if df is not None and not df.empty:
             return df.rename(columns=_OHLCV_COL_MAP)
-    except Exception:
-        pass
+        else:
+            logger.debug("AKShare stock_zh_a_hist(%s) 返回空数据", code)
+    except Exception as e:
+        logger.warning("AKShare stock_zh_a_hist(%s) 失败: %s", code, e)
 
     # 2. 新浪源 fallback（stock_zh_a_daily 需要 sh/sz 前缀格式）
     try:
@@ -88,8 +93,10 @@ def _get_ohlcv(ak, code: str, start_date: str, end_date: str) -> pd.DataFrame:
         )
         if df is not None and not df.empty:
             return df.rename(columns=_OHLCV_COL_MAP_SINA)
-    except Exception:
-        pass
+        else:
+            logger.debug("AKShare stock_zh_a_daily(%s) 返回空数据", sina_symbol)
+    except Exception as e:
+        logger.warning("AKShare stock_zh_a_daily(%s) 失败: %s", sina_symbol, e)
 
     # 3. ETF 行情接口（东方财富源）— stock_zh_a_hist 对 ETF 常返回空
     try:
@@ -102,8 +109,10 @@ def _get_ohlcv(ak, code: str, start_date: str, end_date: str) -> pd.DataFrame:
         )
         if df is not None and not df.empty:
             return df.rename(columns=_OHLCV_COL_MAP)
-    except Exception:
-        pass
+        else:
+            logger.debug("AKShare fund_etf_hist_em(%s) 返回空数据", code)
+    except Exception as e:
+        logger.warning("AKShare fund_etf_hist_em(%s) 失败: %s", code, e)
 
     # 4. ETF 新浪源 fallback（fund_etf_hist_sina 需要 sh/sz 前缀，不支持日期范围）
     try:
@@ -121,9 +130,12 @@ def _get_ohlcv(ak, code: str, start_date: str, end_date: str) -> pd.DataFrame:
                 df["Date"] = df["Date"].dt.strftime("%Y-%m-%d")
             if not df.empty:
                 return df
-    except Exception:
-        pass
+        else:
+            logger.debug("AKShare fund_etf_hist_sina(%s) 返回空数据", sina_symbol)
+    except Exception as e:
+        logger.warning("AKShare fund_etf_hist_sina(%s) 失败: %s", sina_symbol, e)
 
+    logger.error("AKShare _get_ohlcv(%s) 所有接口均失败，返回空 DataFrame", code)
     return pd.DataFrame()
 
 
