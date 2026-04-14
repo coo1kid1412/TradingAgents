@@ -63,7 +63,7 @@ ta = TradingAgentsGraph(
 )
 
 # A股测试：淳中科技 603516
-_ticker = "300913"
+_ticker = "688008"
 final_state, decision = ta.propagate(_ticker, "2026-04-14")
 print(decision)
 
