@@ -165,8 +165,14 @@ def get_stock(
 
     csv_string = df.to_csv(index=False)
 
+    # 显示实际返回的数据范围，而非请求的数据范围
+    actual_start = df["Date"].iloc[0] if "Date" in df.columns else start_date
+    actual_end = df["Date"].iloc[-1] if "Date" in df.columns else end_date
+
     header = (
-        f"# Stock data for {symbol} from {start_date} to {end_date}\n"
+        f"# Stock data for {symbol}\n"
+        f"# Actual date range: {actual_start} to {actual_end} "
+        f"(requested: {start_date} to {end_date})\n"
         f"# Source: AKShare (东方财富)\n"
         f"# Total records: {len(df)}\n"
         f"# Data retrieved on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
@@ -202,12 +208,20 @@ def get_indicator(
         return f"未找到股票 '{symbol}' 的历史行情数据，无法计算指标"
     indicator_data = calculate_indicator_from_ohlcv(df, indicator)
 
+    # 记录股票最早有数据的日期，用于区分"非交易日"和"尚未上市"
+    first_available_date = df["Date"].min() if "Date" in df.columns and not df.empty else None
+
     before = curr_dt - timedelta(days=look_back_days)
     lines = []
     current_dt = curr_dt
     while current_dt >= before:
         ds = current_dt.strftime("%Y-%m-%d")
-        val = indicator_data.get(ds, "N/A：非交易日（周末或节假日）")
+        if ds in indicator_data:
+            val = indicator_data[ds]
+        elif first_available_date and ds < first_available_date:
+            val = "N/A：股票尚未上市"
+        else:
+            val = "N/A：非交易日（周末或节假日）"
         lines.append(f"{ds}: {val}")
         current_dt -= timedelta(days=1)
 

@@ -30,6 +30,7 @@ _DOMESTIC_NO_PROXY = ",".join([
     ".akshare.xyz",         # AKShare
     ".minimaxi.com",        # MiniMax (国内 LLM)
     "api.tauric.ai",        # Tauric
+    ".pypi.org",            # pypi
 ])
 _existing = os.environ.get("NO_PROXY", "")
 os.environ["NO_PROXY"] = f"{_existing},{_DOMESTIC_NO_PROXY}" if _existing else _DOMESTIC_NO_PROXY
@@ -909,6 +910,8 @@ def run_analysis():
     config["deep_think_llm"] = selections["deep_thinker"]
     config["backend_url"] = selections["backend_url"]
     config["llm_provider"] = selections["llm_provider"].lower()
+    # 分析师使用 deep think 模型（用户可以通过修改此项来调整）
+    config["use_deep_think_for_analysts"] = True
     # Provider-specific thinking configuration
     config["google_thinking_level"] = selections.get("google_thinking_level")
     config["openai_reasoning_effort"] = selections.get("openai_reasoning_effort")

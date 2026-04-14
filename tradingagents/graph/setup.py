@@ -24,6 +24,17 @@ class GraphSetup:
         invest_judge_memory,
         portfolio_manager_memory,
         conditional_logic: ConditionalLogic,
+        # Role-specific LLMs with different temperatures
+        market_llm: Any = None,
+        sentiment_llm: Any = None,
+        news_llm: Any = None,
+        fundamentals_llm: Any = None,
+        trader_llm: Any = None,
+        research_manager_llm: Any = None,
+        portfolio_manager_llm: Any = None,
+        aggressive_risk_llm: Any = None,
+        conservative_risk_llm: Any = None,
+        neutral_risk_llm: Any = None,
     ):
         """Initialize with required components."""
         self.quick_thinking_llm = quick_thinking_llm
@@ -35,6 +46,18 @@ class GraphSetup:
         self.invest_judge_memory = invest_judge_memory
         self.portfolio_manager_memory = portfolio_manager_memory
         self.conditional_logic = conditional_logic
+        
+        # Role-specific LLMs (fallback to quick_thinking_llm if not provided)
+        self.market_llm = market_llm or quick_thinking_llm
+        self.sentiment_llm = sentiment_llm or quick_thinking_llm
+        self.news_llm = news_llm or quick_thinking_llm
+        self.fundamentals_llm = fundamentals_llm or quick_thinking_llm
+        self.trader_llm = trader_llm or quick_thinking_llm
+        self.research_manager_llm = research_manager_llm or deep_thinking_llm
+        self.portfolio_manager_llm = portfolio_manager_llm or deep_thinking_llm
+        self.aggressive_risk_llm = aggressive_risk_llm or quick_thinking_llm
+        self.conservative_risk_llm = conservative_risk_llm or quick_thinking_llm
+        self.neutral_risk_llm = neutral_risk_llm or quick_thinking_llm
 
     def setup_graph(
         self, selected_analysts=["market", "social", "news", "fundamentals"]
@@ -58,28 +81,28 @@ class GraphSetup:
 
         if "market" in selected_analysts:
             analyst_nodes["market"] = create_market_analyst(
-                self.quick_thinking_llm
+                self.market_llm
             )
             delete_nodes["market"] = create_msg_delete()
             tool_nodes["market"] = self.tool_nodes["market"]
 
         if "social" in selected_analysts:
             analyst_nodes["social"] = create_social_media_analyst(
-                self.quick_thinking_llm
+                self.sentiment_llm
             )
             delete_nodes["social"] = create_msg_delete()
             tool_nodes["social"] = self.tool_nodes["social"]
 
         if "news" in selected_analysts:
             analyst_nodes["news"] = create_news_analyst(
-                self.quick_thinking_llm
+                self.news_llm
             )
             delete_nodes["news"] = create_msg_delete()
             tool_nodes["news"] = self.tool_nodes["news"]
 
         if "fundamentals" in selected_analysts:
             analyst_nodes["fundamentals"] = create_fundamentals_analyst(
-                self.quick_thinking_llm
+                self.fundamentals_llm
             )
             delete_nodes["fundamentals"] = create_msg_delete()
             tool_nodes["fundamentals"] = self.tool_nodes["fundamentals"]
@@ -92,16 +115,16 @@ class GraphSetup:
             self.quick_thinking_llm, self.bear_memory
         )
         research_manager_node = create_research_manager(
-            self.deep_thinking_llm, self.invest_judge_memory
+            self.research_manager_llm, self.invest_judge_memory
         )
-        trader_node = create_trader(self.quick_thinking_llm, self.trader_memory)
+        trader_node = create_trader(self.trader_llm, self.trader_memory)
 
         # Create risk analysis nodes
-        aggressive_analyst = create_aggressive_debator(self.quick_thinking_llm)
-        neutral_analyst = create_neutral_debator(self.quick_thinking_llm)
-        conservative_analyst = create_conservative_debator(self.quick_thinking_llm)
+        aggressive_analyst = create_aggressive_debator(self.aggressive_risk_llm)
+        neutral_analyst = create_neutral_debator(self.neutral_risk_llm)
+        conservative_analyst = create_conservative_debator(self.conservative_risk_llm)
         portfolio_manager_node = create_portfolio_manager(
-            self.deep_thinking_llm, self.portfolio_manager_memory
+            self.portfolio_manager_llm, self.portfolio_manager_memory
         )
 
         # Create workflow

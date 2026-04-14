@@ -99,6 +99,22 @@ class TradingAgentsGraph:
         self.deep_thinking_llm = deep_client.get_llm()
         self.quick_thinking_llm = quick_client.get_llm()
         
+        # Create LLM instances with role-specific temperatures
+        # 四个基础分析师 + 交易员：使用 CLI 选择的模型（受 use_deep_think_for_analysts 控制）
+        use_deep = self.config.get("use_deep_think_for_analysts", True)
+        self.market_llm = self._create_templllm(self.config.get("temperature_market", 0.5), use_deep_think=use_deep)
+        self.sentiment_llm = self._create_templllm(self.config.get("temperature_sentiment", 0.5), use_deep_think=use_deep)
+        self.news_llm = self._create_templllm(self.config.get("temperature_news", 0.5), use_deep_think=use_deep)
+        self.fundamentals_llm = self._create_templllm(self.config.get("temperature_fundamentals", 0.2), use_deep_think=use_deep)
+        self.trader_llm = self._create_templllm(self.config.get("temperature_trader", 0.3), use_deep_think=use_deep)
+        # 其他角色：固定配置，不受 CLI 选择影响
+        self.research_manager_llm = self._create_templllm(self.config.get("temperature_research_manager", 0.4), use_deep_think=True)  # 固定 deep think
+        self.portfolio_manager_llm = self._create_templllm(self.config.get("temperature_portfolio_manager", 0.3), use_deep_think=True)  # 固定 deep think
+        # 风控分析师：固定使用 quick_think_llm
+        self.aggressive_risk_llm = self._create_templllm(self.config.get("temperature_aggressive_risk", 0.6), use_deep_think=False)
+        self.conservative_risk_llm = self._create_templllm(self.config.get("temperature_conservative_risk", 0.6), use_deep_think=False)
+        self.neutral_risk_llm = self._create_templllm(self.config.get("temperature_neutral_risk", 0.6), use_deep_think=False)
+        
         # Initialize memories
         self.bull_memory = FinancialSituationMemory("bull_memory", self.config)
         self.bear_memory = FinancialSituationMemory("bear_memory", self.config)
@@ -124,6 +140,17 @@ class TradingAgentsGraph:
             self.invest_judge_memory,
             self.portfolio_manager_memory,
             self.conditional_logic,
+            # Role-specific LLMs with different temperatures
+            market_llm=self.market_llm,
+            sentiment_llm=self.sentiment_llm,
+            news_llm=self.news_llm,
+            fundamentals_llm=self.fundamentals_llm,
+            trader_llm=self.trader_llm,
+            research_manager_llm=self.research_manager_llm,
+            portfolio_manager_llm=self.portfolio_manager_llm,
+            aggressive_risk_llm=self.aggressive_risk_llm,
+            conservative_risk_llm=self.conservative_risk_llm,
+            neutral_risk_llm=self.neutral_risk_llm,
         )
 
         self.propagator = Propagator()
@@ -164,6 +191,32 @@ class TradingAgentsGraph:
                 kwargs["max_tokens"] = max_tokens
 
         return kwargs
+
+    def _create_templllm(self, temperature: float, use_deep_think: bool = True) -> Any:
+        """Create an LLM instance with a specific temperature.
+        
+        Args:
+            temperature: Temperature value for controlling randomness (0.0-1.0)
+            use_deep_think: If True, use deep_think_llm; otherwise use quick_think_llm
+            
+        Returns:
+            Configured LLM instance with the specified temperature
+        """
+        llm_kwargs = self._get_provider_kwargs()
+        if self.callbacks:
+            llm_kwargs["callbacks"] = self.callbacks
+        
+        # Choose model based on use_deep_think flag
+        model_name = self.config["deep_think_llm"] if use_deep_think else self.config["quick_think_llm"]
+        
+        client = create_llm_client(
+            provider=self.config["llm_provider"],
+            model=model_name,
+            base_url=self.config.get("backend_url"),
+            temperature=temperature,
+            **llm_kwargs,
+        )
+        return client.get_llm()
 
     def _create_tool_nodes(self) -> Dict[str, ToolNode]:
         """Create tool nodes for different data sources using abstract methods."""

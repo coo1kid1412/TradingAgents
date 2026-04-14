@@ -26,6 +26,7 @@ _DOMESTIC_NO_PROXY = ",".join([
     ".akshare.xyz",         # AKShare
     ".minimaxi.com",        # MiniMax (国内 LLM)
     "api.tauric.ai",        # Tauric
+    ".pypi.org",            # pypi
 ])
 _existing = os.environ.get("NO_PROXY", "")
 os.environ["NO_PROXY"] = f"{_existing},{_DOMESTIC_NO_PROXY}" if _existing else _DOMESTIC_NO_PROXY
@@ -39,6 +40,9 @@ config["llm_provider"] = "minimax"
 config["backend_url"] = "https://api.minimaxi.com/v1"
 config["deep_think_llm"] = "MiniMax-M2.7"
 config["quick_think_llm"] = "MiniMax-M2.7"
+# 默认使用 deep_think_llm 作为分析师和交易员的模型（可通过此开关切换）
+# use_deep_think_for_analysts: True=使用 deep_think_llm（默认）, False=使用 quick_think_llm
+config["use_deep_think_for_analysts"] = True
 config["max_debate_rounds"] = 3
 config["max_risk_discuss_rounds"] = 3
 
@@ -58,9 +62,9 @@ ta = TradingAgentsGraph(
     config=config,
 )
 
-# A股测试：淳中科技 002565
-_ticker = "603516"
-final_state, decision = ta.propagate(_ticker, "2026-04-10")
+# A股测试：淳中科技 603516
+_ticker = "300913"
+final_state, decision = ta.propagate(_ticker, "2026-04-14")
 print(decision)
 
 

@@ -18,7 +18,7 @@ _MINIMAX_API_KEY_ENV = "MINIMAX_API_KEY"
 # Kwargs forwarded from user config to ChatOpenAI
 _PASSTHROUGH_KWARGS = (
     "timeout", "max_retries", "api_key", "callbacks",
-    "http_client", "http_async_client",
+    "http_client", "http_async_client", "temperature",
 )
 
 

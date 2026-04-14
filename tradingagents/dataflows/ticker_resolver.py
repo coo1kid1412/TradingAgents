@@ -14,6 +14,7 @@ import functools
 import logging
 import os
 import re
+import warnings
 from dataclasses import dataclass
 from typing import Dict, Optional, Tuple
 
@@ -447,11 +448,28 @@ def _resolve_global(user_input: str) -> ResolvedTicker:
             if len(stripped) < 4:
                 candidates.append(f"{stripped.zfill(4)}.HK")
 
+    # Handle US stock suffixes: .US, .O (NASDAQ), .N (NYSE)
+    # Strip suffix before passing to yfinance, keep original for candidate lookup
+    if t.endswith(".US") or t.endswith(".O") or t.endswith(".N"):
+        # Add clean ticker (without suffix) as candidate for yfinance
+        clean_ticker = t.rsplit(".", 1)[0]
+        candidates.append(clean_ticker)
+
     last_err = None
     for candidate in candidates:
         try:
-            ticker = yf.Ticker(candidate)
-            info = ticker.info
+            # Suppress yfinance HTTP 404 warnings for candidate lookups
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                yf_logger = logging.getLogger("yfinance")
+                old_level = yf_logger.level
+                yf_logger.setLevel(logging.CRITICAL)
+                
+                ticker = yf.Ticker(candidate)
+                info = ticker.info
+                
+                yf_logger.setLevel(old_level)
+            
             if not info or info.get("regularMarketPrice") is None:
                 continue
 
@@ -461,7 +479,13 @@ def _resolve_global(user_input: str) -> ResolvedTicker:
             if t.endswith(".HK"):
                 market = "hk"
                 ex = "HK"
-                code = t.replace(".HK", "")
+                # Use candidate's code part (may have leading zeros stripped for yfinance compatibility)
+                code = candidate.replace(".HK", "")
+            elif t.endswith(".US") or t.endswith(".O") or t.endswith(".N"):
+                # Strip US stock suffixes (.US, .O for NASDAQ, .N for NYSE)
+                market = "us"
+                ex = "US"
+                code = t.rsplit(".", 1)[0]
             elif re.match(r"^[A-Z]{1,5}$", t):
                 market = "us"
                 ex = "US"

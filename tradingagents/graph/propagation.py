@@ -32,9 +32,13 @@ class Propagator:
 
         # 构建规范化 ticker —— 供所有 agent 工具调用使用
         # A股用纯6位代码（is_a_share 可识别、各 vendor 可转换）
-        # 港股用 code.HK，美股用纯 ticker
+        # 港股用 code.HK，美股用纯 ticker（不带 .US 后缀）
         if resolved.market == "a_share":
             normalized_ticker = resolved.code
+        elif resolved.market == "hk":
+            normalized_ticker = f"{resolved.code}.{resolved.exchange}"
+        elif resolved.market == "us":
+            normalized_ticker = resolved.code  # Pure ticker like "SNDK", not "SNDK.US"
         elif resolved.exchange:
             normalized_ticker = f"{resolved.code}.{resolved.exchange}"
         else:

@@ -40,8 +40,18 @@ def get_YFin_data_online(
     # Convert DataFrame to CSV string
     csv_string = data.to_csv()
 
+    # 显示实际返回的数据范围，而非请求的数据范围
+    if not data.empty:
+        actual_start = data.index[0].strftime('%Y-%m-%d')
+        actual_end = data.index[-1].strftime('%Y-%m-%d')
+    else:
+        actual_start = start_date
+        actual_end = end_date
+
     # Add header information
-    header = f"# Stock data for {symbol.upper()} from {start_date} to {end_date}\n"
+    header = f"# Stock data for {symbol.upper()}\n"
+    header += f"# Actual date range: {actual_start} to {actual_end} "
+    header += f"(requested: {start_date} to {end_date})\n"
     header += f"# Total records: {len(data)}\n"
     header += f"# Data retrieved on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
 
@@ -142,6 +152,9 @@ def get_stock_stats_indicators_window(
     try:
         indicator_data = _get_stock_stats_bulk(symbol, indicator, curr_date)
         
+        # 获取最早有数据的日期，用于区分"非交易日"和"无历史数据"
+        first_available_date = min(indicator_data.keys()) if indicator_data else None
+        
         # Generate the date range we need
         current_dt = curr_date_dt
         date_values = []
@@ -152,6 +165,8 @@ def get_stock_stats_indicators_window(
             # Look up the indicator value for this date
             if date_str in indicator_data:
                 indicator_value = indicator_data[date_str]
+            elif first_available_date and date_str < first_available_date:
+                indicator_value = "N/A: No historical data available (stock may be newly listed)"
             else:
                 indicator_value = "N/A: Not a trading day (weekend or holiday)"
             

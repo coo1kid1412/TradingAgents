@@ -90,8 +90,14 @@ def get_stock(
 
     csv_string = result.to_csv(index=False)
 
+    # 显示实际返回的数据范围，而非请求的数据范围
+    actual_start = result["Date"].iloc[0]
+    actual_end = result["Date"].iloc[-1]
+
     header = (
-        f"# Stock data for {symbol} from {start_date} to {end_date}\n"
+        f"# Stock data for {symbol}\n"
+        f"# Actual date range: {actual_start} to {actual_end} "
+        f"(requested: {start_date} to {end_date})\n"
         f"# Source: Tushare Pro\n"
         f"# Total records: {len(result)}\n"
         f"# Data retrieved on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
@@ -139,12 +145,20 @@ def get_indicator(
 
     indicator_data = calculate_indicator_from_ohlcv(ohlcv, indicator)
 
+    # 记录股票最早上市日期，用于区分"非交易日"和"尚未上市"
+    first_listed_date = ohlcv["Date"].min() if not ohlcv.empty else None
+
     before = curr_dt - timedelta(days=look_back_days)
     lines = []
     current_dt = curr_dt
     while current_dt >= before:
         ds = current_dt.strftime("%Y-%m-%d")
-        val = indicator_data.get(ds, "N/A：非交易日（周末或节假日）")
+        if ds in indicator_data:
+            val = indicator_data[ds]
+        elif first_listed_date and ds < first_listed_date:
+            val = "N/A：股票尚未上市"
+        else:
+            val = "N/A：非交易日（周末或节假日）"
         lines.append(f"{ds}: {val}")
         current_dt -= timedelta(days=1)
 

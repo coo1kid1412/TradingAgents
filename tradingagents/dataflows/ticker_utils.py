@@ -10,11 +10,11 @@ import re
 
 # A股代码首位 → 交易所映射
 # 上交所：6（主板）, 9（B股）, 5（ETF/基金/权证）
-_SHANGHAI_PREFIXES = ("6", "9", "5")
+_SHANGHAI_PREFIXES = ("6", "5")
 # 深交所：0（主板/中小板）, 2（B股）, 3（创业板）, 1（ETF/可转债/国债逆回购）
 _SHENZHEN_PREFIXES = ("0", "2", "3", "1")
-# 北交所/新三板：4（老三板/新三板）, 8（北交所/新三板）
-_BEIJING_PREFIXES = ("4", "8")
+# 北交所/新三板：4（老三板/新三板）, 8（北交所/新三板）, 9（北交所新代码段 92xxxx）
+_BEIJING_PREFIXES = ("4", "8", "9")
 
 # 所有合法 A 股交易所后缀
 _A_SHARE_SUFFIXES = {".SS", ".SH", ".SZ", ".BJ"}
