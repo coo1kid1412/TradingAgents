@@ -196,51 +196,6 @@ def analyze_single_stock(ticker: str, analysis_date: str, config: dict) -> Tuple
     Returns:
         (ticker, success, report_path_or_error)
     """
-    import signal
-    import traceback
-    
-    # 内存监控函数
-    def log_memory_usage(stage: str):
-        """记录当前内存使用"""
-        try:
-            import psutil
-            process = psutil.Process()
-            mem_info = process.memory_info()
-            mem_mb = mem_info.rss / 1024 / 1024
-            print(f"[{ticker}] 内存使用 [{stage}]: {mem_mb:.1f} MB")
-        except ImportError:
-            pass  # psutil 未安装则跳过
-    
-    # 保存中间状态（防止崩溃后丢失）
-    def save_intermediate_report(final_state, stage_name: str):
-        """保存中间状态报告"""
-        try:
-            temp_path = Path(_PROJECT_ROOT) / "reports" / f"{ticker}_temp_{stage_name}"
-            temp_path.mkdir(parents=True, exist_ok=True)
-            
-            # 保存完整 state 到 JSON
-            import json
-            state_file = temp_path / "state.json"
-            with open(state_file, 'w', encoding='utf-8') as f:
-                # 简化 state 只保存关键字段
-                simple_state = {
-                    'ticker': ticker,
-                    'date': analysis_date,
-                    'stage': stage_name,
-                    'decision': final_state.get('final_trade_decision', 'N/A'),
-                    'company_name': final_state.get('company_name', ''),
-                }
-                json.dump(simple_state, f, indent=2, ensure_ascii=False)
-            
-            # 如果有 trader 决策，单独保存
-            if final_state.get('trader_investment_plan'):
-                trader_file = temp_path / "trader_decision.md"
-                trader_file.write_text(final_state['trader_investment_plan'], encoding='utf-8')
-            
-            print(f"[{ticker}] 中间状态已保存: {temp_path}")
-        except Exception as e:
-            print(f"[{ticker}] 保存中间状态失败: {e}")
-    
     try:
         # 每个进程独立导入，避免 multiprocessing 序列化问题
         from tradingagents.graph.trading_graph import TradingAgentsGraph
@@ -249,8 +204,6 @@ def analyze_single_stock(ticker: str, analysis_date: str, config: dict) -> Tuple
         print(f"[{ticker}] 开始分析 (日期: {analysis_date})")
         print(f"{'='*60}\n")
         
-        log_memory_usage("启动时")
-        
         # 创建独立的 TradingAgentsGraph 实例
         ta = TradingAgentsGraph(
             selected_analysts=["market", "social", "news", "fundamentals"],
@@ -258,19 +211,11 @@ def analyze_single_stock(ticker: str, analysis_date: str, config: dict) -> Tuple
             config=config,
         )
         
-        log_memory_usage("Graph 初始化后")
-        
         # 执行分析
-        print(f"[{ticker}] 开始执行分析流程...")
         final_state, decision = ta.propagate(ticker, analysis_date)
-        
-        log_memory_usage("分析完成后")
         
         # 打印决策
         print(f"\n[{ticker}] 分析完成，决策: {decision}\n")
-        
-        # 保存中间状态（在保存正式报告前）
-        save_intermediate_report(final_state, "before_save")
         
         # 保存报告
         company_name_safe = re.sub(
@@ -294,22 +239,12 @@ def analyze_single_stock(ticker: str, analysis_date: str, config: dict) -> Tuple
         
         return (ticker, True, str(report_path))
         
-    except MemoryError as e:
-        error_msg = f"[{ticker}] 内存不足: {str(e)}"
-        print(f"\n{'!'*60}")
-        print(error_msg)
-        print(f"{'!'*60}\n")
-        print("建议：")
-        print("  1. 关闭其他占用内存的程序")
-        print("  2. 减少并发分析的股票数量")
-        print("  3. 增加系统内存")
-        return (ticker, False, error_msg)
-        
     except Exception as e:
         error_msg = f"[{ticker}] 分析失败: {str(e)}"
         print(f"\n{'!'*60}")
         print(error_msg)
         print(f"{'!'*60}\n")
+        import traceback
         traceback.print_exc()
         return (ticker, False, error_msg)
 
@@ -318,7 +253,7 @@ def analyze_single_stock(ticker: str, analysis_date: str, config: dict) -> Tuple
 #  主函数：顺序启动多进程
 # ---------------------------------------------------------------------------
 def main():
-    """主函数：顺序启动多个进程分析股票"""
+    """主函数：智能选择单进程或多进程模式"""
     
     # 解析股票代码
     tickers = [t.strip() for t in _TICKERS.split(",") if t.strip()]
@@ -327,97 +262,101 @@ def main():
         print("错误：未指定要分析的股票代码，请修改 _TICKERS 配置")
         sys.exit(1)
     
-    # 系统资源检查
-    print("=" * 60)
-    print("系统资源检查")
-    print("=" * 60)
-    
-    try:
-        import psutil
-        mem = psutil.virtual_memory()
-        mem_available_gb = mem.available / 1024 / 1024 / 1024
-        mem_total_gb = mem.total / 1024 / 1024 / 1024
-        mem_percent = mem.percent
-        
-        print(f"内存: {mem_available_gb:.1f} GB 可用 / {mem_total_gb:.1f} GB 总计 ({mem_percent}% 已用)")
-        
-        if mem_available_gb < 4:
-            print("⚠️  警告：可用内存不足 4GB，可能导致进程被 OOM Killer 终止")
-            print("建议：")
-            print("  1. 关闭浏览器等占用内存的程序")
-            print("  2. 减少同时分析的股票数量")
-            print("  3. 增加系统内存或使用 swap")
-            response = input("\n是否继续？(y/N): ").strip().lower()
-            if response != 'y':
-                print("已取消")
-                sys.exit(0)
-    except ImportError:
-        print("psutil 未安装，跳过内存检查 (pip install psutil)")
-    except Exception as e:
-        print(f"内存检查失败: {e}")
-    
     # 限制最多分析数量
     if len(tickers) > _MAX_CONCURRENT:
         print(f"警告：指定了 {len(tickers)} 支股票，但最多只分析 {_MAX_CONCURRENT} 支")
         print(f"将分析前 {_MAX_CONCURRENT} 支: {', '.join(tickers[:_MAX_CONCURRENT])}\n")
         tickers = tickers[:_MAX_CONCURRENT]
     
-    print("\n" + "=" * 60)
-    print("多股票并发分析启动")
-    print("=" * 60)
-    print(f"分析日期: {_ANALYSIS_DATE}")
-    print(f"股票列表: {', '.join(tickers)}")
-    print(f"启动间隔: {_START_INTERVAL_SECONDS} 秒 ({_START_INTERVAL_SECONDS/60:.1f} 分钟)")
-    print(f"预计总启动时间: {(len(tickers)-1) * _START_INTERVAL_SECONDS / 60:.1f} 分钟")
-    print("=" * 60)
-    
     # 构建配置
     config = _build_config()
     
-    # 存储进程和结果
-    results = []
-    
-    # 顺序启动进程
-    for idx, ticker in enumerate(tickers):
-        if idx > 0:
-            # 延迟启动，错开 LLM API 和数据源请求
-            print(f"\n等待 {_START_INTERVAL_SECONDS} 秒后启动下一支股票...")
-            time.sleep(_START_INTERVAL_SECONDS)
+    # 智能模式选择：单支股票用单进程，多支股票用多进程
+    if len(tickers) == 1:
+        # 单支股票：直接在主进程运行（避免多进程开销）
+        ticker = tickers[0]
+        print("=" * 60)
+        print("单股票分析模式（主进程直接执行）")
+        print("=" * 60)
+        print(f"分析日期: {_ANALYSIS_DATE}")
+        print(f"股票: {ticker}")
+        print("=" * 60)
         
-        print(f"\n>>> 启动 [{ticker}] 的分析进程 (第 {idx+1}/{len(tickers)} 支)")
+        try:
+            ticker_result, success, result_path = analyze_single_stock(ticker, _ANALYSIS_DATE, config)
+            
+            print("\n" + "=" * 60)
+            if success:
+                print(f"分析完成: {ticker}")
+                print(f"报告路径: {result_path}")
+            else:
+                print(f"分析失败: {ticker}")
+                print(f"错误信息: {result_path}")
+            print("=" * 60)
+            
+        except KeyboardInterrupt:
+            print("\n\n用户中断分析")
+            sys.exit(1)
+        except Exception as e:
+            print(f"\n\n分析异常: {e}")
+            import traceback
+            traceback.print_exc()
+            sys.exit(1)
+    else:
+        # 多支股票：使用多进程并发
+        print("=" * 60)
+        print("多股票并发分析模式")
+        print("=" * 60)
+        print(f"分析日期: {_ANALYSIS_DATE}")
+        print(f"股票列表: {', '.join(tickers)}")
+        print(f"启动间隔: {_START_INTERVAL_SECONDS} 秒 ({_START_INTERVAL_SECONDS/60:.1f} 分钟)")
+        print(f"预计总启动时间: {(len(tickers)-1) * _START_INTERVAL_SECONDS / 60:.1f} 分钟")
+        print("=" * 60)
         
-        # 创建独立进程
-        process = multiprocessing.Process(
-            target=analyze_single_stock,
-            args=(ticker, _ANALYSIS_DATE, config),
-            name=f"StockAnalysis-{ticker}"
-        )
+        # 存储进程和结果
+        results = []
         
-        # 启动进程
-        process.start()
-        results.append((ticker, process))
+        # 顺序启动进程
+        for idx, ticker in enumerate(tickers):
+            if idx > 0:
+                # 延迟启动，错开 LLM API 和数据源请求
+                print(f"\n等待 {_START_INTERVAL_SECONDS} 秒后启动下一支股票...")
+                time.sleep(_START_INTERVAL_SECONDS)
+            
+            print(f"\n>>> 启动 [{ticker}] 的分析进程 (第 {idx+1}/{len(tickers)} 支)")
+            
+            # 创建独立进程
+            process = multiprocessing.Process(
+                target=analyze_single_stock,
+                args=(ticker, _ANALYSIS_DATE, config),
+                name=f"StockAnalysis-{ticker}"
+            )
+            
+            # 启动进程
+            process.start()
+            results.append((ticker, process))
+            
+            print(f"[{ticker}] 进程已启动 (PID: {process.pid})")
         
-        print(f"[{ticker}] 进程已启动 (PID: {process.pid})")
-    
-    # 等待所有进程完成
-    print("\n" + "=" * 60)
-    print("等待所有分析任务完成...")
-    print("=" * 60 + "\n")
-    
-    for ticker, process in results:
-        process.join()
-        exit_code = process.exitcode
-        status = "成功" if exit_code == 0 else f"失败 (退出码: {exit_code})"
-        print(f"[{ticker}] 进程结束: {status}")
-    
-    # 输出总结
-    print("\n" + "=" * 60)
-    print("分析任务全部完成")
-    print("=" * 60)
-    for ticker, process in results:
-        status = "成功" if process.exitcode == 0 else "失败"
-        print(f"  {ticker}: {status}")
-    print("=" * 60)
+        # 等待所有进程完成
+        print("\n" + "=" * 60)
+        print("等待所有分析任务完成...")
+        print("=" * 60 + "\n")
+        
+        for ticker, process in results:
+            process.join()
+            exit_code = process.exitcode
+            status = "成功" if exit_code == 0 else f"失败 (退出码: {exit_code})"
+            print(f"[{ticker}] 进程结束: {status}")
+        
+        # 输出总结
+        print("\n" + "=" * 60)
+        print("分析任务全部完成")
+        print("=" * 60)
+        for ticker, process in results:
+            status = "成功" if process.exitcode == 0 else "失败"
+            print(f"  {ticker}: {status}")
+        print("=" * 60)
 
 
 if __name__ == "__main__":
