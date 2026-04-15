@@ -40,7 +40,7 @@ os.environ["NO_PROXY"] = f"{_existing},{_DOMESTIC_NO_PROXY}" if _existing else _
 #  并发配置
 # ---------------------------------------------------------------------------
 # 要分析的股票列表（逗号分隔）
-_TICKERS = "300857,601138,603516"
+_TICKERS = "300857"
 
 # 最多同时分析的股票数（不超过 3）
 _MAX_CONCURRENT = 3
@@ -196,6 +196,51 @@ def analyze_single_stock(ticker: str, analysis_date: str, config: dict) -> Tuple
     Returns:
         (ticker, success, report_path_or_error)
     """
+    import signal
+    import traceback
+    
+    # 内存监控函数
+    def log_memory_usage(stage: str):
+        """记录当前内存使用"""
+        try:
+            import psutil
+            process = psutil.Process()
+            mem_info = process.memory_info()
+            mem_mb = mem_info.rss / 1024 / 1024
+            print(f"[{ticker}] 内存使用 [{stage}]: {mem_mb:.1f} MB")
+        except ImportError:
+            pass  # psutil 未安装则跳过
+    
+    # 保存中间状态（防止崩溃后丢失）
+    def save_intermediate_report(final_state, stage_name: str):
+        """保存中间状态报告"""
+        try:
+            temp_path = Path(_PROJECT_ROOT) / "reports" / f"{ticker}_temp_{stage_name}"
+            temp_path.mkdir(parents=True, exist_ok=True)
+            
+            # 保存完整 state 到 JSON
+            import json
+            state_file = temp_path / "state.json"
+            with open(state_file, 'w', encoding='utf-8') as f:
+                # 简化 state 只保存关键字段
+                simple_state = {
+                    'ticker': ticker,
+                    'date': analysis_date,
+                    'stage': stage_name,
+                    'decision': final_state.get('final_trade_decision', 'N/A'),
+                    'company_name': final_state.get('company_name', ''),
+                }
+                json.dump(simple_state, f, indent=2, ensure_ascii=False)
+            
+            # 如果有 trader 决策，单独保存
+            if final_state.get('trader_investment_plan'):
+                trader_file = temp_path / "trader_decision.md"
+                trader_file.write_text(final_state['trader_investment_plan'], encoding='utf-8')
+            
+            print(f"[{ticker}] 中间状态已保存: {temp_path}")
+        except Exception as e:
+            print(f"[{ticker}] 保存中间状态失败: {e}")
+    
     try:
         # 每个进程独立导入，避免 multiprocessing 序列化问题
         from tradingagents.graph.trading_graph import TradingAgentsGraph
@@ -204,6 +249,8 @@ def analyze_single_stock(ticker: str, analysis_date: str, config: dict) -> Tuple
         print(f"[{ticker}] 开始分析 (日期: {analysis_date})")
         print(f"{'='*60}\n")
         
+        log_memory_usage("启动时")
+        
         # 创建独立的 TradingAgentsGraph 实例
         ta = TradingAgentsGraph(
             selected_analysts=["market", "social", "news", "fundamentals"],
@@ -211,11 +258,19 @@ def analyze_single_stock(ticker: str, analysis_date: str, config: dict) -> Tuple
             config=config,
         )
         
+        log_memory_usage("Graph 初始化后")
+        
         # 执行分析
+        print(f"[{ticker}] 开始执行分析流程...")
         final_state, decision = ta.propagate(ticker, analysis_date)
+        
+        log_memory_usage("分析完成后")
         
         # 打印决策
         print(f"\n[{ticker}] 分析完成，决策: {decision}\n")
+        
+        # 保存中间状态（在保存正式报告前）
+        save_intermediate_report(final_state, "before_save")
         
         # 保存报告
         company_name_safe = re.sub(
@@ -239,12 +294,22 @@ def analyze_single_stock(ticker: str, analysis_date: str, config: dict) -> Tuple
         
         return (ticker, True, str(report_path))
         
+    except MemoryError as e:
+        error_msg = f"[{ticker}] 内存不足: {str(e)}"
+        print(f"\n{'!'*60}")
+        print(error_msg)
+        print(f"{'!'*60}\n")
+        print("建议：")
+        print("  1. 关闭其他占用内存的程序")
+        print("  2. 减少并发分析的股票数量")
+        print("  3. 增加系统内存")
+        return (ticker, False, error_msg)
+        
     except Exception as e:
         error_msg = f"[{ticker}] 分析失败: {str(e)}"
         print(f"\n{'!'*60}")
         print(error_msg)
         print(f"{'!'*60}\n")
-        import traceback
         traceback.print_exc()
         return (ticker, False, error_msg)
 
@@ -262,13 +327,42 @@ def main():
         print("错误：未指定要分析的股票代码，请修改 _TICKERS 配置")
         sys.exit(1)
     
+    # 系统资源检查
+    print("=" * 60)
+    print("系统资源检查")
+    print("=" * 60)
+    
+    try:
+        import psutil
+        mem = psutil.virtual_memory()
+        mem_available_gb = mem.available / 1024 / 1024 / 1024
+        mem_total_gb = mem.total / 1024 / 1024 / 1024
+        mem_percent = mem.percent
+        
+        print(f"内存: {mem_available_gb:.1f} GB 可用 / {mem_total_gb:.1f} GB 总计 ({mem_percent}% 已用)")
+        
+        if mem_available_gb < 4:
+            print("⚠️  警告：可用内存不足 4GB，可能导致进程被 OOM Killer 终止")
+            print("建议：")
+            print("  1. 关闭浏览器等占用内存的程序")
+            print("  2. 减少同时分析的股票数量")
+            print("  3. 增加系统内存或使用 swap")
+            response = input("\n是否继续？(y/N): ").strip().lower()
+            if response != 'y':
+                print("已取消")
+                sys.exit(0)
+    except ImportError:
+        print("psutil 未安装，跳过内存检查 (pip install psutil)")
+    except Exception as e:
+        print(f"内存检查失败: {e}")
+    
     # 限制最多分析数量
     if len(tickers) > _MAX_CONCURRENT:
         print(f"警告：指定了 {len(tickers)} 支股票，但最多只分析 {_MAX_CONCURRENT} 支")
         print(f"将分析前 {_MAX_CONCURRENT} 支: {', '.join(tickers[:_MAX_CONCURRENT])}\n")
         tickers = tickers[:_MAX_CONCURRENT]
     
-    print("=" * 60)
+    print("\n" + "=" * 60)
     print("多股票并发分析启动")
     print("=" * 60)
     print(f"分析日期: {_ANALYSIS_DATE}")
