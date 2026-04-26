@@ -40,7 +40,7 @@ os.environ["NO_PROXY"] = f"{_existing},{_DOMESTIC_NO_PROXY}" if _existing else _
 #  并发配置
 # ---------------------------------------------------------------------------
 # 要分析的股票列表（逗号分隔）
-_TICKERS = "300857"
+_TICKERS = "601138"
 
 # 最多同时分析的股票数（不超过 3）
 _MAX_CONCURRENT = 3
@@ -51,6 +51,26 @@ _START_INTERVAL_SECONDS = 300
 
 # 分析日期（默认今天）
 _ANALYSIS_DATE = datetime.datetime.now().strftime("%Y-%m-%d")
+
+# 辩论轮数配置（同时控制研究团队辩论和风控团队讨论）
+# 范围：1-3，默认 3
+# - max_debate_rounds: 多头 vs 空头的辩论轮数
+# - max_risk_discuss_rounds: 激进/保守/中立风控分析师的讨论轮数
+_DEBATE_ROUNDS = 3
+
+
+def _clamp_debate_rounds(value: int, min_val: int = 1, max_val: int = 3) -> int:
+    """限制辩论轮数在合理范围内（默认 1-3）"""
+    if not isinstance(value, int):
+        print(f"警告: 辩论轮数应为整数，使用默认值 3")
+        return 3
+    if value < min_val:
+        print(f"警告: 辩论轮数 {value} 小于最小值 {min_val}，已调整为 {min_val}")
+        return min_val
+    if value > max_val:
+        print(f"警告: 辩论轮数 {value} 大于最大值 {max_val}，已调整为 {max_val}")
+        return max_val
+    return value
 
 
 def _build_config() -> dict:
@@ -63,8 +83,12 @@ def _build_config() -> dict:
     config["deep_think_llm"] = "MiniMax-M2.7"
     config["quick_think_llm"] = "MiniMax-M2.7"
     config["use_deep_think_for_analysts"] = True
-    config["max_debate_rounds"] = 3
-    config["max_risk_discuss_rounds"] = 3
+    
+    # 统一设置辩论轮数（带保护机制）
+    debate_rounds = _clamp_debate_rounds(_DEBATE_ROUNDS)
+    config["max_debate_rounds"] = debate_rounds
+    config["max_risk_discuss_rounds"] = debate_rounds
+    
     config["data_vendors"] = {
         "core_stock_apis": "yfinance",
         "technical_indicators": "yfinance",

@@ -10,7 +10,7 @@ from datetime import datetime, timedelta
 
 import pandas as pd
 
-from .ticker_utils import to_tushare_format, to_akshare_date, to_standard_date
+from .ticker_utils import to_tushare_format, to_akshare_date, to_standard_date, is_etf_or_lof
 from .vendor_errors import TushareRateLimitError, TushareUnavailableError
 
 _ts_api = None
@@ -64,12 +64,22 @@ def get_stock(
     start_date: Annotated[str, "Start date in yyyy-mm-dd format"],
     end_date: Annotated[str, "End date in yyyy-mm-dd format"],
 ) -> str:
-    """获取 A 股日线行情（Tushare Pro）。"""
+    """获取 A 股日线行情（Tushare Pro）。
+    
+    自动识别股票和基金（ETF/LOF），使用对应的接口：
+    - 股票：pro.daily
+    - 基金/ETF：pro.fund_daily
+    """
     pro = _get_tushare_api()
     ts_code = to_tushare_format(symbol)
+    
+    # 检测是否为 ETF/LOF 基金，选择对应的接口
+    is_fund = is_etf_or_lof(symbol)
+    api_func = pro.fund_daily if is_fund else pro.daily
+    data_source = "Tushare Pro (基金)" if is_fund else "Tushare Pro"
 
     df = _safe_call(
-        pro.daily,
+        api_func,
         ts_code=ts_code,
         start_date=to_akshare_date(start_date),
         end_date=to_akshare_date(end_date),
@@ -98,7 +108,7 @@ def get_stock(
         f"# Stock data for {symbol}\n"
         f"# Actual date range: {actual_start} to {actual_end} "
         f"(requested: {start_date} to {end_date})\n"
-        f"# Source: Tushare Pro\n"
+        f"# Source: {data_source}\n"
         f"# Total records: {len(result)}\n"
         f"# Data retrieved on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
     )

@@ -35,9 +35,9 @@ DEFAULT_CONFIG = {
     "temperature_research_manager": 0.4,    # 研究主管：偏向稳定综合判断
     "temperature_portfolio_manager": 0.3,   # 投资组合经理：最终决策需要高稳定性
     # 多头/空头研究员使用默认 temperature (0.7)，保持辩论的多样性
-    "temperature_aggressive_risk": 0.6,     # 激进风控分析师：适度多样性
-    "temperature_conservative_risk": 0.6,   # 保守风控分析师：适度多样性
-    "temperature_neutral_risk": 0.6,        # 中立风控分析师：适度多样性
+    "temperature_aggressive_risk": 0.5,     # 激进风控分析师：降低随机性，更稳定判断
+    "temperature_conservative_risk": 0.5,   # 保守风控分析师：降低随机性，更稳定判断
+    "temperature_neutral_risk": 0.5,        # 中立风控分析师：降低随机性，更稳定判断
     # 使用 deep think 模型作为分析师和交易员（True=deep_think_llm, False=quick_think_llm）
     "use_deep_think_for_analysts": True,
     # Output language for analyst reports and final decision
