@@ -1,5 +1,6 @@
 # TradingAgents/graph/trading_graph.py
 
+import logging
 import os
 from pathlib import Path
 import json
@@ -43,6 +44,9 @@ from .setup import GraphSetup
 from .propagation import Propagator
 from .reflection import Reflector
 from .signal_processing import SignalProcessor
+from .checkpointer import checkpoint_step, clear_checkpoint, get_checkpointer, thread_id
+
+logger = logging.getLogger(__name__)
 
 
 class TradingAgentsGraph:
@@ -162,8 +166,10 @@ class TradingAgentsGraph:
         self.ticker = None
         self.log_states_dict = {}  # date to full state dict
 
-        # Set up the graph
-        self.graph = self.graph_setup.setup_graph(selected_analysts)
+        # Set up the graph: keep the workflow for recompilation with a checkpointer.
+        self.workflow = self.graph_setup.setup_graph(selected_analysts)
+        self.graph = self.workflow.compile()
+        self._checkpointer_ctx = None
 
     def _get_provider_kwargs(self) -> Dict[str, Any]:
         """Get provider-specific kwargs for LLM client creation."""
@@ -265,9 +271,31 @@ class TradingAgentsGraph:
         }
 
     def propagate(self, company_name, trade_date):
-        """Run the trading agents graph for a company on a specific date."""
+        """Run the trading agents graph for a company on a specific date.
 
+        When ``checkpoint_enabled`` is set in config, the graph is recompiled
+        with a per-ticker SqliteSaver so a crashed run can resume from the last
+        successful node on a subsequent invocation with the same ticker+date.
+        """
         self.ticker = company_name
+
+        # Recompile with a checkpointer if the user opted in.
+        if self.config.get("checkpoint_enabled"):
+            self._checkpointer_ctx = get_checkpointer(
+                self.config["data_cache_dir"], company_name
+            )
+            saver = self._checkpointer_ctx.__enter__()
+            self.graph = self.workflow.compile(checkpointer=saver)
+
+            step = checkpoint_step(
+                self.config["data_cache_dir"], company_name, str(trade_date)
+            )
+            if step is not None:
+                logger.info(
+                    "Resuming from step %d for %s on %s", step, company_name, trade_date
+                )
+            else:
+                logger.info("Starting fresh for %s on %s", company_name, trade_date)
 
         # Initialize state
         init_agent_state = self.propagator.create_initial_state(
