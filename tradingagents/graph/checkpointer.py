@@ -1,6 +1,10 @@
 """LangGraph checkpoint support for resumable analysis runs.
 
 Per-ticker SQLite databases so concurrent tickers don't contend.
+
+The ``langgraph-checkpoint-sqlite`` package is imported lazily so that the
+rest of the codebase works even when the package is not installed.
+A clear error is raised only when checkpoint features are actually used.
 """
 
 from __future__ import annotations
@@ -11,7 +15,17 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Generator
 
-from langgraph.checkpoint.sqlite import SqliteSaver
+
+def _get_sqlite_saver_cls():
+    """Lazily import SqliteSaver, raising a helpful error if missing."""
+    try:
+        from langgraph.checkpoint.sqlite import SqliteSaver
+        return SqliteSaver
+    except ImportError:
+        raise ImportError(
+            "Checkpoint 功能需要 langgraph-checkpoint-sqlite 包。\n"
+            "请运行: pip install langgraph-checkpoint-sqlite"
+        )
 
 
 def _db_path(data_dir: str | Path, ticker: str) -> Path:
@@ -27,8 +41,9 @@ def thread_id(ticker: str, date: str) -> str:
 
 
 @contextmanager
-def get_checkpointer(data_dir: str | Path, ticker: str) -> Generator[SqliteSaver, None, None]:
+def get_checkpointer(data_dir: str | Path, ticker: str) -> Generator:
     """Context manager yielding a SqliteSaver backed by a per-ticker DB."""
+    SqliteSaver = _get_sqlite_saver_cls()
     db = _db_path(data_dir, ticker)
     conn = sqlite3.connect(str(db), check_same_thread=False)
     try:

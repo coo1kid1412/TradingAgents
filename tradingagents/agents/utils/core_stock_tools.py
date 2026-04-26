@@ -33,7 +33,10 @@ def get_stock_data(
             start_date = (end_dt - timedelta(days=_MIN_STOCK_LOOKBACK_DAYS)).strftime("%Y-%m-%d")
     except ValueError:
         pass
+    print(f"[get_stock_data] 正在获取 {symbol} 行情数据 ({start_date} ~ {end_date})...")
     try:
-        return route_to_vendor("get_stock_data", symbol, start_date, end_date)
+        result = route_to_vendor("get_stock_data", symbol, start_date, end_date)
+        print(f"[get_stock_data] {symbol} 行情数据获取完成 ({len(result)} chars)")
+        return result
     except Exception as e:
         return f"获取行情数据失败 ({symbol}): {e}"

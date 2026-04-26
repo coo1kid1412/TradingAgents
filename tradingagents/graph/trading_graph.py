@@ -25,10 +25,6 @@ from tradingagents.dataflows.config import set_config
 from tradingagents.agents.utils.agent_utils import (
     get_stock_data,
     get_indicators,
-    get_fundamentals,
-    get_balance_sheet,
-    get_cashflow,
-    get_income_statement,
     get_news,
     get_insider_transactions,
     get_global_news,
@@ -44,7 +40,6 @@ from .setup import GraphSetup
 from .propagation import Propagator
 from .reflection import Reflector
 from .signal_processing import SignalProcessor
-from .checkpointer import checkpoint_step, clear_checkpoint, get_checkpointer, thread_id
 
 logger = logging.getLogger(__name__)
 
@@ -166,9 +161,8 @@ class TradingAgentsGraph:
         self.ticker = None
         self.log_states_dict = {}  # date to full state dict
 
-        # Set up the graph: keep the workflow for recompilation with a checkpointer.
-        self.workflow = self.graph_setup.setup_graph(selected_analysts)
-        self.graph = self.workflow.compile()
+        # Set up the graph
+        self.graph = self.graph_setup.setup_graph(selected_analysts)
         self._checkpointer_ctx = None
 
     def _get_provider_kwargs(self) -> Dict[str, Any]:
@@ -259,15 +253,6 @@ class TradingAgentsGraph:
                     get_news_from_search,
                 ]
             ),
-            "fundamentals": ToolNode(
-                [
-                    # Fundamental analysis tools
-                    get_fundamentals,
-                    get_balance_sheet,
-                    get_cashflow,
-                    get_income_statement,
-                ]
-            ),
         }
 
     def propagate(self, company_name, trade_date):
@@ -281,11 +266,13 @@ class TradingAgentsGraph:
 
         # Recompile with a checkpointer if the user opted in.
         if self.config.get("checkpoint_enabled"):
+            from .checkpointer import checkpoint_step, get_checkpointer
+
             self._checkpointer_ctx = get_checkpointer(
                 self.config["data_cache_dir"], company_name
             )
             saver = self._checkpointer_ctx.__enter__()
-            self.graph = self.workflow.compile(checkpointer=saver)
+            self.graph = self.graph_setup._workflow.compile(checkpointer=saver)
 
             step = checkpoint_step(
                 self.config["data_cache_dir"], company_name, str(trade_date)
