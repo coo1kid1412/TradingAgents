@@ -53,7 +53,7 @@ def _get_tushare_api():
         raise TushareUnavailableError(f"Tushare 初始化失败：{e}")
 
 
-def _parse_retry_delay(error_msg: str) -> int:
+def _parse_retry_delay(error_msg: str) -> int | None:
     """从 Tushare 限流错误消息中解析重试等待时间（秒）。
 
     Tushare 错误格式示例:
@@ -61,8 +61,9 @@ def _parse_retry_delay(error_msg: str) -> int:
       "抱歉，您每分钟最多访问200次"
 
     Returns:
-        等待秒数（含 5 秒缓冲），解析失败时返回 65 秒（保守默认值）。
-        结果被限制在 5~120 秒之间（过短无意义，过长不如 fallback）。
+        等待秒数（含 5 秒缓冲），适用于分钟级限流；
+        对于小时/天级限流返回 None（表示不应重试，直接 fallback）；
+        解析失败时返回 65 秒（保守默认值，按分钟级处理）。
     """
     # 格式1: "1次/分钟" / "200次/分钟"
     match = re.search(r'(\d+)\s*次\s*/\s*(\S+)', error_msg)
@@ -82,14 +83,18 @@ def _parse_retry_delay(error_msg: str) -> int:
     if "分" in unit:
         interval = 60
     elif "小" in unit:
-        interval = 3600
+        # 小时级限流：重试无意义（需要等 3600+ 秒），直接 fallback
+        logger.info("Tushare 小时级限流，跳过重试直接 fallback: %s", error_msg)
+        return None
     elif "天" in unit or "日" in unit:
-        interval = 86400
+        # 天级限流：同上，直接 fallback
+        logger.info("Tushare 天级限流，跳过重试直接 fallback: %s", error_msg)
+        return None
     else:
         return 65
 
     wait = interval // count + 5  # 加 5 秒缓冲
-    return min(max(wait, 5), 120)  # 限制在 5~120 秒之间
+    return min(max(wait, 5), 120)  # 分钟级限制在 5~120 秒之间
 
 
 # 限流重试配置
@@ -101,7 +106,8 @@ def _safe_call(func, *args, **kwargs):
 
     限流时自动重试：从错误消息中解析限流频率（如 "1次/分钟"→等65秒），
     计算合适的等待时间后重试，最多重试 _RATE_LIMIT_MAX_RETRIES 次。
-    仅对频率限制类错误重试，权限/积分类错误不重试。
+    小时/天级限流不重试，直接抛异常触发 fallback。
+    仅对分钟级频率限制重试，权限/积分类错误不重试。
     """
     retries = 0
 
@@ -114,10 +120,15 @@ def _safe_call(func, *args, **kwargs):
             msg = str(e)
             msg_lower = msg.lower()
 
-            if any(kw in msg_lower for kw in ("每分钟", "rate", "频率", "too many")):
+            if any(kw in msg_lower for kw in ("每分钟", "rate", "频率", "too many", "每小时", "每天")):
+                delay = _parse_retry_delay(msg)
+                if delay is None:
+                    # 小时/天级限流，重试无意义，直接抛异常触发 fallback
+                    raise TushareRateLimitError(
+                        f"Tushare 限流级别过高（小时/天），跳过重试：{e}"
+                    )
                 if retries < _RATE_LIMIT_MAX_RETRIES:
                     retries += 1
-                    delay = _parse_retry_delay(msg)
                     logger.warning(
                         "Tushare 限流，第 %d 次重试（等待 %ds）: %s",
                         retries, delay, e,
