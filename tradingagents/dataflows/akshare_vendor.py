@@ -12,6 +12,13 @@ import pandas as pd
 
 from .ticker_utils import to_akshare_format, to_akshare_report_format, to_akshare_date, to_standard_date, is_etf_or_lof, _get_exchange
 from .vendor_errors import AKShareError
+from .financial_field_maps import (
+    extract_and_format,
+    AKSHARE_FUNDAMENTALS_MAP,
+    AKSHARE_BALANCE_SHEET_MAP,
+    AKSHARE_CASHFLOW_MAP,
+    AKSHARE_INCOME_MAP,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -262,12 +269,12 @@ def get_fundamentals(
     except Exception as e:
         sections.append(f"# 获取公司信息出错：{e}\n")
 
-    # 财务分析指标
+    # 财务分析指标（精选关键字段，消除列名歧义）
     try:
         fa_df = ak.stock_financial_analysis_indicator(symbol=code)
         if fa_df is not None and not fa_df.empty:
             sections.append("## 财务分析指标（最近3期）")
-            sections.append(fa_df.head(3).to_csv(index=False))
+            sections.append(extract_and_format(fa_df, AKSHARE_FUNDAMENTALS_MAP, period_col="日期", limit=3))
     except Exception as e:
         sections.append(f"# 获取财务分析指标出错：{e}\n")
 
@@ -379,14 +386,14 @@ def get_balance_sheet(
         return f"未找到股票 '{ticker}' 的资产负债表数据"
 
     limit = 4 if freq == "quarterly" else 2
-    csv_string = df.head(limit).to_csv(index=False)
+    table = extract_and_format(df, AKSHARE_BALANCE_SHEET_MAP, period_col="REPORT_DATE", limit=limit)
 
     header = (
         f"# Balance Sheet for {ticker} ({freq})\n"
         f"# Source: AKShare (东方财富)\n"
         f"# Data retrieved on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
     )
-    return header + csv_string
+    return header + table
 
 
 # ---------------------------------------------------------------------------
@@ -417,14 +424,14 @@ def get_cashflow(
         return f"未找到股票 '{ticker}' 的现金流量表数据"
 
     limit = 4 if freq == "quarterly" else 2
-    csv_string = df.head(limit).to_csv(index=False)
+    table = extract_and_format(df, AKSHARE_CASHFLOW_MAP, period_col="REPORT_DATE", limit=limit)
 
     header = (
         f"# Cash Flow for {ticker} ({freq})\n"
         f"# Source: AKShare (东方财富)\n"
         f"# Data retrieved on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
     )
-    return header + csv_string
+    return header + table
 
 
 # ---------------------------------------------------------------------------
@@ -455,14 +462,14 @@ def get_income_statement(
         return f"未找到股票 '{ticker}' 的利润表数据"
 
     limit = 4 if freq == "quarterly" else 2
-    csv_string = df.head(limit).to_csv(index=False)
+    table = extract_and_format(df, AKSHARE_INCOME_MAP, period_col="REPORT_DATE", limit=limit)
 
     header = (
         f"# Income Statement for {ticker} ({freq})\n"
         f"# Source: AKShare (东方财富)\n"
         f"# Data retrieved on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
     )
-    return header + csv_string
+    return header + table
 
 
 # ---------------------------------------------------------------------------

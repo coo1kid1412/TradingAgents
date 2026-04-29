@@ -5,6 +5,12 @@ import pandas as pd
 import yfinance as yf
 import os
 from .stockstats_utils import StockstatsUtils, _clean_dataframe, yf_retry, load_ohlcv, filter_financials_by_date
+from .financial_field_maps import (
+    extract_yfinance_table,
+    YFINANCE_BALANCE_SHEET_MAP,
+    YFINANCE_CASHFLOW_MAP,
+    YFINANCE_INCOME_MAP,
+)
 
 def get_YFin_data_online(
     symbol: Annotated[str, "ticker symbol of the company"],
@@ -335,15 +341,15 @@ def get_balance_sheet(
 
         if data.empty:
             return f"No balance sheet data found for symbol '{ticker}'"
-            
-        # Convert to CSV string for consistency with other functions
-        csv_string = data.to_csv()
-        
+
+        # Curated field extraction (replaces raw to_csv dump)
+        table = extract_yfinance_table(data, YFINANCE_BALANCE_SHEET_MAP)
+
         # Add header information
         header = f"# Balance Sheet data for {ticker.upper()} ({freq})\n"
         header += f"# Data retrieved on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
-        
-        return header + csv_string
+
+        return header + table
         
     except Exception as e:
         return f"获取 {ticker} 资产负债表数据出错：{str(e)}"
@@ -367,15 +373,15 @@ def get_cashflow(
 
         if data.empty:
             return f"No cash flow data found for symbol '{ticker}'"
-            
-        # Convert to CSV string for consistency with other functions
-        csv_string = data.to_csv()
-        
+
+        # Curated field extraction (replaces raw to_csv dump)
+        table = extract_yfinance_table(data, YFINANCE_CASHFLOW_MAP)
+
         # Add header information
         header = f"# Cash Flow data for {ticker.upper()} ({freq})\n"
         header += f"# Data retrieved on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
-        
-        return header + csv_string
+
+        return header + table
         
     except Exception as e:
         return f"获取 {ticker} 现金流量表数据出错：{str(e)}"
@@ -399,15 +405,15 @@ def get_income_statement(
 
         if data.empty:
             return f"No income statement data found for symbol '{ticker}'"
-            
-        # Convert to CSV string for consistency with other functions
-        csv_string = data.to_csv()
-        
+
+        # Curated field extraction (replaces raw to_csv dump)
+        table = extract_yfinance_table(data, YFINANCE_INCOME_MAP)
+
         # Add header information
         header = f"# Income Statement data for {ticker.upper()} ({freq})\n"
         header += f"# Data retrieved on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
-        
-        return header + csv_string
+
+        return header + table
         
     except Exception as e:
         return f"Error retrieving income statement for {ticker}: {str(e)}"

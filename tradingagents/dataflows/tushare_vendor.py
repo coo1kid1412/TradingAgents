@@ -5,6 +5,9 @@ Token 通过环境变量 TUSHARE_TOKEN 配置。
 """
 
 import os
+import re
+import time
+import logging
 from typing import Annotated
 from datetime import datetime, timedelta
 
@@ -12,6 +15,15 @@ import pandas as pd
 
 from .ticker_utils import to_tushare_format, to_akshare_date, to_standard_date, is_etf_or_lof
 from .vendor_errors import TushareRateLimitError, TushareUnavailableError
+from .financial_field_maps import (
+    extract_and_format,
+    TUSHARE_FUNDAMENTALS_MAP,
+    TUSHARE_BALANCE_SHEET_MAP,
+    TUSHARE_CASHFLOW_MAP,
+    TUSHARE_INCOME_MAP,
+)
+
+logger = logging.getLogger(__name__)
 
 _ts_api = None
 
@@ -41,19 +53,85 @@ def _get_tushare_api():
         raise TushareUnavailableError(f"Tushare 初始化失败：{e}")
 
 
+def _parse_retry_delay(error_msg: str) -> int:
+    """从 Tushare 限流错误消息中解析重试等待时间（秒）。
+
+    Tushare 错误格式示例:
+      "抱歉，您访问接口(stock_basic)频率超限(1次/分钟)"
+      "抱歉，您每分钟最多访问200次"
+
+    Returns:
+        等待秒数（含 5 秒缓冲），解析失败时返回 65 秒（保守默认值）。
+        结果被限制在 5~120 秒之间（过短无意义，过长不如 fallback）。
+    """
+    # 格式1: "1次/分钟" / "200次/分钟"
+    match = re.search(r'(\d+)\s*次\s*/\s*(\S+)', error_msg)
+    if match:
+        count = int(match.group(1))
+        unit = match.group(2)
+    else:
+        # 格式2: "每分钟最多访问200次" / "每小时最多访问10次"
+        match = re.search(r'每(\S+?)最多.*?(\d+)\s*次', error_msg)
+        if match:
+            unit = match.group(1)
+            count = int(match.group(2))
+        else:
+            logger.debug("无法解析限流频率，使用默认等待 65s: %s", error_msg)
+            return 65  # 保守默认：1次/分钟 + 5s 缓冲
+
+    if "分" in unit:
+        interval = 60
+    elif "小" in unit:
+        interval = 3600
+    elif "天" in unit or "日" in unit:
+        interval = 86400
+    else:
+        return 65
+
+    wait = interval // count + 5  # 加 5 秒缓冲
+    return min(max(wait, 5), 120)  # 限制在 5~120 秒之间
+
+
+# 限流重试配置
+_RATE_LIMIT_MAX_RETRIES = 2  # 最大重试次数
+
+
 def _safe_call(func, *args, **kwargs):
-    """包装 Tushare API 调用，捕获频率限制和权限错误。"""
-    try:
-        return func(*args, **kwargs)
-    except (TushareUnavailableError, TushareRateLimitError):
-        raise
-    except Exception as e:
-        msg = str(e).lower()
-        if any(kw in msg for kw in ("每分钟", "rate", "频率", "too many")):
-            raise TushareRateLimitError(f"Tushare 请求频率超限：{e}")
-        if any(kw in msg for kw in ("积分", "权限", "point", "permission")):
-            raise TushareUnavailableError(f"Tushare 积分不足或权限不够：{e}")
-        raise TushareUnavailableError(f"Tushare API 调用失败：{e}")
+    """包装 Tushare API 调用，捕获频率限制和权限错误。
+
+    限流时自动重试：从错误消息中解析限流频率（如 "1次/分钟"→等65秒），
+    计算合适的等待时间后重试，最多重试 _RATE_LIMIT_MAX_RETRIES 次。
+    仅对频率限制类错误重试，权限/积分类错误不重试。
+    """
+    retries = 0
+
+    while True:
+        try:
+            return func(*args, **kwargs)
+        except (TushareUnavailableError, TushareRateLimitError):
+            raise
+        except Exception as e:
+            msg = str(e)
+            msg_lower = msg.lower()
+
+            if any(kw in msg_lower for kw in ("每分钟", "rate", "频率", "too many")):
+                if retries < _RATE_LIMIT_MAX_RETRIES:
+                    retries += 1
+                    delay = _parse_retry_delay(msg)
+                    logger.warning(
+                        "Tushare 限流，第 %d 次重试（等待 %ds）: %s",
+                        retries, delay, e,
+                    )
+                    time.sleep(delay)
+                    continue
+                raise TushareRateLimitError(
+                    f"Tushare 请求频率超限（已重试 {retries} 次）：{e}"
+                )
+
+            if any(kw in msg_lower for kw in ("积分", "权限", "point", "permission")):
+                raise TushareUnavailableError(f"Tushare 积分不足或权限不够：{e}")
+
+            raise TushareUnavailableError(f"Tushare API 调用失败：{e}")
 
 
 # ---------------------------------------------------------------------------
@@ -187,10 +265,16 @@ def get_fundamentals(
     ticker: Annotated[str, "ticker symbol of the company"],
     curr_date: Annotated[str, "current date"] = None,
 ) -> str:
-    """获取 A 股公司基本面（Tushare Pro）。"""
+    """获取 A 股公司基本面（Tushare Pro）。
+
+    三个子接口（stock_basic / fina_indicator / daily_basic）独立获取，
+    单个接口限流或不可用时不阻塞其他接口——这样即使 stock_basic 限流，
+    daily_basic 仍可返回 PE/PB/PS 等估值指标。
+    """
     pro = _get_tushare_api()
     ts_code = to_tushare_format(ticker)
     sections: list[str] = []
+    has_data = False  # 追踪是否至少有一个接口返回了有效数据
 
     # 公司基本信息
     try:
@@ -200,6 +284,7 @@ def get_fundamentals(
             fields="ts_code,symbol,name,area,industry,market,list_date",
         )
         if basic is not None and not basic.empty:
+            has_data = True
             row = basic.iloc[0]
             sections.append("## 公司基本信息")
             sections.append(f"代码: {row.get('ts_code', 'N/A')}")
@@ -209,19 +294,20 @@ def get_fundamentals(
             sections.append(f"市场: {row.get('market', 'N/A')}")
             sections.append(f"上市日期: {row.get('list_date', 'N/A')}")
             sections.append("")
-    except (TushareUnavailableError, TushareRateLimitError):
-        raise
+    except (TushareUnavailableError, TushareRateLimitError) as e:
+        logger.warning("获取公司基本信息失败（接口限流或不可用），跳过: %s", e)
     except Exception as e:
         sections.append(f"# 获取公司信息出错：{e}\n")
 
-    # 财务指标
+    # 财务指标（精选关键字段，消除列名歧义）
     try:
         fina = _safe_call(pro.fina_indicator, ts_code=ts_code, limit=4)
         if fina is not None and not fina.empty:
+            has_data = True
             sections.append("## 财务指标（最近4期）")
-            sections.append(fina.to_csv(index=False))
-    except (TushareUnavailableError, TushareRateLimitError):
-        raise
+            sections.append(extract_and_format(fina, TUSHARE_FUNDAMENTALS_MAP, period_col="end_date", limit=4))
+    except (TushareUnavailableError, TushareRateLimitError) as e:
+        logger.warning("获取财务指标失败（接口限流或不可用），跳过: %s", e)
     except Exception as e:
         sections.append(f"# 获取财务指标出错：{e}\n")
 
@@ -236,6 +322,7 @@ def get_fundamentals(
         else:
             daily_basic = _safe_call(pro.daily_basic, ts_code=ts_code, limit=1)
         if daily_basic is not None and not daily_basic.empty:
+            has_data = True
             r = daily_basic.iloc[0]
             sections.append("## 估值指标")
             sections.append(f"PE(TTM): {r.get('pe_ttm', 'N/A')}")
@@ -244,10 +331,16 @@ def get_fundamentals(
             sections.append(f"总市值(万元): {r.get('total_mv', 'N/A')}")
             sections.append(f"流通市值(万元): {r.get('circ_mv', 'N/A')}")
             sections.append("")
-    except (TushareUnavailableError, TushareRateLimitError):
-        raise
+    except (TushareUnavailableError, TushareRateLimitError) as e:
+        logger.warning("获取估值指标失败（接口限流或不可用），跳过: %s", e)
     except Exception as e:
         sections.append(f"# 获取估值指标出错：{e}\n")
+
+    # 如果三个接口全部失败，抛出异常让 route_to_vendor fallback 到 AKShare
+    if not has_data:
+        raise TushareUnavailableError(
+            f"Tushare get_fundamentals 所有子接口均未返回数据（{ticker}）"
+        )
 
     header = (
         f"# Company Fundamentals for {ticker}\n"
@@ -275,13 +368,13 @@ def get_balance_sheet(
     if df is None or df.empty:
         return f"未找到股票 '{ticker}' 的资产负债表数据"
 
-    csv_string = df.to_csv(index=False)
+    table = extract_and_format(df, TUSHARE_BALANCE_SHEET_MAP, period_col="end_date", limit=limit)
     header = (
         f"# Balance Sheet for {ticker} ({freq})\n"
         f"# Source: Tushare Pro\n"
         f"# Data retrieved on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
     )
-    return header + csv_string
+    return header + table
 
 
 # ---------------------------------------------------------------------------
@@ -302,13 +395,13 @@ def get_cashflow(
     if df is None or df.empty:
         return f"未找到股票 '{ticker}' 的现金流量表数据"
 
-    csv_string = df.to_csv(index=False)
+    table = extract_and_format(df, TUSHARE_CASHFLOW_MAP, period_col="end_date", limit=limit)
     header = (
         f"# Cash Flow for {ticker} ({freq})\n"
         f"# Source: Tushare Pro\n"
         f"# Data retrieved on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
     )
-    return header + csv_string
+    return header + table
 
 
 # ---------------------------------------------------------------------------
@@ -329,13 +422,13 @@ def get_income_statement(
     if df is None or df.empty:
         return f"未找到股票 '{ticker}' 的利润表数据"
 
-    csv_string = df.to_csv(index=False)
+    table = extract_and_format(df, TUSHARE_INCOME_MAP, period_col="end_date", limit=limit)
     header = (
         f"# Income Statement for {ticker} ({freq})\n"
         f"# Source: Tushare Pro\n"
         f"# Data retrieved on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
     )
-    return header + csv_string
+    return header + table
 
 
 # ---------------------------------------------------------------------------

@@ -27,17 +27,19 @@ DEFAULT_CONFIG = {
     "anthropic_effort": None,           # "high", "medium", "low"
     "minimax_max_tokens": 8192,         # MiniMax default max_tokens (upstream default 256 too small)
     # Temperature settings for different agent roles
-    "temperature_market": 0.5,          # 市场分析师：适度创意发现不同技术视角
-    "temperature_sentiment": 0.5,       # 舆情分析师：适度创意理解复杂情绪
-    "temperature_news": 0.5,            # 新闻分析师：适度创意发现隐藏关联
+    "temperature_market": 0.2,          # 市场分析师：纯量化数据解读，最低随机性确保结论一致性
+    "temperature_sentiment": 0.4,       # 舆情分析师：适度创意理解复杂情绪
+    "temperature_news": 0.4,            # 新闻分析师：适度创意发现隐藏关联
     "temperature_fundamentals": 0.2,    # 基本面分析师：低随机性确保客观分析
     "temperature_trader": 0.3,          # 交易员：平衡稳定性和灵活性
-    "temperature_research_manager": 0.4,    # 研究主管：偏向稳定综合判断
+    "temperature_research_manager": 0.3,    # 研究主管：偏向稳定综合判断
     "temperature_portfolio_manager": 0.3,   # 投资组合经理：最终决策需要高稳定性
-    # 多头/空头研究员使用默认 temperature (0.7)，保持辩论的多样性
-    "temperature_aggressive_risk": 0.5,     # 激进风控分析师：降低随机性，更稳定判断
-    "temperature_conservative_risk": 0.5,   # 保守风控分析师：降低随机性，更稳定判断
-    "temperature_neutral_risk": 0.5,        # 中立风控分析师：降低随机性，更稳定判断
+    "temperature_bull_researcher": 0.5,     # 多头研究员：保持辩论的多样性
+    "temperature_bear_researcher": 0.5,     # 空头研究员：保持辩论的多样性
+    # 多头/空头研究员通过 temperature_bull_researcher / temperature_bear_researcher 配置
+    "temperature_aggressive_risk": 0.4,     # 激进风控分析师：降低随机性，更稳定判断
+    "temperature_conservative_risk": 0.4,   # 保守风控分析师：降低随机性，更稳定判断
+    "temperature_neutral_risk": 0.4,        # 中立风控分析师：降低随机性，更稳定判断
     # 使用 deep think 模型作为分析师和交易员（True=deep_think_llm, False=quick_think_llm）
     "use_deep_think_for_analysts": True,
     # Output language for analyst reports and final decision

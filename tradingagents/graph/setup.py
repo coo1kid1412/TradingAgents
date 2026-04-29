@@ -35,6 +35,8 @@ class GraphSetup:
         aggressive_risk_llm: Any = None,
         conservative_risk_llm: Any = None,
         neutral_risk_llm: Any = None,
+        bull_researcher_llm: Any = None,
+        bear_researcher_llm: Any = None,
     ):
         """Initialize with required components."""
         self.quick_thinking_llm = quick_thinking_llm
@@ -58,6 +60,8 @@ class GraphSetup:
         self.aggressive_risk_llm = aggressive_risk_llm or quick_thinking_llm
         self.conservative_risk_llm = conservative_risk_llm or quick_thinking_llm
         self.neutral_risk_llm = neutral_risk_llm or quick_thinking_llm
+        self.bull_researcher_llm = bull_researcher_llm or deep_thinking_llm
+        self.bear_researcher_llm = bear_researcher_llm or deep_thinking_llm
 
     def setup_graph(
         self, selected_analysts=["market", "social", "news", "fundamentals"]
@@ -109,10 +113,10 @@ class GraphSetup:
 
         # Create researcher and manager nodes
         bull_researcher_node = create_bull_researcher(
-            self.quick_thinking_llm, self.bull_memory
+            self.bull_researcher_llm, self.bull_memory
         )
         bear_researcher_node = create_bear_researcher(
-            self.quick_thinking_llm, self.bear_memory
+            self.bear_researcher_llm, self.bear_memory
         )
         research_manager_node = create_research_manager(
             self.research_manager_llm, self.invest_judge_memory

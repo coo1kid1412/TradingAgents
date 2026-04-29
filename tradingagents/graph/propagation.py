@@ -54,6 +54,7 @@ class Propagator:
             "messages": [("human", company_name)],
             "company_of_interest": normalized_ticker,
             "company_name": resolved.name,
+            "market": resolved.market,  # "a_share" / "hk" / "us" / "other"
             "trade_date": str(trade_date),
             "investment_debate_state": InvestDebateState(
                 {

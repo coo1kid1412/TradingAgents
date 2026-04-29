@@ -193,6 +193,6 @@ def get_news_from_search(
     parts.append("新闻")
     query = " ".join(parts)
     try:
-        return search_news(query, count=20, freshness="pm")
+        return search_news(query, count=20, freshness="pw")
     except Exception as e:
         return f"Brave Search 调用失败: {e}"

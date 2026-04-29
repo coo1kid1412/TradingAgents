@@ -5,7 +5,7 @@ import os
 from pathlib import Path
 import json
 from datetime import date
-from typing import Dict, Any, Tuple, List, Optional
+from typing import Dict, Any, Tuple, List, Optional, Set
 
 from langgraph.prebuilt import ToolNode
 
@@ -14,6 +14,7 @@ from tradingagents.llm_clients import create_llm_client
 from tradingagents.agents import *
 from tradingagents.default_config import DEFAULT_CONFIG
 from tradingagents.agents.utils.memory import FinancialSituationMemory
+from tradingagents.agents.utils.seed_lessons import get_seed_lessons
 from tradingagents.agents.utils.agent_states import (
     AgentState,
     InvestDebateState,
@@ -101,18 +102,21 @@ class TradingAgentsGraph:
         # Create LLM instances with role-specific temperatures
         # 四个基础分析师 + 交易员：使用 CLI 选择的模型（受 use_deep_think_for_analysts 控制）
         use_deep = self.config.get("use_deep_think_for_analysts", True)
-        self.market_llm = self._create_templllm(self.config.get("temperature_market", 0.5), use_deep_think=use_deep)
+        self.market_llm = self._create_templllm(self.config.get("temperature_market", 0.2), use_deep_think=use_deep)
         self.sentiment_llm = self._create_templllm(self.config.get("temperature_sentiment", 0.5), use_deep_think=use_deep)
         self.news_llm = self._create_templllm(self.config.get("temperature_news", 0.5), use_deep_think=use_deep)
         self.fundamentals_llm = self._create_templllm(self.config.get("temperature_fundamentals", 0.2), use_deep_think=use_deep)
         self.trader_llm = self._create_templllm(self.config.get("temperature_trader", 0.3), use_deep_think=use_deep)
         # 其他角色：固定配置，不受 CLI 选择影响
-        self.research_manager_llm = self._create_templllm(self.config.get("temperature_research_manager", 0.4), use_deep_think=True)  # 固定 deep think
+        self.research_manager_llm = self._create_templllm(self.config.get("temperature_research_manager", 0.3), use_deep_think=True)  # 固定 deep think
         self.portfolio_manager_llm = self._create_templllm(self.config.get("temperature_portfolio_manager", 0.3), use_deep_think=True)  # 固定 deep think
+        # 多/空研究员：使用 deep_think_llm，温度可配置
+        self.bull_researcher_llm = self._create_templllm(self.config.get("temperature_bull_researcher", 0.5), use_deep_think=True)
+        self.bear_researcher_llm = self._create_templllm(self.config.get("temperature_bear_researcher", 0.5), use_deep_think=True)
         # 风控分析师：固定使用 quick_think_llm
-        self.aggressive_risk_llm = self._create_templllm(self.config.get("temperature_aggressive_risk", 0.6), use_deep_think=False)
-        self.conservative_risk_llm = self._create_templllm(self.config.get("temperature_conservative_risk", 0.6), use_deep_think=False)
-        self.neutral_risk_llm = self._create_templllm(self.config.get("temperature_neutral_risk", 0.6), use_deep_think=False)
+        self.aggressive_risk_llm = self._create_templllm(self.config.get("temperature_aggressive_risk", 0.4), use_deep_think=False)
+        self.conservative_risk_llm = self._create_templllm(self.config.get("temperature_conservative_risk", 0.4), use_deep_think=False)
+        self.neutral_risk_llm = self._create_templllm(self.config.get("temperature_neutral_risk", 0.4), use_deep_think=False)
         
         # Initialize memories
         self.bull_memory = FinancialSituationMemory("bull_memory", self.config)
@@ -150,6 +154,8 @@ class TradingAgentsGraph:
             aggressive_risk_llm=self.aggressive_risk_llm,
             conservative_risk_llm=self.conservative_risk_llm,
             neutral_risk_llm=self.neutral_risk_llm,
+            bull_researcher_llm=self.bull_researcher_llm,
+            bear_researcher_llm=self.bear_researcher_llm,
         )
 
         self.propagator = Propagator()
@@ -160,6 +166,7 @@ class TradingAgentsGraph:
         self.curr_state = None
         self.ticker = None
         self.log_states_dict = {}  # date to full state dict
+        self._seed_lessons_loaded: Set[str] = set()  # track which markets' seed lessons have been injected
 
         # Set up the graph
         self.graph = self.graph_setup.setup_graph(selected_analysts)
@@ -255,6 +262,47 @@ class TradingAgentsGraph:
             ),
         }
 
+    def _inject_seed_lessons(self, market: str):
+        """Inject seed lessons into all 5 memory instances for the given market.
+
+        Common lessons are injected once (on first call regardless of market).
+        Market-specific lessons are injected once per unique market.
+
+        Args:
+            market: Market identifier from ResolvedTicker ("a_share"/"hk"/"us"/"other")
+        """
+        # Inject common lessons only once across all markets (idempotent)
+        if "common" not in self._seed_lessons_loaded:
+            common = get_seed_lessons("other")  # returns only COMMON_LESSONS
+            self._add_to_all_memories(common, "common")
+            self._seed_lessons_loaded.add("common")
+
+        # Inject market-specific lessons once per unique market
+        if market not in self._seed_lessons_loaded and market != "other":
+            # get_seed_lessons(market) returns common + market-specific.
+            # Extract only the market-specific portion.
+            common_count = len(get_seed_lessons("other"))
+            all_for_market = get_seed_lessons(market)
+            market_specific = all_for_market[common_count:]
+            if market_specific:
+                self._add_to_all_memories(market_specific, f"{market}-specific")
+            self._seed_lessons_loaded.add(market)
+
+    def _add_to_all_memories(self, lessons, label: str):
+        """Inject lessons into all 5 FinancialSituationMemory instances."""
+        logger.info(
+            "Injecting %d %s seed lessons into all 5 memory instances",
+            len(lessons), label,
+        )
+        for mem in (
+            self.bull_memory,
+            self.bear_memory,
+            self.trader_memory,
+            self.invest_judge_memory,
+            self.portfolio_manager_memory,
+        ):
+            mem.add_situations(lessons)
+
     def propagate(self, company_name, trade_date):
         """Run the trading agents graph for a company on a specific date.
 
@@ -288,6 +336,10 @@ class TradingAgentsGraph:
         init_agent_state = self.propagator.create_initial_state(
             company_name, trade_date
         )
+
+        # Inject seed lessons based on the resolved market (idempotent per market)
+        self._inject_seed_lessons(init_agent_state.get("market", "other"))
+
         args = self.propagator.get_graph_args()
 
         if self.debug:
