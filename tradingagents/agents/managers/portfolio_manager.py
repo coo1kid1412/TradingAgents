@@ -20,7 +20,7 @@ def create_portfolio_manager(llm, memory):
 
         past_memory_str = ""
         for i, rec in enumerate(past_memories, 1):
-            past_memory_str += rec["recommendation"] + "\n\n"
+            past_memory_str += f"【适用场景】{rec['matched_situation']}\n【经验教训】{rec['recommendation']}\n\n"
 
         prompt = f"""【语言要求】你必须使用中文撰写以下所有分析内容和回复。评级关键词（Buy/Overweight/Hold/Underweight/Sell）和股票代码可保留英文。
 
@@ -35,7 +35,6 @@ def create_portfolio_manager(llm, memory):
 **Context:**
 - Research Manager's investment plan: **{research_plan}**
 - Trader's transaction proposal: **{trader_plan}**
-- Lessons from past decisions: **{past_memory_str}**
 
 ### 第一步：方向判断
 根据风险团队辩论内容，先判断当前标的的整体方向：
@@ -67,7 +66,9 @@ def create_portfolio_manager(llm, memory):
 
 **交易员的初步方案：** {trader_plan}
 
-**历史教训：** {past_memory_str}
+**历史教训**（每条包含适用场景和经验教训，请先判断当前标的是否符合适用场景，仅对符合场景的教训采信）：
+
+{past_memory_str}
 
 **风险团队辩论记录：**
 {history}
