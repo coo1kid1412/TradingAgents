@@ -289,19 +289,18 @@ class TradingAgentsGraph:
             self._seed_lessons_loaded.add(market)
 
     def _add_to_all_memories(self, lessons, label: str):
-        """Inject lessons into all 5 FinancialSituationMemory instances."""
+        """Inject lessons into portfolio_manager_memory only.
+
+        Seed lessons serve as guardrails for the final decision maker.
+        Injecting into only portfolio_manager (vs. all 5 memories) prevents
+        prior knowledge from biasing the bull/bear debate and intermediate
+        decisions — the debate should be driven by analyst data, not priors.
+        """
         logger.info(
-            "Injecting %d %s seed lessons into all 5 memory instances",
+            "Injecting %d %s seed lessons into portfolio_manager_memory",
             len(lessons), label,
         )
-        for mem in (
-            self.bull_memory,
-            self.bear_memory,
-            self.trader_memory,
-            self.invest_judge_memory,
-            self.portfolio_manager_memory,
-        ):
-            mem.add_situations(lessons)
+        self.portfolio_manager_memory.add_situations(lessons)
 
     def propagate(self, company_name, trade_date):
         """Run the trading agents graph for a company on a specific date.
