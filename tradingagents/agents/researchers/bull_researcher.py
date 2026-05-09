@@ -41,6 +41,11 @@ Reflections from similar situations and lessons learned: {past_memory_str}
 Use this information to deliver a compelling bull argument, refute the bear's concerns, and engage in a dynamic debate that demonstrates the strengths of the bull position. You must also address reflections and learn from lessons and mistakes you made in the past.
 
 **重要：请用中文进行辩论和分析。** 股票代码和技术指标名称请保留英文原文。请以中文口语化方式直接反驳空头分析师的观点，进行有力的辩论。
+
+## ⚠️ 数值类指标使用规范
+- 引用 PE(TTM)、动态PE、EPS 等估值指标时，**必须使用分析师报告中的「系统计算」值**（如「动态PE(系统计算)」），严禁自行计算不同的 PE 值
+- 如果发现两个不同的 PE 数值（如 API 参考值 vs 系统计算值），**以系统计算值为准**
+- 如需验证或自行计算，必须写明公式和中间步骤
 """
 
         response = llm.invoke(prompt)

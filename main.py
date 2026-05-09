@@ -40,7 +40,7 @@ os.environ["NO_PROXY"] = f"{_existing},{_DOMESTIC_NO_PROXY}" if _existing else _
 #  并发配置
 # ---------------------------------------------------------------------------
 # 要分析的股票列表（逗号分隔）
-_TICKERS = "688008"
+_TICKERS = "300857"
 
 # 最多同时分析的股票数（不超过 3）
 _MAX_CONCURRENT = 3

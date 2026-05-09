@@ -54,7 +54,7 @@ class OpenAIClient(BaseLLMClient):
     def get_llm(self) -> Any:
         """Return configured ChatOpenAI instance."""
         self.warn_if_unknown_model()
-        llm_kwargs = {"model": self.model}
+        llm_kwargs = {"model": self.model, "timeout": self._get_timeout()}
 
         # Provider-specific base URL and auth
         if self.provider in _PROVIDER_CONFIG:
@@ -69,9 +69,9 @@ class OpenAIClient(BaseLLMClient):
         elif self.base_url:
             llm_kwargs["base_url"] = self.base_url
 
-        # Forward user-provided kwargs
+        # Forward user-provided kwargs (timeout already set, skip it)
         for key in _PASSTHROUGH_KWARGS:
-            if key in self.kwargs:
+            if key in self.kwargs and key not in llm_kwargs:
                 llm_kwargs[key] = self.kwargs[key]
 
         # Native OpenAI: use Responses API for consistent behavior across

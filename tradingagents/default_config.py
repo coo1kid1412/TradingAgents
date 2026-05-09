@@ -26,6 +26,8 @@ DEFAULT_CONFIG = {
     "openai_reasoning_effort": None,    # "medium", "high", "low"
     "anthropic_effort": None,           # "high", "medium", "low"
     "minimax_max_tokens": 8192,         # MiniMax default max_tokens (upstream default 256 too small)
+    # LLM request timeout (seconds); prevents indefinite hangs when API is unresponsive
+    "llm_timeout": 180,
     # Temperature settings for different agent roles
     "temperature_market": 0.2,          # 市场分析师：纯量化数据解读，最低随机性确保结论一致性
     "temperature_sentiment": 0.4,       # 舆情分析师：适度创意理解复杂情绪

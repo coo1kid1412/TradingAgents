@@ -1,15 +1,18 @@
 import os
 import json
+import logging
 import pandas as pd
 from datetime import date, timedelta, datetime
 from typing import Annotated
 
 SavePathType = Annotated[str, "File path to save data. If None, data is not saved."]
 
+logger = logging.getLogger(__name__)
+
 def save_output(data: pd.DataFrame, tag: str, save_path: SavePathType = None) -> None:
     if save_path:
         data.to_csv(save_path)
-        print(f"{tag} 已保存至 {save_path}")
+        logger.info("%s 已保存至 %s", tag, save_path)
 
 
 def get_current_date():

@@ -1,3 +1,6 @@
+import logging
+import queue
+import threading
 from typing import Annotated
 
 # Import from vendor-specific modules
@@ -58,6 +61,11 @@ except ImportError:
 
 # Configuration and routing logic
 from .config import get_config
+
+logger = logging.getLogger(__name__)
+
+# 供应商单次调用的壁钟超时（秒），防止 AKShare 等无 timeout 的调用无限阻塞
+_VENDOR_CALL_TIMEOUT = 60
 
 # Tools organized by category
 TOOLS_CATEGORIES = {
@@ -221,6 +229,33 @@ def get_vendor(category: str, method: str = None) -> str:
     # Fall back to category-level configuration
     return config.get("data_vendors", {}).get(category, "default")
 
+def _call_with_timeout(func, timeout, *args, **kwargs):
+    """在子线程中调用 func，设置壁钟超时；超时则抛 TimeoutError 并 fallback。
+
+    使用 daemon 线程 + queue 而非 ThreadPoolExecutor，因为 executor.shutdown(wait=True)
+    会阻塞直到已提交任务完成，导致超时形同虚设。
+    """
+    q: queue.Queue = queue.Queue()
+
+    def _worker():
+        try:
+            q.put((func(*args, **kwargs), None))
+        except Exception as e:
+            q.put((None, e))
+
+    t = threading.Thread(target=_worker, daemon=True)
+    t.start()
+    t.join(timeout=timeout)
+
+    if t.is_alive():
+        raise TimeoutError(f"供应商调用超时（{timeout}s）")
+
+    result, exc = q.get()
+    if exc is not None:
+        raise exc
+    return result
+
+
 def route_to_vendor(method: str, *args, **kwargs):
     """Route method calls to appropriate vendor implementation with fallback support.
 
@@ -228,6 +263,9 @@ def route_to_vendor(method: str, *args, **kwargs):
       - 行情/财务类：tushare → akshare → yfinance
       - 新闻/公告类：akshare → tushare → yfinance
     非A股代码按配置文件的 vendor 顺序路由。
+
+    每个供应商调用受 _VENDOR_CALL_TIMEOUT 秒壁钟超时保护，
+    超时后自动 fallback 到下一个供应商，防止进程无限阻塞。
     """
     if method not in VENDOR_METHODS:
         raise ValueError(f"Method '{method}' not supported")
@@ -266,7 +304,16 @@ def route_to_vendor(method: str, *args, **kwargs):
         impl_func = vendor_impl[0] if isinstance(vendor_impl, list) else vendor_impl
 
         try:
-            return impl_func(*args, **kwargs)
+            return _call_with_timeout(
+                impl_func, _VENDOR_CALL_TIMEOUT, *args, **kwargs
+            )
+        except TimeoutError as e:
+            last_error = e
+            logger.warning(
+                "[route_to_vendor] %s → %s 超时（%ds），fallback 到下一个供应商",
+                method, vendor, _VENDOR_CALL_TIMEOUT,
+            )
+            continue
         except (AlphaVantageRateLimitError, VendorRateLimitError,
                 VendorUnavailableError, YFRateLimitError) as e:
             last_error = e

@@ -1,7 +1,11 @@
+import logging
+
 from langchain_core.tools import tool
 from typing import Annotated
 from datetime import datetime, timedelta
 from tradingagents.dataflows.interface import route_to_vendor
+
+logger = logging.getLogger(__name__)
 
 # 行情数据最低回看天数：确保覆盖中长期趋势
 _MIN_STOCK_LOOKBACK_DAYS = 730
@@ -33,10 +37,10 @@ def get_stock_data(
             start_date = (end_dt - timedelta(days=_MIN_STOCK_LOOKBACK_DAYS)).strftime("%Y-%m-%d")
     except ValueError:
         pass
-    print(f"[get_stock_data] 正在获取 {symbol} 行情数据 ({start_date} ~ {end_date})...")
+    logger.info("正在获取 %s 行情数据 (%s ~ %s)...", symbol, start_date, end_date)
     try:
         result = route_to_vendor("get_stock_data", symbol, start_date, end_date)
-        print(f"[get_stock_data] {symbol} 行情数据获取完成 ({len(result)} chars)")
+        logger.info("%s 行情数据获取完成 (%d chars)", symbol, len(result))
         return result
     except Exception as e:
         return f"获取行情数据失败 ({symbol}): {e}"

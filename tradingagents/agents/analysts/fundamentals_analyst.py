@@ -6,6 +6,7 @@ from langchain_core.messages import AIMessage
 from tradingagents.agents.utils.agent_utils import (
     build_instrument_context,
     get_language_instruction,
+    validate_fundamentals_data,
 )
 from tradingagents.dataflows.interface import route_to_vendor
 
@@ -83,6 +84,11 @@ def create_fundamentals_analyst(llm):
         # 2. Format into structured text
         structured_data = _format_structured_data(raw_data, ticker, current_date)
 
+        # 2.5. Run data cross-validation on PE/EPS consistency
+        validation_warning = validate_fundamentals_data(raw_data.get("fundamentals", ""))
+        if validation_warning:
+            structured_data = validation_warning + structured_data
+
         # 3. Single LLM call for analysis
         lang_instruction = get_language_instruction()
 
@@ -134,6 +140,12 @@ def create_fundamentals_analyst(llm):
 | EPS(TTM) | | | |
 
 注意：如果某项指标在提供的数据中不可用（如 ETF/基金无财务报表），在表格中标注「不适用」并在正文中说明原因，不要编造数据。
+
+## ⚠️ 数值类指标使用规范（PE/EPS/PB 等）
+- **PE(TTM)、动态PE、静态PE、EPS 等有标准计算公式的指标**：必须优先使用数据中「## PE估值（系统计算）」段落的「系统计算」值
+- **仅在「系统计算」值不可用时**，才可使用「API参考」值或自行计算
+- **如需自行计算**：必须写明公式并验证结果（示例: PE = 收盘价/年度EPS = 210.27/1.97 = 106.7），不允许凭记忆估算
+- **数据校验警告**：如果数据前方出现「⚠️ 数据质量校验警告」段落，请优先处理其建议
 
 当前日期：{current_date}。{instrument_context}{lang_instruction}"""
 

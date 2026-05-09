@@ -1,6 +1,10 @@
+import logging
+
 from langchain_core.tools import tool
 from typing import Annotated
 from tradingagents.dataflows.interface import route_to_vendor
+
+logger = logging.getLogger(__name__)
 
 @tool
 def get_indicators(
@@ -26,7 +30,7 @@ def get_indicators(
     results = []
     for ind in indicators:
         try:
-            print(f"[get_indicators] 正在获取 {symbol} 技术指标: {ind}")
+            logger.info("正在获取 %s 技术指标: %s", symbol, ind)
             results.append(route_to_vendor("get_indicators", symbol, ind, curr_date, look_back_days))
         except (ValueError, Exception) as e:
             results.append(f"获取技术指标数据失败 ({symbol}, {ind}): {e}")

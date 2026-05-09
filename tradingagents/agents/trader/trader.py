@@ -59,6 +59,11 @@ def create_trader(llm, memory):
 
 结论必须以 'FINAL TRANSACTION PROPOSAL: **BUY/HOLD/SELL**' 结尾。
 
+## ⚠️ 数值类指标审查规范
+- 审查研究经理的 PE/EPS 相关评分时，对比原始分析师数据中的「系统计算」PE 值
+- 如果发现报告中存在两个矛盾的 PE 数值（如「动态PE 19倍」和「动态PE 42倍」），指出数据引用混乱并建议以「系统计算」值为准
+- 在评估估值论据时，优先采信数据源中标记为「系统计算」的指标
+
 ## 历史教训
 {past_memory_str}
 

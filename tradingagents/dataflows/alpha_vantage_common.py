@@ -1,9 +1,12 @@
 import os
+import logging
 import requests
 import pandas as pd
 import json
 from datetime import datetime
 from io import StringIO
+
+logger = logging.getLogger(__name__)
 
 API_BASE_URL = "https://www.alphavantage.co/query"
 
@@ -118,5 +121,5 @@ def _filter_csv_by_date_range(csv_data: str, start_date: str, end_date: str) -> 
 
     except Exception as e:
         # If filtering fails, return original data with a warning
-        print(f"警告：按日期范围过滤 CSV 数据失败：{e}")
+        logger.warning("按日期范围过滤 CSV 数据失败: %s", e)
         return csv_data

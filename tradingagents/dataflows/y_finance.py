@@ -1,6 +1,7 @@
 from typing import Annotated
 from datetime import datetime
 from dateutil.relativedelta import relativedelta
+import logging
 import pandas as pd
 import yfinance as yf
 import os
@@ -11,6 +12,8 @@ from .financial_field_maps import (
     YFINANCE_CASHFLOW_MAP,
     YFINANCE_INCOME_MAP,
 )
+
+logger = logging.getLogger(__name__)
 
 def get_YFin_data_online(
     symbol: Annotated[str, "ticker symbol of the company"],
@@ -185,7 +188,7 @@ def get_stock_stats_indicators_window(
             ind_string += f"{date_str}: {value}\n"
         
     except Exception as e:
-        print(f"批量获取 stockstats 数据出错：{e}")
+        logger.warning("批量获取 stockstats 数据出错: %s", e)
         # Fallback to original implementation if bulk method fails
         ind_string = ""
         curr_date_dt = datetime.strptime(curr_date, "%Y-%m-%d")
@@ -258,8 +261,8 @@ def get_stockstats_indicator(
             curr_date,
         )
     except Exception as e:
-        print(
-            f"Error getting stockstats indicator data for indicator {indicator} on {curr_date}: {e}"
+        logger.warning(
+            "获取 stockstats 指标数据出错 (%s, %s): %s", indicator, curr_date, e,
         )
         return ""
 

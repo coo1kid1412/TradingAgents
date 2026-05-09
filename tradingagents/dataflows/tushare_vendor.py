@@ -272,6 +272,55 @@ def get_indicator(
 # ---------------------------------------------------------------------------
 # 3. get_fundamentals
 # ---------------------------------------------------------------------------
+
+def _compute_ttm_eps(fina_df: pd.DataFrame) -> float | None:
+    """从 fina_indicator 累计数据计算 TTM（滚动12个月）每股收益。
+
+    TTM_EPS = 最新年报EPS - 上年同期Q1_EPS + 今年Q1_EPS
+
+    中国财报披露规则:
+      Q1(单季) → H1(累计) → 9M(累计) → Annual(累计)
+      fina_indicator 的 eps 字段为累计值，故:
+      TTM = Annual_EPS - prev_Q1_EPS + curr_Q1_EPS
+    """
+    if fina_df is None or fina_df.empty or "eps" not in fina_df.columns:
+        return None
+    if "end_date" not in fina_df.columns:
+        return None
+
+    df = fina_df.sort_values("end_date").copy()
+    df["end_date"] = df["end_date"].astype(str)
+
+    # 最新年报 EPS
+    annual_mask = df["end_date"].str.endswith("1231")
+    annual_rows = df[annual_mask]
+    if annual_rows.empty:
+        return None
+    latest_annual = annual_rows.iloc[-1]
+    annual_eps = latest_annual.get("eps", None)
+    if annual_eps is None or annual_eps <= 0:
+        return None
+
+    ttm_eps = float(annual_eps)
+
+    # + 最新 Q1 EPS
+    q1_mask = df["end_date"].str.endswith("0331")
+    if q1_mask.any():
+        latest_q1 = df[q1_mask].iloc[-1]
+        latest_q1_eps = latest_q1.get("eps", None)
+        if latest_q1_eps is not None:
+            ttm_eps = ttm_eps + float(latest_q1_eps)
+
+    # - 上年同期 Q1 EPS
+    if q1_mask.sum() >= 2:
+        prev_q1 = df[q1_mask].iloc[-2]
+        prev_q1_eps = prev_q1.get("eps", None)
+        if prev_q1_eps is not None:
+            ttm_eps = ttm_eps - float(prev_q1_eps)
+
+    return ttm_eps if ttm_eps > 0 else None
+
+
 def get_fundamentals(
     ticker: Annotated[str, "ticker symbol of the company"],
     curr_date: Annotated[str, "current date"] = None,
@@ -286,6 +335,7 @@ def get_fundamentals(
     ts_code = to_tushare_format(ticker)
     sections: list[str] = []
     has_data = False  # 追踪是否至少有一个接口返回了有效数据
+    fina = None  # 提升到函数级别，供后续 PE 计算使用
 
     # 公司基本信息
     try:
@@ -312,17 +362,20 @@ def get_fundamentals(
 
     # 财务指标（精选关键字段，消除列名歧义）
     try:
-        fina = _safe_call(pro.fina_indicator, ts_code=ts_code, limit=4)
+        fina = _safe_call(pro.fina_indicator, ts_code=ts_code, limit=5)
         if fina is not None and not fina.empty:
             has_data = True
             sections.append("## 财务指标（最近4期）")
-            sections.append(extract_and_format(fina, TUSHARE_FUNDAMENTALS_MAP, period_col="end_date", limit=4))
+            sections.append(extract_and_format(fina, TUSHARE_FUNDAMENTALS_MAP, period_col="end_date", limit=5))
     except (TushareUnavailableError, TushareRateLimitError) as e:
         logger.warning("获取财务指标失败（接口限流或不可用），跳过: %s", e)
     except Exception as e:
         sections.append(f"# 获取财务指标出错：{e}\n")
 
-    # 估值指标（PE / PB 等）
+    # 估值指标（PE / PB 等）—— 系统计算 PE，不依赖 API 的 pe_ttm
+    close_price = None
+    api_pe_ttm = None
+    daily_basic = None
     try:
         if curr_date:
             daily_basic = _safe_call(
@@ -332,20 +385,69 @@ def get_fundamentals(
             )
         else:
             daily_basic = _safe_call(pro.daily_basic, ts_code=ts_code, limit=1)
+        # 非交易日时 trade_date 查询返回空，自动回退到 limit=1 获取最近交易日
+        if (daily_basic is None or daily_basic.empty) and curr_date:
+            logger.info("daily_basic 指定日期无数据（可能是非交易日），回退到 limit=1: %s", ts_code)
+            daily_basic = _safe_call(pro.daily_basic, ts_code=ts_code, limit=1)
         if daily_basic is not None and not daily_basic.empty:
             has_data = True
             r = daily_basic.iloc[0]
-            sections.append("## 估值指标")
-            sections.append(f"PE(TTM): {r.get('pe_ttm', 'N/A')}")
-            sections.append(f"PB: {r.get('pb', 'N/A')}")
-            sections.append(f"PS(TTM): {r.get('ps_ttm', 'N/A')}")
-            sections.append(f"总市值(万元): {r.get('total_mv', 'N/A')}")
-            sections.append(f"流通市值(万元): {r.get('circ_mv', 'N/A')}")
-            sections.append("")
+            close_price = float(r["close"]) if pd.notna(r.get("close")) else None
+            api_pe_ttm = float(r["pe_ttm"]) if pd.notna(r.get("pe_ttm")) else None
+            sections.append(f"收盘价(元): {r.get('close', 'N/A')}")
     except (TushareUnavailableError, TushareRateLimitError) as e:
         logger.warning("获取估值指标失败（接口限流或不可用），跳过: %s", e)
     except Exception as e:
         sections.append(f"# 获取估值指标出错：{e}\n")
+
+    # 系统计算 PE（核心修复：不再依赖 Tushare pe_ttm，自行计算确保准确性）
+    try:
+        sections.append("## PE估值（系统计算）")
+
+        # 动态 PE(TTM)：收盘价 / TTM_EPS
+        ttm_eps = _compute_ttm_eps(fina)
+        if close_price and ttm_eps:
+            dynamic_pe = round(close_price / ttm_eps, 2)
+            sections.append(f"动态PE(系统计算): {dynamic_pe}倍 (公式: 收盘价/TTM_EPS)")
+        else:
+            sections.append("动态PE(系统计算): N/A (缺少收盘价或TTM_EPS)")
+
+        # 静态 PE：收盘价 / 年度 EPS
+        if fina is not None and not fina.empty and close_price:
+            annual_mask = fina["end_date"].astype(str).str.endswith("1231")
+            annual_rows = fina[annual_mask]
+            if not annual_rows.empty:
+                annual_eps = float(annual_rows.iloc[-1].get("eps", 0))
+                if annual_eps > 0:
+                    static_pe = round(close_price / annual_eps, 2)
+                    sections.append(f"静态PE(系统计算): {static_pe}倍 (公式: 收盘价/年度EPS)")
+                else:
+                    sections.append("静态PE(系统计算): N/A (年度EPS<=0)")
+
+        # API 参考值（仅供对比，不作为主要依据）
+        if api_pe_ttm is not None:
+            sections.append(f"PE(TTM/API参考): {round(api_pe_ttm, 4)}倍 (Tushare daily_basic 直接返回，仅供参考)")
+
+        # 偏差警告
+        if close_price and ttm_eps and api_pe_ttm is not None:
+            calc_pe = close_price / ttm_eps
+            if calc_pe > 0 and abs(api_pe_ttm - calc_pe) / calc_pe > 0.15:
+                deviation = round(abs(api_pe_ttm - calc_pe) / calc_pe * 100)
+                sections.append(f"⚠️ PE偏差警告: API值与系统计算值偏差 {deviation}%，以系统计算值为准")
+
+        # PB / PS / 市值
+        if daily_basic is not None and not daily_basic.empty:
+            r = daily_basic.iloc[0]
+            sections.append(f"PB: {r.get('pb', 'N/A')}")
+            sections.append(f"PS(TTM): {r.get('ps_ttm', 'N/A')}")
+            total_mv = r.get('total_mv', None)
+            sections.append(f"总市值(万元): {total_mv if total_mv is not None else 'N/A'}")
+            if total_mv is not None and pd.notna(total_mv):
+                sections.append(f"总市值(亿元): {round(float(total_mv) / 10000, 2)}")
+            sections.append(f"流通市值(万元): {r.get('circ_mv', 'N/A')}")
+        sections.append("")
+    except Exception as e:
+        logger.warning("系统计算 PE 出错: %s", e)
 
     # 如果三个接口全部失败，抛出异常让 route_to_vendor fallback 到 AKShare
     if not has_data:

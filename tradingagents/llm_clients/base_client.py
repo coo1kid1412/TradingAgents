@@ -48,10 +48,19 @@ def normalize_content(response):
 class BaseLLMClient(ABC):
     """Abstract base class for LLM clients."""
 
+    # Default timeout (seconds) for LLM API requests.
+    # Prevents indefinite hangs when the API is unresponsive.
+    # Can be overridden via kwargs["timeout"] or config["llm_timeout"].
+    DEFAULT_TIMEOUT = 180
+
     def __init__(self, model: str, base_url: Optional[str] = None, **kwargs):
         self.model = model
         self.base_url = base_url
         self.kwargs = kwargs
+
+    def _get_timeout(self) -> int:
+        """Return the timeout value from kwargs or the default."""
+        return self.kwargs.get("timeout", self.DEFAULT_TIMEOUT)
 
     def get_provider_name(self) -> str:
         """Return the provider name used in warning messages."""

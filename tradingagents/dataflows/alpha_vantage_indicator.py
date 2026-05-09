@@ -1,4 +1,8 @@
+import logging
+
 from .alpha_vantage_common import _make_api_request
+
+logger = logging.getLogger(__name__)
 
 def get_indicator(
     symbol: str,
@@ -218,5 +222,5 @@ def get_indicator(
         return result_str
 
     except Exception as e:
-        print(f"获取 Alpha Vantage 指标 {indicator} 数据出错：{e}")
+        logger.warning("获取 Alpha Vantage 指标 %s 数据出错: %s", indicator, e)
         return f"获取 {indicator} 数据出错：{str(e)}"

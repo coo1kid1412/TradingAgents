@@ -32,13 +32,13 @@ class AnthropicClient(BaseLLMClient):
     def get_llm(self) -> Any:
         """Return configured ChatAnthropic instance."""
         self.warn_if_unknown_model()
-        llm_kwargs = {"model": self.model}
+        llm_kwargs = {"model": self.model, "timeout": self._get_timeout()}
 
         if self.base_url:
             llm_kwargs["base_url"] = self.base_url
 
         for key in _PASSTHROUGH_KWARGS:
-            if key in self.kwargs:
+            if key in self.kwargs and key not in llm_kwargs:
                 llm_kwargs[key] = self.kwargs[key]
 
         return NormalizedChatAnthropic(**llm_kwargs)

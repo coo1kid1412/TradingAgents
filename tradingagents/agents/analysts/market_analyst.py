@@ -1,3 +1,4 @@
+import logging
 import uuid
 from datetime import datetime, timedelta
 
@@ -11,6 +12,8 @@ from tradingagents.agents.utils.agent_utils import (
     get_stock_data,
 )
 from tradingagents.dataflows.config import get_config
+
+logger = logging.getLogger(__name__)
 
 # ── 技术指标目录（供 system prompt 使用） ──────────────────────────────
 _INDICATOR_CATALOG = """
@@ -53,7 +56,7 @@ def _prefetch_stock_data(ticker: str, current_date: str, messages: list):
         if getattr(m, "name", None) == "get_stock_data":
             return [], True
 
-    print(f"[market_analyst] 预取注入: 正在为 {ticker} 强制获取行情数据...")
+    logger.info("预取注入: 正在为 %s 强制获取行情数据...", ticker)
     try:
         end_dt = datetime.strptime(current_date, "%Y-%m-%d")
     except ValueError:
@@ -84,13 +87,13 @@ def _prefetch_stock_data(ticker: str, current_date: str, messages: list):
             tool_call_id=tool_call_id,
             name="get_stock_data",
         )
-        print(
-            f"[market_analyst] 预取注入: {ticker} 行情数据已注入 "
-            f"({len(str(stock_data_result))} chars)"
+        logger.info(
+            "预取注入: %s 行情数据已注入 (%d chars)",
+            ticker, len(str(stock_data_result)),
         )
         return [ai_msg, tool_msg], True
     except Exception as e:
-        print(f"[market_analyst] 预取注入失败: {e}，LLM 将自行调用工具")
+        logger.warning("预取注入失败: %s，LLM 将自行调用工具", e)
         return [], False
 
 

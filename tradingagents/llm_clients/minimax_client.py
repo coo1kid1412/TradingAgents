@@ -36,6 +36,7 @@ class MiniMaxClient(BaseLLMClient):
             "model": self.model,
             "base_url": self.base_url or _MINIMAX_BASE_URL,
             "max_tokens": self.kwargs.get("max_tokens", 8192),
+            "timeout": self._get_timeout(),
         }
 
         # Read API key from env if not explicitly provided
@@ -43,8 +44,8 @@ class MiniMaxClient(BaseLLMClient):
             api_key = os.environ.get(_MINIMAX_API_KEY_ENV)
             if api_key:
                 llm_kwargs["api_key"] = api_key
-        
-        # Forward user-provided kwargs
+
+        # Forward user-provided kwargs (timeout already set, skip it)
         for key in _PASSTHROUGH_KWARGS:
             if key in self.kwargs and key not in llm_kwargs:
                 llm_kwargs[key] = self.kwargs[key]

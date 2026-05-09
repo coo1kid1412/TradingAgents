@@ -7,6 +7,9 @@ no token limits, works offline with any LLM provider.
 from rank_bm25 import BM25Okapi
 from typing import List, Tuple
 import re
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 class FinancialSituationMemory:
@@ -135,10 +138,10 @@ if __name__ == "__main__":
         recommendations = matcher.get_memories(current_situation, n_matches=2)
 
         for i, rec in enumerate(recommendations, 1):
-            print(f"\nMatch {i}:")
-            print(f"Similarity Score: {rec['similarity_score']:.2f}")
-            print(f"Matched Situation: {rec['matched_situation']}")
-            print(f"Recommendation: {rec['recommendation']}")
+            logger.debug(
+                "Match %d: score=%.2f, situation=%s",
+                i, rec['similarity_score'], rec['matched_situation'],
+            )
 
     except Exception as e:
-        print(f"Error during recommendation: {str(e)}")
+        logger.warning("推荐检索异常: %s", e)
