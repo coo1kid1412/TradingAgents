@@ -75,13 +75,13 @@ def create_portfolio_manager(llm, memory):
 
 | Conviction | 触发条件 | 仓位上限 |
 |------------|---------|---------|
-| ⭐⭐⭐⭐⭐ (5★ Very High) | \|d\| > 2.0 且 R > 2.0 且 anchor 不敏感 | 15-20% |
-| ⭐⭐⭐⭐ (4★ High) | \|d\| > 1.5 且 R > 1.5 | 8-12% |
-| ⭐⭐⭐ (3★ Medium) | \|d\| > 1.0 且 R ≥ 1.0 | 4-6% |
-| ⭐⭐ (2★ Low) | \|d\| > 0.5 | 2-3% |
-| ⭐ (1★ Very Low) | \|d\| ≤ 0.5 | ≤1%（试探仓或观望）|
+| ⭐⭐⭐⭐⭐ (5★ Very High) | |d| > 2.0 且 R > 2.0 且 anchor 不敏感 | 15-20% |
+| ⭐⭐⭐⭐ (4★ High) | |d| > 1.5 且 R > 1.5 | 8-12% |
+| ⭐⭐⭐ (3★ Medium) | |d| > 1.0 且 R ≥ 1.0 | 4-6% |
+| ⭐⭐ (2★ Low) | |d| > 0.5 | 2-3% |
+| ⭐ (1★ Very Low) | |d| ≤ 0.5 | ≤1%（试探仓或观望）|
 
-**强制**：先计算 \|d\| 和 R，再对照表选 Conviction，仓位严格在区间内。
+**强制**：先计算 |d| 和 R，再对照表选 Conviction，仓位严格在区间内。
 
 **风控修正**：若风控辩论任一维度"高风险"未缓释，Conviction 可下调一档，仓位对应下移。
 
@@ -167,7 +167,7 @@ PM 必须明确"thesis 兑现"的具体里程碑（如"Q2 营收增速 >25%"、"
 | 字段 | 内容 |
 |------|------|
 | Rating 评级 | <BUY / OVERWEIGHT / HOLD / UNDERWEIGHT / SELL> |
-| Conviction 信心 | <⭐⭐⭐ Medium>（\|d\| = X.XX） |
+| Conviction 信心 | <⭐⭐⭐ Medium>（&#124;d&#124; = X.XX） |
 | 投资判断 | <YES / NO / CONDITIONAL>（含等待条件） |
 | 入场判断 | <BUY NOW / WAIT / DON'T BUY>（含等待条件） |
 
