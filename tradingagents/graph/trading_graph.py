@@ -100,19 +100,20 @@ class TradingAgentsGraph:
         self.quick_thinking_llm = quick_client.get_llm()
         
         # Create LLM instances with role-specific temperatures
-        # 四个基础分析师 + 交易员：使用 CLI 选择的模型（受 use_deep_think_for_analysts 控制）
+        # 四个基础分析师：使用 CLI 选择的模型（受 use_deep_think_for_analysts 控制）
         use_deep = self.config.get("use_deep_think_for_analysts", True)
         self.market_llm = self._create_templllm(self.config.get("temperature_market", 0.2), use_deep_think=use_deep)
         self.sentiment_llm = self._create_templllm(self.config.get("temperature_sentiment", 0.5), use_deep_think=use_deep)
         self.news_llm = self._create_templllm(self.config.get("temperature_news", 0.5), use_deep_think=use_deep)
         self.fundamentals_llm = self._create_templllm(self.config.get("temperature_fundamentals", 0.2), use_deep_think=use_deep)
-        self.trader_llm = self._create_templllm(self.config.get("temperature_trader", 0.3), use_deep_think=use_deep)
-        # 其他角色：固定配置，不受 CLI 选择影响
-        self.research_manager_llm = self._create_templllm(self.config.get("temperature_research_manager", 0.3), use_deep_think=True)  # 固定 deep think
-        self.portfolio_manager_llm = self._create_templllm(self.config.get("temperature_portfolio_manager", 0.3), use_deep_think=True)  # 固定 deep think
-        # 多/空研究员：使用 deep_think_llm，温度可配置
-        self.bull_researcher_llm = self._create_templllm(self.config.get("temperature_bull_researcher", 0.5), use_deep_think=True)
-        self.bear_researcher_llm = self._create_templllm(self.config.get("temperature_bear_researcher", 0.5), use_deep_think=True)
+        # 交易员：默认 quick_think（优化01后只做执行评估），可通过 use_deep_for_trader 回退
+        self.trader_llm = self._create_templllm(self.config.get("temperature_trader", 0.3), use_deep_think=self.config.get("use_deep_for_trader", False))
+        # RM/PM：固定 deep_think，最终决策推理需要深度
+        self.research_manager_llm = self._create_templllm(self.config.get("temperature_research_manager", 0.3), use_deep_think=True)
+        self.portfolio_manager_llm = self._create_templllm(self.config.get("temperature_portfolio_manager", 0.3), use_deep_think=True)
+        # 多/空研究员：默认 quick_think（修辞密度高但推理深度低），可通过 config flag 回退
+        self.bull_researcher_llm = self._create_templllm(self.config.get("temperature_bull_researcher", 0.5), use_deep_think=self.config.get("use_deep_for_bull_researcher", False))
+        self.bear_researcher_llm = self._create_templllm(self.config.get("temperature_bear_researcher", 0.5), use_deep_think=self.config.get("use_deep_for_bear_researcher", False))
         # 风控分析师：固定使用 quick_think_llm
         self.aggressive_risk_llm = self._create_templllm(self.config.get("temperature_aggressive_risk", 0.4), use_deep_think=False)
         self.conservative_risk_llm = self._create_templllm(self.config.get("temperature_conservative_risk", 0.4), use_deep_think=False)
@@ -180,6 +181,11 @@ class TradingAgentsGraph:
         llm_timeout = self.config.get("llm_timeout")
         if llm_timeout:
             kwargs["timeout"] = llm_timeout
+
+        # Pass LLM retry count from config (handles transient 429/5xx errors)
+        max_retries = self.config.get("llm_max_retries")
+        if max_retries is not None:
+            kwargs["max_retries"] = max_retries
 
         provider = self.config.get("llm_provider", "").lower()
 
@@ -347,11 +353,47 @@ class TradingAgentsGraph:
 
         args = self.propagator.get_graph_args()
 
+        # 阶段进度映射：state 字段 → 阶段标签
+        _PHASE_LABELS = {
+            "market_report": "市场分析师",
+            "sentiment_report": "舆情分析师",
+            "news_report": "新闻分析师",
+            "fundamentals_report": "基本面分析师",
+            "consensus_snapshot": "共识识别官",
+            "investment_plan": "研究主管 (RM)",
+            # "trader_investment_plan": "交易员",  # DEPRECATED in optimization 05
+            "final_trade_decision": "投资组合经理 (PM)",
+        }
+        # 阶段排序（用于显示序号）
+        _PHASE_ORDER = [
+            "market_report", "sentiment_report", "news_report", "fundamentals_report",
+            "consensus_snapshot",
+            "investment_plan", "final_trade_decision",  # trader_investment_plan removed in 05
+        ]
+
         if self.debug:
+            import sys
             # Debug mode with tracing
             trace = []
             _last_printed_msg_id = None
+            _completed_phases = set()
+            _prev_state = {}
+
+            print(f"[{company_name}] 正在启动分析流程...", flush=True)
             for chunk in self.graph.stream(init_agent_state, **args):
+                for field in _PHASE_ORDER:
+                    if field in _completed_phases:
+                        continue
+                    new_val = chunk.get(field, "")
+                    old_val = _prev_state.get(field, "")
+                    if new_val and not old_val:
+                        phase_idx = _PHASE_ORDER.index(field) + 1
+                        total = len(_PHASE_ORDER)
+                        label = _PHASE_LABELS[field]
+                        print(f"\n[{company_name}] ✓ Phase {phase_idx}/{total}: {label} 完成", flush=True)
+                        _completed_phases.add(field)
+                _prev_state = {k: v for k, v in chunk.items() if k in _PHASE_ORDER}
+
                 if len(chunk["messages"]) == 0:
                     pass
                 else:
@@ -359,9 +401,9 @@ class TradingAgentsGraph:
                     msg_id = getattr(last_msg, "id", id(last_msg))
                     if msg_id != _last_printed_msg_id:
                         last_msg.pretty_print()
+                        sys.stdout.flush()
                         _last_printed_msg_id = msg_id
                     trace.append(chunk)
-
             final_state = trace[-1]
         else:
             # Standard mode without tracing
@@ -385,6 +427,7 @@ class TradingAgentsGraph:
             "sentiment_report": final_state["sentiment_report"],
             "news_report": final_state["news_report"],
             "fundamentals_report": final_state["fundamentals_report"],
+            "consensus_snapshot": final_state.get("consensus_snapshot", ""),
             "investment_debate_state": {
                 "bull_history": final_state["investment_debate_state"]["bull_history"],
                 "bear_history": final_state["investment_debate_state"]["bear_history"],
@@ -396,7 +439,7 @@ class TradingAgentsGraph:
                     "judge_decision"
                 ],
             },
-            "trader_investment_decision": final_state["trader_investment_plan"],
+            # "trader_investment_decision": final_state["trader_investment_plan"],  # DEPRECATED in optimization 05
             "risk_debate_state": {
                 "aggressive_history": final_state["risk_debate_state"]["aggressive_history"],
                 "conservative_history": final_state["risk_debate_state"]["conservative_history"],

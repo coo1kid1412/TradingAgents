@@ -1,9 +1,9 @@
+import logging
 import os
 import re
 import sys
 import time
 import datetime
-import multiprocessing
 from pathlib import Path
 from typing import List, Tuple
 from dotenv import load_dotenv
@@ -11,6 +11,30 @@ from dotenv import load_dotenv
 # Load environment variables from .env file (use project root, not CWD)
 _PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 load_dotenv(os.path.join(_PROJECT_ROOT, ".env"))
+
+# Logger setup: 让 dataflows / agents 中的 logger.warning/error 可见到终端
+# 用于排查 tushare/akshare fallback 链上的具体失败原因
+# 同时写到 logs/run_<timestamp>.log 文件，避免开头日志被滚动出屏幕后丢失
+_LOG_DIR = Path(_PROJECT_ROOT) / "logs"
+_LOG_DIR.mkdir(exist_ok=True)
+_LOG_FILE = _LOG_DIR / f"run_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+
+logging.basicConfig(
+    level=logging.WARNING,
+    format="[%(asctime)s %(levelname)s %(name)s] %(message)s",
+    datefmt="%H:%M:%S",
+    handlers=[
+        logging.StreamHandler(sys.stderr),
+        logging.FileHandler(_LOG_FILE, encoding="utf-8"),
+    ],
+)
+# 抑制几个第三方库的噪音 WARNING
+for noisy in ("urllib3", "httpx", "httpcore", "matplotlib", "PIL"):
+    logging.getLogger(noisy).setLevel(logging.ERROR)
+# 启动横幅写入日志文件（方便日后辨认是哪一次运行）
+logging.getLogger(__name__).warning(
+    "=== main.py 启动 ===  日志文件: %s", _LOG_FILE
+)
 
 # 确保代理可用（Google Gemini 等国际 API 需要代理）
 os.environ.setdefault("HTTP_PROXY", "http://127.0.0.1:7890")
@@ -40,7 +64,7 @@ os.environ["NO_PROXY"] = f"{_existing},{_DOMESTIC_NO_PROXY}" if _existing else _
 #  并发配置
 # ---------------------------------------------------------------------------
 # 要分析的股票列表（逗号分隔）
-_TICKERS = "300857"
+_TICKERS = "688008"
 
 # 最多同时分析的股票数（不超过 3）
 _MAX_CONCURRENT = 3
@@ -52,23 +76,24 @@ _START_INTERVAL_SECONDS = 300
 # 分析日期（默认今天）
 _ANALYSIS_DATE = datetime.datetime.now().strftime("%Y-%m-%d")
 
-# 辩论轮数配置（同时控制研究团队辩论和风控团队讨论）
-# 范围：1-3，默认 3
-# - max_debate_rounds: 多头 vs 空头的辩论轮数
-# - max_risk_discuss_rounds: 激进/保守/中立风控分析师的讨论轮数
-_DEBATE_ROUNDS = 3
+# 辩论轮数配置（研究团队多空辩论 与 风控团队讨论 可独立配置）
+# 范围：1-3
+# - _BULL_BEAR_ROUNDS（多头 vs 空头）：2 = 立论 + 反驳（最小有效辩论单位）
+# - _RISK_ROUNDS（激进/保守/中立风控）：1 = 三个维度并行审查，PM 综合（多轮重复度高）
+_BULL_BEAR_ROUNDS = 2
+_RISK_ROUNDS = 1
 
 
-def _clamp_debate_rounds(value: int, min_val: int = 1, max_val: int = 3) -> int:
+def _clamp_debate_rounds(value: int, name: str, default: int, min_val: int = 1, max_val: int = 3) -> int:
     """限制辩论轮数在合理范围内（默认 1-3）"""
     if not isinstance(value, int):
-        print(f"警告: 辩论轮数应为整数，使用默认值 3")
-        return 3
+        print(f"警告: {name} 应为整数，使用默认值 {default}")
+        return default
     if value < min_val:
-        print(f"警告: 辩论轮数 {value} 小于最小值 {min_val}，已调整为 {min_val}")
+        print(f"警告: {name}={value} 小于最小值 {min_val}，已调整为 {min_val}")
         return min_val
     if value > max_val:
-        print(f"警告: 辩论轮数 {value} 大于最大值 {max_val}，已调整为 {max_val}")
+        print(f"警告: {name}={value} 大于最大值 {max_val}，已调整为 {max_val}")
         return max_val
     return value
 
@@ -83,11 +108,14 @@ def _build_config() -> dict:
     config["deep_think_llm"] = "MiniMax-M2.7"
     config["quick_think_llm"] = "MiniMax-M2.7"
     config["use_deep_think_for_analysts"] = True
+    # P1 LLM 选择配置（perf_02 保留）
+    config["use_deep_for_trader"] = False       # trader 默认 quick_think
+    config["use_deep_for_bull_researcher"] = False  # bull 默认 quick_think
+    config["use_deep_for_bear_researcher"] = False  # bear 默认 quick_think
     
-    # 统一设置辩论轮数（带保护机制）
-    debate_rounds = _clamp_debate_rounds(_DEBATE_ROUNDS)
-    config["max_debate_rounds"] = debate_rounds
-    config["max_risk_discuss_rounds"] = debate_rounds
+    # 分别设置多空辩论与风控辩论轮数（带保护机制）
+    config["max_debate_rounds"] = _clamp_debate_rounds(_BULL_BEAR_ROUNDS, "_BULL_BEAR_ROUNDS", default=2)
+    config["max_risk_discuss_rounds"] = _clamp_debate_rounds(_RISK_ROUNDS, "_RISK_ROUNDS", default=1)
     
     config["data_vendors"] = {
         "core_stock_apis": "yfinance",
@@ -106,13 +134,14 @@ _AGENT_CN = {
     "Social Analyst": "舆情分析师",
     "News Analyst": "新闻分析师",
     "Fundamentals Analyst": "基本面分析师",
+    "Consensus Officer": "共识识别官",
     "Bull Researcher": "多头研究员",
     "Bear Researcher": "空头研究员",
     "Research Manager": "研究主管",
     "Trader": "交易员",
-    "Aggressive Analyst": "激进风控分析师",
-    "Conservative Analyst": "保守风控分析师",
-    "Neutral Analyst": "中立风控分析师",
+    "Aggressive Analyst": "流动性风控分析师",
+    "Conservative Analyst": "事件风控分析师",
+    "Neutral Analyst": "尾部风控分析师",
     "Portfolio Manager": "投资组合经理",
 }
 
@@ -131,6 +160,7 @@ def _save_report(state, ticker: str, save_path: Path):
         ("sentiment_report", "sentiment.md", "Social Analyst"),
         ("news_report", "news.md", "News Analyst"),
         ("fundamentals_report", "fundamentals.md", "Fundamentals Analyst"),
+        ("consensus_snapshot", "consensus.md", "Consensus Officer"),
     ]:
         if state.get(key):
             analysts_dir.mkdir(exist_ok=True)
@@ -158,7 +188,8 @@ def _save_report(state, ticker: str, save_path: Path):
             content = "\n\n".join(f"### {name}\n{text}" for name, text in research_parts)
             sections.append(f"## 二、研究团队决策\n\n{content}")
 
-    # 3. Trading
+    # 3. Trading (DEPRECATED in optimization 05: Trader node removed)
+    # 保留此段以兼容旧报告，新运行不再产生 trader 章节
     if state.get("trader_investment_plan"):
         trading_dir = save_path / "3_trading"
         trading_dir.mkdir(exist_ok=True)
@@ -216,61 +247,87 @@ def _save_report(state, ticker: str, save_path: Path):
 def analyze_single_stock(ticker: str, analysis_date: str, config: dict) -> Tuple[str, bool, str]:
     """
     在独立进程中分析单支股票
-    
+
     Returns:
         (ticker, success, report_path_or_error)
     """
-    try:
-        # 每个进程独立导入，避免 multiprocessing 序列化问题
-        from tradingagents.graph.trading_graph import TradingAgentsGraph
-        
-        print(f"\n{'='*60}")
-        print(f"[{ticker}] 开始分析 (日期: {analysis_date})")
-        print(f"{'='*60}\n")
-        
-        # 创建独立的 TradingAgentsGraph 实例
-        ta = TradingAgentsGraph(
-            selected_analysts=["market", "social", "news", "fundamentals"],
-            debug=True,
-            config=config,
-        )
-        
-        # 执行分析
-        final_state, decision = ta.propagate(ticker, analysis_date)
-        
-        # 打印决策
-        print(f"\n[{ticker}] 分析完成，决策: {decision}\n")
-        
-        # 保存报告
-        company_name_safe = re.sub(
-            r'[\\/:*?"<>|]', "", final_state.get("company_name", "")
-        ).strip()
-        
-        if company_name_safe and company_name_safe == ticker:
-            company_name_safe = ""
-            
-        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        if company_name_safe:
-            folder = f"{ticker}_{company_name_safe}_{timestamp}"
-        else:
-            folder = f"{ticker}_{timestamp}"
-            
-        report_path = Path(_PROJECT_ROOT) / "reports" / folder
-        report_file = _save_report(final_state, ticker, report_path)
-        
-        print(f"[{ticker}] 报告已保存至: {report_path.resolve()}")
-        print(f"[{ticker}] 完整报告: {report_file.name}\n")
-        
-        return (ticker, True, str(report_path))
-        
-    except Exception as e:
-        error_msg = f"[{ticker}] 分析失败: {str(e)}"
-        print(f"\n{'!'*60}")
-        print(error_msg)
-        print(f"{'!'*60}\n")
-        import traceback
-        traceback.print_exc()
-        return (ticker, False, error_msg)
+    # MiniMax 529 整点高峰重试配置
+    _MAX_529_RETRIES = 2          # 最多额外重试次数（不含首次执行）
+    _529_RETRY_WAIT_BASE = 120    # 基础等待秒数（指数递增：120→240）
+
+    for attempt in range(1 + _MAX_529_RETRIES):
+        try:
+            # 每个进程独立导入，避免 multiprocessing 序列化问题
+            from tradingagents.graph.trading_graph import TradingAgentsGraph
+            from tradingagents import profiling
+
+            if attempt == 0:
+                print(f"\n{'='*60}", flush=True)
+                print(f"[{ticker}] 开始分析 (日期: {analysis_date})", flush=True)
+                print(f"{'='*60}\n", flush=True)
+                profiling.reset()  # 开始新一支股票分析，重置计时器
+            else:
+                wait_sec = _529_RETRY_WAIT_BASE * attempt
+                print(f"\n[{ticker}] MiniMax 529 重试 (第 {attempt} 次)，等待 {wait_sec}s...", flush=True)
+                time.sleep(wait_sec)
+
+            # 创建独立的 TradingAgentsGraph 实例
+            ta = TradingAgentsGraph(
+                selected_analysts=["market", "social", "news", "fundamentals"],
+                debug=True,
+                config=config,
+            )
+
+            # 执行分析
+            final_state, decision = ta.propagate(ticker, analysis_date)
+
+            # 打印决策
+            print(f"\n[{ticker}] 分析完成，决策: {decision}\n", flush=True)
+
+            # 保存报告
+            company_name_safe = re.sub(
+                r'[\\/:*?"<>|]', "", final_state.get("company_name", "")
+            ).strip()
+
+            if company_name_safe and company_name_safe == ticker:
+                company_name_safe = ""
+
+            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            if company_name_safe:
+                folder = f"{ticker}_{company_name_safe}_{timestamp}"
+            else:
+                folder = f"{ticker}_{timestamp}"
+
+            report_path = Path(_PROJECT_ROOT) / "reports" / folder
+            report_file = _save_report(final_state, ticker, report_path)
+
+            print(f"[{ticker}] 报告已保存至: {report_path.resolve()}")
+            print(f"[{ticker}] 完整报告: {report_file.name}\n")
+
+            # 打印性能分析摘要
+            try:
+                profiling.print_summary(label=ticker)
+            except Exception as _e:
+                print(f"[{ticker}] 性能摘要生成失败: {_e}", flush=True)
+
+            return (ticker, True, str(report_path))
+
+        except Exception as e:
+            error_str = str(e)
+            is_529 = "529" in error_str and ("overloaded" in error_str.lower() or "繁忙" in error_str)
+
+            if is_529 and attempt < _MAX_529_RETRIES:
+                print(f"\n[{ticker}] MiniMax 529 整点高峰错误，将自动重试...", flush=True)
+                continue
+
+            # 非重试性错误或重试耗尽
+            error_msg = f"[{ticker}] 分析失败: {error_str}"
+            print(f"\n{'!'*60}", flush=True)
+            print(error_msg, flush=True)
+            print(f"{'!'*60}\n", flush=True)
+            import traceback
+            traceback.print_exc()
+            return (ticker, False, error_msg)
 
 
 # ---------------------------------------------------------------------------
@@ -327,7 +384,10 @@ def main():
             traceback.print_exc()
             sys.exit(1)
     else:
-        # 多支股票：使用多进程并发
+        # 多支股票：使用多进程并发（仅在多股票模式下才导入 multiprocessing）
+        import multiprocessing
+        multiprocessing.set_start_method("spawn", force=True)
+
         print("=" * 60)
         print("多股票并发分析模式")
         print("=" * 60)
@@ -384,6 +444,4 @@ def main():
 
 
 if __name__ == "__main__":
-    # Windows/macOS 多进程保护
-    multiprocessing.set_start_method("spawn", force=True)
     main()

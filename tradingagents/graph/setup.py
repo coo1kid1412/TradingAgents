@@ -6,6 +6,7 @@ from langgraph.prebuilt import ToolNode
 
 from tradingagents.agents import *
 from tradingagents.agents.utils.agent_states import AgentState
+from tradingagents.agents.utils.consensus_node import create_consensus_node
 
 from .conditional_logic import ConditionalLogic
 
@@ -111,6 +112,9 @@ class GraphSetup:
             delete_nodes["fundamentals"] = create_msg_delete()
             # fundamentals analyst fetches data programmatically, no ToolNode needed
 
+        # Consensus officer: synthesizes market consensus before bull/bear debate
+        consensus_officer_node = create_consensus_node(self.quick_thinking_llm)
+
         # Create researcher and manager nodes
         bull_researcher_node = create_bull_researcher(
             self.bull_researcher_llm, self.bull_memory
@@ -121,7 +125,8 @@ class GraphSetup:
         research_manager_node = create_research_manager(
             self.research_manager_llm, self.invest_judge_memory
         )
-        trader_node = create_trader(self.trader_llm, self.trader_memory)
+        # Trader 节点已废弃（optimization 05），RM 输出直接进入风控辩论
+        # trader_node = create_trader(self.trader_llm, self.trader_memory)  # REMOVED in 05
 
         # Create risk analysis nodes
         aggressive_analyst = create_aggressive_debator(self.aggressive_risk_llm)
@@ -144,10 +149,11 @@ class GraphSetup:
                 workflow.add_node(f"tools_{analyst_type}", tool_nodes[analyst_type])
 
         # Add other nodes
+        workflow.add_node("Consensus Officer", consensus_officer_node)
         workflow.add_node("Bull Researcher", bull_researcher_node)
         workflow.add_node("Bear Researcher", bear_researcher_node)
         workflow.add_node("Research Manager", research_manager_node)
-        workflow.add_node("Trader", trader_node)
+        # workflow.add_node("Trader", trader_node)  # REMOVED in optimization 05
         workflow.add_node("Aggressive Analyst", aggressive_analyst)
         workflow.add_node("Neutral Analyst", neutral_analyst)
         workflow.add_node("Conservative Analyst", conservative_analyst)
@@ -176,12 +182,15 @@ class GraphSetup:
                 # Analyst with programmatic data fetching: direct edge
                 workflow.add_edge(current_analyst, current_clear)
 
-            # Connect to next analyst or to Bull Researcher if this is the last analyst
+            # Connect to next analyst, or to Consensus Officer if this is the last analyst
             if i < len(selected_analysts) - 1:
                 next_analyst = f"{selected_analysts[i+1].capitalize()} Analyst"
                 workflow.add_edge(current_clear, next_analyst)
             else:
-                workflow.add_edge(current_clear, "Bull Researcher")
+                workflow.add_edge(current_clear, "Consensus Officer")
+
+        # Consensus Officer feeds Bull Researcher
+        workflow.add_edge("Consensus Officer", "Bull Researcher")
 
         # Add remaining edges
         workflow.add_conditional_edges(
@@ -200,8 +209,10 @@ class GraphSetup:
                 "Research Manager": "Research Manager",
             },
         )
-        workflow.add_edge("Research Manager", "Trader")
-        workflow.add_edge("Trader", "Aggressive Analyst")
+        # Trader 节点已移除，RM 直接进入风控辩论
+        workflow.add_edge("Research Manager", "Aggressive Analyst")
+        # workflow.add_edge("Research Manager", "Trader")  # REMOVED in optimization 05
+        # workflow.add_edge("Trader", "Aggressive Analyst")  # REMOVED in optimization 05
         workflow.add_conditional_edges(
             "Aggressive Analyst",
             self.conditional_logic.should_continue_risk_analysis,

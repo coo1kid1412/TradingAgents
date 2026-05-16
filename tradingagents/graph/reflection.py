@@ -52,8 +52,12 @@ Adhere strictly to these instructions, and ensure your output is detailed, accur
         curr_sentiment_report = current_state["sentiment_report"]
         curr_news_report = current_state["news_report"]
         curr_fundamentals_report = current_state["fundamentals_report"]
+        curr_consensus_snapshot = current_state.get("consensus_snapshot", "")
 
-        return f"{curr_market_report}\n\n{curr_sentiment_report}\n\n{curr_news_report}\n\n{curr_fundamentals_report}"
+        parts = [curr_market_report, curr_sentiment_report, curr_news_report, curr_fundamentals_report]
+        if curr_consensus_snapshot:
+            parts.append(curr_consensus_snapshot)
+        return "\n\n".join(parts)
 
     def _reflect_on_component(
         self, component_type: str, report: str, situation: str, returns_losses
@@ -91,9 +95,16 @@ Adhere strictly to these instructions, and ensure your output is detailed, accur
         bear_memory.add_situations([(situation, result)])
 
     def reflect_trader(self, current_state, returns_losses, trader_memory):
-        """Reflect on trader's decision and update memory."""
+        """Reflect on trader's decision and update memory.
+        
+        DEPRECATED in optimization 05: Trader node removed.
+        Now uses RM investment plan for reflection instead.
+        """
         situation = self._extract_current_situation(current_state)
-        trader_decision = current_state["trader_investment_plan"]
+        # Use RM investment plan instead of trader plan
+        trader_decision = current_state.get("investment_plan", "")
+        if not trader_decision:
+            return  # Skip reflection if no plan available
 
         result = self._reflect_on_component(
             "TRADER", trader_decision, situation, returns_losses
