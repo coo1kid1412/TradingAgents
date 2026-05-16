@@ -16,6 +16,7 @@ def create_portfolio_manager(llm, memory):
         news_report = state.get("news_report", "")
         fundamentals_report = state.get("fundamentals_report", "")
         consensus_snapshot = state.get("consensus_snapshot", "")
+        stock_profile = state.get("stock_profile", "")
 
         # 决策卡头部信息
         pm_ticker = state["company_of_interest"]
@@ -58,9 +59,23 @@ def create_portfolio_manager(llm, memory):
 
 ## 决策流程（必须严格按顺序）
 
-### 第一步：吸收上下文 + 提取关键数值
+### 第一步：吸收股票画像 + 上下文
 
-从 RM thesis 中提取并显式列出：
+从画像识别官的输出（在"输入资料"区"股票画像"段）提取并显式列出：
+- **决策风格**（value_anchor / catalyst_driven / momentum / event_driven）
+- **4 份报告最终权重**（用于校验 RM 评分是否合理）
+- **关键时间窗口事件**
+
+**决策风格→操作动作的映射规则**（必须严格遵守）：
+
+| 决策风格 | Time Stop | Entry 节奏 | TP/SL 节奏 | 监控指标侧重 |
+|---------|-----------|----------|----------|------------|
+| **value_anchor 价值锚定** | 12-18 月 | 等 PE 跌至历史中位数附近建仓 | 宽 TP（≥3R），宽 SL（≥1R），不追求精确 | 季度财报、ROE、毛利率趋势 |
+| **catalyst_driven 催化驱动** | 6-9 月 | 等关键催化前 2 周建仓 | TP 1R/2R 阶梯（催化兑现阶段性减仓） | 催化进度、行业事件、机构持仓 |
+| **momentum 动量** | 1-3 月 | 突破/回踩均线建仓 | 紧 TP（1R 立刻减半），紧 SL（0.7R） | RSI、MACD、成交量、舆情拥挤度 |
+| **event_driven 事件驱动** | 至事件结束（1-2 月）| 事件前 1 周内 | 事件后立即清仓（无视价位） | 事件日历、政策细则、公告 |
+
+**从 RM thesis 中提取**：
 - 评级 R2、得分差 d、目标价 P_up / P_dn、当前价 P_0、赔率 R、期望收益 E
 
 ### 第二步：评级微调（仅限执行层因素）
@@ -273,6 +288,9 @@ PM 必须明确推荐其中之一，并解释理由。
 
 ### Research Manager 的 thesis（核心输入）
 {research_plan}
+
+### 股票画像（决定决策风格 + 报告使用权重 + Time Stop / Entry 节奏）
+{stock_profile if stock_profile else "（未提供）"}
 
 ### 共识快照（用于 entry timing 判断）
 {consensus_snapshot if consensus_snapshot else "（未提供）"}

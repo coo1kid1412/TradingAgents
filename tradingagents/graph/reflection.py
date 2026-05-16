@@ -53,8 +53,11 @@ Adhere strictly to these instructions, and ensure your output is detailed, accur
         curr_news_report = current_state["news_report"]
         curr_fundamentals_report = current_state["fundamentals_report"]
         curr_consensus_snapshot = current_state.get("consensus_snapshot", "")
+        curr_stock_profile = current_state.get("stock_profile", "")
 
         parts = [curr_market_report, curr_sentiment_report, curr_news_report, curr_fundamentals_report]
+        if curr_stock_profile:
+            parts.append(curr_stock_profile)
         if curr_consensus_snapshot:
             parts.append(curr_consensus_snapshot)
         return "\n\n".join(parts)

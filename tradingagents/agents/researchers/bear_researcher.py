@@ -15,6 +15,7 @@ def create_bear_researcher(llm, memory):
         news_report = state["news_report"]
         fundamentals_report = state["fundamentals_report"]
         consensus_snapshot = state.get("consensus_snapshot", "")
+        stock_profile = state.get("stock_profile", "")
 
         curr_situation = f"{fundamentals_report}\n\n{market_research_report}\n\n{news_report}\n\n{sentiment_report}"
         past_memories = memory.get_memories(curr_situation, n_matches=3)
@@ -32,6 +33,17 @@ def create_bear_researcher(llm, memory):
 1. **共识同向论据 ≠ alpha**：如果市场已经认为"PE 偏高"，那"PE 偏高"不是空头论据，是中性事实。下游 RM 会把共识方向的空头论据**封顶 6 分**。
 2. **反共识论据 = 真价值**：找出"共识忽视的空头点"——比如共识乐观的 X 其实有隐患；或共识没意识到 Y 的负向影响。下游 RM 会把反共识空头论据**下限抬高 1 分**。
 3. **数据说话**：每条论据必须明确"是否引用具体数值"。RM 据此判定证据等级，**不再接受 1-5 自评信心度**。
+
+---
+
+## 股票画像（决定你应该重点引用哪份报告作为论据来源）
+
+{stock_profile if stock_profile else "（画像缺失，按 4 份报告等权处理）"}
+
+**使用规则**：画像里给了 4 份报告的推荐权重。**权重越高的报告，你的论据应该越多来自该报告**。例如：
+- 题材炒作股（舆情权重高）：你的空头论据应优先来自 sentiment（拥挤拐点、KOL 反向信号、舆情亢奋指数）
+- 大盘蓝筹（基本面权重高）：你的空头论据应优先来自 fundamentals（盈利质量恶化、估值过高、ROE 下行）
+- 周期股（新闻权重高）：你的空头论据应优先来自 news（商品价格见顶、政策收紧、海外需求下行）
 
 ---
 

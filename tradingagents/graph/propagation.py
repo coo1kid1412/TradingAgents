@@ -84,6 +84,7 @@ class Propagator:
             "fundamentals_report": "",
             "sentiment_report": "",
             "news_report": "",
+            "stock_profile": "",
             "consensus_snapshot": "",
         }
 

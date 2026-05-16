@@ -359,6 +359,7 @@ class TradingAgentsGraph:
             "sentiment_report": "舆情分析师",
             "news_report": "新闻分析师",
             "fundamentals_report": "基本面分析师",
+            "stock_profile": "股票画像识别官",
             "consensus_snapshot": "共识识别官",
             "investment_plan": "研究主管 (RM)",
             # "trader_investment_plan": "交易员",  # DEPRECATED in optimization 05
@@ -367,6 +368,7 @@ class TradingAgentsGraph:
         # 阶段排序（用于显示序号）
         _PHASE_ORDER = [
             "market_report", "sentiment_report", "news_report", "fundamentals_report",
+            "stock_profile",
             "consensus_snapshot",
             "investment_plan", "final_trade_decision",  # trader_investment_plan removed in 05
         ]
@@ -427,6 +429,7 @@ class TradingAgentsGraph:
             "sentiment_report": final_state["sentiment_report"],
             "news_report": final_state["news_report"],
             "fundamentals_report": final_state["fundamentals_report"],
+            "stock_profile": final_state.get("stock_profile", ""),
             "consensus_snapshot": final_state.get("consensus_snapshot", ""),
             "investment_debate_state": {
                 "bull_history": final_state["investment_debate_state"]["bull_history"],

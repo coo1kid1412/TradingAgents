@@ -15,6 +15,7 @@ def create_bull_researcher(llm, memory):
         news_report = state["news_report"]
         fundamentals_report = state["fundamentals_report"]
         consensus_snapshot = state.get("consensus_snapshot", "")
+        stock_profile = state.get("stock_profile", "")
 
         curr_situation = f"{fundamentals_report}\n\n{market_research_report}\n\n{news_report}\n\n{sentiment_report}"
         past_memories = memory.get_memories(curr_situation, n_matches=3)
@@ -32,6 +33,18 @@ def create_bull_researcher(llm, memory):
 1. **共识同向论据 ≠ alpha**：如果市场已经在期待"业绩增长 50%"，那"业绩会增长 50%"不是多头论据，是中性事实。下游 RM 会把共识方向的多头论据**封顶 6 分**。
 2. **反共识论据 = 真价值**：找出"共识忽视的多头点"——比如共识担心 X，但你有证据表明 X 不成立；或共识没意识到 Y 的正向影响。下游 RM 会把反共识多头论据**下限抬高 1 分**。
 3. **数据说话**：每条论据必须明确"是否引用具体数值"。RM 据此判定证据等级，**不再接受 1-5 自评信心度**。
+
+---
+
+## 股票画像（决定你应该重点引用哪份报告作为论据来源）
+
+{stock_profile if stock_profile else "（画像缺失，按 4 份报告等权处理）"}
+
+**使用规则**：画像里给了 4 份报告的推荐权重。**权重越高的报告，你的论据应该越多来自该报告**。例如：
+- 题材炒作股（舆情权重高）：你的论据应优先来自 sentiment（KOL 观点、舆情拐点、资金流向）
+- 大盘蓝筹（基本面权重高）：你的论据应优先来自 fundamentals（ROE、毛利率、现金流、估值分位）
+- 周期股（新闻权重高）：你的论据应优先来自 news（商品价格、行业政策、海外同行）
+- ETF/指数（技术面权重高）：你的论据应优先来自 market（技术形态、资金流、跨市场联动）
 
 ---
 

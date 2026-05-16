@@ -64,7 +64,7 @@ os.environ["NO_PROXY"] = f"{_existing},{_DOMESTIC_NO_PROXY}" if _existing else _
 #  并发配置
 # ---------------------------------------------------------------------------
 # 要分析的股票列表（逗号分隔）
-_TICKERS = "688008"
+_TICKERS = "603629"
 
 # 最多同时分析的股票数（不超过 3）
 _MAX_CONCURRENT = 3
@@ -134,6 +134,7 @@ _AGENT_CN = {
     "Social Analyst": "舆情分析师",
     "News Analyst": "新闻分析师",
     "Fundamentals Analyst": "基本面分析师",
+    "Stock Profile Officer": "股票画像识别官",
     "Consensus Officer": "共识识别官",
     "Bull Researcher": "多头研究员",
     "Bear Researcher": "空头研究员",
@@ -160,6 +161,7 @@ def _save_report(state, ticker: str, save_path: Path):
         ("sentiment_report", "sentiment.md", "Social Analyst"),
         ("news_report", "news.md", "News Analyst"),
         ("fundamentals_report", "fundamentals.md", "Fundamentals Analyst"),
+        ("stock_profile", "stock_profile.md", "Stock Profile Officer"),
         ("consensus_snapshot", "consensus.md", "Consensus Officer"),
     ]:
         if state.get(key):

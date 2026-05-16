@@ -58,6 +58,11 @@ class AgentState(MessagesState):
     ]
     fundamentals_report: Annotated[str, "Report from the Fundamentals Researcher"]
 
+    # stock profile (synthesized first, drives downstream report weighting and decision style)
+    stock_profile: Annotated[
+        str, "Stock profile: market cap tier, style, liquidity, instrument type, report weights, decision style, event windows"
+    ]
+
     # consensus snapshot (synthesized after all analysts, before bull/bear)
     consensus_snapshot: Annotated[
         str, "Market consensus snapshot: priced-in expectations, narrative, unknowns"

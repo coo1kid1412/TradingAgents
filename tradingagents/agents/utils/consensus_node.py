@@ -21,12 +21,23 @@ def create_consensus_node(llm):
         sentiment_report = state.get("sentiment_report", "")
         news_report = state.get("news_report", "")
         fundamentals_report = state.get("fundamentals_report", "")
+        stock_profile = state.get("stock_profile", "")
 
         prompt = f"""【语言要求】你必须使用中文撰写以下分析。股票代码和技术指标名称可保留英文。
 
 你是投研团队的**共识识别官**。你的唯一任务：基于 4 份分析师报告，提炼"当前市场对该标的的一致预期"，作为下游 Bull/Bear 辩论的校准基准。
 
 {instrument_context}
+
+---
+
+## 股票画像（由画像识别官在你之前提炼，影响你的报告权重）
+
+{stock_profile if stock_profile else "（画像缺失，按 4 份报告等权处理）"}
+
+**重要**：画像里给了 4 份报告的推荐权重。**权重越高的报告，你在识别共识时越要重点引用其口径**。例如：
+- 题材炒作小盘股：舆情权重高 → 共识 narrative 应主要来自舆情/新闻口径
+- 大盘蓝筹：基本面权重高 → 共识应主要来自卖方一致预期 + 基本面数据
 
 ---
 
