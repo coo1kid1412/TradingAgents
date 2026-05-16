@@ -2,6 +2,10 @@
 
 Uses BM25 (Best Matching 25) algorithm for retrieval - no API calls,
 no token limits, works offline with any LLM provider.
+
+Tokenization: jieba for CJK + regex fallback for ASCII tokens
+(numbers, English terms like 'PE', 'CXL'). Required because raw \\w+
+regex treats long Chinese phrases as single tokens, destroying recall.
 """
 
 from rank_bm25 import BM25Okapi
@@ -9,7 +13,21 @@ from typing import List, Tuple
 import re
 import logging
 
+import jieba
+# Quiet jieba's first-run initialization log
+jieba.setLogLevel(logging.WARNING)
+
 logger = logging.getLogger(__name__)
+
+# Stopwords that hurt BM25 recall in financial Chinese text
+_STOPWORDS = frozenset([
+    "的", "了", "和", "是", "在", "与", "及", "或", "且", "但", "而",
+    "为", "对", "从", "向", "以", "之", "其", "此", "该", "等",
+    "也", "都", "就", "还", "又", "已", "并", "可", "需",
+    "一", "一个", "一些", "这", "这个", "这些", "那", "那个", "那些",
+    "有", "无", "不", "没", "没有",
+    " ", "\t", "\n",
+])
 
 
 class FinancialSituationMemory:
@@ -30,10 +48,26 @@ class FinancialSituationMemory:
     def _tokenize(self, text: str) -> List[str]:
         """Tokenize text for BM25 indexing.
 
-        Simple whitespace + punctuation tokenization with lowercasing.
+        jieba for Chinese segmentation; ASCII alphanumerics (numbers,
+        English terms like 'PE'/'CXL') are preserved as-is via lowercasing.
+        Stopwords and pure punctuation are filtered to improve recall.
         """
-        # Lowercase and split on non-alphanumeric characters
-        tokens = re.findall(r'\b\w+\b', text.lower())
+        if not text:
+            return []
+        # jieba 处理混合中英文文本，对 ASCII 的"PE"、"CXL"、"19.51"等保留为整 token
+        # 用 list(cut(...)) 而非 lcut(...) 以兼容 jieba 旧版本
+        raw = list(jieba.cut(text.lower(), cut_all=False))
+        tokens = []
+        for tok in raw:
+            tok = tok.strip()
+            if not tok:
+                continue
+            if tok in _STOPWORDS:
+                continue
+            # 过滤纯标点（保留含字母/数字的 token）
+            if not re.search(r'[\w一-鿿]', tok):
+                continue
+            tokens.append(tok)
         return tokens
 
     def _rebuild_index(self):
