@@ -123,7 +123,21 @@ CONSENSUS_SUMMARY:
   uncertainties:
     - <问题1>
     - <问题2>
+
+MARKET_IMPLIED_VALUATION:
+  market_expected_eps_2026e: <数值或 null>       # 卖方/舆情口径的 2026E EPS 共识
+  market_expected_growth_yoy: <百分比或 null>    # 共识隐含的净利润增速
+  market_implied_pe_range: [<low>, <high>]      # 共识隐含的合理 PE 区间，如 [80, 90]；不可用填 null
+  sell_side_target_price_range: [<low>, <high>] # 卖方目标价区间，如 [277.9, 363]；不可用填 null
+  industry_pe_median: <数值或 null>             # 行业 PE 中位数（如 news/research 报告中提到）
+  data_source_note: <1 句话说明数据来源与可信度>
 ```
+
+**MARKET_IMPLIED_VALUATION 提取规则**（必读）：
+- 必须从 fundamentals/news/sentiment 原文里**显式提取**，禁止凭训练知识捏造
+- 找不到的字段填 null，并在 `data_source_note` 中标明"无可用共识口径"
+- 优先级：news 报告中卖方研报口径 > sentiment 中 KOL 引述 > fundamentals 报告中行业对照
+- 区间型字段（pe_range / target_price_range）至少要找到 2 个独立来源做交叉验证（如高盛 + 中金）；只有 1 个来源时区间用单点表达 [X, X]
 """
 
         response = llm.invoke(prompt)

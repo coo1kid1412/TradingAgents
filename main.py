@@ -5,7 +5,7 @@ import sys
 import time
 import datetime
 from pathlib import Path
-from typing import List, Tuple
+from typing import Tuple
 from dotenv import load_dotenv
 
 # Load environment variables from .env file (use project root, not CWD)
@@ -61,17 +61,12 @@ os.environ["NO_PROXY"] = f"{_existing},{_DOMESTIC_NO_PROXY}" if _existing else _
 
 
 # ---------------------------------------------------------------------------
-#  并发配置
+#  分析配置（单股票模式）
 # ---------------------------------------------------------------------------
-# 要分析的股票列表（逗号分隔）
-_TICKERS = "603629"
-
-# 最多同时分析的股票数（不超过 3）
-_MAX_CONCURRENT = 3
-
-# 每支股票启动间隔（秒），默认 5 分钟 = 300 秒
-# 用于错开 LLM API 和数据源的并发请求，避免触发限流
-_START_INTERVAL_SECONDS = 300
+# 要分析的股票代码（单只）
+# 多股票并发已彻底移除——LLM API 偶发假死 + multiprocessing.join 会形成死锁链
+# 如需分析多只，请顺序多次运行本脚本
+_TICKER = "688008"
 
 # 分析日期（默认今天）
 _ANALYSIS_DATE = datetime.datetime.now().strftime("%Y-%m-%d")
@@ -248,7 +243,7 @@ def _save_report(state, ticker: str, save_path: Path):
 # ---------------------------------------------------------------------------
 def analyze_single_stock(ticker: str, analysis_date: str, config: dict) -> Tuple[str, bool, str]:
     """
-    在独立进程中分析单支股票
+    分析单支股票（主进程直接执行）
 
     Returns:
         (ticker, success, report_path_or_error)
@@ -259,7 +254,6 @@ def analyze_single_stock(ticker: str, analysis_date: str, config: dict) -> Tuple
 
     for attempt in range(1 + _MAX_529_RETRIES):
         try:
-            # 每个进程独立导入，避免 multiprocessing 序列化问题
             from tradingagents.graph.trading_graph import TradingAgentsGraph
             from tradingagents import profiling
 
@@ -333,116 +327,45 @@ def analyze_single_stock(ticker: str, analysis_date: str, config: dict) -> Tuple
 
 
 # ---------------------------------------------------------------------------
-#  主函数：顺序启动多进程
+#  主函数：单股票顺序执行
 # ---------------------------------------------------------------------------
 def main():
-    """主函数：智能选择单进程或多进程模式"""
-    
-    # 解析股票代码
-    tickers = [t.strip() for t in _TICKERS.split(",") if t.strip()]
-    
-    if not tickers:
-        print("错误：未指定要分析的股票代码，请修改 _TICKERS 配置")
-        sys.exit(1)
-    
-    # 限制最多分析数量
-    if len(tickers) > _MAX_CONCURRENT:
-        print(f"警告：指定了 {len(tickers)} 支股票，但最多只分析 {_MAX_CONCURRENT} 支")
-        print(f"将分析前 {_MAX_CONCURRENT} 支: {', '.join(tickers[:_MAX_CONCURRENT])}\n")
-        tickers = tickers[:_MAX_CONCURRENT]
-    
-    # 构建配置
-    config = _build_config()
-    
-    # 智能模式选择：单支股票用单进程，多支股票用多进程
-    if len(tickers) == 1:
-        # 单支股票：直接在主进程运行（避免多进程开销）
-        ticker = tickers[0]
-        print("=" * 60)
-        print("单股票分析模式（主进程直接执行）")
-        print("=" * 60)
-        print(f"分析日期: {_ANALYSIS_DATE}")
-        print(f"股票: {ticker}")
-        print("=" * 60)
-        
-        try:
-            ticker_result, success, result_path = analyze_single_stock(ticker, _ANALYSIS_DATE, config)
-            
-            print("\n" + "=" * 60)
-            if success:
-                print(f"分析完成: {ticker}")
-                print(f"报告路径: {result_path}")
-            else:
-                print(f"分析失败: {ticker}")
-                print(f"错误信息: {result_path}")
-            print("=" * 60)
-            
-        except KeyboardInterrupt:
-            print("\n\n用户中断分析")
-            sys.exit(1)
-        except Exception as e:
-            print(f"\n\n分析异常: {e}")
-            import traceback
-            traceback.print_exc()
-            sys.exit(1)
-    else:
-        # 多支股票：使用多进程并发（仅在多股票模式下才导入 multiprocessing）
-        import multiprocessing
-        multiprocessing.set_start_method("spawn", force=True)
+    """主函数：单股票主进程直接执行（不使用 multiprocessing）"""
 
-        print("=" * 60)
-        print("多股票并发分析模式")
-        print("=" * 60)
-        print(f"分析日期: {_ANALYSIS_DATE}")
-        print(f"股票列表: {', '.join(tickers)}")
-        print(f"启动间隔: {_START_INTERVAL_SECONDS} 秒 ({_START_INTERVAL_SECONDS/60:.1f} 分钟)")
-        print(f"预计总启动时间: {(len(tickers)-1) * _START_INTERVAL_SECONDS / 60:.1f} 分钟")
-        print("=" * 60)
-        
-        # 存储进程和结果
-        results = []
-        
-        # 顺序启动进程
-        for idx, ticker in enumerate(tickers):
-            if idx > 0:
-                # 延迟启动，错开 LLM API 和数据源请求
-                print(f"\n等待 {_START_INTERVAL_SECONDS} 秒后启动下一支股票...")
-                time.sleep(_START_INTERVAL_SECONDS)
-            
-            print(f"\n>>> 启动 [{ticker}] 的分析进程 (第 {idx+1}/{len(tickers)} 支)")
-            
-            # 创建独立进程
-            process = multiprocessing.Process(
-                target=analyze_single_stock,
-                args=(ticker, _ANALYSIS_DATE, config),
-                name=f"StockAnalysis-{ticker}"
-            )
-            
-            # 启动进程
-            process.start()
-            results.append((ticker, process))
-            
-            print(f"[{ticker}] 进程已启动 (PID: {process.pid})")
-        
-        # 等待所有进程完成
+    ticker = _TICKER.strip()
+    if not ticker:
+        print("错误：未指定要分析的股票代码，请修改 _TICKER 配置")
+        sys.exit(1)
+
+    config = _build_config()
+
+    print("=" * 60)
+    print("单股票分析模式（主进程直接执行）")
+    print("=" * 60)
+    print(f"分析日期: {_ANALYSIS_DATE}")
+    print(f"股票: {ticker}")
+    print("=" * 60)
+
+    try:
+        ticker_result, success, result_path = analyze_single_stock(ticker, _ANALYSIS_DATE, config)
+
         print("\n" + "=" * 60)
-        print("等待所有分析任务完成...")
-        print("=" * 60 + "\n")
-        
-        for ticker, process in results:
-            process.join()
-            exit_code = process.exitcode
-            status = "成功" if exit_code == 0 else f"失败 (退出码: {exit_code})"
-            print(f"[{ticker}] 进程结束: {status}")
-        
-        # 输出总结
-        print("\n" + "=" * 60)
-        print("分析任务全部完成")
+        if success:
+            print(f"分析完成: {ticker}")
+            print(f"报告路径: {result_path}")
+        else:
+            print(f"分析失败: {ticker}")
+            print(f"错误信息: {result_path}")
         print("=" * 60)
-        for ticker, process in results:
-            status = "成功" if process.exitcode == 0 else "失败"
-            print(f"  {ticker}: {status}")
-        print("=" * 60)
+
+    except KeyboardInterrupt:
+        print("\n\n用户中断分析")
+        sys.exit(1)
+    except Exception as e:
+        print(f"\n\n分析异常: {e}")
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
 
 
 if __name__ == "__main__":

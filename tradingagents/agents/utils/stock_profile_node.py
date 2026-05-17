@@ -127,6 +127,34 @@ def create_stock_profile_node(llm):
 - 应该**警惕**哪份报告里的什么误导？
 - 该标的的"alpha 来源"通常在哪份报告里？
 
+### 七、估值方法推荐（供 RM 多元交叉验证使用）
+
+根据股性画像，推荐 RM 使用以下估值方法做交叉验证（**至少 3 种**）。请按 style 选择最合适的组合：
+
+| style | 主估值法 | 次估值法 | 辅助法 | 不适用 |
+|-------|---------|---------|--------|-------|
+| blue_chip 蓝筹 | DCF | PE × EPS | 历史分位 + 同业可比 | — |
+| high_beta_growth 高弹性成长 | PEG | PE × 预期 EPS | 同业可比（看龙头估值上限） | DCF（折现率过敏感）|
+| theme_speculation 题材炒作 | 历史分位（自身上下沿）| 市值天花板 | 卖方目标价区间 | DCF / PB（基本面不主导）|
+| cyclical 周期 | PB × BPS | 周期顶/底 PE | 同业可比 | DCF（现金流不稳）|
+| illiquid 流动性差 | PB × BPS × 0.8（流动性折价）| PE × EPS（保守目标 PE）| 历史分位 | DCF |
+| etf | 跟踪指数估值 | 折溢价 | — | 个股法全部不适用 |
+
+**输出要求**：
+- 显式给出 **主方法目标 PE/PB 区间**（如成长股目标 PE 30-50 倍、蓝筹股 PE 15-25 倍、周期股 PB 1-3 倍）
+- 推荐区间必须有依据（行业平均 / 历史分位 / 同业可比）
+- 明确数据完整度等级 L0-L3
+- 说明该方法的局限性（防止 RM 盲信单一方法）
+
+| 字段 | 说明 |
+|------|------|
+| `primary_method` | 主估值方法 |
+| `secondary_methods` | 次要交叉验证方法（至少 2 个）|
+| `target_pe_range` | 主方法的目标 PE 区间（如适用）|
+| `target_pb_range` | 主方法的目标 PB 区间（如适用）|
+| `data_completeness` | L0（完整）/ L1（缺行业 PE）/ L2（缺 EPS）/ L3（无估值数据）|
+| `rationale` | 1-2 句话说明为什么这套方法适合该标的 |
+
 ---
 
 ## 输入资料
@@ -164,6 +192,16 @@ REPORT_WEIGHTS:
   sentiment: __
 
 DECISION_STYLE: value_anchor / catalyst_driven / momentum / event_driven
+
+VALUATION_METHOD:
+  primary_method: dcf / pe_eps / peg / pb_bps / ev_ebitda / historical_quantile / relative_position
+  secondary_methods:
+    - <方法 1>
+    - <方法 2>
+  target_pe_range: [__, __]    # 如适用，否则 null
+  target_pb_range: [__, __]    # 如适用，否则 null
+  data_completeness: L0 / L1 / L2 / L3
+  rationale: <1-2 句话>
 
 EVENT_WINDOWS:
   - event: <事件描述>
