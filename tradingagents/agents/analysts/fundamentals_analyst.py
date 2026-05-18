@@ -1,14 +1,22 @@
+import json
 import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from langchain_core.messages import AIMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 
 from tradingagents.agents.utils.agent_utils import (
     build_instrument_context,
     get_language_instruction,
     validate_fundamentals_data,
 )
+from tradingagents.agents.analysts.fundamentals_tools import (
+    FUNDAMENTALS_TOOLS, FUNDAMENTALS_TOOLS_BY_NAME,
+)
 from tradingagents.dataflows.interface import route_to_vendor
+from tradingagents.dataflows.akshare_vendor import get_industry_pe_table
+
+# 工具调用循环上限（防止 LLM 反复调同一工具）
+_MAX_TOOL_ITERATIONS = 8
 
 logger = logging.getLogger(__name__)
 
@@ -22,6 +30,15 @@ def _safe_fetch(method: str, *args, **kwargs) -> str:
         return ""
 
 
+def _safe_fetch_industry_pe(target_date: str) -> str:
+    """Wrap industry PE table fetch with graceful error handling."""
+    try:
+        return get_industry_pe_table(target_date)
+    except Exception as e:
+        logger.warning("行业 PE 表获取失败: %s", e)
+        return ""
+
+
 def _fetch_all_fundamentals(ticker: str, current_date: str) -> dict:
     """Fetch all fundamental data in parallel via ThreadPoolExecutor."""
     methods = {
@@ -32,11 +49,14 @@ def _fetch_all_fundamentals(ticker: str, current_date: str) -> dict:
     }
 
     results = {}
-    with ThreadPoolExecutor(max_workers=4) as executor:
+    with ThreadPoolExecutor(max_workers=5) as executor:
         future_to_key = {
             executor.submit(_safe_fetch, method, *args): key
             for key, (method, args) in methods.items()
         }
+        # 并行多拉一个行业 PE 表（来源 akshare 巨潮，独立于 route_to_vendor）
+        future_to_key[executor.submit(_safe_fetch_industry_pe, current_date)] = "industry_pe_table"
+
         for future in as_completed(future_to_key):
             key = future_to_key[future]
             try:
@@ -65,6 +85,13 @@ def _format_structured_data(raw_data: dict, ticker: str, current_date: str) -> s
             sections.append(f"## {title}\n{desc}：\n\n{data}")
         else:
             sections.append(f"## {title}\n（数据获取失败，请基于其他可用数据进行分析）")
+
+    # 行业 PE 中位数表（巨潮 cninfo，独立于其他财务数据）
+    industry_pe = raw_data.get("industry_pe_table", "")
+    if industry_pe:
+        sections.append(industry_pe)
+    else:
+        sections.append("# 行业 PE 中位数表\n（数据不可用，pe_industry_median 字段请尝试从 news 报告中提取卖方研报的同业可比 PE）")
 
     header = f"# {ticker} 基本面数据（截至 {current_date}）\n\n"
     return header + "\n\n---\n\n".join(sections)
@@ -96,6 +123,26 @@ def create_fundamentals_analyst(llm):
 
 你是一名专业的基本面分析师，负责分析公司的基本面信息并撰写全面的研究报告。
 
+## ⚠️ 数值计算必须调用工具（强制约束）
+
+你已绑定 7 个计算工具。**所有以下数值必须通过工具调用完成，禁止心算或偷懒填 null**：
+
+| 计算场景 | 必须调用的工具 |
+|---------|-------------|
+| 自由现金流 FCF = OCF − CapEx | `compute_fcf` |
+| 营收/净利润同比增速 | `compute_yoy_growth` |
+| 扣非净利润同比（扣非 EPS × 总股本）| `compute_recurring_profit_yoy` |
+| 应收增速 vs 营收增速差 | `compute_receivable_revenue_gap` |
+| 经营现金流/净利润比（盈利质量）| `compute_ocf_to_profit_ratio` |
+| 应付/应收比（议价能力）| `compute_payable_receivable_ratio` |
+| TTM 年化 ROE（滚动 4 季）| `compute_ttm_roe` |
+
+**规则**：
+- 涉及上述任何数值时，**必须**先调用对应工具，再把工具结果写入报告
+- raw_data 里有原始数据但**没有现成的派生指标**（如 FCF / 同比增速 / TTM ROE）时，调工具自算
+- 工具返回的数值直接采用，不要"调整"或"修正"
+- ⛔ **禁止偷懒**：发现 raw_data 里没有"净利润同比"字段就填 null —— 这是过往 bug 来源。raw_data 里几乎一定有本期和去年同期的绝对值，必须调工具自算
+
 ## 报告结构（必须按此顺序）
 
 ### 一、公司概况
@@ -115,6 +162,14 @@ def create_fundamentals_analyst(llm):
 
 ⚠️ **若 raw_data 中无具体收入构成数据，明确标注"数据不可用"，禁止凭印象编造比例**。
 
+**客户集中度数据提取要求**（必读）：
+- akshare/tushare 的财报数据**不直接提供**客户集中度，但年报附注/卖方研报通常有
+- **优先从 news 报告中查找**"前 5 大客户占营收 X%" / "客户集中度 X%" / "前 5 名客户合计销售 X 亿元"等表述
+- 若 news 报告里有提到，**必须提取数值**填入 SUMMARY 的 `customer_concentration_top5_pct` 字段
+- 例如：news 报告中"前五大客户营收占比 47.92%" → `customer_concentration_top5_pct: 47.92`
+- 仅当 news 报告也确实没有客户集中度信息时，才填 null
+- ⛔ **禁止偷懒填 null**：必须先在 news 报告里搜索过
+
 ### 三、管理层与公司治理评估（新增）
 
 | 维度 | 输出 |
@@ -130,11 +185,39 @@ def create_fundamentals_analyst(llm):
 ### 四、估值分析
 分析 PE(TTM)、PB、PS 等估值指标的水平及历史分位，判断当前估值处于高估/合理/低估区间，说明理由。
 
-**行业 PE 对照（必须尝试，数据可用时强制输出）**：
-- 检查 fundamentals 数据中是否含「行业 PE」、「行业平均 PE」、「同业可比 PE」等字段
-- 若可用，在估值分析中显式输出："当前 PE=X 倍 vs 行业中位数 Y 倍，处于 [高于/接近/低于] 水平"
-- 若 raw_data 中无行业数据，明确标注 "行业 PE 数据不可用，仅基于自身历史分位判断估值水位"，并在 SUMMARY 的 `pe_industry_median` 字段填 null
-- **禁止**凭印象给出行业 PE（如"行业平均约 25 倍"——若无数据来源，不要写）
+**行业 PE 对照（数据源三级 fallback，必须执行）**：
+
+下方"输入资料"区可能包含一段"# 行业 PE 中位数表（来源：巨潮 cninfo）"——这是从巨潮接口拉来的全行业 PE 数据，含 19 个一级行业 + 91 个二级行业的静态市盈率中位数。
+
+**Step 1**: 检查是否拼进来了"行业 PE 中位数表"
+- ✅ 有 → 走 Step 2
+- ❌ 无 → 跳到 Step 3（news fallback）
+
+**Step 2**: 从巨潮行业表中**自行选最匹配的行业**
+- 优先选**二级行业**（精度更高，如 C39 计算机、通信和其他电子设备制造业；C27 医药制造业）
+- 若二级行业不直接命中，fallback 到对应**一级行业**（如 C 制造业 / I 信息传输 / J 金融业）
+- 取该行业的"静态市盈率-中位数"作为 pe_industry_median
+- 显式说明匹配过程："本标的属于'XXX'，匹配巨潮行业表中的'C39 计算机...'（二级），PE 中位数 = 88.6"
+- SUMMARY 的 `pe_industry_median_source` 填 `cninfo`
+
+**Step 3**（fallback）: 巨潮表不可用时，从 news 报告中查找
+- 搜索 news 报告中"行业 PE" / "同业可比 PE" / "可比公司平均 PE" / "卖方对标 X / Y / Z 公司 PE 平均 N 倍"等表述
+- 找到则提取，SUMMARY 的 `pe_industry_median_source` 填 `news_research`
+- 注明数据局限性（卖方研报"可比公司"口径，不是行业全样本中位数）
+
+**Step 4**（最后兜底）: 上述两源都不可用
+- pe_industry_median 填 null
+- pe_industry_median_source 填 `unavailable`
+- pe_vs_industry 填 "不可比"
+
+**输出格式**（必须执行）：
+- 在估值分析正文中显式说明数据来源 + 匹配过程
+- 例：'当前 PE 80.73 vs 巨潮行业表 C39（计算机/通信/电子设备制造业）中位数 88.6 倍 → 略低于行业'
+
+⛔ **禁止**：
+- 凭印象给出"行业平均约 25 倍"（若无明确数据来源）
+- 拼进来了巨潮行业表却不去用、直接填 null
+- 把可比公司"算术平均"当成"行业中位数"——这是两个口径，必须区分
 
 ### 五、盈利能力
 分析 ROE、ROA、净利润率、毛利率等盈利指标的近几期变化趋势，判断盈利能力是否在改善或恶化，指出关键驱动因素。
@@ -178,8 +261,27 @@ def create_fundamentals_analyst(llm):
 - ⛔ **禁止偷懒填 null**：当 income_statement 中明显有多期数据时，必须自算并填具体数值
 - 若涉及扣非净利润，**必须区分**：growth_yoy_profit_reported（归母净利润同比）vs growth_yoy_profit_recurring（扣非净利润同比）
 
+**growth_yoy_profit_recurring（扣非净利润同比）计算要求**：
+- raw_data 中通常包含"扣非每股收益(元)"字段（多个报告期）
+- **自算方式**：扣非净利润 = 扣非每股收益 × 总股本（总股本可从 fundamentals 报告"总股本"或 share_capital 字段获取）
+- 同比公式：`(本期扣非净利 − 去年同期扣非净利) / |去年同期扣非净利| × 100%`
+- 显式展开：'扣非净利 2026Q1 = 扣非 EPS X × 总股本 N = Y 亿元 vs 2025Q1 = Z 亿元，同比 +W%'
+- 仅当扣非每股收益字段缺失时才填 null
+- ⛔ **禁止偷懒填 null**：raw_data 里几乎一定有扣非 EPS 数据，没数据再填 null
+
 ### 九、现金流分析
 分析经营性现金流、投资性现金流、筹资性现金流的规模和趋势，重点关注经营性现金流与净利润的匹配度（盈利质量）。
+
+**自由现金流（FCF）计算要求**（必读）：
+- FCF 是衡量公司"赚到真钱"能力的核心指标——下游 RM 估值时会用到
+- raw_data 的 cashflow 报告中通常**两个关键字段都有**：
+  - 经营性现金流净额（OCF）：cashflow 报告里"经营活动产生的现金流量净额"
+  - 资本开支（CapEx）：cashflow 报告里"购建固定资产、无形资产和其他长期资产支付的现金"
+- **自算公式**：`FCF = OCF − CapEx`
+- 显式展开：'FCF 2026Q1 = OCF X 亿 − CapEx Y 亿 = Z 亿元'
+- 若多个季度都能算，给出 TTM 自由现金流（4 季度累加）和环比趋势
+- ⛔ **禁止偷懒填"数据不可用，需计算"**：raw_data 的 cashflow 几乎一定有 OCF 和 CapEx 两个字段，必须自算
+- 仅当 cashflow 报告整段为空（如 ETF）时才填"不适用"
 
 ### 十、投资建议与风险提示
 基于以上分析，给出明确的基本面判断（正面/中性/负面），列出 2-3 个核心支撑论据和 1-2 个主要风险点。
@@ -215,6 +317,7 @@ SUMMARY:
   pe_ttm: <数值>
   pe_zone: 高估 / 合理 / 低估
   pe_industry_median: <数值或 null>
+  pe_industry_median_source: cninfo / news_research / unavailable  # 数据来源标注
   pe_vs_industry: 高于 / 接近 / 低于 / 不可比
   growth_yoy_revenue: <百分比>                          # 优先 TTM/年度同比，缺失时按计算要求自算
   growth_yoy_profit: <百分比>                           # 归母净利润同比（优先 TTM/年度）
@@ -257,14 +360,41 @@ SUMMARY:
 当前日期：{current_date}。{instrument_context}{lang_instruction}"""
 
         messages = [
-            {"role": "system", "content": system_message},
-            {
-                "role": "user",
-                "content": f"请基于以下基本面数据撰写详细的分析报告：\n\n{structured_data}",
-            },
+            SystemMessage(content=system_message),
+            HumanMessage(content=f"请基于以下基本面数据撰写详细的分析报告：\n\n{structured_data}"),
         ]
 
-        result = llm.invoke(messages)
+        # 绑定 Fundamentals 计算工具，让 LLM 调工具算 FCF / 同比 / TTM ROE 等
+        llm_with_tools = llm.bind_tools(FUNDAMENTALS_TOOLS)
+
+        result = None
+        for iteration in range(_MAX_TOOL_ITERATIONS):
+            result = llm_with_tools.invoke(messages)
+            messages.append(result)
+            tool_calls = getattr(result, "tool_calls", None) or []
+            if not tool_calls:
+                logger.info("Fundamentals tool loop 结束（第 %d 轮，无 tool_calls）", iteration + 1)
+                break
+
+            logger.info("Fundamentals 第 %d 轮工具调用：%d 个", iteration + 1, len(tool_calls))
+            for tc in tool_calls:
+                tool_name = tc.get("name")
+                tool_args = tc.get("args", {})
+                tool_id = tc.get("id", "")
+                tool = FUNDAMENTALS_TOOLS_BY_NAME.get(tool_name)
+                if tool is None:
+                    messages.append(ToolMessage(content=f"未知工具：{tool_name}", tool_call_id=tool_id))
+                    continue
+                try:
+                    tool_result = tool.invoke(tool_args)
+                    payload = json.dumps(tool_result, ensure_ascii=False) if isinstance(tool_result, dict) else str(tool_result)
+                    messages.append(ToolMessage(content=payload, tool_call_id=tool_id))
+                except Exception as e:
+                    messages.append(ToolMessage(content=f"工具 {tool_name} 失败: {e}", tool_call_id=tool_id))
+        else:
+            logger.warning("Fundamentals 达到工具调用上限 %d 轮，强制续写", _MAX_TOOL_ITERATIONS)
+            messages.append(HumanMessage(content="请基于已有工具结果直接写出完整报告，不要再调工具。"))
+            result = llm_with_tools.invoke(messages)
 
         report = result.content if hasattr(result, "content") else str(result)
 

@@ -66,7 +66,7 @@ os.environ["NO_PROXY"] = f"{_existing},{_DOMESTIC_NO_PROXY}" if _existing else _
 # 要分析的股票代码（单只）
 # 多股票并发已彻底移除——LLM API 偶发假死 + multiprocessing.join 会形成死锁链
 # 如需分析多只，请顺序多次运行本脚本
-_TICKER = "688008"
+_TICKER = "603986"
 
 # 分析日期（默认今天）
 _ANALYSIS_DATE = datetime.datetime.now().strftime("%Y-%m-%d")
@@ -75,7 +75,7 @@ _ANALYSIS_DATE = datetime.datetime.now().strftime("%Y-%m-%d")
 # 范围：1-3
 # - _BULL_BEAR_ROUNDS（多头 vs 空头）：2 = 立论 + 反驳（最小有效辩论单位）
 # - _RISK_ROUNDS（激进/保守/中立风控）：1 = 三个维度并行审查，PM 综合（多轮重复度高）
-_BULL_BEAR_ROUNDS = 2
+_BULL_BEAR_ROUNDS = 3
 _RISK_ROUNDS = 1
 
 

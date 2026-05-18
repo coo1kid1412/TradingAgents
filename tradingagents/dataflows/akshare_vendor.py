@@ -397,6 +397,77 @@ def _get_shares_from_cninfo(ak, code: str, target_date: str | None) -> tuple[flo
         return None, None
 
 
+def get_industry_pe_table(target_date: str | None = None) -> str:
+    """从巨潮（cninfo）拉取证监会行业 PE 中位数表，作为 fundamentals 的"行业 PE 对照"数据源。
+
+    返回格式化字符串供 LLM 在 fundamentals 报告中匹配到自身行业并提取 PE。
+
+    数据特点：
+    - 巨潮 stock_industry_pe_ratio_cninfo 是按"证监会行业分类"分级
+    - 一级行业 19 个（如 C 制造业、I 信息传输、J 金融业）
+    - 二级行业 91 个（如 C39 计算机/通信/电子设备制造业、C27 医药制造业）
+    - 每行业含：静态市盈率-中位数 / 静态市盈率-加权平均 / 公司数量
+
+    Args:
+        target_date: "YYYY-MM-DD" 或 None（用今天）；若指定日期无数据自动 fallback 到前几个交易日
+
+    Returns:
+        格式化字符串。失败时返回空字符串。
+    """
+    try:
+        ak = _import_akshare()
+        end_dt = target_date or datetime.now().strftime("%Y-%m-%d")
+        # 兼容 YYYY-MM-DD / YYYYMMDD
+        end_obj = datetime.strptime(end_dt.replace("-", ""), "%Y%m%d")
+
+        # 按日 fallback：今天 → 1 天前 → ... → 7 天前
+        df = None
+        used_date = None
+        for days_back in range(0, 8):
+            try_date = (end_obj - timedelta(days=days_back)).strftime("%Y%m%d")
+            try:
+                attempt = ak.stock_industry_pe_ratio_cninfo(
+                    symbol="证监会行业分类", date=try_date
+                )
+                if attempt is not None and not attempt.empty:
+                    df = attempt
+                    used_date = try_date
+                    break
+            except Exception:
+                continue
+
+        if df is None or df.empty:
+            logger.debug("巨潮行业 PE 数据近 8 日均不可用")
+            return ""
+
+        # 仅保留关键列 + 排除无 PE 数据的行
+        keep_cols = [
+            "行业层级", "行业编码", "行业名称",
+            "纳入计算公司数量", "静态市盈率-中位数", "静态市盈率-加权平均",
+        ]
+        df = df[[c for c in keep_cols if c in df.columns]].copy()
+        df = df.dropna(subset=["静态市盈率-中位数"])
+
+        # 排序：一级行业在前、二级行业在后
+        if "行业层级" in df.columns:
+            df = df.sort_values(["行业层级", "行业编码"])
+
+        logger.info(
+            "巨潮行业 PE 中位数表拉取成功（数据日期 %s，共 %d 条行业）",
+            used_date, len(df),
+        )
+
+        header = (
+            f"# 行业 PE 中位数表（来源：巨潮 cninfo，数据日期：{used_date}）\n"
+            f"# 共 {len(df)} 个行业（证监会行业分类，一级 + 二级）\n"
+            f"# 使用方法：从下表中匹配本标的所属行业，取'静态市盈率-中位数'作为 pe_industry_median\n\n"
+        )
+        return header + df.to_markdown(index=False, floatfmt=".2f")
+    except Exception as e:
+        logger.debug("get_industry_pe_table 失败: %s", e)
+        return ""
+
+
 def _append_valuation_section(
     sections: list[str],
     ak,

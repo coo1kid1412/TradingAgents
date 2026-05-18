@@ -1,4 +1,44 @@
+import json
+import logging
+
+from langchain_core.messages import HumanMessage, ToolMessage
+
 from tradingagents.agents.utils.agent_utils import build_instrument_context, get_language_instruction, RISK_DEBATE_PHRASING_RULES
+from tradingagents.agents.managers.pm_tools import PM_TOOLS, PM_TOOLS_BY_NAME
+
+logger = logging.getLogger(__name__)
+
+_MAX_TOOL_ITERATIONS = 6
+
+
+def _pm_tool_loop(llm_with_tools, initial_messages):
+    """PM 工具调用循环。"""
+    messages = list(initial_messages)
+    for iteration in range(_MAX_TOOL_ITERATIONS):
+        response = llm_with_tools.invoke(messages)
+        messages.append(response)
+        tool_calls = getattr(response, "tool_calls", None) or []
+        if not tool_calls:
+            logger.info("PM tool loop 结束（第 %d 轮）", iteration + 1)
+            return response
+
+        logger.info("PM 第 %d 轮工具调用：%d 个", iteration + 1, len(tool_calls))
+        for tc in tool_calls:
+            tool_name = tc.get("name")
+            tool = PM_TOOLS_BY_NAME.get(tool_name)
+            if tool is None:
+                messages.append(ToolMessage(content=f"未知工具：{tool_name}", tool_call_id=tc.get("id", "")))
+                continue
+            try:
+                result = tool.invoke(tc.get("args", {}))
+                payload = json.dumps(result, ensure_ascii=False) if isinstance(result, dict) else str(result)
+                messages.append(ToolMessage(content=payload, tool_call_id=tc.get("id", "")))
+            except Exception as e:
+                messages.append(ToolMessage(content=f"工具 {tool_name} 失败: {e}", tool_call_id=tc.get("id", "")))
+
+    logger.warning("PM 达到工具调用上限 %d 轮", _MAX_TOOL_ITERATIONS)
+    messages.append(HumanMessage(content="请基于已有工具结果直接写出最终决策，不要再调工具。"))
+    return llm_with_tools.invoke(messages)
 
 
 def create_portfolio_manager(llm, memory):
@@ -34,6 +74,21 @@ def create_portfolio_manager(llm, memory):
         prompt = f"""【语言要求】你必须使用中文撰写以下所有分析内容和回复。评级关键词（Buy/Overweight/Hold/Underweight/Sell）、股票代码、专业交易术语（Action/Size/R/TP/SL/Time Stop）可保留英文，但需带中文注释。
 
 你是**投资组合经理（Portfolio Manager）**，对标头部对冲基金 PM 角色，输出**专业交易票（Trade Ticket）**风格的决策。
+
+## ⚠️ 数值计算必须调用工具（强制约束）
+
+你已绑定 3 个计算工具。**以下数值必须通过工具调用完成，禁止心算**：
+
+| 计算场景 | 必须调用的工具 |
+|---------|-------------|
+| 1R / TP1-3 / SL_soft / SL_hard 完整 R-multiple 价位体系 | `compute_r_multiple_levels`（输入 Entry + SL_hard）|
+| Conviction 五星 + 仓位上限（基于 &#124;d&#124; 和赔率 R）| `compute_conviction_position_map` |
+| 4 情景概率加权 E（含黑天鹅档）| `compute_pm_scenario_e` |
+
+**规则**：
+- 决定 Entry 和 SL_hard 后**必须**调 `compute_r_multiple_levels` 算 TP1/TP2/TP3/SL_soft，**禁止心算"+1R/+2R/+3R"**
+- 决定 Conviction 时**必须**调 `compute_conviction_position_map`，仓位严格采用工具返回的区间
+- 输出 4 情景表后**必须**调 `compute_pm_scenario_e` 算加权 E，**禁止自己加权**
 
 {instrument_context}
 
@@ -376,7 +431,9 @@ PM 必须明确推荐其中之一，并解释理由。
 
 Be decisive and ground every conclusion in specific evidence from the analysts.{get_language_instruction()}"""
 
-        response = llm.invoke(prompt)
+        # 绑定 PM 计算工具，让 LLM 调工具算 R-multiple / Conviction / 4 情景 E
+        llm_with_tools = llm.bind_tools(PM_TOOLS)
+        response = _pm_tool_loop(llm_with_tools, [HumanMessage(content=prompt)])
 
         new_risk_debate_state = {
             "judge_decision": response.content,

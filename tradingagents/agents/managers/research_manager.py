@@ -1,5 +1,64 @@
+import logging
+import json
+
+from langchain_core.messages import HumanMessage, AIMessage, ToolMessage, SystemMessage
 
 from tradingagents.agents.utils.agent_utils import build_instrument_context, RISK_DEBATE_PHRASING_RULES
+from tradingagents.agents.managers.rm_tools import RM_TOOLS, RM_TOOLS_BY_NAME
+
+logger = logging.getLogger(__name__)
+
+# 工具调用循环上限——避免 LLM 反复调同一工具陷入死循环
+_MAX_TOOL_ITERATIONS = 10
+
+
+def _run_tool_calling_loop(llm_with_tools, initial_messages):
+    """执行 LLM 工具调用循环，直到 LLM 不再调工具或达到上限。
+
+    返回最终 AIMessage（含完整 thesis 文本）。
+    """
+    messages = list(initial_messages)
+    for iteration in range(_MAX_TOOL_ITERATIONS):
+        response = llm_with_tools.invoke(messages)
+        messages.append(response)
+
+        tool_calls = getattr(response, "tool_calls", None) or []
+        if not tool_calls:
+            # LLM 不再调工具，循环结束
+            logger.info("RM tool calling 循环结束（第 %d 轮，无 tool_calls）", iteration + 1)
+            return response
+
+        logger.info("RM 第 %d 轮工具调用：%d 个工具", iteration + 1, len(tool_calls))
+        for tc in tool_calls:
+            tool_name = tc.get("name")
+            tool_args = tc.get("args", {})
+            tool_id = tc.get("id", "")
+
+            tool = RM_TOOLS_BY_NAME.get(tool_name)
+            if tool is None:
+                error_msg = f"未知工具：{tool_name}"
+                logger.warning(error_msg)
+                messages.append(ToolMessage(content=error_msg, tool_call_id=tool_id))
+                continue
+
+            try:
+                result = tool.invoke(tool_args)
+                result_str = json.dumps(result, ensure_ascii=False) if isinstance(result, dict) else str(result)
+                logger.debug("RM 工具 %s 结果: %s", tool_name, result_str[:200])
+                messages.append(ToolMessage(content=result_str, tool_call_id=tool_id))
+            except Exception as e:
+                error_msg = f"工具 {tool_name} 执行失败: {e}"
+                logger.warning(error_msg)
+                messages.append(ToolMessage(content=error_msg, tool_call_id=tool_id))
+
+    # 达到上限仍未结束——强制再调一次，要求 LLM 不再用工具直接给最终答案
+    logger.warning("RM 达到工具调用上限 (%d 轮)，强制 LLM 续写最终结论", _MAX_TOOL_ITERATIONS)
+    messages.append(HumanMessage(
+        content="你已经调用足够多次工具了。请基于已有的工具结果直接写出最终的 thesis 报告，"
+                "**不要再调用任何工具**。"
+    ))
+    final = llm_with_tools.invoke(messages)
+    return final
 
 
 def create_research_manager(llm, memory):
@@ -39,6 +98,29 @@ def create_research_manager(llm, memory):
 - 只输出 thesis：评级 + 目标价区间 + 业绩拐点判断 + 风险清单
 - 不输出执行细节：建仓价/止损价/仓位比例由 PM 决定
 - 评级是综合判断，必须 COT 透明（能说清楚"为什么是这个评级而不是其他"）
+
+## ⚠️ 数值计算必须调用工具（强制约束）
+
+你已经绑定了 9 个计算工具。**所有数值计算必须通过工具调用完成，禁止在报告里"心算"或"凭感觉"算**。
+
+| 计算场景 | 必须调用的工具 |
+|---------|-------------|
+| Step 4 估值方法 1 PE×EPS | `compute_pe_eps_target_price` |
+| Step 4 估值方法 PEG | `compute_peg_target_price` |
+| Step 4 综合目标价区间（严格重叠）| `compute_overlap_target_price` |
+| Step 4 综合目标价（加权折中，当无严格重叠时）| `compute_weighted_target_price` |
+| Step 5 三情景概率加权 E | `compute_scenario_weighted_e` |
+| 多空辩论 Bull Score | `compute_bull_bear_score`（传 Bull 论据列表）|
+| 多空辩论 Bear Score | `compute_bull_bear_score`（传 Bear 论据列表）|
+| 得分差 d | `compute_score_difference` |
+| Conviction 校准 | `compute_conviction_calibration` |
+| 赔率 R 和单一胜率 E（简化兜底）| `compute_odds_and_expected_return` |
+
+**规则**：
+- 凡涉及加权平均、目标价区间运算、概率加权、PEG/PE×EPS 公式的地方，**必须**调用工具
+- 工具返回结果后，**直接采用工具的数值**，不要再"调整"或"修正"
+- 报告中引用数值时显式说明"工具计算结果：__"（透明可追溯）
+- ⛔ **禁止**：自己心算后写入报告（这是过往 bug 来源）
 
 {instrument_context}
 
@@ -455,7 +537,10 @@ Hard Data 修正：yes 不变；no × 0.5
 - 多空辩论评分只影响 Conviction，不影响评级方向
 - 你只出 thesis，不出执行细节（建仓价/止损/仓位由 PM 决定）
 """
-        response = llm.invoke(prompt)
+        # 绑定 RM 计算工具，让 LLM 在 Step 4 / 辅助分析等数值步骤显式调用工具
+        # 替代之前 LLM 心算导致的 Bull Score / 目标价区间 等计算 bug
+        llm_with_tools = llm.bind_tools(RM_TOOLS)
+        response = _run_tool_calling_loop(llm_with_tools, [HumanMessage(content=prompt)])
 
         new_investment_debate_state = {
             "judge_decision": response.content,
