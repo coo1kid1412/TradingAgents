@@ -20,10 +20,6 @@ class GraphSetup:
         quick_thinking_llm: Any,
         deep_thinking_llm: Any,
         tool_nodes: Dict[str, ToolNode],
-        bull_memory,
-        bear_memory,
-        trader_memory,
-        invest_judge_memory,
         portfolio_manager_memory,
         conditional_logic: ConditionalLogic,
         # Role-specific LLMs with different temperatures
@@ -44,10 +40,6 @@ class GraphSetup:
         self.quick_thinking_llm = quick_thinking_llm
         self.deep_thinking_llm = deep_thinking_llm
         self.tool_nodes = tool_nodes
-        self.bull_memory = bull_memory
-        self.bear_memory = bear_memory
-        self.trader_memory = trader_memory
-        self.invest_judge_memory = invest_judge_memory
         self.portfolio_manager_memory = portfolio_manager_memory
         self.conditional_logic = conditional_logic
         
@@ -120,17 +112,11 @@ class GraphSetup:
         consensus_officer_node = create_consensus_node(self.quick_thinking_llm)
 
         # Create researcher and manager nodes
-        bull_researcher_node = create_bull_researcher(
-            self.bull_researcher_llm, self.bull_memory
-        )
-        bear_researcher_node = create_bear_researcher(
-            self.bear_researcher_llm, self.bear_memory
-        )
-        research_manager_node = create_research_manager(
-            self.research_manager_llm, self.invest_judge_memory
-        )
+        # 改造 A：去掉 memory 参数（bull/bear/RM 的 memory 实例已删除，永远为空）
+        bull_researcher_node = create_bull_researcher(self.bull_researcher_llm)
+        bear_researcher_node = create_bear_researcher(self.bear_researcher_llm)
+        research_manager_node = create_research_manager(self.research_manager_llm)
         # Trader 节点已废弃（optimization 05），RM 输出直接进入风控辩论
-        # trader_node = create_trader(self.trader_llm, self.trader_memory)  # REMOVED in 05
 
         # Create risk analysis nodes
         aggressive_analyst = create_aggressive_debator(self.aggressive_risk_llm)

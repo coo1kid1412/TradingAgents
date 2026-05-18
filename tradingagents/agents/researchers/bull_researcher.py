@@ -3,7 +3,8 @@
 from tradingagents.agents.utils.agent_utils import build_instrument_context, RISK_DEBATE_PHRASING_RULES
 
 
-def create_bull_researcher(llm, memory):
+def create_bull_researcher(llm):
+    """改造 A：移除 memory 参数（旧版 memory 在当前工作流下永远为空，纯属装饰）。"""
     def bull_node(state) -> dict:
         investment_debate_state = state["investment_debate_state"]
         history = investment_debate_state.get("history", "")
@@ -16,13 +17,6 @@ def create_bull_researcher(llm, memory):
         fundamentals_report = state["fundamentals_report"]
         consensus_snapshot = state.get("consensus_snapshot", "")
         stock_profile = state.get("stock_profile", "")
-
-        curr_situation = f"{fundamentals_report}\n\n{market_research_report}\n\n{news_report}\n\n{sentiment_report}"
-        past_memories = memory.get_memories(curr_situation, n_matches=3)
-
-        past_memory_str = ""
-        for i, rec in enumerate(past_memories, 1):
-            past_memory_str += rec["recommendation"] + "\n\n"
 
         prompt = f"""【语言要求】你必须使用中文撰写以下所有分析内容和回复。股票代码和技术指标名称可保留英文。
 
@@ -108,7 +102,6 @@ Resources available:
 [置信度:中低] Social media sentiment report: {sentiment_report}
 Conversation history of the debate: {history}
 Last bear argument: {current_response}
-Reflections from similar situations and lessons learned: {past_memory_str}
 
 **重要：请用中文进行辩论和分析。** 股票代码和技术指标名称请保留英文原文。请以中文口语化方式直接反驳空头分析师的观点，进行有力的辩论。
 

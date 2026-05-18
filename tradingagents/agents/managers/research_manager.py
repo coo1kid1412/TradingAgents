@@ -61,7 +61,8 @@ def _run_tool_calling_loop(llm_with_tools, initial_messages):
     return final
 
 
-def create_research_manager(llm, memory):
+def create_research_manager(llm):
+    """改造 A：移除 memory 参数（invest_judge_memory 在当前工作流下永远为空，纯属装饰）。"""
     def research_manager_node(state) -> dict:
         instrument_context = build_instrument_context(state["company_of_interest"], state.get("company_name", ""))
         history = state["investment_debate_state"].get("history", "")
@@ -73,13 +74,6 @@ def create_research_manager(llm, memory):
         stock_profile = state.get("stock_profile", "")
 
         investment_debate_state = state["investment_debate_state"]
-
-        curr_situation = f"{fundamentals_report}\n\n{market_research_report}\n\n{news_report}\n\n{sentiment_report}"
-        past_memories = memory.get_memories(curr_situation, n_matches=3)
-
-        past_memory_str = ""
-        for i, rec in enumerate(past_memories, 1):
-            past_memory_str += rec["recommendation"] + "\n\n"
 
         prompt = f"""【语言要求】你必须使用中文撰写以下所有分析内容和回复。评级关键词（Buy/Overweight/Hold/Underweight/Sell）和股票代码可保留英文。
 
@@ -306,63 +300,210 @@ def create_research_manager(llm, memory):
 
 **评级不是公式产出，是 RM 基于 Step 1-5 综合判断后的主观决定**。
 
+### 第一步：计算动态估值偏离阈值（强制，先算阈值再判评级）
+
+**核心理念**：不同股性 + 主题热度对估值偏离的容忍度天然不同。蓝筹股 PE 偏离 +15% 就该警惕；AI 算力加速期的龙头 PE 偏离 +80% 仍可能合理。**用一刀切的 ±10%/±30% 会错杀整轮主题上升周期**（参考美股：NVDA 2024 PE 偏离历史中位 +240% 仍维持 BUY，TSLA 2020 PE 偏离 +500% 仍 BUY）。
+
+#### 阈值计算公式
+
+```
+最终偏离阈值 = 基础阈值 × style 系数 × (1 + theme_premium_pct / 100)
+
+基础阈值：±15% / ±35%（默认温和宽容）
+
+style 系数（来自 stock_profile.style）：
+  blue_chip          × 1.0    （蓝筹守严格）
+  cyclical           × 1.0    （周期股看 PB 不看 PE 偏离）
+  illiquid           × 0.7    （流动性差更严格保护）
+  etf                × 1.0
+  high_beta_growth   × 1.5    （成长股容忍偏离）
+  theme_speculation  × 2.0    （题材炒作大幅放宽）
+
+theme_premium_pct（来自 stock_profile.THEMATIC_PREMIUM）：
+  启动期 initiation   +30%
+  加速期 acceleration +50%    ← 主题最宽容
+  顶部期 peak         +20%    （开始警惕）
+  退潮期 fading       -20%    （主题反噬，反向收紧）
+  不在主题 none       +0%
+```
+
+#### 计算示例
+
+| 标的 | style | theme_stage | 阈值计算 | UNDERWEIGHT 触发偏离 |
+|------|-------|-------------|---------|---------------------|
+| 寒武纪（AI 算力加速期）| high_beta_growth | acceleration | 35 × 1.5 × 1.5 | **+78.75%** |
+| 中际旭创（CPO 加速期）| high_beta_growth | acceleration | 35 × 1.5 × 1.5 | **+78.75%** |
+| 招商银行（不在主题）| blue_chip | none | 35 × 1.0 × 1.0 | **+35%** |
+| 某算力租赁小盘 | theme_speculation | acceleration | 35 × 2.0 × 1.5 | **+105%** |
+| 某退潮主题股 | theme_speculation | fading | 35 × 2.0 × 0.8 | **+56%**（已收紧）|
+
+#### 评级阈值表（按动态阈值映射）
+
+```
+设动态偏离阈值（下沿 −threshold_dn%，上沿 +threshold_up%）：
+  - threshold_dn = base_15 × style × theme_factor
+  - threshold_up = base_35 × style × theme_factor
+
+  偏离 < -threshold_up  → BUY（深度低估）
+  -threshold_up ~ -threshold_dn → OVERWEIGHT（低估）
+  ±threshold_dn 区间   → HOLD（合理估值）
+  +threshold_dn ~ +threshold_up → UNDERWEIGHT
+  > +threshold_up      → SELL（明显高估）
+```
+
+#### ⚠️ 主题溢价上限（硬保护，激进版）
+
+即使主题最热也不能无限放宽：
+
+```
+任何情况下，最终阈值不能超过：
+- BUY 评级最大偏离容忍：+100%（即超过 +100% 强制降至 OVERWEIGHT）
+- OVERWEIGHT 最大偏离容忍：+150%（超过强制降至 HOLD）
+- 主题退潮期：直接锁定上限到 +30%（主题反噬保护，不再放宽）
+```
+
+#### 强制输出（在评级 COT 前显式列出）
+
+```
+- stock_profile.style = __
+- THEMATIC_PREMIUM.theme_stage = __  / theme_name = __
+- 动态阈值计算：基础 35 × style __ × theme __ = ±__ / ±__
+- 当前偏离度 = (当前价 - 综合目标价中位) / 综合目标价中位 = ±__%
+- 触发评级方向：BUY/OVERWEIGHT/HOLD/UNDERWEIGHT/SELL
+- 是否触发硬上限保护：是/否（含原因）
+```
+
+---
+
+### 第二步：综合评级 COT（200-300 字）
+
 写一段 200-300 字的"评级 COT"，必须包含以下要素：
 
-1. **当前价 vs 综合目标价区间**的位置（在区间下沿/区间内/区间上沿/超出区间）
+1. **当前价 vs 综合目标价区间**的位置（结合动态阈值，区间下沿/区间内/区间上沿/超出区间）
 2. **业绩拐点判断**对评级的支撑/反对
 3. **Base case 目标价**是否对当前价格有吸引力
 4. **多元估值交叉一致性**（3 种方法是否一致指向同一方向）
 5. **如果偏离行业典型估值范式**，说明为什么这么做
 6. **反方推理**：明确回答"为什么不给更激进/更保守的评级"
 
-### 评级（5 档之一）
+### 第三步：评级（5 档之一）— **强制按动态阈值百分比映射**
 
-> **最终评级 R**：BUY / OVERWEIGHT / HOLD / UNDERWEIGHT / SELL
+⚠️ **核心约束（必读）**：评级**必须**严格按"当前偏离度 vs 动态阈值百分比"做机械映射，**禁止用"区间上限/下限"作为评级锚**——这是历史 bug 来源（如 AI 加速期标的偏离区间上限仅 +11% 但远未到 +78% 动态阈值，被 LLM 主观判断"短期透支"误给 UNDERWEIGHT）。
 
-### 拥挤度调整（在评级输出后强制检查）
+#### 强制映射规则（无主观空间）
 
-⚠️ **核心理念**：拥挤度本身就是**反向风险信号**。拥挤多头 = 大家追多到极致，反向风险是下跌；拥挤空头 = 大家空到极致，反向风险是反弹。因此：
-- **拥挤多头时，做空（UNDERWEIGHT/SELL）是合理的反向操作**，不应被规则拦下
-- **拥挤空头时，做多（OVERWEIGHT/BUY）是合理的反向机会**，不应被规则拦下
+基于第一步算出的"当前偏离度（用综合目标价中位）"和"动态阈值（±threshold_dn / ±threshold_up）"：
 
-#### 强制对照表（按 consensus.crowded 和 direction 查表，禁止其他理解）
+| 当前偏离度 | 评级 |
+|------------|------|
+| 偏离 < -threshold_up | **BUY**（深度低估）|
+| -threshold_up ≤ 偏离 < -threshold_dn | **OVERWEIGHT**（低估）|
+| -threshold_dn ≤ 偏离 ≤ +threshold_dn | **HOLD**（合理估值区间）|
+| +threshold_dn < 偏离 ≤ +threshold_up | **UNDERWEIGHT** |
+| 偏离 > +threshold_up | **SELL**（明显高估）|
+
+#### 强制示例（按动态阈值，禁止用区间上限）
+
+✅ 正确：偏离 +11%，动态阈值 ±35%/±78%（high_beta_growth × acceleration）→ 落入 ±35% HOLD 区间 → **HOLD**
+✅ 正确：偏离 +50%，动态阈值 ±35%/±78% → 落入 +35~+78% → **UNDERWEIGHT**
+✅ 正确：偏离 +90%，动态阈值 ±35%/±78% → 超过 +78% → **SELL**
+❌ 错误：偏离 +11%，看到"当前价超出综合目标价区间上限 11%" → 主观判 UNDERWEIGHT（**绕过了动态阈值**）
+
+⛔ **绝对禁止**：用"区间上限/下限"+ 任意百分比做评级判断。**必须**用"偏离度 vs 动态阈值百分比"机械映射。
+
+#### 例外情形（可微调评级但必须留痕）
+
+仅以下三种情形允许"按动态阈值得出 X，但主观调整为 Y"：
+1. 业绩拐点已经确认衰退/顶部 + 数据完整度 L0/L1 + 红旗 ≥3 → 可下调 1 档（说明"业绩拐点恶化覆盖估值优势"）
+2. 业绩拐点已经确认底部反转 + 数据完整度 L0/L1 + 红旗 ≤1 + Bull anchor 强 → 可上调 1 档
+3. consensus.crowded = yes 时按第四步对照表调整
+
+**其他任何主观调整（如"短期透支""估值消化"等）一律不允许覆盖动态阈值映射**。
+
+#### 输出格式（强制）
+
+> 第一步算出动态阈值：±__/±__ ; 当前偏离度：±__% ; 按映射应给：**X** ; 是否有例外情形：是/否（如有，说明哪条+调整为 Y）
+
+> **最终评级 R（拥挤度调整 + 对称升降档前）**：BUY / OVERWEIGHT / HOLD / UNDERWEIGHT / SELL
+
+### 第四步：拥挤度调整（在评级输出后强制检查）
+
+⚠️ **核心理念**：拥挤度本身就是**反向风险信号**。拥挤多头 = 大家追多到极致，反向风险是下跌。但**温和降档原则**——只惩罚极端追高（BUY 档），不阻止中度偏多（OVERWEIGHT 在反向风险中仍可接受）。
+
+#### 强制对照表（温和降档版）
 
 **情形 A：consensus.crowded = yes 且 direction = 偏多（拥挤多头）**
 
 | 按估值得出的 R | 是否允许 | 理由 |
 |---------------|---------|------|
-| BUY | ❌ 禁止 → 降至 OVERWEIGHT | 不能在拥挤多头继续追高 |
-| OVERWEIGHT | ❌ 禁止 → 降至 HOLD | 同上 |
+| BUY | ❌ 禁止 → 降至 OVERWEIGHT | 不能在拥挤多头继续极端追高 |
+| OVERWEIGHT | ✅ **保留**（温和降档原则）| 中度偏多在反向风险中仍可接受 |
 | HOLD | ✅ 保留 | — |
-| UNDERWEIGHT | ✅ **保留**（拥挤多头本身就是反向信号，UNDERWEIGHT 是合理反向） | 不应该被拉回 HOLD |
+| UNDERWEIGHT | ✅ **保留**（拥挤多头本身就是反向信号）| 不应该被拉回 HOLD |
 | SELL | ✅ **保留** | 同上 |
 
 **情形 B：consensus.crowded = yes 且 direction = 偏空（拥挤空头）**
 
 | 按估值得出的 R | 是否允许 | 理由 |
 |---------------|---------|------|
-| SELL | ❌ 禁止 → 升至 UNDERWEIGHT | 不能在拥挤空头继续追空 |
-| UNDERWEIGHT | ❌ 禁止 → 升至 HOLD | 同上 |
+| SELL | ❌ 禁止 → 升至 UNDERWEIGHT | 不能在拥挤空头继续极端追空 |
+| UNDERWEIGHT | ✅ **保留**（温和升档原则）| 中度偏空在反向机会中仍可接受 |
 | HOLD | ✅ 保留 | — |
-| OVERWEIGHT | ✅ **保留**（拥挤空头本身就是反向机会，OVERWEIGHT 是合理反向） | 不应该被拉回 HOLD |
+| OVERWEIGHT | ✅ **保留**（拥挤空头本身就是反向机会）| 不应该被拉回 HOLD |
 | BUY | ✅ **保留** | 同上 |
 
 **情形 C：consensus.crowded = no** —— 无任何调整，按估值得出的 R 直接采纳。
 
-#### 强制示例（必须严格遵守，不准重蹈覆辙）
+#### 强制示例（温和降档版）
 
-✅ 正确：按估值给 UNDERWEIGHT，consensus = 拥挤多头 → **保留 UNDERWEIGHT**（拥挤多头不阻止偏空评级）
-✅ 正确：按估值给 OVERWEIGHT，consensus = 拥挤多头 → **降至 HOLD**（拥挤多头禁止追高）
-✅ 正确：按估值给 OVERWEIGHT，consensus = 拥挤空头 → **保留 OVERWEIGHT**（拥挤空头不阻止偏多评级，反而支持反向机会）
-✅ 正确：按估值给 SELL，consensus = 拥挤空头 → **升至 UNDERWEIGHT**（拥挤空头禁止追空）
-❌ 错误：按估值给 UNDERWEIGHT，consensus = 拥挤多头 → 拉回 HOLD（**反方向理解了规则**——拥挤多头不是"禁止偏空"，是"禁止偏多"）
-
-⛔ **绝对禁止**：在拥挤多头时把 UNDERWEIGHT/SELL 拉回 HOLD。这是把"反向风险信号"误读成了"反向操作禁令"，逻辑完全反了。
+✅ 正确：按估值给 OVERWEIGHT，consensus = 拥挤多头 → **保留 OVERWEIGHT**（温和降档原则）
+✅ 正确：按估值给 BUY，consensus = 拥挤多头 → **降至 OVERWEIGHT**（只惩罚极端追高）
+✅ 正确：按估值给 UNDERWEIGHT，consensus = 拥挤多头 → **保留 UNDERWEIGHT**
+✅ 正确：按估值给 UNDERWEIGHT，consensus = 拥挤空头 → **保留 UNDERWEIGHT**（温和升档原则）
+✅ 正确：按估值给 SELL，consensus = 拥挤空头 → **升至 UNDERWEIGHT**（只惩罚极端追空）
+❌ 错误：按估值给 OVERWEIGHT，consensus = 拥挤多头 → 降至 HOLD（**旧逻辑双档降，已废弃**）
+❌ 错误：按估值给 UNDERWEIGHT，consensus = 拥挤多头 → 拉回 HOLD（反方向理解了规则）
 
 #### 输出格式
 
 - 如果 R 因拥挤度调整改变 → 写明"按估值得出 X，因 consensus = 拥挤[多/空]头，按对照表调整为 Y"
 - 如果 R 不变 → 写明"consensus = 拥挤[多/空]头，但按估值得出 X 落在保留区，无调整"
+
+### 第五步：对称升降档修正（强制检查）
+
+之前 RM 只有"降档机制"（拥挤度/数据缺失/红旗都向下），导致"低估值 + 优质 + 拐点确认"票被锁死在 HOLD。本步加**对称升档机制**：
+
+#### 升档条件（所有条件同时满足）
+
+| 条件 | 说明 |
+|------|------|
+| Step 3 业绩拐点 | "加速期" 或 "底部反转" |
+| 数据完整度 | L0 或 L1（VALUATION_METHOD.data_completeness）|
+| 红旗数量 | fundamentals.SUMMARY.red_flags ≤ 1 条（且无重大红旗）|
+| 估值偏离 | 当前价处于综合区间中位以下（深度低估区间）|
+| 反向无拥挤限制 | 不能与拥挤度调整冲突（如拥挤多头时不能升档 OVERWEIGHT → BUY）|
+| stock_profile 推荐 | DECISION_STYLE 不是 momentum（动量股不靠估值低估升档）|
+
+→ 评级可上调 1 档（HOLD → OVERWEIGHT，OVERWEIGHT → BUY，UNDERWEIGHT 升 HOLD 不允许 — 升档只对偏多档）
+
+#### 降档条件（多个独立触发，可叠加但最多降 2 档）
+
+| 条件 | 影响 |
+|------|------|
+| 数据完整度 L3 | -1 档 |
+| 红旗 ≥3 条 | -1 档 |
+| 拐点 = "顶部" 或 "衰退" | -1 档 |
+| Bear 论据 anchor 强 + 业绩可持续性 = "待验证" | -1 档 |
+
+#### 输出格式
+
+```
+- 升档检查：[通过/不通过]，[如通过：升至 X / 如不通过：列出不满足的条件]
+- 降档检查：[触发数 N，降 N 档至 X / 未触发任何降档]
+- 最终 R 修正后：__
+```
+
+⚠️ **强制约束**：升档机制不能与拥挤多头规则冲突（即拥挤多头时不能从 OVERWEIGHT 升至 BUY）。升档前必须先过拥挤度对照表。
 
 ### 评级 COT 示例（参考格式，禁止照抄结论）
 
@@ -508,9 +649,6 @@ Hard Data 修正：yes 不变；no × 0.5
 - **COT 必须透明**：每步都有可追溯的结构化输出，PM 能复盘你的思考路径
 
 ---
-
-## 历史教训
-\"{past_memory_str}\"
 
 ## 原始分析师报告（交叉校验数据用）
 

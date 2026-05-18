@@ -96,8 +96,9 @@ class TradingAgentsGraph:
             **llm_kwargs,
         )
 
-        self.deep_thinking_llm = deep_client.get_llm()
-        self.quick_thinking_llm = quick_client.get_llm()
+        # 使用 get_llm_wrapped 注入 wall-clock 超时保护，防止 LLM API 假死导致进程死锁
+        self.deep_thinking_llm = deep_client.get_llm_wrapped()
+        self.quick_thinking_llm = quick_client.get_llm_wrapped()
         
         # Create LLM instances with role-specific temperatures
         # 四个基础分析师：使用 CLI 选择的模型（受 use_deep_think_for_analysts 控制）
@@ -120,10 +121,10 @@ class TradingAgentsGraph:
         self.neutral_risk_llm = self._create_templllm(self.config.get("temperature_neutral_risk", 0.4), use_deep_think=False)
         
         # Initialize memories
-        self.bull_memory = FinancialSituationMemory("bull_memory", self.config)
-        self.bear_memory = FinancialSituationMemory("bear_memory", self.config)
-        self.trader_memory = FinancialSituationMemory("trader_memory", self.config)
-        self.invest_judge_memory = FinancialSituationMemory("invest_judge_memory", self.config)
+        # Memory 系统简化：旧版给 bull/bear/trader/invest_judge 各分配一个 memory 实例，
+        # 但当前工作流（单股票实时分析）下 reflect_* 没有 backtest 闭环触发，且 seed_lessons
+        # 只注入 PM——其他 memory 永远是空字符串，纯粹是 prompt 装饰。改造 A 清理：只保留
+        # portfolio_manager_memory 一份真正在用的。
         self.portfolio_manager_memory = FinancialSituationMemory("portfolio_manager_memory", self.config)
 
         # Create tool nodes
@@ -138,10 +139,6 @@ class TradingAgentsGraph:
             self.quick_thinking_llm,
             self.deep_thinking_llm,
             self.tool_nodes,
-            self.bull_memory,
-            self.bear_memory,
-            self.trader_memory,
-            self.invest_judge_memory,
             self.portfolio_manager_memory,
             self.conditional_logic,
             # Role-specific LLMs with different temperatures
@@ -235,7 +232,8 @@ class TradingAgentsGraph:
             temperature=temperature,
             **llm_kwargs,
         )
-        return client.get_llm()
+        # 使用 get_llm_wrapped 注入 wall-clock 超时保护
+        return client.get_llm_wrapped()
 
     def _create_tool_nodes(self) -> Dict[str, ToolNode]:
         """Create tool nodes for different data sources using abstract methods."""
@@ -464,19 +462,12 @@ class TradingAgentsGraph:
             json.dump(self.log_states_dict, f, indent=4)
 
     def reflect_and_remember(self, returns_losses):
-        """Reflect on decisions and update memory based on returns."""
-        self.reflector.reflect_bull_researcher(
-            self.curr_state, returns_losses, self.bull_memory
-        )
-        self.reflector.reflect_bear_researcher(
-            self.curr_state, returns_losses, self.bear_memory
-        )
-        self.reflector.reflect_trader(
-            self.curr_state, returns_losses, self.trader_memory
-        )
-        self.reflector.reflect_invest_judge(
-            self.curr_state, returns_losses, self.invest_judge_memory
-        )
+        """Reflect on decisions and update memory based on returns.
+
+        改造 A 简化：只对 PM 反思（其他 memory 实例已删除）。
+        reflect_bull/bear/trader/invest_judge 在 backtest 闭环存在时可重新启用，
+        但需先恢复对应 memory 实例（trading_graph.py __init__）。
+        """
         self.reflector.reflect_portfolio_manager(
             self.curr_state, returns_losses, self.portfolio_manager_memory
         )
