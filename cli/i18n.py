@@ -11,6 +11,7 @@ AGENT_NAMES = {
     "Social Analyst": "舆情分析师",
     "News Analyst": "新闻分析师",
     "Fundamentals Analyst": "基本面分析师",
+    "Macro Context Officer": "宏观策略师",
     "Stock Profile Officer": "股票画像识别官",
     "Consensus Officer": "共识识别官",
     "Bull Researcher": "多头研究员",

@@ -129,6 +129,7 @@ _AGENT_CN = {
     "Social Analyst": "舆情分析师",
     "News Analyst": "新闻分析师",
     "Fundamentals Analyst": "基本面分析师",
+    "Macro Context Officer": "宏观策略师",
     "Stock Profile Officer": "股票画像识别官",
     "Consensus Officer": "共识识别官",
     "Bull Researcher": "多头研究员",
@@ -156,6 +157,7 @@ def _save_report(state, ticker: str, save_path: Path):
         ("sentiment_report", "sentiment.md", "Social Analyst"),
         ("news_report", "news.md", "News Analyst"),
         ("fundamentals_report", "fundamentals.md", "Fundamentals Analyst"),
+        ("macro_context", "macro.md", "Macro Context Officer"),
         ("stock_profile", "stock_profile.md", "Stock Profile Officer"),
         ("consensus_snapshot", "consensus.md", "Consensus Officer"),
     ]:

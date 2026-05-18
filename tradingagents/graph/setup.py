@@ -8,6 +8,7 @@ from tradingagents.agents import *
 from tradingagents.agents.utils.agent_states import AgentState
 from tradingagents.agents.utils.consensus_node import create_consensus_node
 from tradingagents.agents.utils.stock_profile_node import create_stock_profile_node
+from tradingagents.agents.utils.macro_context_node import create_macro_context_node
 
 from .conditional_logic import ConditionalLogic
 
@@ -105,6 +106,9 @@ class GraphSetup:
             delete_nodes["fundamentals"] = create_msg_delete()
             # fundamentals analyst fetches data programmatically, no ToolNode needed
 
+        # Macro Strategist: identifies rate cycle, liquidity, geopolitical risks, sector relative impact
+        macro_context_officer_node = create_macro_context_node(self.quick_thinking_llm)
+
         # Stock profile officer: identifies stock characteristics + recommended report weights
         stock_profile_officer_node = create_stock_profile_node(self.quick_thinking_llm)
 
@@ -139,6 +143,7 @@ class GraphSetup:
                 workflow.add_node(f"tools_{analyst_type}", tool_nodes[analyst_type])
 
         # Add other nodes
+        workflow.add_node("Macro Context Officer", macro_context_officer_node)
         workflow.add_node("Stock Profile Officer", stock_profile_officer_node)
         workflow.add_node("Consensus Officer", consensus_officer_node)
         workflow.add_node("Bull Researcher", bull_researcher_node)
@@ -173,14 +178,15 @@ class GraphSetup:
                 # Analyst with programmatic data fetching: direct edge
                 workflow.add_edge(current_analyst, current_clear)
 
-            # Connect to next analyst, or to Stock Profile Officer if this is the last analyst
+            # Connect to next analyst, or to Macro Context Officer if this is the last analyst
             if i < len(selected_analysts) - 1:
                 next_analyst = f"{selected_analysts[i+1].capitalize()} Analyst"
                 workflow.add_edge(current_clear, next_analyst)
             else:
-                workflow.add_edge(current_clear, "Stock Profile Officer")
+                workflow.add_edge(current_clear, "Macro Context Officer")
 
-        # Stock Profile Officer feeds Consensus Officer; Consensus feeds Bull Researcher
+        # Macro → Stock Profile → Consensus → Bull Researcher
+        workflow.add_edge("Macro Context Officer", "Stock Profile Officer")
         workflow.add_edge("Stock Profile Officer", "Consensus Officer")
         workflow.add_edge("Consensus Officer", "Bull Researcher")
 

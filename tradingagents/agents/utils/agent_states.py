@@ -58,7 +58,12 @@ class AgentState(MessagesState):
     ]
     fundamentals_report: Annotated[str, "Report from the Fundamentals Researcher"]
 
-    # stock profile (synthesized first, drives downstream report weighting and decision style)
+    # macro context (synthesized after analysts, before stock_profile)
+    macro_context: Annotated[
+        str, "Macro context: rate cycle stage, liquidity tightness, geopolitical risk, sector relative impact"
+    ]
+
+    # stock profile (synthesized after macro_context, drives downstream report weighting and decision style)
     stock_profile: Annotated[
         str, "Stock profile: market cap tier, style, liquidity, instrument type, report weights, decision style, event windows"
     ]

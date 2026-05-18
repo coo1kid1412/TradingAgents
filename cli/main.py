@@ -646,6 +646,10 @@ def save_report_to_disk(final_state, ticker: str, save_path: Path):
         analysts_dir.mkdir(exist_ok=True)
         (analysts_dir / "fundamentals.md").write_text(final_state["fundamentals_report"])
         analyst_parts.append((t("Fundamentals Analyst", AGENT_NAMES), final_state["fundamentals_report"]))
+    if final_state.get("macro_context"):
+        analysts_dir.mkdir(exist_ok=True)
+        (analysts_dir / "macro.md").write_text(final_state["macro_context"])
+        analyst_parts.append((t("Macro Context Officer", AGENT_NAMES), final_state["macro_context"]))
     if final_state.get("stock_profile"):
         analysts_dir.mkdir(exist_ok=True)
         (analysts_dir / "stock_profile.md").write_text(final_state["stock_profile"])

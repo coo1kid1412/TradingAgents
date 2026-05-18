@@ -72,6 +72,7 @@ def create_research_manager(llm):
         fundamentals_report = state["fundamentals_report"]
         consensus_snapshot = state.get("consensus_snapshot", "")
         stock_profile = state.get("stock_profile", "")
+        macro_context = state.get("macro_context", "")
 
         investment_debate_state = state["investment_debate_state"]
 
@@ -149,6 +150,16 @@ def create_research_manager(llm):
 ### 0.1 股票画像（由画像识别官提炼）
 
 {stock_profile if stock_profile else "（画像缺失，按通用框架处理）"}
+
+### 0.3 宏观上下文（由宏观策略师提炼）
+
+{macro_context if macro_context else "（宏观上下文缺失，按中性环境处理）"}
+
+**重点提取**：MACRO_CONTEXT.{{rate_cycle, liquidity, industry_macro_direction, premium_adjustment_pct}}
+
+**用法**：
+- Step 1 行业景气度判断必须叠加宏观顺/逆风修正（如行业本身上行但宏观强逆风 → 实际景气度降一档）
+- Step 6 动态阈值计算时，stock_profile.THEMATIC_PREMIUM 已经吸收了宏观修正，你按其最终值使用即可
 
 **重点提取**：style / industry / VALUATION_METHOD.primary_method / target_pe_range / target_pb_range / data_completeness
 
