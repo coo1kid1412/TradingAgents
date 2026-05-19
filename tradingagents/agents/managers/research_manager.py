@@ -73,6 +73,7 @@ def create_research_manager(llm):
         consensus_snapshot = state.get("consensus_snapshot", "")
         stock_profile = state.get("stock_profile", "")
         macro_context = state.get("macro_context", "")
+        quant_score = state.get("quant_score", "")
 
         investment_debate_state = state["investment_debate_state"]
 
@@ -160,6 +161,17 @@ def create_research_manager(llm):
 **用法**：
 - Step 1 行业景气度判断必须叠加宏观顺/逆风修正（如行业本身上行但宏观强逆风 → 实际景气度降一档）
 - Step 6 动态阈值计算时，stock_profile.THEMATIC_PREMIUM 已经吸收了宏观修正，你按其最终值使用即可
+
+### 0.4 量化锚（由量化打分官 Python 确定性输出，无 LLM 主观空间）
+
+{quant_score if quant_score else "（量化锚缺失，Step 6 第六步交叉校验跳过）"}
+
+**重点提取**：QUANT_SCORE.composite（0-100 综合分） + factor_scores（6 类因子分项）
+
+**用法**：
+- 这是**独立于 LLM 判断的量化锚**，由 Python 直接基于动量/价值/质量/成长/低波/反拥挤 6 因子打分得出
+- Step 6 第六步（量化锚交叉校验）会强制对照本节，若 RM 评级方向与量化锚严重背离需说明原因
+- factor_scores 中 <30 分的单项代表该维度有显著风险，Step 8 风险清单应当独立列出
 
 **重点提取**：style / industry / VALUATION_METHOD.primary_method / target_pe_range / target_pb_range / data_completeness
 
@@ -253,30 +265,82 @@ def create_research_manager(llm):
 | 历史估值分位 | 任何有历史数据的标的 | 当前估值 vs 自身历史 1Y/3Y/5Y 分位 |
 | 同业可比 | 行业内有可比标的 | 同业平均 PE/PB × 公司财务指标 |
 
+### 方法选择规则（强制按 stock_profile.VALUATION_METHOD 选，不再凭感觉）
+
+⚠️ **核心约束（必读）**：方法**不能**自由选 3 种凑数，**必须**按 stock_profile.VALUATION_METHOD 输出的 `primary_method` + `secondary_methods` 来选。这是历史 bug 来源——RM 习惯性给银行股套 PEG、给周期股套 PE×EPS，结构性偏差。
+
+#### 强制选择规则
+
+| 字段 | 用作 | 默认权重 |
+|------|------|---------|
+| `primary_method`（1 个）| Step 4 方法 1 | **50%** |
+| `secondary_methods`（通常 2 个）| Step 4 方法 2 / 方法 3 | **每个 25%** |
+| 若 secondary 只有 1 个 | Step 4 方法 2 | 50% |
+| 若 secondary 有 3+ 个 | 选最适合的 2 个作为方法 2/3 | 每个 25% |
+
+#### 行业对照（用于审计 stock_profile 是否合理，不是用来覆盖它）
+
+| 典型行业 | 应该看到的 primary | 应该看到的 secondaries |
+|---------|------------------|---------------------|
+| 银行/保险 | pb | 历史分位、DDM、同业可比 |
+| 钢铁/化工/煤炭（周期）| pb / 历史分位 | 同业可比、EV/EBITDA |
+| 高成长 SaaS / AI 应用 | peg | PE×EPS、同业可比 |
+| 半导体设计 / 创新药 | peg | PE×EPS、同业可比 |
+| 消费 / 家电 / 医药 | pe_eps | 同业可比、DCF |
+| 公用事业 / 高股息蓝筹 | ddm / 股息率倒推 | PE×EPS、DCF |
+| 资源 / 能源 | pb | EV/EBITDA、PE×EPS |
+| 资本密集型重工业 | ev_ebitda | PB×BPS、PE×EPS |
+| ETF / 封闭式基金 | nav / 折溢价率 | （单一方法即可）|
+
+**若 stock_profile.primary_method 与本表严重不符**（例如银行股给了 peg）：
+- 在 Step 4 开头**先指出该问题**
+- 仍按 stock_profile 原意计算（不要私自换方法），但在置信度评估时降一档（"估值方法选择存疑"）
+- 不要私自把方法换掉——这是 stock_profile 的责任
+
+#### 已实现的工具覆盖矩阵（决定能否用 compute_*_target_price 工具）
+
+| primary_method | 是否有专用工具 | 计算方式 |
+|---------------|-------------|---------|
+| pe_eps | ✅ compute_pe_eps_target_price | 工具计算 |
+| peg | ✅ compute_peg_target_price | 工具计算 |
+| pb | ❌ 无专用工具 | LLM 手算：目标 PB × 当期 BPS（必须显式展示公式） |
+| dcf | ❌ 无专用工具 | LLM 手算：三阶段 DCF，须显式给出 WACC / 永续 g / 现金流预测 |
+| ddm | ❌ 无专用工具 | LLM 手算：DDM = 每股股息 / (折现率 − 增长率) |
+| ev_ebitda | ❌ 无专用工具 | LLM 手算：目标倍数 × EBITDA（市值 = EV − 净债务） |
+| nav | ❌ 无专用工具 | LLM 手算（ETF/封基用） |
+| 同业可比 | 通过 compute_pe_eps_target_price 套行业 PE 实现 | 目标 PE = 行业 PE 中位数 ± 龙头/折价调整 |
+| 历史分位 | 通过 compute_pe_eps_target_price 套自身历史 PE 实现 | 目标 PE = 自身历史 PE 分位（25%/50%/75%）|
+
+⚠️ **手算时强制要求**：
+- 公式必须展开成可审计形式（不能写"DCF 估值约 200 元"）
+- 关键输入（WACC / g / 折现率 / EBITDA 等）必须**显式列出**，说明来源
+- 若关键输入只能凭感觉给（例如 WACC 没有行业基准）→ 该方法标为"低置信度"，权重砍半（primary 50% → 25%；secondary 25% → 12.5%）
+
 ### 输出要求（每种方法独立）
 
-> **方法 1: [方法名]**
+> **方法 1: [方法名]**（来源：stock_profile.primary_method = __）
 > - 输入数据：[列出所有用到的数据 + 来源]
-> - 计算过程：[公式展开]
+> - 计算过程：[公式展开 / 或工具调用]
 > - 目标价：__ 元
 > - 该方法的局限性：[1 句话]
 >
-> **方法 2: [方法名]**
+> **方法 2: [方法名]**（来源：stock_profile.secondary_methods[0] = __）
 > - ...
 >
-> **方法 3: [方法名]**
+> **方法 3: [方法名]**（来源：stock_profile.secondary_methods[1] = __）
 > - ...
 
-### 综合目标价
+### 综合目标价（权重必须按本节规则选，不再 40/30/30 默认）
 
-> | 方法 | 目标价 | 权重 |
-> |------|--------|------|
-> | 方法 1 | __ | __ |
-> | 方法 2 | __ | __ |
-> | 方法 3 | __ | __ |
+> | 方法 | 目标价 | 权重 | 权重来源 |
+> |------|--------|------|---------|
+> | 方法 1（primary）| __ | 50% | stock_profile.primary_method |
+> | 方法 2（secondary[0]）| __ | 25% | stock_profile.secondary_methods |
+> | 方法 3（secondary[1]）| __ | 25% | stock_profile.secondary_methods |
 >
-> **综合目标价区间**：[低位] 至 [高位] 元
-> （区间 = 3 种方法的合理重叠区域；不重叠则取相对均匀的覆盖区间，并说明分歧原因）
+> **权重例外说明**（如果偏离上表）：__（如某方法标为"低置信度"权重砍半，剩余权重按比例分给其他方法）
+>
+> **综合目标价区间**：[低位] 至 [高位] 元（**必须调 compute_overlap_target_price 或 compute_weighted_target_price**）
 
 ### 重要约束
 
@@ -284,6 +348,7 @@ def create_research_manager(llm):
 - **数据缺失**：如某方法关键输入缺失（如 fundamentals.SUMMARY 的 EPS=null），明确写"该方法不适用，原因：__"，不强行外推
 - **禁止凭感觉给目标 PE/PB**：必须引用 stock_profile.target_pe_range / consensus.market_implied_pe_range / 行业可比数据，其中至少一个
 - **置信度对照**：综合目标价区间宽度 > 当前价 × 50% → 标"低置信度"
+- **时间窗一致性**：forward EPS 不能乘 trailing PE，反之亦然。Step 4 顶部必须显式说明使用的 EPS 是哪个口径（TTM / 2025E / 2026E）+ PE 是哪个口径（TTM / forward），两者必须匹配
 
 ---
 
@@ -515,6 +580,42 @@ theme_premium_pct（来自 stock_profile.THEMATIC_PREMIUM）：
 ```
 
 ⚠️ **强制约束**：升档机制不能与拥挤多头规则冲突（即拥挤多头时不能从 OVERWEIGHT 升至 BUY）。升档前必须先过拥挤度对照表。
+
+### 第六步：量化锚交叉校验（强制，不可跳过）
+
+⚠️ **核心理念**：以上五步全部由 LLM 主观判断或半机械化映射，最后通过 0.4 节 QUANT_SCORE.composite（**Python 确定性输出，无 LLM 介入**）做"独立第二眼"校验。这是为了避免 LLM 在数值选择上的偏差被一路传递到评级。
+
+#### 评级 → 量化锚一致性映射表
+
+| 当前评级（第五步后） | 期望量化分区间 | 若严重背离则 |
+|--------------------|--------------|------------|
+| **BUY** | ≥ 70 | 量化 < 35 → 强制降至 **OVERWEIGHT**（说明背离原因） |
+| **OVERWEIGHT** | ≥ 55 | 量化 < 30 → 强制降至 **HOLD** |
+| **HOLD** | 35-75 | 量化 < 25 → 降至 UNDERWEIGHT；量化 > 80 → 升至 OVERWEIGHT |
+| **UNDERWEIGHT** | ≤ 55 | 量化 > 75 → 强制升至 **HOLD** |
+| **SELL** | ≤ 35 | 量化 > 65 → 强制升至 **UNDERWEIGHT** |
+
+#### 强制规则
+
+1. **轻度背离（差距 < 35 分）**：保留原评级，但必须在 COT 中说明"量化锚 X 分与评级 Y 方向一致 / 仅轻度差异，不调整"
+2. **中度背离（35-50 分）**：保留原评级，但必须列出 2 个具体原因解释为什么 LLM 判断优于量化锚（如"行业框架特殊性""业绩拐点未在量化因子中体现"）
+3. **严重背离（≥ 50 分）**：按上表强制调整一档，并说明背离来源
+
+#### 例外（允许保留 LLM 评级不被量化推翻的唯一情况）
+
+- 业绩拐点确认（如刚出超预期 Q1 净利率大幅跳升，量化模型还未吸收新季度数据）→ 须显式说明"量化锚滞后于业绩拐点新增数据"
+- 地雷排查命中（第负一步触发任一 L 项）→ 直接 SELL，量化锚不参与
+
+#### 输出格式（强制）
+
+```
+- 第五步后评级：__
+- QUANT_SCORE.composite：__/100
+- 背离程度：轻度/中度/严重（差距 __分）
+- 处理：[保留原评级 / 强制调整为 __]
+- 理由：__
+- 最终 R（第六步后）：__
+```
 
 ### 评级 COT 示例（参考格式，禁止照抄结论）
 

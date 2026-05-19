@@ -58,6 +58,11 @@ class AgentState(MessagesState):
     ]
     fundamentals_report: Annotated[str, "Report from the Fundamentals Researcher"]
 
+    # quant score (deterministic factor scoring after analysts, before macro_context)
+    quant_score: Annotated[
+        str, "Quant factor score report (momentum/value/quality/growth/lowvol/anticrowding), 0-100 composite + breakdown"
+    ]
+
     # macro context (synthesized after analysts, before stock_profile)
     macro_context: Annotated[
         str, "Macro context: rate cycle stage, liquidity tightness, geopolitical risk, sector relative impact"
