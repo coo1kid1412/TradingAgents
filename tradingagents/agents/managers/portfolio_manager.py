@@ -1,7 +1,7 @@
 import json
 import logging
 
-from langchain_core.messages import HumanMessage, ToolMessage
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
 from tradingagents.agents.utils.agent_utils import build_instrument_context, get_language_instruction, RISK_DEBATE_PHRASING_RULES
 from tradingagents.agents.managers.pm_tools import PM_TOOLS, PM_TOOLS_BY_NAME
@@ -12,15 +12,25 @@ _MAX_TOOL_ITERATIONS = 6
 
 
 def _pm_tool_loop(llm_with_tools, initial_messages):
-    """PM 工具调用循环。"""
+    """PM 工具调用循环。返回累积了所有迭代 LLM 文本的 AIMessage（保留 9 步决策链路）。"""
     messages = list(initial_messages)
+    cot_segments: list[str] = []
+
     for iteration in range(_MAX_TOOL_ITERATIONS):
         response = llm_with_tools.invoke(messages)
         messages.append(response)
+
+        content = (response.content or "").strip()
+        if content:
+            cot_segments.append(content)
+
         tool_calls = getattr(response, "tool_calls", None) or []
         if not tool_calls:
-            logger.info("PM tool loop 结束（第 %d 轮）", iteration + 1)
-            return response
+            logger.info(
+                "PM tool loop 结束（第 %d 轮，累积 %d 段，总长 %d 字符）",
+                iteration + 1, len(cot_segments), sum(len(s) for s in cot_segments),
+            )
+            return AIMessage(content="\n\n".join(cot_segments))
 
         logger.info("PM 第 %d 轮工具调用：%d 个", iteration + 1, len(tool_calls))
         for tc in tool_calls:
@@ -38,7 +48,11 @@ def _pm_tool_loop(llm_with_tools, initial_messages):
 
     logger.warning("PM 达到工具调用上限 %d 轮", _MAX_TOOL_ITERATIONS)
     messages.append(HumanMessage(content="请基于已有工具结果直接写出最终决策，不要再调工具。"))
-    return llm_with_tools.invoke(messages)
+    final = llm_with_tools.invoke(messages)
+    final_content = (final.content or "").strip()
+    if final_content:
+        cot_segments.append(final_content)
+    return AIMessage(content="\n\n".join(cot_segments))
 
 
 def create_portfolio_manager(llm, memory):
@@ -50,13 +64,14 @@ def create_portfolio_manager(llm, memory):
         risk_debate_state = state["risk_debate_state"]
         research_plan = state["investment_plan"]
 
-        # PM 直接读 4 个 analyst 原始报告 + consensus + RM thesis
+        # PM 直接读 4 个 analyst 原始报告 + consensus + RM thesis + quant_score
         market_report = state.get("market_report", "")
         sentiment_report = state.get("sentiment_report", "")
         news_report = state.get("news_report", "")
         fundamentals_report = state.get("fundamentals_report", "")
         consensus_snapshot = state.get("consensus_snapshot", "")
         stock_profile = state.get("stock_profile", "")
+        quant_score = state.get("quant_score", "")
 
         # 决策卡头部信息
         pm_ticker = state["company_of_interest"]
@@ -148,6 +163,16 @@ def create_portfolio_manager(llm, memory):
 - 旧版 RM 输出的 R0/R1/R2/赔率 R/期望 E **已废弃**，新版只输出"最终评级 R + Conviction + 三情景目标价"
 - 三情景目标价由 RM 给出，你的"情景概率分布"段可直接复用 RM 的 Bull/Base/Bear，只需再加"黑天鹅"一档（5-15%）即可
 - 综合目标价区间是 RM 多元估值交叉的输出，比单一 P_up/P_dn 更可靠，你的 1R 计算应基于此区间
+
+**从 quant_score 提取**（Python 确定性输出，独立第二眼）：
+
+| 字段 | quant_score 输出位置 | 你的用途 |
+|------|--------------------|---------|
+| **QUANT_SCORE.composite**（0-100） | YAML 摘要 | 评级一致性交叉校验：若 RM 评级方向与 quant 严重背离（如 RM=OVERWEIGHT 但 composite<30），需在 2B 评级微调中说明 |
+| **factor_scores 中 <30 分的因子** | YAML 摘要 / 因子分项表 | **必须列入 Trade Ticket 的 Key Risks 段**（如 lowvol=5 → "极端高波动"；value=18 → "估值显著偏贵"）|
+| **Conviction 强化**（评级与 quant 方向一致时）| —— | RM=OVERWEIGHT 且 composite≥70 → Conviction 可在 RM 给的基础上 +1 档 |
+
+⚠️ **强制约束**：本节列出的薄弱因子（<30）**必须**出现在 Trade Ticket 的"Key Risks"段，禁止以"已在 RM 风险清单覆盖"为由跳过——这是 Python 量化锚，是独立信号来源。
 
 ### 第二步：评级微调（含对 RM thesis 的反向质疑）
 
@@ -461,6 +486,9 @@ PM 必须明确推荐其中之一，并解释理由。
 
 ### 股票画像（决定决策风格 + 报告使用权重 + Time Stop / Entry 节奏）
 {stock_profile if stock_profile else "（未提供）"}
+
+### 量化打分官（独立第二眼，Python 确定性输出 0-100 综合分 + 6 因子分项）
+{quant_score if quant_score else "（量化锚未生成，PM 跳过量化交叉校验）"}
 
 ### 共识快照（用于 entry timing 判断）
 {consensus_snapshot if consensus_snapshot else "（未提供）"}

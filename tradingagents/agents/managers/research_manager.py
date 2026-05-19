@@ -15,18 +15,29 @@ _MAX_TOOL_ITERATIONS = 10
 def _run_tool_calling_loop(llm_with_tools, initial_messages):
     """执行 LLM 工具调用循环，直到 LLM 不再调工具或达到上限。
 
-    返回最终 AIMessage（含完整 thesis 文本）。
+    返回 AIMessage，其 content 是**所有迭代的 LLM 文本累积**——保留完整 8 步 COT 链路。
+    历史 bug：之前只返回最后一次 response.content，导致 Step 1-8 + 第六步 COT 全丢，
+    judge_decision 只剩"最终输出 Thesis 报告"段。
     """
     messages = list(initial_messages)
+    cot_segments: list[str] = []
+
     for iteration in range(_MAX_TOOL_ITERATIONS):
         response = llm_with_tools.invoke(messages)
         messages.append(response)
 
+        # 累积本轮 LLM 输出的文本（即使含 tool_calls，也常含 Step COT 片段）
+        content = (response.content or "").strip()
+        if content:
+            cot_segments.append(content)
+
         tool_calls = getattr(response, "tool_calls", None) or []
         if not tool_calls:
-            # LLM 不再调工具，循环结束
-            logger.info("RM tool calling 循环结束（第 %d 轮，无 tool_calls）", iteration + 1)
-            return response
+            logger.info(
+                "RM tool calling 循环结束（第 %d 轮，累积 %d 段 COT，总长 %d 字符）",
+                iteration + 1, len(cot_segments), sum(len(s) for s in cot_segments),
+            )
+            return AIMessage(content="\n\n".join(cot_segments))
 
         logger.info("RM 第 %d 轮工具调用：%d 个工具", iteration + 1, len(tool_calls))
         for tc in tool_calls:
@@ -58,7 +69,10 @@ def _run_tool_calling_loop(llm_with_tools, initial_messages):
                 "**不要再调用任何工具**。"
     ))
     final = llm_with_tools.invoke(messages)
-    return final
+    final_content = (final.content or "").strip()
+    if final_content:
+        cot_segments.append(final_content)
+    return AIMessage(content="\n\n".join(cot_segments))
 
 
 def create_research_manager(llm):
