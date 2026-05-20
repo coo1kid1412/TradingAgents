@@ -294,17 +294,21 @@ def _format_report(
             lines.append(f"| {k} | {_fmt(v)} |")
         lines.append("")
 
-    # 原始输入（diagnostic）
-    lines.append("## 四、原始输入（用于审计）")
-    lines.append("")
-    lines.append("| 字段 | 来源 | 数值 |")
-    lines.append("|------|------|------|")
-    for k, v in raw_inputs.items():
-        lines.append(f"| {k} | 自动取数 | {_fmt(v)} |")
-    lines.append("")
+    # 数据缺失字段（仅在有缺失时显示，避免与第三节重复）
+    missing_fields = [k for k, v in raw_inputs.items() if v is None]
+    next_section_idx = 4
+    if missing_fields:
+        lines.append("## 四、数据缺失字段（未参与因子打分）")
+        lines.append("")
+        lines.append(f"以下 {len(missing_fields)} 个字段取数失败：`{', '.join(missing_fields)}`")
+        lines.append("")
+        lines.append("（其余字段的具体数值见上方「三、因子明细」各因子表格）")
+        lines.append("")
+        next_section_idx = 5
 
     # 给 RM 的提示
-    lines.append("## 五、给 RM / PM 的使用指引")
+    _section_label = {4: "四", 5: "五"}[next_section_idx]
+    lines.append(f"## {_section_label}、给 RM / PM 的使用指引")
     lines.append("")
     if composite is None:
         lines.append("- 量化分缺失，RM 应在 Step 6 评级映射中**不引用**本节，按估值偏离度逻辑独立判断。")

@@ -28,6 +28,30 @@ from tradingagents.agents.utils.xueqiu_data_tools import (
 )
 
 
+RISK_DEBATE_PHRASING_RULES = """
+【输出措辞规范（合规要求，必须严格遵守）】
+为避免触发输出层合规审核（如 MiniMax 1027），请使用以下中性表述：
+- ❌ "暴雷" / "爆雷" / "业绩暴雷" → ✅ "业绩显著低于预期" / "业绩大幅不达预期"
+- ❌ "崩盘" / "崩塌" / "崩溃" / "股价崩盘" → ✅ "深度回调" / "估值大幅压缩"
+- ❌ "血洗" / "腰斩" → ✅ "跌幅超过 50%"
+- ❌ "做空获利" / "砸盘" → ✅ "下行情景的对冲收益" / "卖压释放"
+- ❌ "亏多少" / "巨亏" / "血亏" → ✅ "潜在下行幅度" / "下行风险敞口"
+- ❌ "时间炸弹" / "引爆" / "爆炸" → ✅ "风险事件" / "触发" / "兑现"
+- ❌ "踩雷" / "雷区" → ✅ "命中风险点" / "高风险区域"
+
+保留所有定量分析和数字，仅替换情绪化/煽动性措辞。本规则仅针对措辞，不影响风险识别的严谨性与深度。
+"""
+
+
+# 数值类指标使用规范（Bull/Bear/PM 共享，避免在三处分别 inline）
+NUMERIC_VALUE_USAGE_RULES = """
+## ⚠️ 数值类指标使用规范
+- 引用 PE(TTM)、动态PE、EPS 等估值指标时，**必须使用分析师报告中的「系统计算」值**（如「动态PE(系统计算)」），严禁自行计算不同的 PE 值
+- 如果发现两个不同的 PE 数值（如 API 参考值 vs 系统计算值），**以系统计算值为准**
+- 如需验证或自行计算，必须写明公式和中间步骤
+"""
+
+
 def get_language_instruction() -> str:
     """Return a prompt instruction for the configured output language.
 
@@ -71,10 +95,10 @@ def build_report_context(state) -> str:
     """将各分析师报告拼接为上下文字符串，供风控团队等 agent 使用。"""
     parts = []
     for key, label in [
-        ("market_report", "Market research report"),
-        ("sentiment_report", "Social media sentiment report"),
-        ("news_report", "Latest world affairs news"),
-        ("fundamentals_report", "Company fundamentals report"),
+        ("fundamentals_report", "[置信度:高] Company fundamentals report"),
+        ("market_report", "[置信度:中高] Market research report"),
+        ("news_report", "[置信度:中] Latest world affairs news"),
+        ("sentiment_report", "[置信度:中低] Social media sentiment report"),
     ]:
         data = state.get(key, "")
         if data:

@@ -1,6 +1,10 @@
 
 
-from tradingagents.agents.utils.agent_utils import build_instrument_context, RISK_DEBATE_PHRASING_RULES
+from tradingagents.agents.utils.agent_utils import (
+    build_instrument_context,
+    RISK_DEBATE_PHRASING_RULES,
+    NUMERIC_VALUE_USAGE_RULES,
+)
 
 
 def create_bear_researcher(llm):
@@ -34,10 +38,7 @@ def create_bear_researcher(llm):
 
 {stock_profile if stock_profile else "（画像缺失，按 4 份报告等权处理）"}
 
-**使用规则**：画像里给了 4 份报告的推荐权重。**权重越高的报告，你的论据应该越多来自该报告**。例如：
-- 题材炒作股（舆情权重高）：你的空头论据应优先来自 sentiment（拥挤拐点、KOL 反向信号、舆情亢奋指数）
-- 大盘蓝筹（基本面权重高）：你的空头论据应优先来自 fundamentals（盈利质量恶化、估值过高、ROE 下行）
-- 周期股（新闻权重高）：你的空头论据应优先来自 news（商品价格见顶、政策收紧、海外需求下行）
+**使用规则**：画像 YAML 里的 `REPORT_WEIGHTS` 已经给出 4 份报告的具体权重——**权重越高的报告，你的论据应该越多来自该报告**。直接按 stock_profile 给的权重比例分配论据来源，不要自己重新判断股性。
 
 ---
 
@@ -104,10 +105,7 @@ Last bull argument: {current_response}
 
 **重要：请用中文进行辩论和分析。** 股票代码和技术指标名称请保留英文原文。请以中文口语化方式直接反驳多头分析师的观点，进行有力的辩论。
 
-## ⚠️ 数值类指标使用规范
-- 引用 PE(TTM)、动态PE、EPS 等估值指标时，**必须使用分析师报告中的「系统计算」值**（如「动态PE(系统计算)」），严禁自行计算不同的 PE 值
-- 如果发现两个不同的 PE 数值（如 API 参考值 vs 系统计算值），**以系统计算值为准**
-- 如需验证或自行计算，必须写明公式和中间步骤
+{NUMERIC_VALUE_USAGE_RULES}
 
 {RISK_DEBATE_PHRASING_RULES}
 """
