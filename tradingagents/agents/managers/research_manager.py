@@ -111,7 +111,7 @@ def create_research_manager(llm):
 
 ## ⚠️ 数值计算必须调用工具（强制约束）
 
-你已经绑定了 9 个计算工具。**所有数值计算必须通过工具调用完成，禁止在报告里"心算"或"凭感觉"算**。
+你已经绑定了 11 个计算工具。**所有数值计算必须通过工具调用完成，禁止在报告里"心算"或"凭感觉"算**。
 
 | 计算场景 | 必须调用的工具 |
 |---------|-------------|
@@ -119,7 +119,9 @@ def create_research_manager(llm):
 | Step 4 估值方法 PEG | `compute_peg_target_price` |
 | Step 4 综合目标价区间（严格重叠）| `compute_overlap_target_price` |
 | Step 4 综合目标价（加权折中，当无严格重叠时）| `compute_weighted_target_price` |
+| **Step 5 三情景 vs Step 4 一致性检验**（**强制**） | `compute_scenario_consistency_check` |
 | Step 5 三情景概率加权 E | `compute_scenario_weighted_e` |
+| **Step 6 第三步评级机械映射**（**强制**）| `compute_step6_rating_mapping` |
 | 多空辩论 Bull Score | `compute_bull_bear_score`（传 Bull 论据列表）|
 | 多空辩论 Bear Score | `compute_bull_bear_score`（传 Bear 论据列表）|
 | 得分差 d | `compute_score_difference` |
@@ -379,10 +381,28 @@ def create_research_manager(llm):
 **约束**：
 - 概率加总 = 100%
 - Base case 概率必须在 40-60%（默认假设市场延续当前路径）
-- 三情景目标价应大致覆盖 Step 4 综合目标价区间
+- **Base case 目标价必须在 Step 4 综合目标价区间内**（Base 代表"维持估值方法的中性路径"）
+- Bull case 目标价**通常** ≤ Step 4 上限 × 1.5（超出需充分论证）
+- Bear case 目标价**通常** ≥ Step 4 下限 × 0.6（超出需充分论证）
 - 核心假设必须可观测可证伪（"业绩超预期"不可接受，"Q2 营收 >25%"可接受）
 
 **Base case 是真实预期，不是中位数**——你认为最可能发生的路径，不是 Bull 和 Bear 的平均。
+
+### ⚠️ Step 5 末尾强制工具调用：一致性检验
+
+设计完 Bull/Base/Bear 三档目标价后，**必须**调用 `compute_scenario_consistency_check` 工具检查三情景与 Step 4 估值区间的一致性，输入：
+
+```
+step4_target_low / step4_target_high → 必须用 Step 4 综合目标价区间（来自 compute_overlap_target_price 或 compute_weighted_target_price 工具输出）
+bull_target / base_target / bear_target → 你刚设计的三情景目标价
+```
+
+**强制规则**：
+- 若工具返回 `ok: True`（无 warning）→ Step 5 通过，继续 Step 6
+- 若工具返回 `ok: False`（有 warning）→ **必须逐条回应**：
+  - Base 超出 Step 4 区间 → **必须修正 Base case 或回头改 Step 4 估值方法**（禁止"加一句解释"就过）
+  - Bull/Bear 超出弱阈值 → 在 Step 5 末尾补充论证（具体催化、anchor 失效路径）
+- **禁止**自评"约束验证 ✅"——这是工具的工作，不是你写一句话就过
 
 ---
 
@@ -476,43 +496,56 @@ theme_premium_pct（来自 stock_profile.THEMATIC_PREMIUM）：
 5. **如果偏离行业典型估值范式**，说明为什么这么做
 6. **反方推理**：明确回答"为什么不给更激进/更保守的评级"
 
-### 第三步：评级（5 档之一）— **强制按动态阈值百分比映射**
+### 第三步：评级（5 档之一）— **强制调用 `compute_step6_rating_mapping` 工具**
 
-⚠️ **核心约束（必读）**：评级**必须**严格按"当前偏离度 vs 动态阈值百分比"做机械映射，**禁止用"区间上限/下限"作为评级锚**——这是历史 bug 来源（如 AI 加速期标的偏离区间上限仅 +11% 但远未到 +78% 动态阈值，被 LLM 主观判断"短期透支"误给 UNDERWEIGHT）。
+⚠️ **核心约束（必读）**：评级映射这一步**完全交给 Python 工具**，你只负责：
+1. 提供正确输入（当前价 + Step 4 目标价中位 + 动态阈值）
+2. 读取工具返回的评级
+3. 写评级 COT 解释（200-300 字）
 
-#### 强制映射规则（无主观空间）
+#### 强制工具调用（必须）
 
-基于第一步算出的"当前偏离度（用综合目标价中位）"和"动态阈值（±threshold_dn / ±threshold_up）"：
+**必须**调用 `compute_step6_rating_mapping` 工具，输入：
 
-| 当前偏离度 | 评级 |
-|------------|------|
-| 偏离 < -threshold_up | **BUY**（深度低估）|
-| -threshold_up ≤ 偏离 < -threshold_dn | **OVERWEIGHT**（低估）|
-| -threshold_dn ≤ 偏离 ≤ +threshold_dn | **HOLD**（合理估值区间）|
-| +threshold_dn < 偏离 ≤ +threshold_up | **UNDERWEIGHT** |
-| 偏离 > +threshold_up | **SELL**（明显高估）|
+```
+current_price = 当前价 P_0（从 instrument_context 或 market_report 提取）
+target_price_mid = Step 4 综合目标价中位
+                  → **必须**用 Step 4 中 compute_weighted_target_price 或
+                    compute_overlap_target_price 工具输出的 mid 值
+                  → 禁止用"自己重算的调整后中位"或"Step 5 Base case 反推"
+threshold_dn_pct = 第一步算出的下沿阈值（如 27 表示 27%）
+threshold_up_pct = 第一步算出的上沿阈值（如 63 表示 63%）
+target_price_source = "compute_weighted_target_price #N 工具输出"（审计字段）
+```
 
-#### 强制示例（按动态阈值，禁止用区间上限）
+工具返回：
+- `deviation_pct`：偏离度（Python 计算，可信）
+- `rating`：BUY / OVERWEIGHT / HOLD / UNDERWEIGHT / SELL（机械映射结果）
+- `explanation`：完整计算链路
 
-✅ 正确：偏离 +11%，动态阈值 ±35%/±78%（high_beta_growth × acceleration）→ 落入 ±35% HOLD 区间 → **HOLD**
-✅ 正确：偏离 +50%，动态阈值 ±35%/±78% → 落入 +35~+78% → **UNDERWEIGHT**
-✅ 正确：偏离 +90%，动态阈值 ±35%/±78% → 超过 +78% → **SELL**
-❌ 错误：偏离 +11%，看到"当前价超出综合目标价区间上限 11%" → 主观判 UNDERWEIGHT（**绕过了动态阈值**）
+**你的工作**：直接采用工具返回的 `rating`。
 
-⛔ **绝对禁止**：用"区间上限/下限"+ 任意百分比做评级判断。**必须**用"偏离度 vs 动态阈值百分比"机械映射。
+#### ⛔ 已经堵的漏洞（禁止重犯）
+
+1. **绕道 #1**：LLM 自己在 Step 6 第二步重新调整 PEG 参数（或其他估值方法的输入参数），算出新的"调整后目标价"，反推新的偏离度。**禁止**——若你认为 Step 4 估值方法选错或参数不合理，必须**回头改 Step 4**（重新调用 compute_pe_eps_target_price 等工具），不允许在 Step 6 内部偷改。
+
+2. **绕道 #2**：用"区间上限/下限"+ 主观百分比判评级。**禁止**——评级只能由 `compute_step6_rating_mapping` 工具输出。
 
 #### 例外情形（可微调评级但必须留痕）
 
-仅以下三种情形允许"按动态阈值得出 X，但主观调整为 Y"：
-1. 业绩拐点已经确认衰退/顶部 + 数据完整度 L0/L1 + 红旗 ≥3 → 可下调 1 档（说明"业绩拐点恶化覆盖估值优势"）
+仅以下三种情形允许"按工具得出 X，但主观调整为 Y"：
+1. 业绩拐点已经确认衰退/顶部 + 数据完整度 L0/L1 + 红旗 ≥3 → 可下调 1 档
 2. 业绩拐点已经确认底部反转 + 数据完整度 L0/L1 + 红旗 ≤1 + Bull anchor 强 → 可上调 1 档
 3. consensus.crowded = yes 时按第四步对照表调整
 
-**其他任何主观调整（如"短期透支""估值消化"等）一律不允许覆盖动态阈值映射**。
+**其他任何主观调整（"短期透支" / "估值消化" / "市场情绪" 等）一律禁止**。
 
 #### 输出格式（强制）
 
-> 第一步算出动态阈值：±__/±__ ; 当前偏离度：±__% ; 按映射应给：**X** ; 是否有例外情形：是/否（如有，说明哪条+调整为 Y）
+> 工具调用：`compute_step6_rating_mapping`
+> 输入：current_price=__, target_price_mid=__（来源：__）, threshold_dn=__%, threshold_up=__%
+> 工具返回：deviation_pct=__, rating=**__**
+> 是否有例外情形：是/否（如有，说明哪条 + 调整为 Y + 留痕理由）
 
 > **最终评级 R（拥挤度调整 + 对称升降档前）**：BUY / OVERWEIGHT / HOLD / UNDERWEIGHT / SELL
 

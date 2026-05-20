@@ -367,6 +367,166 @@ def compute_conviction_calibration(abs_d: float,
     }
 
 
+@tool
+def compute_step6_rating_mapping(
+    current_price: float,
+    target_price_mid: float,
+    threshold_dn_pct: float,
+    threshold_up_pct: float,
+    target_price_source: str = "",
+) -> dict:
+    """Step 6 评级机械映射工具。
+
+    把"动态阈值 → 评级"这个机械计算从 LLM 端移到 Python 端，杜绝 LLM 通过
+    "重新调整估值参数" 私改 target_price_mid 从而规避机械映射的漏洞。
+
+    强制约束：
+    - target_price_mid **必须**等于 Step 4 中 compute_weighted_target_price 或
+      compute_overlap_target_price 工具输出的中位数。若 LLM 想换 target_price_mid，
+      必须重新调用 Step 4 工具（这会暴露在工具调用日志里）
+    - target_price_source 字段填写产生该中位数的工具调用 ID 或一句话来源（如
+      "compute_weighted_target_price 工具结果"），便于审计
+
+    评级映射规则（与 Step 6 第一步动态阈值匹配）：
+      偏离度 < -threshold_up   → BUY（深度低估）
+      [-threshold_up, -threshold_dn]  → OVERWEIGHT
+      [-threshold_dn, +threshold_dn]  → HOLD
+      (+threshold_dn, +threshold_up]  → UNDERWEIGHT
+      偏离度 > +threshold_up   → SELL（明显高估）
+
+    Args:
+        current_price: 当前价 P_0
+        target_price_mid: Step 4 综合目标价中位（必须来自 Step 4 工具输出）
+        threshold_dn_pct: 动态阈值下沿百分比（如 27 表示 27%）
+        threshold_up_pct: 动态阈值上沿百分比（如 63 表示 63%）
+        target_price_source: 目标价来源说明（审计字段）
+
+    Returns:
+        dict: {"deviation_pct", "rating", "target_price_mid",
+               "target_price_source", "explanation"}
+    """
+    if target_price_mid <= 0:
+        return {"error": f"target_price_mid 必须 > 0，当前={target_price_mid}"}
+    if threshold_dn_pct <= 0 or threshold_up_pct <= 0:
+        return {"error": "动态阈值必须 > 0"}
+    if threshold_dn_pct >= threshold_up_pct:
+        return {"error": f"threshold_dn_pct({threshold_dn_pct}) 必须小于 threshold_up_pct({threshold_up_pct})"}
+
+    deviation_pct = (current_price - target_price_mid) / target_price_mid * 100
+
+    if deviation_pct < -threshold_up_pct:
+        rating = "BUY"
+    elif deviation_pct < -threshold_dn_pct:
+        rating = "OVERWEIGHT"
+    elif deviation_pct <= threshold_dn_pct:
+        rating = "HOLD"
+    elif deviation_pct <= threshold_up_pct:
+        rating = "UNDERWEIGHT"
+    else:
+        rating = "SELL"
+
+    explanation = (
+        f"偏离度 = (当前价 {current_price} - 目标价中位 {target_price_mid}) / {target_price_mid} = "
+        f"{deviation_pct:+.2f}% | 动态阈值 ±{threshold_dn_pct}%/±{threshold_up_pct}% | "
+        f"机械映射 → {rating}"
+    )
+
+    return {
+        "deviation_pct": round(deviation_pct, 2),
+        "rating": rating,
+        "target_price_mid": target_price_mid,
+        "target_price_source": target_price_source or "（未填写来源，需补充）",
+        "explanation": explanation,
+    }
+
+
+@tool
+def compute_scenario_consistency_check(
+    step4_target_low: float,
+    step4_target_high: float,
+    bull_target: float,
+    base_target: float,
+    bear_target: float,
+) -> dict:
+    """Step 5 三情景 vs Step 4 综合目标价区间 一致性检查。
+
+    Step 4 综合目标价区间是"加权折中估值"，Base case 应在此区间内
+    （Base 代表"维持估值方法的中性路径"）。Bull/Bear case 可以超出区间，
+    但偏离过大需要充分论证。
+
+    本工具检查：
+    - Base 是否在 Step 4 区间内（强约束）
+    - Bull 是否超过 Step 4 上限 +50%（提示警告）
+    - Bear 是否低于 Step 4 下限 -40%（提示警告）
+
+    LLM 必须显式查看返回的 warnings，并在 Step 5 末尾对每条 warning 给出回应。
+
+    Args:
+        step4_target_low: Step 4 综合目标价区间下沿
+        step4_target_high: Step 4 综合目标价区间上沿
+        bull_target: Bull case 目标价
+        base_target: Base case 目标价
+        bear_target: Bear case 目标价
+
+    Returns:
+        dict: {"ok": bool, "warnings": [...], "details": {...}}
+    """
+    if step4_target_low >= step4_target_high:
+        return {"error": f"step4_target_low({step4_target_low}) 必须 < step4_target_high({step4_target_high})"}
+
+    warnings: list[str] = []
+    details: dict = {
+        "step4_range": [step4_target_low, step4_target_high],
+        "step4_mid": (step4_target_low + step4_target_high) / 2,
+    }
+
+    # Base case 必须 within Step 4 范围（强约束）
+    if base_target < step4_target_low:
+        warnings.append(
+            f"❌ Base case {base_target} 低于 Step 4 区间下沿 {step4_target_low}——"
+            f"Base 应反映'维持估值方法的中性路径'，必须在 [{step4_target_low}, {step4_target_high}] 内。"
+            "请回头修正 Base case 或修改 Step 4 估值方法。"
+        )
+    elif base_target > step4_target_high:
+        warnings.append(
+            f"❌ Base case {base_target} 高于 Step 4 区间上沿 {step4_target_high}——"
+            f"Base 应反映'维持估值方法的中性路径'，必须在 [{step4_target_low}, {step4_target_high}] 内。"
+            "请回头修正 Base case 或修改 Step 4 估值方法。"
+        )
+
+    # Bull case 上限保护（弱约束）
+    bull_threshold = step4_target_high * 1.5
+    if bull_target > bull_threshold:
+        warnings.append(
+            f"⚠ Bull case {bull_target} 超出 Step 4 上限 {step4_target_high} 的 50%"
+            f"（阈值 {bull_threshold:.1f}）——必须在 Step 5 末尾给出充分理由："
+            "Step 1 行业景气度是否支持估值整体上移？哪个具体催化兑现？"
+        )
+
+    # Bear case 下限保护（弱约束）
+    bear_threshold = step4_target_low * 0.6
+    if bear_target < bear_threshold:
+        warnings.append(
+            f"⚠ Bear case {bear_target} 低于 Step 4 下沿 {step4_target_low} 的 40%"
+            f"（阈值 {bear_threshold:.1f}）——必须在 Step 5 末尾给出充分理由："
+            "哪个 anchor 失效会触发深度估值压缩？时间窗口？"
+        )
+
+    details.update({
+        "bull_target": bull_target,
+        "base_target": base_target,
+        "bear_target": bear_target,
+        "bull_threshold_upper": bull_threshold,
+        "bear_threshold_lower": bear_threshold,
+    })
+
+    return {
+        "ok": len(warnings) == 0,
+        "warnings": warnings,
+        "details": details,
+    }
+
+
 # ============================================================================
 # 工具集合（供 research_manager.py 一次性绑定）
 # ============================================================================
@@ -381,6 +541,8 @@ RM_TOOLS = [
     compute_scenario_weighted_e,
     compute_odds_and_expected_return,
     compute_conviction_calibration,
+    compute_step6_rating_mapping,
+    compute_scenario_consistency_check,
 ]
 
 
