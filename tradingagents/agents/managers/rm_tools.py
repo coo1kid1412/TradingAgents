@@ -527,6 +527,192 @@ def compute_scenario_consistency_check(
     }
 
 
+_RATINGS_ORDER = ["SELL", "UNDERWEIGHT", "HOLD", "OVERWEIGHT", "BUY"]
+
+
+def _shift_rating(rating: str, delta: int, no_cross_hold: bool = True) -> tuple[str, str]:
+    """按 delta（+1 上调 / -1 下调）调整评级，返回 (new_rating, cap_reason)。
+
+    no_cross_hold=True 时禁止单次跨过 HOLD：
+      UNDERWEIGHT → 最多上调到 HOLD（不能直接到 OVERWEIGHT）
+      HOLD → 上调到 OVERWEIGHT 允许
+      OVERWEIGHT → 上调到 BUY 允许
+      反之亦然
+    """
+    if rating not in _RATINGS_ORDER:
+        return rating, f"unknown rating: {rating}"
+    idx = _RATINGS_ORDER.index(rating)
+    new_idx = max(0, min(len(_RATINGS_ORDER) - 1, idx + delta))
+
+    if no_cross_hold:
+        hold_idx = _RATINGS_ORDER.index("HOLD")
+        # 上调：从 SELL/UNDERWEIGHT 上调最多到 HOLD
+        if delta > 0 and idx < hold_idx and new_idx > hold_idx:
+            new_idx = hold_idx
+        # 下调：从 BUY/OVERWEIGHT 下调最多到 HOLD
+        if delta < 0 and idx > hold_idx and new_idx < hold_idx:
+            new_idx = hold_idx
+
+    if new_idx == idx:
+        return rating, "已到边界，无调整空间"
+    return _RATINGS_ORDER[new_idx], ""
+
+
+# Style-conditional 调整规则表
+# 设计哲学：不同 style 对量化趋势信号的敏感度不同
+#   blue_chip   永不调整（估值绝对主导）
+#   cyclical    极端时才调（周期股估值锚定强）
+#   high_beta_growth  中度敏感（成长股看趋势）
+#   theme_speculation 最敏感（题材股情绪/动量主导）
+#   illiquid    谨慎调整
+#   etf         看动量（技术面主导）
+_STYLE_RULES = {
+    "blue_chip": {
+        "upgrade": lambda c, m: False,
+        "downgrade": lambda c, m: False,
+        "rationale": "blue_chip 估值绝对主导，趋势信号不参与评级调整",
+    },
+    "cyclical": {
+        "upgrade": lambda c, m: c is not None and m is not None and c >= 80 and m >= 80,
+        "downgrade": lambda c, m: c is not None and m is not None and c <= 20 and m <= 30,
+        "rationale": "周期股估值锚定强，仅在量化分极端（≥80 或 ≤20）时调整",
+    },
+    "high_beta_growth": {
+        "upgrade": lambda c, m: c is not None and m is not None and c >= 65 and m >= 75,
+        "downgrade": lambda c, m: c is not None and m is not None and c <= 35 and m <= 30,
+        "rationale": "成长股趋势信号有显著话语权，composite≥65 + momentum≥75 上调",
+    },
+    "theme_speculation": {
+        "upgrade": lambda c, m: c is not None and m is not None and c >= 55 and m >= 70,
+        "downgrade": lambda c, m: c is not None and m is not None and c <= 45 and m <= 40,
+        "rationale": "题材股情绪+动量主导，触发阈值最敏感（防止纯估值锁死趋势机会）",
+    },
+    "illiquid": {
+        "upgrade": lambda c, m: c is not None and m is not None and c >= 70 and m >= 70,
+        "downgrade": lambda c, m: c is not None and m is not None and c <= 30 and m <= 30,
+        "rationale": "流动性差谨慎调整，避免被短期信号误导",
+    },
+    "etf": {
+        "upgrade": lambda c, m: m is not None and m >= 70,
+        "downgrade": lambda c, m: m is not None and m <= 30,
+        "rationale": "ETF 技术面主导，仅看 momentum（composite 对 ETF 意义有限）",
+    },
+}
+
+
+@tool
+def compute_step6_style_adjustment(
+    rating_after_mechanical: str,
+    style: str,
+    composite_score: float | None = None,
+    momentum_score: float | None = None,
+) -> dict:
+    """Step 6 Style-Conditional 趋势叠加调整。
+
+    在机械映射（compute_step6_rating_mapping）+ 拥挤度调整 + 对称升降档之后，
+    根据 stock_profile.style 用量化趋势信号（composite + momentum）做最后 ±1 档调整。
+
+    设计动机：纯估值主导评级在题材股 / 高 beta 成长股加速期容易"过早 SELL"，
+    错过趋势机会。头部投研团队对不同股性用不同框架——blue_chip 估值主导，
+    theme_speculation 情绪/动量主导。本工具按 style 差异化用规则化方式注入这种判断，
+    避免 LLM 主观介入。
+
+    规则表（同时满足 upgrade / downgrade 条件才触发）：
+      blue_chip:         永不调整
+      cyclical:          composite≥80 + momentum≥80 → +1；c≤20 + m≤30 → -1
+      high_beta_growth:  composite≥65 + momentum≥75 → +1；c≤35 + m≤30 → -1
+      theme_speculation: composite≥55 + momentum≥70 → +1；c≤45 + m≤40 → -1
+      illiquid:          composite≥70 + momentum≥70 → +1；c≤30 + m≤30 → -1
+      etf:               momentum≥70 → +1；momentum≤30 → -1（不看 composite）
+
+    保护规则：
+      - 单次调整 ≤ ±1 档
+      - **禁止跨 HOLD 单次调整**——UNDERWEIGHT 上调最多到 HOLD，不允许直接到 OVERWEIGHT；反之亦然
+      - 缺数据（style/composite/momentum 任一缺失）→ 不调整，返回 skipped
+
+    Args:
+        rating_after_mechanical: 第五步对称升降档后的评级（BUY/OVERWEIGHT/HOLD/UNDERWEIGHT/SELL）
+        style: stock_profile.style
+        composite_score: QUANT_SCORE.composite（0-100）
+        momentum_score: QUANT_SCORE.factor_scores.momentum（0-100）
+
+    Returns:
+        dict: {
+            "adjustment": -1 / 0 / +1,
+            "new_rating": 调整后评级,
+            "rule_applied": upgrade / downgrade / no_change / skipped,
+            "trigger": 触发条件描述,
+            "rationale": style-specific 设计理由,
+            "skip_reason": 仅当 skipped 时有值,
+        }
+    """
+    if rating_after_mechanical not in _RATINGS_ORDER:
+        return {
+            "adjustment": 0,
+            "new_rating": rating_after_mechanical,
+            "rule_applied": "error",
+            "skip_reason": f"未知评级：{rating_after_mechanical}",
+        }
+
+    if not style:
+        return {
+            "adjustment": 0,
+            "new_rating": rating_after_mechanical,
+            "rule_applied": "skipped",
+            "skip_reason": "style 缺失，不做调整",
+        }
+
+    rule = _STYLE_RULES.get(style)
+    if rule is None:
+        return {
+            "adjustment": 0,
+            "new_rating": rating_after_mechanical,
+            "rule_applied": "skipped",
+            "skip_reason": f"未知 style：{style}（合法值：blue_chip/cyclical/high_beta_growth/theme_speculation/illiquid/etf）",
+        }
+
+    if rule["upgrade"](composite_score, momentum_score):
+        new_rating, cap_reason = _shift_rating(rating_after_mechanical, +1, no_cross_hold=True)
+        result_type = "upgrade_capped" if cap_reason else "upgrade"
+        return {
+            "adjustment": 1 if new_rating != rating_after_mechanical else 0,
+            "new_rating": new_rating,
+            "rule_applied": result_type,
+            "trigger": (
+                f"style={style}: composite={composite_score} + momentum={momentum_score} "
+                f"满足 upgrade 条件"
+            ),
+            "rationale": rule["rationale"],
+            "cap_reason": cap_reason or None,
+        }
+
+    if rule["downgrade"](composite_score, momentum_score):
+        new_rating, cap_reason = _shift_rating(rating_after_mechanical, -1, no_cross_hold=True)
+        result_type = "downgrade_capped" if cap_reason else "downgrade"
+        return {
+            "adjustment": -1 if new_rating != rating_after_mechanical else 0,
+            "new_rating": new_rating,
+            "rule_applied": result_type,
+            "trigger": (
+                f"style={style}: composite={composite_score} + momentum={momentum_score} "
+                f"满足 downgrade 条件"
+            ),
+            "rationale": rule["rationale"],
+            "cap_reason": cap_reason or None,
+        }
+
+    return {
+        "adjustment": 0,
+        "new_rating": rating_after_mechanical,
+        "rule_applied": "no_change",
+        "trigger": (
+            f"style={style}: composite={composite_score} + momentum={momentum_score} "
+            f"未触发任何调整条件"
+        ),
+        "rationale": rule["rationale"],
+    }
+
+
 # ============================================================================
 # 工具集合（供 research_manager.py 一次性绑定）
 # ============================================================================
@@ -543,6 +729,7 @@ RM_TOOLS = [
     compute_conviction_calibration,
     compute_step6_rating_mapping,
     compute_scenario_consistency_check,
+    compute_step6_style_adjustment,
 ]
 
 
