@@ -948,6 +948,44 @@ Hard Data 修正：yes 不变；no × 0.5
 - 你的评级是 8 步 COT 综合判断的产出，**不是 d 阈值的公式输出**
 - 多空辩论评分只影响 Conviction，不影响评级方向
 - 你只出 thesis，不出执行细节（建仓价/止损/仓位由 PM 决定）
+
+---
+
+## ⚠️ 报告末尾强制输出 RM_SUMMARY YAML（用于 harness 自动归档）
+
+报告**完成后**，必须在最末尾输出一段 YAML 摘要，**字段名严格按以下格式**，否则归档失败。
+所有数值直接采用 8 步 COT 工具调用得到的结果，不要再调整。
+
+```yaml
+RM_SUMMARY:
+  ticker: "{ticker_value}"               # 6 位数字股票代码字符串
+  trade_date: "YYYY-MM-DD"
+  current_price: <float>                 # 当前价 P_0（与 Step 6 使用的一致）
+  rm_rating: BUY / OVERWEIGHT / HOLD / UNDERWEIGHT / SELL
+  rm_conviction: 高 / 中 / 低
+  target_price_low: <float>              # Step 4 综合目标价区间下沿
+  target_price_mid: <float>              # Step 4 工具返回的中位数
+  target_price_high: <float>             # Step 4 综合目标价区间上沿
+  bull_target: <float>                   # Step 5 三情景
+  bull_prob: <float>                     # 0-1 之间（如 0.25）
+  base_target: <float>
+  base_prob: <float>
+  bear_target: <float>
+  bear_prob: <float>
+  base_case_expected_return_pct: <float> # Base case 隐含收益百分比
+  style: <stock_profile.style>           # 已确定字段
+  theme_stage: peak / acceleration / initiation / fading / none
+  composite_score: <float>               # QUANT_SCORE.composite
+  momentum_score: <float>                # QUANT_SCORE.factor_scores.momentum
+  deviation_pct: <float>                 # Step 6 第二步偏离度
+  threshold_dn_pct: <float>              # Step 6 第一步动态阈值下沿
+  threshold_up_pct: <float>              # Step 6 第一步动态阈值上沿
+```
+
+**约束**：
+- 缺数据填 `null`（如某只股 momentum_score 缺失）
+- 不要嵌套、不要加注释行；本节是供 Python 解析的固定格式
+- 该 YAML 必须是报告最后一段，前后用 `---` 分隔，方便提取器定位
 """
         # 绑定 RM 计算工具，让 LLM 在 Step 4 / 辅助分析等数值步骤显式调用工具
         # 替代之前 LLM 心算导致的 Bull Score / 目标价区间 等计算 bug

@@ -554,6 +554,42 @@ PM 必须明确推荐其中之一，并解释理由。
 
 **重要**：请用中文撰写。评级关键词、股票代码、交易术语（Action/Size/R/TP/SL/Time Stop）保留英文但带中文注释。
 
+---
+
+## ⚠️ 报告末尾强制输出 PM_SUMMARY YAML（用于 harness 自动归档）
+
+报告**完成后**，必须在最末尾输出一段 YAML 摘要，**字段名严格按以下格式**，否则归档失败。
+所有数值直接采用 Trade Ticket 中已经定下的值，不要再调整。
+
+```yaml
+PM_SUMMARY:
+  ticker: "{pm_ticker}"
+  trade_date: "{pm_trade_date}"
+  current_price: <float>                 # 当前价 P_0
+  pm_rating: BUY / OVERWEIGHT / HOLD / UNDERWEIGHT / SELL
+  pm_conviction_stars: <int 1-5>
+  pm_invest_judgment: YES / NO / CONDITIONAL
+  pm_entry_judgment: BUY_NOW / WAIT / DONT_BUY
+  pm_action_keyword: BUY_NOW / WAIT / REDUCE / EXIT  # Trade Ticket Action 字段的关键词部分
+  pm_size_low_pct: <float>               # 仓位区间下沿百分比（如 2.0 表示 2%）
+  pm_size_high_pct: <float>              # 仓位区间上沿百分比
+  pm_entry_low: <float or null>          # BUY/OVERWEIGHT 时必填；HOLD/UNDERWEIGHT/SELL 填 null
+  pm_entry_high: <float or null>
+  pm_tp1: <float or null>                # 持仓者止盈位 1（针对所有评级都计算 R-multiple）
+  pm_tp2: <float or null>
+  pm_tp3: <float or null>
+  pm_sl_soft: <float or null>
+  pm_sl_hard: <float or null>
+  pm_horizon_months_low: <int>           # Time Stop 时间窗口下沿（月）
+  pm_horizon_months_high: <int>          # Time Stop 时间窗口上沿
+  pm_rating_adjusted_from_rm: <bool>     # PM 是否相对 RM 评级做了 ±1 档微调
+```
+
+**约束**：
+- 缺数据填 `null`，禁止编造
+- 不要嵌套、不要加注释行；本节是供 Python 解析的固定格式
+- 该 YAML 必须是报告最后一段，前后用 `---` 分隔，方便提取器定位
+
 Be decisive and ground every conclusion in specific evidence from the analysts.{get_language_instruction()}"""
 
         # 绑定 PM 计算工具，让 LLM 调工具算 R-multiple / Conviction / 4 情景 E
