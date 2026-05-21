@@ -66,7 +66,7 @@ os.environ["NO_PROXY"] = f"{_existing},{_DOMESTIC_NO_PROXY}" if _existing else _
 # 要分析的股票代码（单只）
 # 多股票并发已彻底移除——LLM API 偶发假死 + multiprocessing.join 会形成死锁链
 # 如需分析多只，请顺序多次运行本脚本
-_TICKER = "603986"
+_TICKER = "603629"
 
 # 分析日期（默认今天）
 _ANALYSIS_DATE = datetime.datetime.now().strftime("%Y-%m-%d")
@@ -243,6 +243,40 @@ def _save_report(state, ticker: str, save_path: Path):
 
 
 # ---------------------------------------------------------------------------
+#  Harness 自动化 hook（报告生成后自动归档 + 拉真值，失败不阻塞主流程）
+# ---------------------------------------------------------------------------
+def _run_harness_post_hook(ticker: str, report_path: Path) -> None:
+    """报告生成后立即：
+    1. 归档本次报告到 SQLite DB（解析 RUN_SUMMARY YAML）
+    2. 顺手扫描所有 pending outcomes，能拉到 T/T+1/T+5/T+30 真值的就拉
+
+    所有错误吞掉，不阻塞主流程。
+    """
+    print(f"[{ticker}] ↻ Harness 归档 + 真值采集...", flush=True)
+    try:
+        from tradingagents.harness import archive as _arch
+        from tradingagents.harness import truth_fetcher as _truth
+
+        run_id = _arch.archive_run(report_path)
+        if run_id is not None:
+            print(f"[{ticker}] ✓ 已归档为 run_id={run_id}", flush=True)
+        else:
+            print(f"[{ticker}] ⚠ 归档跳过（可能已存在或目录名不规范）", flush=True)
+
+        # 真值采集——扫描所有 pending（不只本 run），顺手把过期到日的都更新一次
+        summary = _truth.fetch_all_pending()
+        fetched = summary.get("fetched", 0)
+        not_due = summary.get("not_due", 0)
+        failed = summary.get("failed", 0)
+        print(
+            f"[{ticker}] ✓ 真值采集: fetched={fetched} / not_due={not_due} / failed={failed}",
+            flush=True,
+        )
+    except Exception as e:
+        print(f"[{ticker}] ⚠ Harness 自动化失败（不影响主流程）: {e}", flush=True)
+
+
+# ---------------------------------------------------------------------------
 #  单支股票分析函数（在独立进程中执行）
 # ---------------------------------------------------------------------------
 def analyze_single_stock(ticker: str, analysis_date: str, config: dict) -> Tuple[str, bool, str]:
@@ -309,6 +343,9 @@ def analyze_single_stock(ticker: str, analysis_date: str, config: dict) -> Tuple
                 profiling.print_summary(label=ticker)
             except Exception as _e:
                 print(f"[{ticker}] 性能摘要生成失败: {_e}", flush=True)
+
+            # Harness 自动化：归档本次报告 + 顺手更新所有 pending 真值（失败不阻塞主流程）
+            _run_harness_post_hook(ticker, report_path)
 
             return (ticker, True, str(report_path))
 
