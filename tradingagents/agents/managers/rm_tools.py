@@ -573,28 +573,28 @@ _STYLE_RULES = {
         "rationale": "blue_chip 估值绝对主导，趋势信号不参与评级调整",
     },
     "cyclical": {
-        "upgrade": lambda c, m: c is not None and m is not None and c >= 80 and m >= 80,
-        "downgrade": lambda c, m: c is not None and m is not None and c <= 20 and m <= 30,
-        "rationale": "周期股估值锚定强，仅在量化分极端（≥80 或 ≤20）时调整",
+        "upgrade": lambda c, m: c is not None and m is not None and c >= 75 and m >= 75,
+        "downgrade": lambda c, m: c is not None and m is not None and c <= 25 and m <= 30,
+        "rationale": "周期股估值锚定较强，composite≥75 + momentum≥75 才调整",
     },
     "high_beta_growth": {
-        "upgrade": lambda c, m: c is not None and m is not None and c >= 65 and m >= 75,
-        "downgrade": lambda c, m: c is not None and m is not None and c <= 35 and m <= 30,
-        "rationale": "成长股趋势信号有显著话语权，composite≥65 + momentum≥75 上调",
+        "upgrade": lambda c, m: c is not None and m is not None and c >= 60 and m >= 70,
+        "downgrade": lambda c, m: c is not None and m is not None and c <= 40 and m <= 35,
+        "rationale": "成长股趋势信号有显著话语权，composite≥60 + momentum≥70 上调",
     },
     "theme_speculation": {
-        "upgrade": lambda c, m: c is not None and m is not None and c >= 55 and m >= 70,
-        "downgrade": lambda c, m: c is not None and m is not None and c <= 45 and m <= 40,
+        "upgrade": lambda c, m: c is not None and m is not None and c >= 50 and m >= 65,
+        "downgrade": lambda c, m: c is not None and m is not None and c <= 50 and m <= 45,
         "rationale": "题材股情绪+动量主导，触发阈值最敏感（防止纯估值锁死趋势机会）",
     },
     "illiquid": {
-        "upgrade": lambda c, m: c is not None and m is not None and c >= 70 and m >= 70,
-        "downgrade": lambda c, m: c is not None and m is not None and c <= 30 and m <= 30,
+        "upgrade": lambda c, m: c is not None and m is not None and c >= 65 and m >= 65,
+        "downgrade": lambda c, m: c is not None and m is not None and c <= 35 and m <= 35,
         "rationale": "流动性差谨慎调整，避免被短期信号误导",
     },
     "etf": {
-        "upgrade": lambda c, m: m is not None and m >= 70,
-        "downgrade": lambda c, m: m is not None and m <= 30,
+        "upgrade": lambda c, m: m is not None and m >= 65,
+        "downgrade": lambda c, m: m is not None and m <= 35,
         "rationale": "ETF 技术面主导，仅看 momentum（composite 对 ETF 意义有限）",
     },
 }
@@ -617,13 +617,13 @@ def compute_step6_style_adjustment(
     theme_speculation 情绪/动量主导。本工具按 style 差异化用规则化方式注入这种判断，
     避免 LLM 主观介入。
 
-    规则表（同时满足 upgrade / downgrade 条件才触发）：
+    规则表（同时满足 upgrade / downgrade 条件才触发，已按改造 A 降低阈值）：
       blue_chip:         永不调整
-      cyclical:          composite≥80 + momentum≥80 → +1；c≤20 + m≤30 → -1
-      high_beta_growth:  composite≥65 + momentum≥75 → +1；c≤35 + m≤30 → -1
-      theme_speculation: composite≥55 + momentum≥70 → +1；c≤45 + m≤40 → -1
-      illiquid:          composite≥70 + momentum≥70 → +1；c≤30 + m≤30 → -1
-      etf:               momentum≥70 → +1；momentum≤30 → -1（不看 composite）
+      cyclical:          composite≥75 + momentum≥75 → +1；c≤25 + m≤30 → -1
+      high_beta_growth:  composite≥60 + momentum≥70 → +1；c≤40 + m≤35 → -1
+      theme_speculation: composite≥50 + momentum≥65 → +1；c≤50 + m≤45 → -1
+      illiquid:          composite≥65 + momentum≥65 → +1；c≤35 + m≤35 → -1
+      etf:               momentum≥65 → +1；momentum≤35 → -1（不看 composite）
 
     保护规则：
       - 单次调整 ≤ ±1 档
@@ -713,6 +713,351 @@ def compute_step6_style_adjustment(
     }
 
 
+@tool
+def compute_step6_report_weighted_vote_adjustment(
+    rating_after_style_adj: str,
+    market_weight: float,
+    news_weight: float,
+    sentiment_weight: float,
+    market_direction_vote: float = 0.0,
+    news_direction_vote: float = 0.0,
+    sentiment_direction_vote: float = 0.0,
+) -> dict:
+    """非估值方向票加权调整（改造 B）。
+
+    把 stock_profile.REPORT_WEIGHTS 真正接入评级——市场/新闻/情绪 三个非估值维度
+    的方向投票（LLM 给定 -1~+1）按权重加权，超过阈值则触发 ±1 档调整。
+
+    设计动机：之前 REPORT_WEIGHTS 只影响 Bull/Bear 写论据来源，不影响评级生成。
+    现在题材股情绪权重 30%，能在情绪强烈看多时真正把评级抬一档。
+
+    Args:
+        rating_after_style_adj: Step 6 第六步 style 调整后的评级
+        market_weight: stock_profile.REPORT_WEIGHTS.market（0-100 整数）
+        news_weight: stock_profile.REPORT_WEIGHTS.news（0-100 整数）
+        sentiment_weight: stock_profile.REPORT_WEIGHTS.sentiment（0-100 整数）
+        market_direction_vote: LLM 读 market 报告后给的方向票（-1 全看空 ~ +1 全看多）
+        news_direction_vote: 读 news 报告后给的方向票
+        sentiment_direction_vote: 读 sentiment 报告后给的方向票
+
+    Returns:
+        dict: {
+            "adjustment": -1 / 0 / +1,
+            "new_rating": str,
+            "weighted_vote": float (-1 ~ +1),
+            "trigger_threshold": 0.3,
+            "rule_applied": upgrade / downgrade / no_change,
+        }
+    """
+    if rating_after_style_adj not in _RATINGS_ORDER:
+        return {"error": f"未知评级: {rating_after_style_adj}"}
+
+    total_weight = market_weight + news_weight + sentiment_weight
+    if total_weight <= 0:
+        return {
+            "adjustment": 0,
+            "new_rating": rating_after_style_adj,
+            "rule_applied": "skipped",
+            "skip_reason": f"非估值权重总和={total_weight} 无效",
+        }
+
+    # 每个 vote clamp 到 [-1, +1]
+    mv = max(-1.0, min(1.0, market_direction_vote))
+    nv = max(-1.0, min(1.0, news_direction_vote))
+    sv = max(-1.0, min(1.0, sentiment_direction_vote))
+
+    weighted_vote = (market_weight * mv + news_weight * nv + sentiment_weight * sv) / total_weight
+    weighted_vote = round(weighted_vote, 3)
+
+    THRESHOLD = 0.3
+
+    if weighted_vote >= THRESHOLD:
+        new_rating, cap_reason = _shift_rating(rating_after_style_adj, +1, no_cross_hold=True)
+        return {
+            "adjustment": 1 if new_rating != rating_after_style_adj else 0,
+            "new_rating": new_rating,
+            "weighted_vote": weighted_vote,
+            "trigger_threshold": THRESHOLD,
+            "rule_applied": "upgrade" if new_rating != rating_after_style_adj else "upgrade_capped",
+            "explanation": (
+                f"加权方向票 {weighted_vote:+.3f} ≥ +{THRESHOLD} 触发上调 → "
+                f"{rating_after_style_adj} → {new_rating}"
+                + (f"（{cap_reason}）" if cap_reason else "")
+            ),
+            "votes": {"market": mv, "news": nv, "sentiment": sv},
+            "weights": {"market": market_weight, "news": news_weight, "sentiment": sentiment_weight},
+        }
+
+    if weighted_vote <= -THRESHOLD:
+        new_rating, cap_reason = _shift_rating(rating_after_style_adj, -1, no_cross_hold=True)
+        return {
+            "adjustment": -1 if new_rating != rating_after_style_adj else 0,
+            "new_rating": new_rating,
+            "weighted_vote": weighted_vote,
+            "trigger_threshold": THRESHOLD,
+            "rule_applied": "downgrade" if new_rating != rating_after_style_adj else "downgrade_capped",
+            "explanation": (
+                f"加权方向票 {weighted_vote:+.3f} ≤ -{THRESHOLD} 触发下调 → "
+                f"{rating_after_style_adj} → {new_rating}"
+                + (f"（{cap_reason}）" if cap_reason else "")
+            ),
+            "votes": {"market": mv, "news": nv, "sentiment": sv},
+            "weights": {"market": market_weight, "news": news_weight, "sentiment": sentiment_weight},
+        }
+
+    return {
+        "adjustment": 0,
+        "new_rating": rating_after_style_adj,
+        "weighted_vote": weighted_vote,
+        "trigger_threshold": THRESHOLD,
+        "rule_applied": "no_change",
+        "explanation": (
+            f"加权方向票 {weighted_vote:+.3f} 落在 [-{THRESHOLD}, +{THRESHOLD}] 区间，"
+            "非估值信号方向不够强，不触发调整"
+        ),
+        "votes": {"market": mv, "news": nv, "sentiment": sv},
+        "weights": {"market": market_weight, "news": news_weight, "sentiment": sentiment_weight},
+    }
+
+
+@tool
+def compute_step6_catalyst_momentum_adjustment(
+    rating_after_vote_adj: str,
+    sell_side_target_change_pct: float | None = None,
+    institutional_holding_change_pct: float | None = None,
+    northbound_flow_5d_direction: int | None = None,
+    kol_bullish_ratio_trend_pct: float | None = None,
+) -> dict:
+    """催化动量硬数据调整（改造 C）。
+
+    把 4 个"硬催化信号"打分聚合为 0-100 分，并根据分数给出 ±1 档调整建议。
+    这是 Citadel/Tiger 类机构常用的"催化动量"层级，专门捕捉短期机构动量。
+
+    输入 4 个信号（任一可为 None，缺失则跳过该项；至少需 2 项有效才计分）：
+      1. sell_side_target_change_pct: 近 30 日卖方目标价中位变化百分比
+                                       （如高盛上调 5%, 中信上调 10% → 取中位 7.5）
+      2. institutional_holding_change_pct: 近 1 季机构持仓变化百分比
+                                            （增仓 +5% / 减仓 -10%）
+      3. northbound_flow_5d_direction: 北向资金近 5 日方向（-1 流出 / 0 中性 / +1 流入）
+      4. kol_bullish_ratio_trend_pct: KOL 多头率相对 30 日均的变化（百分点）
+
+    打分细则（各信号独立打分后求和，再 offset 到 0-100）：
+      sell_side: >+15% → +30 / +5~+15% → +15 / -5~+5% → 0 / -15~-5% → -15 / <-15% → -30
+      inst:      >+10% → +20 / 0~+10% → +10 / -10~0% → -10 / <-10% → -20
+      north:     +1 → +15 / 0 → 0 / -1 → -15
+      kol:       >+10pp → +15 / -10~+10pp → 0 / <-10pp → -15
+
+      composite_offset_50 = 50 + sum(scores) → clamp [0, 100]
+
+    调整规则：
+      composite ≥ 70 → +1（催化动量强）
+      composite ≤ 30 → -1（催化动量弱）
+      其他 → 0
+
+    Returns:
+        dict: 含 composite / breakdown / adjustment / new_rating / coverage 等
+    """
+    if rating_after_vote_adj not in _RATINGS_ORDER:
+        return {"error": f"未知评级: {rating_after_vote_adj}"}
+
+    breakdown: dict = {}
+    available_count = 0
+    score_sum = 0
+
+    # 1. sell-side
+    if sell_side_target_change_pct is not None:
+        v = sell_side_target_change_pct
+        if v > 15:
+            s = 30
+        elif v >= 5:
+            s = 15
+        elif v >= -5:
+            s = 0
+        elif v >= -15:
+            s = -15
+        else:
+            s = -30
+        breakdown["sell_side"] = {"value_pct": v, "subscore": s}
+        score_sum += s
+        available_count += 1
+
+    # 2. institutional holding
+    if institutional_holding_change_pct is not None:
+        v = institutional_holding_change_pct
+        if v > 10:
+            s = 20
+        elif v >= 0:
+            s = 10
+        elif v >= -10:
+            s = -10
+        else:
+            s = -20
+        breakdown["institutional"] = {"value_pct": v, "subscore": s}
+        score_sum += s
+        available_count += 1
+
+    # 3. northbound flow
+    if northbound_flow_5d_direction is not None:
+        d = int(northbound_flow_5d_direction)
+        if d > 0:
+            s = 15
+        elif d == 0:
+            s = 0
+        else:
+            s = -15
+        breakdown["northbound"] = {"direction": d, "subscore": s}
+        score_sum += s
+        available_count += 1
+
+    # 4. KOL trend
+    if kol_bullish_ratio_trend_pct is not None:
+        v = kol_bullish_ratio_trend_pct
+        if v > 10:
+            s = 15
+        elif v >= -10:
+            s = 0
+        else:
+            s = -15
+        breakdown["kol"] = {"value_pct": v, "subscore": s}
+        score_sum += s
+        available_count += 1
+
+    # 至少需要 2 项有效
+    if available_count < 2:
+        return {
+            "adjustment": 0,
+            "new_rating": rating_after_vote_adj,
+            "composite": None,
+            "breakdown": breakdown,
+            "available_count": available_count,
+            "rule_applied": "skipped",
+            "skip_reason": f"催化动量数据覆盖不足（{available_count}/4），需 ≥2 项才计分",
+        }
+
+    composite = max(0, min(100, 50 + score_sum))
+
+    if composite >= 70:
+        new_rating, cap_reason = _shift_rating(rating_after_vote_adj, +1, no_cross_hold=True)
+        return {
+            "adjustment": 1 if new_rating != rating_after_vote_adj else 0,
+            "new_rating": new_rating,
+            "composite": composite,
+            "breakdown": breakdown,
+            "available_count": available_count,
+            "rule_applied": "upgrade" if new_rating != rating_after_vote_adj else "upgrade_capped",
+            "explanation": (
+                f"催化动量 composite={composite} ≥ 70 → 触发 +1 档 → "
+                f"{rating_after_vote_adj} → {new_rating}"
+                + (f"（{cap_reason}）" if cap_reason else "")
+            ),
+        }
+
+    if composite <= 30:
+        new_rating, cap_reason = _shift_rating(rating_after_vote_adj, -1, no_cross_hold=True)
+        return {
+            "adjustment": -1 if new_rating != rating_after_vote_adj else 0,
+            "new_rating": new_rating,
+            "composite": composite,
+            "breakdown": breakdown,
+            "available_count": available_count,
+            "rule_applied": "downgrade" if new_rating != rating_after_vote_adj else "downgrade_capped",
+            "explanation": (
+                f"催化动量 composite={composite} ≤ 30 → 触发 -1 档 → "
+                f"{rating_after_vote_adj} → {new_rating}"
+                + (f"（{cap_reason}）" if cap_reason else "")
+            ),
+        }
+
+    return {
+        "adjustment": 0,
+        "new_rating": rating_after_vote_adj,
+        "composite": composite,
+        "breakdown": breakdown,
+        "available_count": available_count,
+        "rule_applied": "no_change",
+        "explanation": f"催化动量 composite={composite} 落在 (30, 70) 中性区间，不触发调整",
+    }
+
+
+@tool
+def compute_step6_adjustment_synthesis(
+    rating_after_symmetric: str,
+    style_adjustment: int,
+    vote_adjustment: int,
+    catalyst_adjustment: int,
+) -> dict:
+    """三类 ±1 信号最终合成（合成工具）。
+
+    Step 6 三个"趋势叠加"子步骤（style / vote / catalyst）各自给出 -1/0/+1
+    建议，本工具合成为**最终单一调整**——总幅度 capped 至 ±1，应用 no-cross-HOLD。
+
+    合成规则：
+      raw_sum = style_adj + vote_adj + catalyst_adj   # range: -3 ~ +3
+      if raw_sum > 0:  final_adjustment = +1
+      if raw_sum < 0:  final_adjustment = -1
+      if raw_sum == 0: final_adjustment = 0
+
+    设计动机：
+    - 三类信号独立建议，避免单一信号过度主导
+    - 累加方向后取符号，避免 +2/-1=+1 这种小偏差被放大
+    - 总幅度 ±1 保护：评级单次最多移动 1 档（杠杆 1+A+2 体系的稳定性约定）
+
+    Args:
+        rating_after_symmetric: Step 6 第五步对称升降档后的评级
+        style_adjustment: style 工具返回的 adjustment 字段（-1/0/+1）
+        vote_adjustment: 非估值方向票工具返回的 adjustment 字段（-1/0/+1）
+        catalyst_adjustment: 催化动量工具返回的 adjustment 字段（-1/0/+1）
+
+    Returns:
+        dict: {
+            "raw_sum": int,
+            "final_adjustment": -1 / 0 / +1,
+            "new_rating": str,
+            "components": {...},
+            "explanation": str,
+        }
+    """
+    if rating_after_symmetric not in _RATINGS_ORDER:
+        return {"error": f"未知评级: {rating_after_symmetric}"}
+
+    # 确保每个输入都是 -1/0/+1
+    def _clamp(v: int) -> int:
+        if v > 0:
+            return 1
+        if v < 0:
+            return -1
+        return 0
+
+    s = _clamp(int(style_adjustment))
+    v = _clamp(int(vote_adjustment))
+    c = _clamp(int(catalyst_adjustment))
+    raw_sum = s + v + c
+
+    if raw_sum > 0:
+        final_adj = 1
+    elif raw_sum < 0:
+        final_adj = -1
+    else:
+        final_adj = 0
+
+    new_rating, cap_reason = _shift_rating(rating_after_symmetric, final_adj, no_cross_hold=True)
+    actual_adj = 0 if new_rating == rating_after_symmetric else final_adj
+
+    return {
+        "raw_sum": raw_sum,
+        "final_adjustment": actual_adj,
+        "new_rating": new_rating,
+        "components": {"style": s, "vote": v, "catalyst": c},
+        "cap_reason": cap_reason or None,
+        "explanation": (
+            f"三类信号: style={s:+d} + vote={v:+d} + catalyst={c:+d} = raw_sum={raw_sum:+d} "
+            f"→ 取符号得 final_adjustment={actual_adj:+d} "
+            f"→ {rating_after_symmetric} → {new_rating}"
+            + (f"（{cap_reason}）" if cap_reason else "")
+        ),
+    }
+
+
 # ============================================================================
 # 工具集合（供 research_manager.py 一次性绑定）
 # ============================================================================
@@ -730,6 +1075,9 @@ RM_TOOLS = [
     compute_step6_rating_mapping,
     compute_scenario_consistency_check,
     compute_step6_style_adjustment,
+    compute_step6_report_weighted_vote_adjustment,
+    compute_step6_catalyst_momentum_adjustment,
+    compute_step6_adjustment_synthesis,
 ]
 
 
