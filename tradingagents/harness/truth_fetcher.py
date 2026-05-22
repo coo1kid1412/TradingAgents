@@ -107,30 +107,56 @@ def fetch_one_run_outcomes(run_id: int, db_path=None) -> dict:
         logger.warning("run %d 缺 reference_price，跳过", run_id)
         return stats
 
-    # 计算 anchor_date（评估起点）
-    anchor = _compute_anchor_date(run["trade_date"], run["report_window"])
-
-    # 一次性拉足够长的数据
-    start_str = anchor.isoformat()
-    end_str = (anchor + _dt.timedelta(days=_FETCH_BUFFER_DAYS)).isoformat()
+    # 拉宽日期范围（trade_date - 5 天 到 trade_date + 60 天），让数据天然包含交易日序列
+    base_date = _dt.date.fromisoformat(run["trade_date"])
+    start_str = (base_date - _dt.timedelta(days=10)).isoformat()
+    end_str = (base_date + _dt.timedelta(days=_FETCH_BUFFER_DAYS + 10)).isoformat()
     df = _fetch_price_df(ticker, start_str, end_str)
 
+    today = _dt.date.today()
+
     if df is None or len(df) == 0:
-        # 数据拉不到 → 全部标 failed
+        # 拉不到任何数据：区分"未来日期未到"（not_due）vs"数据源故障"（failed）
+        is_future = base_date > today
+        new_status = "not_due" if is_future else "failed"
+        err_msg = None if is_future else "no price data"
         with _db.connect(db_path) as conn:
             for o in outs:
                 conn.execute(
                     """UPDATE outcomes
-                       SET fetch_status = 'failed', error_message = 'no price data',
+                       SET fetch_status = ?, error_message = ?,
+                           fetched_at = CURRENT_TIMESTAMP
+                       WHERE run_id = ? AND horizon = ?""",
+                    (new_status, err_msg, run_id, o["horizon"]),
+                )
+                stats[o["horizon"]] = new_status
+        return stats
+
+    # 根据 report_window 找 anchor 行（T 对应的实际交易日）
+    # pre/morning/afternoon：T = trade_date 当天那行（如果当天有数据）
+    # post_market：T = trade_date 之后第一个交易日
+    if run["report_window"] == "post_market":
+        anchor_rows = df[df["Date"] > base_date]
+    else:
+        anchor_rows = df[df["Date"] >= base_date]
+
+    df = anchor_rows.reset_index(drop=True)
+    # 计算实际 anchor 日期（df 第一行的 Date），后续 horizon 偏移基于此
+    anchor = df["Date"].iloc[0] if len(df) > 0 else None
+
+    # 如果没找到 anchor 行（base_date 之后还没有交易日），说明 anchor 还在未来
+    if anchor is None:
+        with _db.connect(db_path) as conn:
+            for o in outs:
+                conn.execute(
+                    """UPDATE outcomes
+                       SET fetch_status = 'not_due', error_message = NULL,
                            fetched_at = CURRENT_TIMESTAMP
                        WHERE run_id = ? AND horizon = ?""",
                     (run_id, o["horizon"]),
                 )
-                stats[o["horizon"]] = "failed"
+                stats[o["horizon"]] = "not_due"
         return stats
-
-    # 过滤：只用 >= anchor 的交易日
-    df = df[df["Date"] >= anchor].reset_index(drop=True)
 
     today = _dt.date.today()
 
