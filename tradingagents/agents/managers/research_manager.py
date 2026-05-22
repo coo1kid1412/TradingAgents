@@ -79,7 +79,9 @@ def _run_tool_calling_loop(llm_with_tools, initial_messages):
 def create_research_manager(llm):
     """改造 A：移除 memory 参数（invest_judge_memory 在当前工作流下永远为空，纯属装饰）。"""
     def research_manager_node(state) -> dict:
-        instrument_context = build_instrument_context(state["company_of_interest"], state.get("company_name", ""))
+        rm_ticker = state["company_of_interest"]
+        rm_trade_date = state.get("trade_date", "")
+        instrument_context = build_instrument_context(rm_ticker, state.get("company_name", ""))
         history = state["investment_debate_state"].get("history", "")
         market_research_report = state["market_report"]
         sentiment_report = state["sentiment_report"]
@@ -958,8 +960,8 @@ Hard Data 修正：yes 不变；no × 0.5
 
 ```yaml
 RM_SUMMARY:
-  ticker: "{ticker_value}"               # 6 位数字股票代码字符串
-  trade_date: "YYYY-MM-DD"
+  ticker: "{rm_ticker}"                  # 已填好，请勿修改
+  trade_date: "{rm_trade_date}"          # 已填好，请勿修改
   current_price: <float>                 # 当前价 P_0（与 Step 6 使用的一致）
   rm_rating: BUY / OVERWEIGHT / HOLD / UNDERWEIGHT / SELL
   rm_conviction: 高 / 中 / 低
