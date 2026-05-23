@@ -73,6 +73,11 @@ class AgentState(MessagesState):
         str, "Stock profile: market cap tier, style, liquidity, instrument type, report weights, decision style, event windows"
     ]
 
+    # sector comparison (after stock_profile: RS vs market/industry/theme ETFs + theme peers)
+    sector_comparison: Annotated[
+        str, "Sector RS report: relative strength vs 大盘三档 + 行业 ETF + 主题 ETF + 主题代表股"
+    ]
+
     # consensus snapshot (synthesized after all analysts, before bull/bear)
     consensus_snapshot: Annotated[
         str, "Market consensus snapshot: priced-in expectations, narrative, unknowns"

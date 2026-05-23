@@ -72,6 +72,7 @@ def create_portfolio_manager(llm, memory):
         consensus_snapshot = state.get("consensus_snapshot", "")
         stock_profile = state.get("stock_profile", "")
         quant_score = state.get("quant_score", "")
+        sector_comparison = state.get("sector_comparison", "")
 
         # 决策卡头部信息
         pm_ticker = state["company_of_interest"]
@@ -173,6 +174,20 @@ def create_portfolio_manager(llm, memory):
 | **Conviction 强化**（评级与 quant 方向一致时）| —— | RM=OVERWEIGHT 且 composite≥70 → Conviction 可在 RM 给的基础上 +1 档 |
 
 ⚠️ **强制约束**：本节列出的薄弱因子（<30）**必须**出现在 Trade Ticket 的"Key Risks"段，禁止以"已在 RM 风险清单覆盖"为由跳过——这是 Python 量化锚，是独立信号来源。
+
+**从 sector_comparison 提取**（板块对照官的 Python 确定性输出）：
+
+| 字段 | 你的用途 |
+|------|---------|
+| **fallback 匹配路径**（层级 1→2→3→4）| 判断对照集可靠度。命中"层级 1 主题"最强；降到"层级 4 大盘兜底"则只能粗略对比 |
+| **本股 vs 主题 ETF 的 30d RS** | Trade Ticket "投资判断" / "入场判断" **必须引用一句** |
+| **主题内 30d 收益排名** | Trade Ticket 决策时引用——若排名靠后则信号弱化（同主题更好选择） |
+| **本股 vs 大盘指数 30d RS** | 用于"宏观背景下本股是否抗跌" 判断 |
+
+⚠️ **强制约束**：Trade Ticket 的 "投资判断" 或 "入场判断" 字段**必须含一句板块 RS 引用**。
+例：
+- "板块 RS 30d +12% 跑赢大盘 + 主题内排名第 2/5，板块β 仍正向，CONDITIONAL（等回调）"
+- "板块 RS 30d -8% 跑输 + 主题内倒数 → 板块走弱强化卖出信号，DON'T BUY"
 
 ### 第二步：评级微调（含对 RM thesis 的反向质疑）
 
@@ -517,6 +532,9 @@ PM 必须明确推荐其中之一，并解释理由。
 
 ### 量化打分官（独立第二眼，Python 确定性输出 0-100 综合分 + 6 因子分项）
 {quant_score if quant_score else "（量化锚未生成，PM 跳过量化交叉校验）"}
+
+### 板块对照（Python 确定性输出，本股 vs 主题/行业/市场 ETF + 主题代表股的 RS）
+{sector_comparison if sector_comparison else "（板块对照未生成，PM 跳过相对强弱判断）"}
 
 ### 共识快照（用于 entry timing 判断）
 {consensus_snapshot if consensus_snapshot else "（未提供）"}

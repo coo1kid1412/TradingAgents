@@ -66,7 +66,7 @@ os.environ["NO_PROXY"] = f"{_existing},{_DOMESTIC_NO_PROXY}" if _existing else _
 # 要分析的股票代码（单只）
 # 多股票并发已彻底移除——LLM API 偶发假死 + multiprocessing.join 会形成死锁链
 # 如需分析多只，请顺序多次运行本脚本
-_TICKER = "688008"
+_TICKER = "603637"
 
 # 分析日期（默认今天）
 _ANALYSIS_DATE = datetime.datetime.now().strftime("%Y-%m-%d")
@@ -132,6 +132,7 @@ _AGENT_CN = {
     "Macro Context Officer": "宏观策略师",
     "Quant Score Officer": "量化打分官",
     "Stock Profile Officer": "股票画像识别官",
+    "Sector Comparison Officer": "板块对照官",
     "Consensus Officer": "共识识别官",
     "Bull Researcher": "多头研究员",
     "Bear Researcher": "空头研究员",
@@ -161,6 +162,7 @@ def _save_report(state, ticker: str, save_path: Path):
         ("quant_score", "quant.md", "Quant Score Officer"),
         ("macro_context", "macro.md", "Macro Context Officer"),
         ("stock_profile", "stock_profile.md", "Stock Profile Officer"),
+        ("sector_comparison", "sector.md", "Sector Comparison Officer"),
         ("consensus_snapshot", "consensus.md", "Consensus Officer"),
     ]:
         if state.get(key):

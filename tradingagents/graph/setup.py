@@ -10,6 +10,7 @@ from tradingagents.agents.utils.consensus_node import create_consensus_node
 from tradingagents.agents.utils.stock_profile_node import create_stock_profile_node
 from tradingagents.agents.utils.macro_context_node import create_macro_context_node
 from tradingagents.agents.utils.quant_score_node import create_quant_score_node
+from tradingagents.agents.utils.sector_comparison_node import create_sector_comparison_node
 
 from .conditional_logic import ConditionalLogic
 
@@ -116,6 +117,9 @@ class GraphSetup:
         # Stock profile officer: identifies stock characteristics + recommended report weights
         stock_profile_officer_node = create_stock_profile_node(self.quick_thinking_llm)
 
+        # Sector Comparison Officer: 纯 Python，无 LLM。算本股 vs 主题 ETF / 行业 ETF / 市场指数 的 RS
+        sector_comparison_officer_node = create_sector_comparison_node()
+
         # Consensus officer: synthesizes market consensus before bull/bear debate
         consensus_officer_node = create_consensus_node(self.quick_thinking_llm)
 
@@ -150,6 +154,7 @@ class GraphSetup:
         workflow.add_node("Quant Score Officer", quant_score_officer_node)
         workflow.add_node("Macro Context Officer", macro_context_officer_node)
         workflow.add_node("Stock Profile Officer", stock_profile_officer_node)
+        workflow.add_node("Sector Comparison Officer", sector_comparison_officer_node)
         workflow.add_node("Consensus Officer", consensus_officer_node)
         workflow.add_node("Bull Researcher", bull_researcher_node)
         workflow.add_node("Bear Researcher", bear_researcher_node)
@@ -190,10 +195,11 @@ class GraphSetup:
             else:
                 workflow.add_edge(current_clear, "Quant Score Officer")
 
-        # Quant Score → Macro → Stock Profile → Consensus → Bull Researcher
+        # Quant Score → Macro → Stock Profile → Sector Comparison → Consensus → Bull Researcher
         workflow.add_edge("Quant Score Officer", "Macro Context Officer")
         workflow.add_edge("Macro Context Officer", "Stock Profile Officer")
-        workflow.add_edge("Stock Profile Officer", "Consensus Officer")
+        workflow.add_edge("Stock Profile Officer", "Sector Comparison Officer")
+        workflow.add_edge("Sector Comparison Officer", "Consensus Officer")
         workflow.add_edge("Consensus Officer", "Bull Researcher")
 
         # Add remaining edges

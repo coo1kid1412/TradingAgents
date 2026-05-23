@@ -360,6 +360,7 @@ class TradingAgentsGraph:
             "quant_score": "量化打分官",
             "macro_context": "宏观策略师",
             "stock_profile": "股票画像识别官",
+            "sector_comparison": "板块对照官",
             "consensus_snapshot": "共识识别官",
             "investment_plan": "研究主管 (RM)",
             # "trader_investment_plan": "交易员",  # DEPRECATED in optimization 05
@@ -371,6 +372,7 @@ class TradingAgentsGraph:
             "quant_score",
             "macro_context",
             "stock_profile",
+            "sector_comparison",
             "consensus_snapshot",
             "investment_plan", "final_trade_decision",  # trader_investment_plan removed in 05
         ]
@@ -434,6 +436,7 @@ class TradingAgentsGraph:
             "quant_score": final_state.get("quant_score", ""),
             "macro_context": final_state.get("macro_context", ""),
             "stock_profile": final_state.get("stock_profile", ""),
+            "sector_comparison": final_state.get("sector_comparison", ""),
             "consensus_snapshot": final_state.get("consensus_snapshot", ""),
             "investment_debate_state": {
                 "bull_history": final_state["investment_debate_state"]["bull_history"],

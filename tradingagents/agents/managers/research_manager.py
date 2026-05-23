@@ -91,6 +91,7 @@ def create_research_manager(llm):
         stock_profile = state.get("stock_profile", "")
         macro_context = state.get("macro_context", "")
         quant_score = state.get("quant_score", "")
+        sector_comparison = state.get("sector_comparison", "")
 
         investment_debate_state = state["investment_debate_state"]
 
@@ -201,6 +202,22 @@ def create_research_manager(llm):
 - factor_scores 中 <30 分的单项代表该维度有显著风险，Step 8 风险清单应当独立列出
 
 **重点提取**：style / industry / VALUATION_METHOD.primary_method / target_pe_range / target_pb_range / data_completeness
+
+### 0.5 板块对照（由板块对照官 Python 确定性输出，含 fallback 兜底）
+
+{sector_comparison if sector_comparison else "（板块对照缺失，参考默认沪深300 比较）"}
+
+**重点提取**：
+- 主题命中？主题 ETF / 主题代表股
+- 本股 vs 主题 ETF 的 30d RS（相对强弱）
+- 主题内 30d 收益排名（第几 / 共几只）
+- 本股 vs 大盘指数（沪深300/科创50/创业板）的 RS
+
+**用法**：
+- **Step 6 第二步评级 COT 时强制引用一句**：例如 "板块 RS 30d +X% 跑赢大盘 / 主题内排名第 N / 板块β 主导"
+- **作为评级的"反方力量"**：估值偏高时，如果板块 RS 强 + 主题内排名靠前 → Conviction 降一档但不机械改评级；
+  反之估值偏高 + 板块 RS 弱 + 主题内排名靠后 → 强化 SELL 信号
+- **fallback 路径透明**：报告头部已经显示了"层级 1→2→3→4"的匹配链路，根据匹配级别判定信号可靠度
 
 ### 0.2 市场共识快照（由共识识别官提炼）
 
@@ -505,7 +522,11 @@ theme_premium_pct（来自 stock_profile.THEMATIC_PREMIUM）：
 3. **Base case 目标价**是否对当前价格有吸引力
 4. **多元估值交叉一致性**（3 种方法是否一致指向同一方向）
 5. **如果偏离行业典型估值范式**，说明为什么这么做
-6. **反方推理**：明确回答"为什么不给更激进/更保守的评级"
+6. **板块相对强弱（强制引用一句话）**：从 0.5 节 sector_comparison 取出本股 vs 主题 ETF 或大盘指数的 30d RS，
+   作为评级的支撑/反方力量。例：
+   - "板块 RS 30d +12%，主题内排名第 2/5，板块β 主导，估值偏高但短期支撑评级不至于 SELL"
+   - "板块 RS 30d -5%，主题内倒数第 3，板块走弱+估值偏高 → 强化 UNDERWEIGHT 信号"
+7. **反方推理**：明确回答"为什么不给更激进/更保守的评级"
 
 ### 第三步：评级（5 档之一）— **强制调用 `compute_step6_rating_mapping` 工具**
 
