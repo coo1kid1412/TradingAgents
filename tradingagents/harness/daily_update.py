@@ -22,6 +22,28 @@ from __future__ import annotations
 
 import datetime as _dt
 import logging
+import os
+from pathlib import Path
+
+# 关键：cron 启动时不继承 shell 环境，必须显式加载 .env（TUSHARE_TOKEN 等）
+# 必须在 import vendor 之前完成
+_PROJECT_ROOT = Path(__file__).resolve().parents[2]
+try:
+    from dotenv import load_dotenv
+    load_dotenv(_PROJECT_ROOT / ".env")
+except ImportError:
+    pass  # dotenv 是 main.py 已经依赖的包，理论上一直可用
+
+# 国内数据源绕过代理（与 main.py 保持一致）
+_DOMESTIC_NO_PROXY = ",".join([
+    ".eastmoney.com", ".sina.com.cn", ".sse.com.cn", ".szse.cn",
+    ".bse.cn", ".tushare.pro", ".xueqiu.com", ".baidu.com",
+    ".akshare.xyz", ".minimaxi.com", "api.tauric.ai", ".pypi.org",
+])
+_existing_no_proxy = os.environ.get("NO_PROXY", "")
+os.environ["NO_PROXY"] = (
+    f"{_existing_no_proxy},{_DOMESTIC_NO_PROXY}" if _existing_no_proxy else _DOMESTIC_NO_PROXY
+)
 
 from tradingagents.harness import db as _db
 from tradingagents.harness import price_cache as _pcache
