@@ -31,6 +31,20 @@ logging.basicConfig(
 # 抑制几个第三方库的噪音 WARNING
 for noisy in ("urllib3", "httpx", "httpcore", "matplotlib", "PIL"):
     logging.getLogger(noisy).setLevel(logging.ERROR)
+# 抑制 vendor 层 fallback chain 中间步骤的 WARNING（保留 ERROR，真挂了仍能看到）
+# 设计动机：tushare 限流 → akshare 失败 → yfinance 兜底成功 是设计内的 fallback，
+# 不该让用户看到 30+ 行 WARNING 误以为出问题
+for vendor_logger in (
+    "tradingagents.dataflows.tushare_vendor",
+    "tradingagents.dataflows.akshare_vendor",
+    "tradingagents.dataflows.alpha_vantage",
+    "tradingagents.dataflows.alpha_vantage_common",
+    "tradingagents.dataflows.y_finance",
+    "tradingagents.dataflows.yfinance_news",
+    "tradingagents.dataflows.interface",
+    "yfinance",
+):
+    logging.getLogger(vendor_logger).setLevel(logging.ERROR)
 # 启动横幅写入日志文件（方便日后辨认是哪一次运行）
 logging.getLogger(__name__).warning(
     "=== main.py 启动 ===  日志文件: %s", _LOG_FILE
@@ -66,7 +80,7 @@ os.environ["NO_PROXY"] = f"{_existing},{_DOMESTIC_NO_PROXY}" if _existing else _
 # 要分析的股票代码（单只）
 # 多股票并发已彻底移除——LLM API 偶发假死 + multiprocessing.join 会形成死锁链
 # 如需分析多只，请顺序多次运行本脚本
-_TICKER = "603637"
+_TICKER = "603629"
 
 # 分析日期（默认今天）
 _ANALYSIS_DATE = datetime.datetime.now().strftime("%Y-%m-%d")
