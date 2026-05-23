@@ -143,8 +143,20 @@ def fetch_with_cache(ticker: str, start_date: str | _dt.date, end_date: str | _d
             logger.info("cache 增量更新 %s [%s, %s]: %d 行",
                         ticker, need_fetch_start, effective_end, n)
         else:
-            logger.debug("cache 增量拉 %s [%s, %s]: vendor 无数据",
-                         ticker, need_fetch_start, effective_end)
+            # 区分两种"vendor 返回空"：
+            #   a) 周末 / 盘前 / 节假日：cache 已是 ≤3 天内最新数据，vendor 拉新没数据 → 预期，silent
+            #   b) cache 严重过期或 ticker 异常：vendor 链真的失败 → WARNING 提醒用户
+            cache_lag_days = (today - cache_max).days if cache_max else 9999
+            if cache_lag_days <= 3:
+                logger.debug(
+                    "cache %s 暂无新数据（cache_max=%s, today=%s）— 多半是周末/盘前/节假日",
+                    ticker, cache_max, today,
+                )
+            else:
+                logger.warning(
+                    "cache 增量拉 %s [%s, %s]: vendor 链全部失败（cache 已落后 %d 天）",
+                    ticker, need_fetch_start, effective_end, cache_lag_days,
+                )
 
     # 从 cache 读完整范围（注意是 [start, end] 不是 effective_end）
     return _read_from_cache(ticker, start, end, db_path)

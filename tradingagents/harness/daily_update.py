@@ -90,13 +90,44 @@ def run_daily_update(db_path=None) -> dict:
     }
 
 
-def main():
-    """CLI 入口：每晚 21:00 跑一次。"""
+def _configure_logging() -> None:
+    """配置日志：抑制 vendor 层 fallback 链路的中间噪音，只显示真正的整链失败。
+
+    噪音来源：tushare → akshare → yfinance 是设计内的 fallback chain。
+    上游 vendor 失败 → 下游兜底成功，但中间步骤会 emit 大量 WARNING/ERROR，
+    用户看到会以为出问题了。
+
+    保留 INFO 的：harness 自己（daily_update / truth_fetcher / price_cache）
+    抑制为 CRITICAL：所有数据源 vendor + 第三方网络库
+    """
     logging.basicConfig(
         level=logging.INFO,
         format="[%(asctime)s %(levelname)s %(name)s] %(message)s",
         datefmt="%H:%M:%S",
     )
+    # 数据源 vendor 层：上游限流/网络抖动的 fallback 内部细节，对用户无意义
+    _NOISY_LOGGERS = [
+        "tradingagents.dataflows.tushare_vendor",
+        "tradingagents.dataflows.akshare_vendor",
+        "tradingagents.dataflows.alpha_vantage",
+        "tradingagents.dataflows.alpha_vantage_common",
+        "tradingagents.dataflows.y_finance",
+        "tradingagents.dataflows.yfinance_news",
+        "tradingagents.dataflows.interface",
+        # 第三方网络库
+        "yfinance",
+        "urllib3",
+        "httpx",
+        "httpcore",
+        "requests",
+    ]
+    for name in _NOISY_LOGGERS:
+        logging.getLogger(name).setLevel(logging.CRITICAL)
+
+
+def main():
+    """CLI 入口：每晚 21:00 跑一次。"""
+    _configure_logging()
     print(f"=== Harness Daily Update @ {_dt.datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ===\n")
 
     result = run_daily_update()
