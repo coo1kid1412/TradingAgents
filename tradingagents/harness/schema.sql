@@ -131,3 +131,22 @@ CREATE TABLE IF NOT EXISTS backtest_metrics (
 );
 
 CREATE INDEX IF NOT EXISTS idx_metrics_snapshot ON backtest_metrics(snapshot_date, horizon);
+
+
+-- ============================================================================
+-- price_cache: 本地价格缓存表，避免重复调 tushare/akshare 拉同一段日期数据
+-- ============================================================================
+CREATE TABLE IF NOT EXISTS price_cache (
+    ticker TEXT NOT NULL,
+    trade_date DATE NOT NULL,
+    open REAL,
+    high REAL,
+    low REAL,
+    close REAL,
+    volume REAL,
+    fetched_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (ticker, trade_date)
+);
+
+CREATE INDEX IF NOT EXISTS idx_price_cache_ticker ON price_cache(ticker);
+CREATE INDEX IF NOT EXISTS idx_price_cache_date ON price_cache(trade_date);

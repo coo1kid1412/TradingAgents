@@ -24,16 +24,35 @@ def get_db_path(custom_path: Path | str | None = None) -> Path:
 
 
 def init_db(db_path: Path | str | None = None) -> Path:
-    """初始化 DB：建目录、建表（IF NOT EXISTS 幂等）。返回 DB 路径。"""
+    """初始化 DB：建目录、建表（IF NOT EXISTS 幂等）、跑必要的 migration。"""
     path = get_db_path(db_path)
     path.parent.mkdir(parents=True, exist_ok=True)
 
     schema_sql = _SCHEMA_FILE.read_text(encoding="utf-8")
     with sqlite3.connect(path) as conn:
         conn.executescript(schema_sql)
+        _migrate_schema(conn)
         conn.commit()
     logger.info("Harness DB initialized at %s", path)
     return path
+
+
+def _migrate_schema(conn: sqlite3.Connection) -> None:
+    """轻量 migration：对已存在 DB 添加新列（SQLite 不支持 IF NOT EXISTS for ALTER）。
+
+    每次 init_db 跑一次（幂等：列已存在则跳过）。
+    """
+    # outcomes 表加 benchmark / relative_return 列
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(outcomes)").fetchall()}
+    if "benchmark_ticker" not in cols:
+        conn.execute("ALTER TABLE outcomes ADD COLUMN benchmark_ticker TEXT")
+        logger.info("Migrated: outcomes.benchmark_ticker added")
+    if "benchmark_return_pct" not in cols:
+        conn.execute("ALTER TABLE outcomes ADD COLUMN benchmark_return_pct REAL")
+        logger.info("Migrated: outcomes.benchmark_return_pct added")
+    if "relative_return_pct" not in cols:
+        conn.execute("ALTER TABLE outcomes ADD COLUMN relative_return_pct REAL")
+        logger.info("Migrated: outcomes.relative_return_pct added")
 
 
 @contextmanager

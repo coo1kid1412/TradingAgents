@@ -1,22 +1,21 @@
 """真值采集器：拉 T/T+1/T+5/T+30 收盘价 + 期间 high/low，计算命中。
 
-V1 防穿越：只用报告时点之后的价格数据。
-对 post_market 报告，T = 下一交易日；对 pre/morning/afternoon，T = 当天交易日。
-
-数据源：复用 dataflows.interface.route_to_vendor("get_stock_data", ...)。
+V2 改造：
+- 用 price_cache 增量拉取（改造 A）
+- 算 relative_return = 个股 - benchmark 同期回报（改造 B）
+- not_due 自动重试（startup 时 promote target_date ≤ today 的 not_due → pending）
 """
 
 from __future__ import annotations
 
 import datetime as _dt
-import io
 import logging
-import re
 from pathlib import Path
 
 import pandas as pd
 
 from tradingagents.harness import db as _db
+from tradingagents.harness import price_cache as _pcache
 
 logger = logging.getLogger(__name__)
 
@@ -26,49 +25,21 @@ _HIT_THRESHOLD_PCT = 2.0
 # 每个 horizon 对应的"交易日偏移量"
 _HORIZON_OFFSETS = {"T": 0, "T+1": 1, "T+5": 5, "T+30": 30}
 
-# 拉数据时多拉一段缓冲（30 天 + 周末/节假日缓冲）
-_FETCH_BUFFER_DAYS = 50
+# 拉数据时多拉一段缓冲（覆盖 horizon=T+30 + 周末/节假日缓冲）
+_FETCH_BUFFER_DAYS = 60
 
-
-def _fetch_price_df(ticker: str, start_date: str, end_date: str) -> pd.DataFrame | None:
-    """从 route_to_vendor 拉 OHLCV CSV → DataFrame。"""
-    from tradingagents.dataflows.interface import route_to_vendor
-
-    try:
-        csv_str = route_to_vendor("get_stock_data", ticker, start_date, end_date)
-    except Exception as e:
-        logger.warning("拉价格失败 %s: %s", ticker, e)
-        return None
-    if not csv_str or "未找到" in csv_str[:200]:
-        return None
-
-    # 跳过以 # 开头的 header 行
-    lines = [ln for ln in csv_str.splitlines() if not ln.startswith("#") and ln.strip()]
-    if not lines:
-        return None
-    try:
-        df = pd.read_csv(io.StringIO("\n".join(lines)))
-    except Exception as e:
-        logger.warning("解析 CSV 失败 %s: %s", ticker, e)
-        return None
-    if "Date" not in df.columns or "Close" not in df.columns:
-        return None
-    # 标准化 Date 字段
-    df["Date"] = pd.to_datetime(df["Date"]).dt.date
-    df = df.sort_values("Date").reset_index(drop=True)
-    return df
-
-
-def _compute_anchor_date(trade_date: str, report_window: str) -> _dt.date:
-    """计算评估起点日（T 对应的日期）。
-
-    pre_market / morning / afternoon：T 是当天（trade_date）
-    post_market：T 是 trade_date 的下一日（实际下一交易日由价格数据决定）
-    """
-    base = _dt.date.fromisoformat(trade_date)
-    if report_window == "post_market":
-        return base + _dt.timedelta(days=1)
-    return base
+# Benchmark 列表（A 股 ETF，覆盖大盘/中盘/创业板/科创板/半导体/消费）
+# 选用 ETF 而非指数，确保 get_stock_data 兼容
+BENCHMARKS = [
+    "510300",  # 沪深300 ETF
+    "510500",  # 中证500 ETF
+    "588000",  # 科创50 ETF
+    "159915",  # 创业板 ETF
+    "512760",  # 半导体 ETF
+    "159928",  # 消费 ETF
+]
+# 默认 benchmark（个股没有更精细行业映射时用此对照大盘）
+DEFAULT_BENCHMARK = "510300"
 
 
 def _direction_hit(direction_predicted: str | None, realized_return_pct: float) -> int | None:
@@ -84,12 +55,84 @@ def _direction_hit(direction_predicted: str | None, realized_return_pct: float) 
     return None
 
 
-def fetch_one_run_outcomes(run_id: int, db_path=None) -> dict:
-    """采集单 run 的全部 horizon 真值。
+def update_benchmark_cache(db_path=None) -> dict:
+    """在 truth_fetcher 启动时把所有 benchmark 更新到 cache。"""
+    today = _dt.date.today()
+    # 拉最近 120 天足够覆盖 T+30 horizon 的 anchor 前后
+    start = (today - _dt.timedelta(days=120)).isoformat()
+    end = today.isoformat()
+    stats: dict = {}
+    for bench in BENCHMARKS:
+        try:
+            df = _pcache.fetch_with_cache(bench, start, end, db_path)
+            stats[bench] = len(df) if df is not None else 0
+        except Exception as e:
+            logger.warning("benchmark %s 更新失败: %s", bench, e)
+            stats[bench] = 0
+    return stats
 
-    Returns:
-        统计字典：{horizon: status} 例 {'T': 'fetched', 'T+1': 'fetched', 'T+5': 'not_due', 'T+30': 'not_due'}
+
+def _compute_benchmark_return(
+    benchmark_ticker: str,
+    anchor_date: _dt.date,
+    horizon_date: _dt.date,
+    db_path=None,
+) -> float | None:
+    """从 cache 读 benchmark 在 anchor_date 和 horizon_date 的收盘价，算 horizon 期间收益。"""
+    # cache 应该已经在 update_benchmark_cache 时填好了
+    bench_df = _pcache.fetch_with_cache(
+        benchmark_ticker,
+        (anchor_date - _dt.timedelta(days=10)).isoformat(),
+        (horizon_date + _dt.timedelta(days=5)).isoformat(),
+        db_path,
+    )
+    if bench_df is None or len(bench_df) == 0:
+        return None
+
+    # 找 >= anchor_date 的第一行 close（基准锚定价）
+    anchor_rows = bench_df[bench_df["Date"] >= anchor_date]
+    if len(anchor_rows) == 0:
+        return None
+    anchor_close = float(anchor_rows.iloc[0]["Close"])
+
+    # 找 horizon_date 那行（找 <= horizon_date 的最后一行）
+    horizon_rows = bench_df[bench_df["Date"] <= horizon_date]
+    if len(horizon_rows) == 0:
+        return None
+    # 在 anchor 之后 + horizon_date 之前的最后一行
+    valid_rows = horizon_rows[horizon_rows["Date"] >= anchor_date]
+    if len(valid_rows) == 0:
+        return None
+    horizon_close = float(valid_rows.iloc[-1]["Close"])
+
+    if anchor_close <= 0:
+        return None
+    return round((horizon_close - anchor_close) / anchor_close * 100, 4)
+
+
+def promote_due_outcomes(db_path=None) -> int:
+    """把 fetch_status='not_due' 但 target_date ≤ today（或 NULL）的 outcomes
+    重置为 'pending' 让下一轮重试。
+
+    Returns: 提升的行数。
     """
+    today_str = _dt.date.today().isoformat()
+    with _db.connect(db_path) as conn:
+        cur = conn.execute(
+            """UPDATE outcomes
+               SET fetch_status = 'pending', error_message = NULL
+               WHERE fetch_status = 'not_due'
+                 AND (target_date IS NULL OR target_date <= ?)""",
+            (today_str,),
+        )
+        n = cur.rowcount
+    if n > 0:
+        logger.info("promote: %d 个 not_due outcomes → pending", n)
+    return n
+
+
+def fetch_one_run_outcomes(run_id: int, db_path=None) -> dict:
+    """采集单 run 的全部 horizon 真值。"""
     stats: dict = {}
     with _db.connect(db_path) as conn:
         run = conn.execute("SELECT * FROM runs WHERE id = ?", (run_id,)).fetchone()
@@ -107,58 +150,46 @@ def fetch_one_run_outcomes(run_id: int, db_path=None) -> dict:
         logger.warning("run %d 缺 reference_price，跳过", run_id)
         return stats
 
-    # 拉宽日期范围（trade_date - 5 天 到 trade_date + 60 天），让数据天然包含交易日序列
     base_date = _dt.date.fromisoformat(run["trade_date"])
-    start_str = (base_date - _dt.timedelta(days=10)).isoformat()
-    end_str = (base_date + _dt.timedelta(days=_FETCH_BUFFER_DAYS + 10)).isoformat()
-    df = _fetch_price_df(ticker, start_str, end_str)
+    start_date = base_date - _dt.timedelta(days=10)
+    end_date = base_date + _dt.timedelta(days=_FETCH_BUFFER_DAYS + 10)
+    df = _pcache.fetch_with_cache(ticker, start_date, end_date, db_path)
 
     today = _dt.date.today()
 
     if df is None or len(df) == 0:
-        # 拉不到任何数据：区分"未来日期未到"（not_due）vs"数据源故障"（failed）
         is_future = base_date > today
         new_status = "not_due" if is_future else "failed"
         err_msg = None if is_future else "no price data"
         with _db.connect(db_path) as conn:
             for o in outs:
                 conn.execute(
-                    """UPDATE outcomes
-                       SET fetch_status = ?, error_message = ?,
-                           fetched_at = CURRENT_TIMESTAMP
-                       WHERE run_id = ? AND horizon = ?""",
+                    """UPDATE outcomes SET fetch_status = ?, error_message = ?,
+                       fetched_at = CURRENT_TIMESTAMP WHERE run_id = ? AND horizon = ?""",
                     (new_status, err_msg, run_id, o["horizon"]),
                 )
                 stats[o["horizon"]] = new_status
         return stats
 
-    # 根据 report_window 找 anchor 行（T 对应的实际交易日）
-    # pre/morning/afternoon：T = trade_date 当天那行（如果当天有数据）
-    # post_market：T = trade_date 之后第一个交易日
+    # 找 anchor 行
     if run["report_window"] == "post_market":
         anchor_rows = df[df["Date"] > base_date]
     else:
         anchor_rows = df[df["Date"] >= base_date]
 
     df = anchor_rows.reset_index(drop=True)
-    # 计算实际 anchor 日期（df 第一行的 Date），后续 horizon 偏移基于此
     anchor = df["Date"].iloc[0] if len(df) > 0 else None
 
-    # 如果没找到 anchor 行（base_date 之后还没有交易日），说明 anchor 还在未来
     if anchor is None:
         with _db.connect(db_path) as conn:
             for o in outs:
                 conn.execute(
-                    """UPDATE outcomes
-                       SET fetch_status = 'not_due', error_message = NULL,
-                           fetched_at = CURRENT_TIMESTAMP
-                       WHERE run_id = ? AND horizon = ?""",
+                    """UPDATE outcomes SET fetch_status = 'not_due', error_message = NULL,
+                       fetched_at = CURRENT_TIMESTAMP WHERE run_id = ? AND horizon = ?""",
                     (run_id, o["horizon"]),
                 )
                 stats[o["horizon"]] = "not_due"
         return stats
-
-    today = _dt.date.today()
 
     for o in outs:
         horizon = o["horizon"]
@@ -166,9 +197,7 @@ def fetch_one_run_outcomes(run_id: int, db_path=None) -> dict:
         if offset is None:
             continue
 
-        # 检查数据是否足够
         if offset >= len(df):
-            # 数据还没到日子（horizon 还没到）
             with _db.connect(db_path) as conn:
                 conn.execute(
                     """UPDATE outcomes SET fetch_status = 'not_due' WHERE run_id = ? AND horizon = ?""",
@@ -180,7 +209,6 @@ def fetch_one_run_outcomes(run_id: int, db_path=None) -> dict:
         target_row = df.iloc[offset]
         target_date = target_row["Date"]
 
-        # 如果 target_date 还在未来 → not_due
         if target_date > today:
             with _db.connect(db_path) as conn:
                 conn.execute(
@@ -192,7 +220,6 @@ def fetch_one_run_outcomes(run_id: int, db_path=None) -> dict:
             continue
 
         actual_close = float(target_row["Close"])
-        # 期间（anchor 到 target）的 high/low
         period = df.iloc[: offset + 1]
         high_during = float(period["High"].max()) if "High" in period.columns else None
         low_during = float(period["Low"].min()) if "Low" in period.columns else None
@@ -200,7 +227,6 @@ def fetch_one_run_outcomes(run_id: int, db_path=None) -> dict:
         realized_return = (actual_close - ref_price) / ref_price * 100.0
         dir_hit = _direction_hit(o["direction_predicted"], realized_return)
 
-        # TP1 / SL_hard 触达
         tp1_hit = None
         sl_hard_hit = None
         if pred["pm_tp1"] is not None and high_during is not None:
@@ -208,49 +234,65 @@ def fetch_one_run_outcomes(run_id: int, db_path=None) -> dict:
         if pred["pm_sl_hard"] is not None and low_during is not None:
             sl_hard_hit = 1 if low_during <= pred["pm_sl_hard"] else 0
 
+        # 算 benchmark / relative_return（改造 B）
+        # V1 简单策略：全部用 DEFAULT_BENCHMARK（沪深300 ETF）作对照
+        benchmark_ticker = DEFAULT_BENCHMARK
+        benchmark_return = _compute_benchmark_return(benchmark_ticker, anchor, target_date, db_path)
+        relative_return = None
+        if benchmark_return is not None:
+            relative_return = round(realized_return - benchmark_return, 4)
+
         with _db.connect(db_path) as conn:
             conn.execute(
                 """UPDATE outcomes SET
-                    target_date = ?,
-                    actual_close_at_horizon = ?,
-                    actual_high_during_horizon = ?,
-                    actual_low_during_horizon = ?,
-                    realized_return_pct = ?,
-                    direction_hit = ?,
-                    tp1_hit = ?,
-                    sl_hard_hit = ?,
-                    fetch_status = 'fetched',
-                    fetched_at = CURRENT_TIMESTAMP,
-                    error_message = NULL
+                    target_date = ?, actual_close_at_horizon = ?,
+                    actual_high_during_horizon = ?, actual_low_during_horizon = ?,
+                    realized_return_pct = ?, direction_hit = ?, tp1_hit = ?, sl_hard_hit = ?,
+                    benchmark_ticker = ?, benchmark_return_pct = ?, relative_return_pct = ?,
+                    fetch_status = 'fetched', fetched_at = CURRENT_TIMESTAMP, error_message = NULL
                    WHERE run_id = ? AND horizon = ?""",
                 (
-                    target_date.isoformat(),
-                    actual_close,
-                    high_during,
-                    low_during,
-                    round(realized_return, 4),
-                    dir_hit,
-                    tp1_hit,
-                    sl_hard_hit,
-                    run_id,
-                    horizon,
+                    target_date.isoformat(), actual_close, high_during, low_during,
+                    round(realized_return, 4), dir_hit, tp1_hit, sl_hard_hit,
+                    benchmark_ticker, benchmark_return, relative_return,
+                    run_id, horizon,
                 ),
             )
         stats[horizon] = "fetched"
+        rel_str = f" | rel={relative_return:+.2f}%" if relative_return is not None else ""
         logger.info(
-            "run %d %s: %s ref=%.2f → close=%.2f (return=%+.2f%%) dir_hit=%s",
-            run_id, horizon, target_date, ref_price, actual_close, realized_return, dir_hit,
+            "run %d %s: %s ref=%.2f → close=%.2f (ret=%+.2f%%%s) dir_hit=%s",
+            run_id, horizon, target_date, ref_price, actual_close, realized_return,
+            rel_str, dir_hit,
         )
 
     return stats
 
 
-def fetch_all_pending(db_path=None) -> dict:
-    """扫描所有 fetch_status='pending' 的 run，能算的就算。"""
-    summary = {"fetched": 0, "not_due": 0, "failed": 0, "skipped_no_ref_price": 0}
+def fetch_all_pending(db_path=None, update_benchmarks: bool = True) -> dict:
+    """扫描所有 fetch_status='pending' 的 run，能算的就算。
 
+    Args:
+        update_benchmarks: 是否先更新 benchmark cache（V1 默认 True；如果短时多次跑可关闭）
+    """
+    summary = {
+        "promoted_from_not_due": 0,
+        "fetched": 0,
+        "not_due": 0,
+        "failed": 0,
+        "skipped_no_ref_price": 0,
+    }
+
+    # Step 1: 先 promote not_due → pending（让旧的 not_due 有机会重试）
+    summary["promoted_from_not_due"] = promote_due_outcomes(db_path)
+
+    # Step 2: 先把 benchmark cache 更新（确保后续 relative_return 算得到）
+    if update_benchmarks:
+        bench_stats = update_benchmark_cache(db_path)
+        logger.info("benchmark cache 更新: %s", bench_stats)
+
+    # Step 3: 处理所有 pending
     with _db.connect(db_path) as conn:
-        # 找出所有还有 pending outcome 的 run
         rows = conn.execute(
             """SELECT DISTINCT run_id FROM outcomes WHERE fetch_status = 'pending'
                ORDER BY run_id"""
@@ -279,6 +321,11 @@ def main():
     print(f"\n真值采集完成统计:")
     for k, v in summary.items():
         print(f"  {k}: {v}")
+    # cache 统计
+    stats = _pcache.get_cache_stats()
+    print(f"\nprice_cache 状态: tickers={stats.get('n_tickers', 0)}, "
+          f"rows={stats.get('n_rows', 0)}, "
+          f"日期跨度: {stats.get('d_min')} → {stats.get('d_max')}")
 
 
 if __name__ == "__main__":
