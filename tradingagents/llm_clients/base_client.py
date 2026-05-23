@@ -2,6 +2,7 @@ from abc import ABC, abstractmethod
 import logging
 import queue
 import re
+import signal
 import threading
 import time
 import warnings
@@ -15,6 +16,18 @@ logger = logging.getLogger(__name__)
 # 支持 <think>...</think> 标准闭合，以及 <think>... 未闭合的情况
 _THINK_TAG_RE = re.compile(r"<think>[\s\S]*?</think>\s*", re.DOTALL)
 _THINK_UNCLOSED_RE = re.compile(r"^<think>[\s\S]*", re.DOTALL)
+
+def _can_use_sigalrm() -> bool:
+    """判断当前进程能否用 SIGALRM 做 wall-clock 超时。
+
+    限制：
+    - Windows 没有 SIGALRM（hasattr 检查）
+    - signal handler 只能由主线程注册（current_thread is main_thread 检查）
+    """
+    if not hasattr(signal, "SIGALRM"):
+        return False
+    return threading.current_thread() is threading.main_thread()
+
 
 def _strip_think_tags(text: str) -> str:
     """移除推理模型输出中的 <think>...</think> 思考链内容。"""
@@ -143,8 +156,14 @@ class WallClockTimeoutLLM(Runnable):
                **kwargs: Any) -> Any:
         """带 wall-clock 超时保护的 invoke，超时后指数退避重试。
 
-        Runnable.invoke 签名：invoke(input, config, **kwargs)
-        我们透传给原 llm（input 作为第一个位置参数）。
+        保护机制（按强度从强到弱，自动选择）：
+        1. SIGALRM 信号（Unix only，主线程，OS 层强制中断，不受 GIL 阻塞）
+        2. daemon thread + join（跨平台兜底，但 GIL 被 C 扩展持有时 join 可能延迟）
+
+        历史 bug（PID 28850，5/23-24）：daemon thread + join(timeout=300) 实际跑了 6 小时
+        才超时，因为 httpx socket read 在 C 层阻塞，GIL 一直未释放，主线程 join 内部的
+        Condition.wait() 没被及时唤醒。SIGALRM 由 OS 调度，在 Python 解释器下一次 bytecode
+        循环时立即触发 handler 抛 TimeoutError，可靠得多。
         """
         last_err: Optional[BaseException] = None
         for attempt in range(1 + self._max_retries):
@@ -156,36 +175,75 @@ class WallClockTimeoutLLM(Runnable):
                 )
                 time.sleep(wait)
 
-            q: queue.Queue = queue.Queue()
-
-            def _worker():
-                try:
-                    # 透传给原 llm.invoke(input, config, **kwargs)
-                    if config is not None:
-                        q.put((self._llm.invoke(input, config, **kwargs), None))
-                    else:
-                        q.put((self._llm.invoke(input, **kwargs), None))
-                except BaseException as e:
-                    q.put((None, e))
-
-            t = threading.Thread(target=_worker, daemon=True)
-            t.start()
-            t.join(timeout=self._timeout)
-
-            if t.is_alive():
-                # 超时：daemon 线程仍在跑（进程退出时被回收），主流程继续重试
-                last_err = TimeoutError(
-                    f"LLM 调用 wall-clock 超时（{self._timeout}s，第 {attempt+1} 次尝试）"
-                )
+            try:
+                if _can_use_sigalrm():
+                    return self._invoke_with_signal(input, config, **kwargs)
+                else:
+                    return self._invoke_with_thread_join(input, config, **kwargs)
+            except TimeoutError as e:
+                last_err = e
                 continue
-
-            result, exc = q.get()
-            if exc is not None:
-                raise exc
-            return result
 
         # 全部重试用尽
         raise last_err if last_err else TimeoutError("LLM 调用超时且无错误信息")
+
+    def _invoke_with_signal(self, input: Any, config: Optional[RunnableConfig],
+                            **kwargs: Any) -> Any:
+        """用 SIGALRM 实现 wall-clock 超时（主线程 + Unix）。
+
+        SIGALRM 由 OS 调度，在 Python 解释器下一次 bytecode 循环就会处理 pending
+        signal——即使 httpx socket read 阻塞，read() 系统调用收到信号后返回 EINTR，
+        Python 转抛 TimeoutError，主线程立即从 LLM invoke 栈逃出。
+        """
+        def _alarm_handler(signum, frame):
+            raise TimeoutError(
+                f"LLM 调用 wall-clock 超时（{self._timeout}s SIGALRM）"
+            )
+
+        old_handler = signal.signal(signal.SIGALRM, _alarm_handler)
+        signal.alarm(self._timeout)
+        try:
+            if config is not None:
+                return self._llm.invoke(input, config, **kwargs)
+            return self._llm.invoke(input, **kwargs)
+        finally:
+            signal.alarm(0)  # 取消 alarm（无论成功失败）
+            try:
+                signal.signal(signal.SIGALRM, old_handler)
+            except (ValueError, TypeError):
+                pass  # 老 handler 可能已失效
+
+    def _invoke_with_thread_join(self, input: Any, config: Optional[RunnableConfig],
+                                  **kwargs: Any) -> Any:
+        """daemon thread + queue 实现 wall-clock 超时（跨平台兜底，但弱保护）。
+
+        ⚠ 已知问题：httpx C 扩展阻塞时 GIL 持有，join(timeout) 内部 Condition.wait()
+        可能延迟唤醒。仅作为 SIGALRM 不可用时的退化方案（如非主线程调用）。
+        """
+        q: queue.Queue = queue.Queue()
+
+        def _worker():
+            try:
+                if config is not None:
+                    q.put((self._llm.invoke(input, config, **kwargs), None))
+                else:
+                    q.put((self._llm.invoke(input, **kwargs), None))
+            except BaseException as e:
+                q.put((None, e))
+
+        t = threading.Thread(target=_worker, daemon=True)
+        t.start()
+        t.join(timeout=self._timeout)
+
+        if t.is_alive():
+            raise TimeoutError(
+                f"LLM 调用 wall-clock 超时（{self._timeout}s thread-join，弱保护）"
+            )
+
+        result, exc = q.get()
+        if exc is not None:
+            raise exc
+        return result
 
     def bind_tools(self, *args, **kwargs) -> "WallClockTimeoutLLM":
         """拦截 bind_tools，让返回的新 llm 实例也保留 wall-clock timeout 保护。
