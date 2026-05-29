@@ -23,6 +23,7 @@ import re
 from tradingagents.agents.utils.agent_utils import build_instrument_context
 from tradingagents.dataflows.factor_calc import compute_price_factors
 from tradingagents.dataflows.interface import route_to_vendor
+from tradingagents.dataflows.ticker_utils import is_a_share
 from tradingagents.dataflows.profile_calc import (
     compute_market_cap_tier,
     compute_liquidity_tier,
@@ -239,8 +240,11 @@ def create_stock_profile_node(llm):
             fundamentals_report, news_report,
         )
         # 同业锚硬天花板（peer 有值且非全-null 兜底时生效；防 target_pe_high 漂到当前 PE）
+        # ⚠️ 仅限 A 股：peer_pe_median 抽自巨潮 cninfo 行业表（A 股专有），美股/港股的"行业 PE 中位数"
+        #    若被填成巨潮 A 股口径会错锚——非 A 股不套此 cap，交回 LLM 用本地同业/卖方（亏损股已由 Layer 1 转 PB/PS）
+        is_a_share_stock = is_a_share(ticker)
         peer_pe_cap = None
-        if not layer2_all_null and peer_pe_median:
+        if is_a_share_stock and not layer2_all_null and peer_pe_median:
             peer_pe_cap = compute_peer_anchored_pe_cap(
                 peer_pe_median=peer_pe_median,
                 pe_ttm=pe_ttm_actual,
