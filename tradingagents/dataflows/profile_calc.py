@@ -710,6 +710,100 @@ def parse_pe_ttm_from_fundamentals(fund_str: str) -> Optional[float]:
     return None
 
 
+def parse_net_profit_growth(fund_str: str) -> Optional[float]:
+    """从 fundamentals 报告抽"归母净利润增速（年度）"，返回小数（如 +51.20% → 0.512）。
+
+    用途（不做循环 forward_pe = PE_TTM/(1+g) 公式——那是恒等式无观点）：
+    1. PEG 校验：合理 PE ≈ 增速值（PEG=1），用来给同业锚一个有界溢价上限
+    2. 提示下游 RM：目标 PE 应配"前瞻 EPS = EPS_TTM×(1+g)"，而非 TTM EPS
+
+    口径优先级（年度优先于单季，避开 Q1 淡季噪音）：
+    1. "归母净利润增速/增长率 ... 年度 ... +XX%"
+    2. 表格行 "归母净利润增长率 | +XX% | ..." / "净利润增速(年度) | +XX%"
+    3. 文字 "净利润同比 +XX%" / "归母净利润同比增长 XX%"
+
+    标签会漂（增速/增长率、归母前缀有无），故用弹性正则。
+    """
+    import re
+
+    if not fund_str:
+        return None
+
+    # 优先匹配显式"年度"口径，避免抓到 Q1 单季增速
+    annual_patterns = [
+        r"净利润增速\s*[(（]\s*年度\s*[)）]\s*\|\s*\*{0,2}\s*([+-]?[0-9.]+)\s*%",
+        r"(?:归母)?净利润(?:增速|增长率)[^\n]{0,12}年度[^\n]{0,12}?([+-]?[0-9.]+)\s*%",
+        r"年度[^\n]{0,12}(?:归母)?净利润(?:增速|增长率)[^\n]{0,8}?([+-]?[0-9.]+)\s*%",
+    ]
+    # 通用口径（表格行 / 文字同比），作为年度抓不到时的兜底
+    generic_patterns = [
+        r"归母净利润(?:增速|增长率)\s*\|\s*\*{0,2}\s*([+-]?[0-9.]+)\s*%",
+        r"净利润(?:增速|增长率)\s*\|\s*\*{0,2}\s*([+-]?[0-9.]+)\s*%",
+        r"归母净利润同比(?:增长)?\s*[:：]?\s*\+?([+-]?[0-9.]+)\s*%",
+        r"净利润同比(?:增长)?\s*[:：]?\s*\+?([+-]?[0-9.]+)\s*%",
+    ]
+
+    def _first_valid(patterns):
+        for pat in patterns:
+            for m in re.finditer(pat, fund_str):
+                try:
+                    pct = float(m.group(1))
+                except ValueError:
+                    continue
+                # 合理性：年度净利增速 -90% ~ +500%（剔除明显误抓）
+                if -90.0 <= pct <= 500.0:
+                    return pct / 100.0
+        return None
+
+    val = _first_valid(annual_patterns)
+    if val is None:
+        val = _first_valid(generic_patterns)
+    return val
+
+
+def compute_peer_anchored_pe_cap(
+    peer_pe_median: Optional[float],
+    pe_ttm: Optional[float],
+    net_profit_growth: Optional[float],
+    leadership_bonus_pct: int = 0,
+) -> Optional[dict]:
+    """计算 target_pe_high 的硬天花板（同业锚 + PEG 有界溢价 + 绝对上限 PE_TTM）。
+
+    投研团队做法：目标 PE 锚同业中位，成长更快者给"有界溢价"（PEG 逻辑），
+    但绝不超过当前 PE_TTM（不能用现价的贵倍数来证明目标价）。
+
+    溢价上限 = PEG 证据封顶：
+    - 增速可得且 > 同业隐含增速代理时，允许溢价，但封顶 +30%
+    - 龙头地位再给最多 +10%（leadership_bonus 已在别处算，这里只取其是否>0）
+    - 总溢价封顶 +40%
+
+    返回 None 表示 peer 锚不可用（交由调用方走全-null 兜底）。
+    返回 dict: {cap, premium_pct_used, formula}
+    """
+    if not peer_pe_median or peer_pe_median <= 0:
+        return None
+
+    # PEG 有界溢价：增速越高允许的溢价越大，但封顶
+    premium_pct = 0
+    if net_profit_growth is not None and net_profit_growth > 0:
+        # 经验映射：增速每超同业基准（这里用 25% 作为行业一般成长基准）10pp，给 +10% 溢价
+        excess = (net_profit_growth - 0.25) * 100.0  # 单位 pp
+        if excess > 0:
+            premium_pct = min(30, int(excess / 10.0) * 10)
+    if leadership_bonus_pct > 0:
+        premium_pct = min(40, premium_pct + 10)
+
+    cap = peer_pe_median * (1 + premium_pct / 100.0)
+    formula = f"peer_median {peer_pe_median:.1f} × (1+{premium_pct}%)"
+
+    # 绝对上限：不得超过当前 PE_TTM（堵死"目标=现价贵倍数"漂移）
+    if pe_ttm is not None and pe_ttm > 0 and cap > pe_ttm:
+        cap = pe_ttm
+        formula += f"，绝对上限 ≤ PE_TTM {pe_ttm:.1f}"
+
+    return {"cap": cap, "premium_pct_used": premium_pct, "formula": formula}
+
+
 def parse_sector_rs_30d(sector_str: str) -> Optional[float]:
     """从 sector_comparison 报告抽本股 vs 主题 ETF (或行业 ETF) 的 30d RS。"""
     import re

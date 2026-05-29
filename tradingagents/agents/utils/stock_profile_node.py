@@ -46,6 +46,8 @@ from tradingagents.dataflows.profile_calc import (
     infer_theme_stage_from_data,
     parse_sector_rs_30d,
     parse_pe_ttm_from_fundamentals,
+    parse_net_profit_growth,
+    compute_peer_anchored_pe_cap,
 )
 
 logger = logging.getLogger(__name__)
@@ -222,16 +224,29 @@ def create_stock_profile_node(llm):
         # ---- Layer 2 兜底：三源全 null 时用 PE_TTM × 0.7 做最后锚（机构 PM "无锚定时保守" 原则）----
         # 这里的 0.7 = "向卖方一致 PE 方向收敛"——A 股 PE 通常比卖方目标 PE 高 30-50%，
         # 取 0.7 倍作为兜底锚等于强制 stock_profile 不能给"PE_TTM 之上"的乐观估值
+        # PE_TTM 与净利增速：所有分支都先抽（PE_TTM 用作硬天花板的绝对上限；增速用作 PEG 有界溢价 + 前瞻 EPS 提示）
+        pe_ttm_actual = parse_pe_ttm_from_fundamentals(fundamentals_report + "\n" + fund_raw)
+        net_profit_growth = parse_net_profit_growth(fundamentals_report + "\n" + fund_raw)
+
         layer2_all_null = (sell_side_pe_range is None and self_pe_p80 is None and peer_pe_median is None)
         pe_ttm_fallback = None
         if layer2_all_null:
-            pe_ttm_fallback = parse_pe_ttm_from_fundamentals(fundamentals_report + "\n" + fund_raw)
+            pe_ttm_fallback = pe_ttm_actual
             if pe_ttm_fallback is not None:
                 # 用 PE_TTM × 0.7 灌到 peer_pe_median 位置（标识为 fallback）
                 peer_pe_median = pe_ttm_fallback * 0.7
         leadership_bonus_pct, leadership_reason = detect_leadership_bonus(
             fundamentals_report, news_report,
         )
+        # 同业锚硬天花板（peer 有值且非全-null 兜底时生效；防 target_pe_high 漂到当前 PE）
+        peer_pe_cap = None
+        if not layer2_all_null and peer_pe_median:
+            peer_pe_cap = compute_peer_anchored_pe_cap(
+                peer_pe_median=peer_pe_median,
+                pe_ttm=pe_ttm_actual,
+                net_profit_growth=net_profit_growth,
+                leadership_bonus_pct=leadership_bonus_pct,
+            )
         sector_rs_30d = parse_sector_rs_30d(sector_comparison_md)
         theme_inferred, theme_reason = infer_theme_stage_from_data(
             momentum_score=momentum_score,
@@ -373,6 +388,28 @@ def create_stock_profile_node(llm):
                 )
             prog_lines.append(
                 "- 这是为了避免 `数据没抓到时 LLM 自由发挥给乐观 target_pe → 评级被宽锚漂移` 的 bug"
+            )
+
+        # ---- Layer 2 有同业锚时的硬天花板（防 target_pe_high 漂到当前 PE，按投研团队做法）----
+        elif peer_pe_cap:
+            prog_lines.append("")
+            prog_lines.append("⛔ **target_pe_high 硬天花板（同业锚 + PEG 有界溢价，防漂移）**：")
+            prog_lines.append(
+                f"- **target_pe_high 严禁超过 {peer_pe_cap['cap']:.1f}**"
+                f"（= {peer_pe_cap['formula']}）"
+            )
+            growth_str = f"{net_profit_growth*100:.0f}%" if net_profit_growth is not None else "未抽到"
+            prog_lines.append(
+                f"- 同业锚 = {peer_pe_median:.1f}（**TTM 口径**，来自巨潮行业中位）；归母净利增速(年度) = {growth_str}；"
+                f"PEG 逻辑：增速越快给越高溢价，已按 PEG 证据封顶（≤+40%）"
+            )
+            prog_lines.append(
+                "- ⚠️ **口径一致铁律**：target_pe 与同业锚同为 **TTM 口径**，目标价 ≈ `target_pe × EPS_TTM`。"
+                "**严禁把 TTM 口径 PE 乘以前瞻 EPS（EPS_TTM×(1+增速)）**——那样会双重计入成长、把目标价虚高近 50%。"
+            )
+            prog_lines.append(
+                "- 理由：成熟投研团队相对估值要求『PE 口径与 EPS 口径一致』；"
+                "禁止用『现价的贵倍数』反推目标价（绝对上限 ≤ PE_TTM）"
             )
 
         prog_lines.append("")
