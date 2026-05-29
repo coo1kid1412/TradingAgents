@@ -329,3 +329,413 @@ def is_etf_ticker(ticker: str) -> bool:
         return False
     head = ticker[:2]
     return head in {"51", "15", "56", "58", "16", "50"}
+
+
+# ---------------------------------------------------------------------------
+# Layer 1: 硬规则 —— 亏损股屏蔽 PE / 行业铁律
+# ---------------------------------------------------------------------------
+def parse_eps_ttm(fund_str: str) -> Optional[float]:
+    """从 fundamentals 报告抽 EPS_TTM（每股收益 TTM）。
+
+    匹配优先级（从专属到通用）：
+    1. "EPS(TTM): X" / "扣非 EPS(TTM): X"（_append_valuation_section 系统计算段）
+    2. "每股收益(TTM): X" / "归母 EPS: X"
+    3. "基本每股收益: X"（季报口径，作为兜底）
+    """
+    import re
+
+    if not fund_str:
+        return None
+
+    patterns = [
+        r"EPS\s*[(（]\s*TTM\s*[)）]\s*[:：]\s*(-?[0-9.]+)",
+        r"每股收益\s*[(（]\s*TTM\s*[)）]\s*[:：]\s*(-?[0-9.]+)",
+        r"扣非\s*EPS\s*[(（]\s*TTM\s*[)）]\s*[:：]\s*(-?[0-9.]+)",
+        r"归母\s*EPS\s*[:：]\s*(-?[0-9.]+)",
+        r"基本每股收益\s*[(（]?元[)）]?\s*[:：]\s*(-?[0-9.]+)",
+    ]
+    for pat in patterns:
+        m = re.search(pat, fund_str)
+        if m:
+            try:
+                v = float(m.group(1))
+                # 合理性检查：A 股个股 EPS 一般在 -10 ~ +30 元区间
+                if -50 < v < 100:
+                    return v
+            except ValueError:
+                continue
+    return None
+
+
+def is_loss_making(eps_ttm: Optional[float]) -> bool:
+    """是否亏损股（EPS_TTM ≤ 0）。EPS 缺失时返回 False（保守）。"""
+    return eps_ttm is not None and eps_ttm <= 0
+
+
+# 行业 → 强制估值范式（仅 PE 失真行业，其他行业 LLM 自由发挥）
+INDUSTRY_FORCED_VALUATION: dict[str, str] = {
+    "银行": "pb",
+    "保险": "pb",
+    "REIT": "ddm",
+    "公用事业": "ddm",
+    "电力": "ddm",  # 公用事业子集
+    "水务": "ddm",
+}
+
+
+def detect_forced_valuation_method(
+    industry: Optional[str],
+    eps_ttm: Optional[float],
+) -> dict:
+    """检测是否触发"强制估值范式"硬规则。
+
+    优先级：
+    1. 亏损股（EPS_TTM ≤ 0）→ 强制 target_pe_range = null，primary_method 必须是 pb/ps/ev_ebitda
+    2. PE 失真行业（银行/保险/REIT/公用事业）→ 强制 primary_method = pb / ddm
+    3. 其他 → 不强制，LLM 自由发挥
+
+    Returns:
+        dict: {
+            'force_valuation': bool,
+            'forced_primary_method': Optional[str],   # 强制选这个 primary_method
+            'forbid_pe': bool,                         # 是否禁止使用 PE 估值
+            'reason': str,
+        }
+    """
+    # 优先级 1: 亏损股
+    if is_loss_making(eps_ttm):
+        return {
+            "force_valuation": True,
+            "forced_primary_method": "pb",  # 默认推荐 pb，LLM 可选 ps/ev_ebitda
+            "allowed_primary_methods": ["pb", "ps", "ev_ebitda"],
+            "forbid_pe": True,
+            "reason": f"EPS_TTM = {eps_ttm:.4f} ≤ 0（亏损股 PE 公式失效）",
+        }
+    # 优先级 2: 行业铁律
+    if industry:
+        for key, primary in INDUSTRY_FORCED_VALUATION.items():
+            if key in industry:
+                return {
+                    "force_valuation": True,
+                    "forced_primary_method": primary,
+                    "allowed_primary_methods": [primary],
+                    "forbid_pe": (primary != "pe_eps"),
+                    "reason": f"行业 '{industry}' 命中 {key} → 必须用 {primary.upper()} 估值（PE 失真行业）",
+                }
+    return {
+        "force_valuation": False,
+        "forced_primary_method": None,
+        "allowed_primary_methods": None,
+        "forbid_pe": False,
+        "reason": "",
+    }
+
+
+# ---------------------------------------------------------------------------
+# Layer 2: 数据参照 —— 三源 PE / 默认 premium / theme_inferred / leadership_bonus
+# ---------------------------------------------------------------------------
+def parse_sell_side_pe_consensus(news_str: str) -> Optional[tuple[float, float]]:
+    """从 news 报告抽卖方一致预期 PE 区间。
+
+    匹配（按优先级）：
+    1. "卖方一致预期 PE 60-85 倍" / "目标 PE 60-85 倍"
+    2. "卖方目标价隐含 PE 60-85x"
+    3. "卖方平均 PE 75 倍"（单值 → ± 15% 区间）
+
+    Returns (low, high) or None.
+    """
+    import re
+
+    if not news_str:
+        return None
+
+    # 模式 1: 区间
+    range_patterns = [
+        r"卖方[^0-9\n]{1,20}PE[^0-9\n]{1,8}([0-9.]+)\s*[-~到至]\s*([0-9.]+)\s*[倍xX]?",
+        r"卖方[^0-9\n]{1,20}目标价[^0-9\n]{1,15}隐含\s*PE[^0-9\n]{0,8}([0-9.]+)\s*[-~到至]\s*([0-9.]+)",
+        r"(?:目标|合理|forward)\s*PE[^0-9\n]{0,8}([0-9.]+)\s*[-~到至]\s*([0-9.]+)\s*[倍xX]",
+        r"一致[预期]{0,2}\s*PE[^0-9\n]{0,8}([0-9.]+)\s*[-~到至]\s*([0-9.]+)",
+    ]
+    for pat in range_patterns:
+        m = re.search(pat, news_str)
+        if m:
+            try:
+                low, high = float(m.group(1)), float(m.group(2))
+                if 0 < low <= high <= 1000:
+                    return (low, high)
+            except ValueError:
+                continue
+
+    # 模式 2: 单值 → 扩为 ± 15% 区间
+    single_patterns = [
+        r"卖方[^0-9\n]{1,15}平均\s*PE\s*[:：]?\s*([0-9.]+)",
+        r"卖方[^0-9\n]{1,15}中位\s*PE\s*[:：]?\s*([0-9.]+)",
+    ]
+    for pat in single_patterns:
+        m = re.search(pat, news_str)
+        if m:
+            try:
+                v = float(m.group(1))
+                if 0 < v <= 500:
+                    return (v * 0.85, v * 1.15)
+            except ValueError:
+                continue
+
+    return None
+
+
+def compute_self_pe_p80(price_df, eps_ttm: Optional[float]) -> Optional[float]:
+    """计算自身近 1 年 PE 的 80% 分位（用于"超共识溢价"对照）。
+
+    简化：用过去 252 个交易日的收盘价 / 当前 EPS_TTM。
+    严格做法应该用滚动 TTM EPS，但 fundamentals 历史 EPS 难获取，简化版可接受。
+    亏损股或 EPS 缺失时返回 None。
+    """
+    import pandas as pd
+
+    if price_df is None or len(price_df) == 0 or "Close" not in price_df.columns:
+        return None
+    if eps_ttm is None or eps_ttm <= 0:
+        return None
+
+    closes = pd.to_numeric(price_df["Close"], errors="coerce").dropna()
+    if len(closes) < 60:
+        return None
+
+    recent = closes.tail(252)
+    pe_series = recent / eps_ttm
+    return float(pe_series.quantile(0.80))
+
+
+def parse_peer_pe_median(news_str: str, fund_str: str) -> Optional[float]:
+    """从 news/fundamentals 报告抽同业/行业 PE 中位数。
+
+    优先级：
+    1. "巨潮行业 PE 中位数 88.6"（fundamentals 行业 PE 表）
+    2. "同业 PE 中位数 75 倍"
+    3. "可比公司 PE 平均 80 倍"
+    """
+    import re
+
+    sources = (news_str or "") + "\n" + (fund_str or "")
+    if not sources.strip():
+        return None
+
+    patterns = [
+        r"巨潮[^0-9\n]{0,30}PE[^0-9\n]{0,15}中位[数值]?\s*[:：=]?\s*([0-9.]+)",
+        r"行业\s*PE\s*中位[数值]?\s*[:：=]?\s*([0-9.]+)",
+        r"同业[^0-9\n]{0,15}PE\s*中位[数值]?\s*[:：=]?\s*([0-9.]+)",
+        r"可比[^0-9\n]{0,15}PE\s*(?:平均|中位)\s*[:：=]?\s*([0-9.]+)",
+        r"行业\s*平均\s*PE\s*[:：=]?\s*([0-9.]+)",
+    ]
+    for pat in patterns:
+        m = re.search(pat, sources)
+        if m:
+            try:
+                v = float(m.group(1))
+                if 0 < v <= 500:
+                    return v
+            except ValueError:
+                continue
+    return None
+
+
+def detect_leadership_bonus(fund_str: str, news_str: str) -> tuple[int, str]:
+    """检测是否享受"龙头/稀缺标的"额外溢价（用于 premium 计算）。
+
+    判定规则（按优先级取最高）：
+    - 全球唯三/唯一/国内唯一 → +30%
+    - 行业市占率 > 30% → +30%
+    - 卖方一致评级 BUY 数量 ≥ 10 家 → +20%
+    - 否则 0
+
+    Returns (bonus_pct, reason)
+    """
+    import re
+
+    sources = (fund_str or "") + "\n" + (news_str or "")
+    if not sources.strip():
+        return 0, ""
+
+    # 全球唯几 / 国内唯一
+    m = re.search(r"全球[^\n]{0,8}(唯一|唯[二三四]|仅[一二三四])\s*(?:供应商|厂商|企业)?", sources)
+    if m:
+        return 30, f"全球稀缺标的：{m.group(0)[:30]}"
+    m = re.search(r"国内\s*唯一\s*(?:供应商|厂商|企业|龙头)?", sources)
+    if m:
+        return 30, "国内唯一标的"
+
+    # 市占率
+    m = re.search(r"(?:全球|国内|世界)?\s*市[占场][率分]?\s*[:：=]?\s*([0-9.]+)\s*%", sources)
+    if m:
+        try:
+            v = float(m.group(1))
+            if v >= 30:
+                return 30, f"市占率 {v:.1f}% ≥ 30%（行业龙头）"
+        except ValueError:
+            pass
+
+    # 卖方 BUY 数量（多模式）
+    patterns_buy = [
+        r"BUY\s*[评级]{0,2}\s*[:：]?\s*([0-9]+)\s*家",
+        r"([0-9]+)\s*家\s*(?:券商|机构|卖方)\s*(?:给予|评级)\s*BUY",
+        r"([0-9]+)\s*份\s*研报\s*(?:全部|均|一致)?\s*(?:BUY|买入|增持)",
+    ]
+    for pat in patterns_buy:
+        m = re.search(pat, sources)
+        if m:
+            try:
+                n = int(m.group(1))
+                if n >= 10:
+                    return 20, f"卖方一致评级 BUY {n} 家（共识强龙头）"
+            except ValueError:
+                continue
+
+    return 0, ""
+
+
+# Theme stage 默认 premium 模板（百分点）
+PREMIUM_DEFAULT_TABLE: dict[str, int] = {
+    "initiation": 30,
+    "acceleration": 50,
+    "peak": 20,
+    "fading": -20,
+    "none": 0,
+}
+
+
+def compute_default_premium(
+    theme_stage_inferred: str,
+    leadership_bonus_pct: int = 0,
+    macro_adjustment_pct: int = 0,
+) -> tuple[int, str]:
+    """计算默认 premium_tolerance_pct（按 theme_stage 查表 + 龙头溢价 + 宏观修正）。
+
+    Returns (premium_pct, formula_explanation)
+    """
+    # initiation_or_acceleration / none_or_acceleration 这些"二选一"标签取保守值
+    stage_for_lookup = theme_stage_inferred
+    if stage_for_lookup == "initiation_or_acceleration":
+        stage_for_lookup = "initiation"  # 二选一取保守端
+    elif stage_for_lookup == "none_or_acceleration":
+        stage_for_lookup = "none"
+
+    base = PREMIUM_DEFAULT_TABLE.get(stage_for_lookup, 0)
+    total = base + leadership_bonus_pct + macro_adjustment_pct
+    formula = (
+        f"{base}（{stage_for_lookup}）"
+        f" + {leadership_bonus_pct}（龙头）"
+        f" + {macro_adjustment_pct}（宏观）"
+        f" = {total}"
+    )
+    return total, formula
+
+
+def infer_theme_stage_from_data(
+    momentum_score: Optional[float],
+    sector_rs_30d: Optional[float],
+    rsi_percentile_1y: Optional[float],
+    has_peak_signal: bool,
+) -> tuple[str, str]:
+    """基于量化 + 板块数据推断 theme_stage（不强制 LLM，仅作"参照值"喂给 LLM）。
+
+    判定优先级：
+    1. peak_signal 触发 → peak（已是硬规则）
+    2. momentum ≥ 70 + sector_rs > 0 + RSI 分位 < 70 → acceleration（趋势确认）
+    3. sector_rs < -15 + momentum < 40 → fading（趋势退潮）
+    4. sector_rs > 5 → initiation_or_acceleration（早期识别，LLM 二选一）
+    5. 其他 → none_or_acceleration（LLM 二选一）
+
+    Returns (inferred_stage, reason_text)
+    """
+    if has_peak_signal:
+        return "peak", "Peak 信号已强制触发"
+
+    has_strong_momentum = momentum_score is not None and momentum_score >= 70
+    has_positive_sector = sector_rs_30d is not None and sector_rs_30d > 0
+    has_extreme_rsi = rsi_percentile_1y is not None and rsi_percentile_1y >= 70
+    has_weak_sector = sector_rs_30d is not None and sector_rs_30d < -15
+    has_weak_momentum = momentum_score is not None and momentum_score < 40
+
+    if has_strong_momentum and has_positive_sector and not has_extreme_rsi:
+        return "acceleration", (
+            f"momentum={momentum_score:.1f} ≥ 70 + sector_rs_30d={sector_rs_30d:+.1f}% > 0"
+            f" + RSI 分位未极端 → 趋势确认"
+        )
+
+    if has_weak_sector and has_weak_momentum:
+        return "fading", (
+            f"sector_rs_30d={sector_rs_30d:+.1f}% < -15"
+            f" + momentum={momentum_score:.1f} < 40 → 趋势退潮"
+        )
+
+    if sector_rs_30d is not None and sector_rs_30d > 5:
+        return "initiation_or_acceleration", (
+            f"sector_rs_30d={sector_rs_30d:+.1f}% > 5 → 早期主题候选，LLM 在 initiation/acceleration 二选一"
+        )
+
+    return "none_or_acceleration", "无明确趋势信号 → LLM 在 none/acceleration 二选一"
+
+
+def parse_pe_ttm_from_fundamentals(fund_str: str) -> Optional[float]:
+    """从 fundamentals 报告抽 PE(TTM) 数值。
+
+    作为"全部 Layer 2 三源都缺失"时的最后兜底锚：
+    fallback_peer_pe_median = PE(TTM) × 0.7（向卖方一致 PE 方向收敛）
+
+    匹配优先级：
+    1. "PE(TTM) | XX 倍 | 系统计算值"（fundamentals 表格格式）
+    2. "PE(TTM) X.XX" / "当前 PE(TTM) X.XX 倍"
+    3. "动态 PE / 静态 PE" 不在此函数处理（口径不同）
+    """
+    import re
+
+    if not fund_str:
+        return None
+
+    patterns = [
+        r"PE\s*[(（]\s*TTM\s*[)）]\s*\|\s*\*{0,2}\s*([0-9.]+)\s*倍",
+        r"PE\s*[(（]\s*TTM\s*[)）]\s*[:：]?\s*([0-9.]+)\s*倍",
+        r"当前\s*PE\s*[(（]\s*TTM\s*[)）]\s*[:：]?\s*([0-9.]+)",
+    ]
+    for pat in patterns:
+        m = re.search(pat, fund_str)
+        if m:
+            try:
+                v = float(m.group(1))
+                if 0 < v <= 5000:  # 合理 PE 范围
+                    return v
+            except ValueError:
+                continue
+    return None
+
+
+def parse_sector_rs_30d(sector_str: str) -> Optional[float]:
+    """从 sector_comparison 报告抽本股 vs 主题 ETF (或行业 ETF) 的 30d RS。"""
+    import re
+
+    if not sector_str:
+        return None
+
+    # 表格匹配：| 30d | ... |
+    m = re.search(r"\|\s*30d\s*\|\s*([+-]?[0-9.]+)\s*%", sector_str)
+    if m:
+        try:
+            return float(m.group(1))
+        except ValueError:
+            pass
+
+    # 文字匹配
+    patterns = [
+        r"30d\s*RS\s*[:：=]\s*([+-]?[0-9.]+)\s*%",
+        r"vs[^0-9\n]{1,30}(?:主题|行业)\s*ETF[^0-9\n]{0,15}([+-]?[0-9.]+)\s*%",
+        r"30d[^0-9\n]{1,15}([+-]?[0-9.]+)\s*%\s*(?:跑赢|跑输)?",
+    ]
+    for pat in patterns:
+        m = re.search(pat, sector_str)
+        if m:
+            try:
+                return float(m.group(1))
+            except ValueError:
+                continue
+    return None

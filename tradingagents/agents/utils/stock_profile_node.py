@@ -34,6 +34,18 @@ from tradingagents.dataflows.profile_calc import (
     liquidity_tier_label,
     market_cap_tier_label,
     parse_market_cap_from_fundamentals,
+    # Layer 1: 硬规则
+    parse_eps_ttm,
+    detect_forced_valuation_method,
+    # Layer 2: 数据参照
+    parse_sell_side_pe_consensus,
+    compute_self_pe_p80,
+    parse_peer_pe_median,
+    detect_leadership_bonus,
+    compute_default_premium,
+    infer_theme_stage_from_data,
+    parse_sector_rs_30d,
+    parse_pe_ttm_from_fundamentals,
 )
 
 logger = logging.getLogger(__name__)
@@ -157,6 +169,7 @@ def create_stock_profile_node(llm):
         fundamentals_report = state.get("fundamentals_report", "")
         macro_context = state.get("macro_context", "")
         quant_score_md = state.get("quant_score", "")
+        sector_comparison_md = state.get("sector_comparison", "")
 
         # === 程序化判定开始 ===
         is_etf = is_etf_ticker(ticker)
@@ -193,6 +206,45 @@ def create_stock_profile_node(llm):
             has_vol_divergence=price_signals.get("has_vol_divergence"),
         )
         base_weights = get_default_weights(style)
+
+        # === Layer 1: 硬规则（亏损股 + 行业铁律）===
+        # 注：行业铁律的 industry 字段在 LLM 输出后才有，本节点入口只能用 EPS 判定
+        # 行业铁律由 prompt 强约束（已存在的行业框架卡 + 下面 LLM 看到 forced_valuation 后自检）
+        eps_ttm_val = parse_eps_ttm(fund_raw + "\n" + fundamentals_report)
+        # industry 由 LLM 输出，此处只用 EPS 触发 Layer 1，industry 字段传 None
+        forced_valuation = detect_forced_valuation_method(industry=None, eps_ttm=eps_ttm_val)
+
+        # === Layer 2: 数据参照（三源 PE / 龙头溢价 / theme_inferred / default premium）===
+        sell_side_pe_range = parse_sell_side_pe_consensus(news_report)
+        self_pe_p80 = compute_self_pe_p80(price_df, eps_ttm_val)
+        peer_pe_median = parse_peer_pe_median(news_report, fundamentals_report)
+
+        # ---- Layer 2 兜底：三源全 null 时用 PE_TTM × 0.7 做最后锚（机构 PM "无锚定时保守" 原则）----
+        # 这里的 0.7 = "向卖方一致 PE 方向收敛"——A 股 PE 通常比卖方目标 PE 高 30-50%，
+        # 取 0.7 倍作为兜底锚等于强制 stock_profile 不能给"PE_TTM 之上"的乐观估值
+        layer2_all_null = (sell_side_pe_range is None and self_pe_p80 is None and peer_pe_median is None)
+        pe_ttm_fallback = None
+        if layer2_all_null:
+            pe_ttm_fallback = parse_pe_ttm_from_fundamentals(fundamentals_report + "\n" + fund_raw)
+            if pe_ttm_fallback is not None:
+                # 用 PE_TTM × 0.7 灌到 peer_pe_median 位置（标识为 fallback）
+                peer_pe_median = pe_ttm_fallback * 0.7
+        leadership_bonus_pct, leadership_reason = detect_leadership_bonus(
+            fundamentals_report, news_report,
+        )
+        sector_rs_30d = parse_sector_rs_30d(sector_comparison_md)
+        theme_inferred, theme_reason = infer_theme_stage_from_data(
+            momentum_score=momentum_score,
+            sector_rs_30d=sector_rs_30d,
+            rsi_percentile_1y=price_signals.get("rsi_percentile_1y"),
+            has_peak_signal=peak_check["force_peak"],
+        )
+        # 宏观修正（macro_context 由 LLM 已经生成；此处简化用 0，LLM 在 YAML 输出时自填）
+        default_premium_pct, default_premium_formula = compute_default_premium(
+            theme_stage_inferred=theme_inferred,
+            leadership_bonus_pct=leadership_bonus_pct,
+            macro_adjustment_pct=0,
+        )
 
         # === 程序化判定结束 ===
 
@@ -257,7 +309,98 @@ def create_stock_profile_node(llm):
             f"/ lowvol={lowvol_score} / value={quant_yaml.get('value')} "
             f"/ quality={quant_yaml.get('quality')} / growth={quant_yaml.get('growth')}"
         )
+
+        # === Layer 1: 估值范式硬规则 ===
+        prog_lines.append("")
+        prog_lines.append("## 估值范式硬规则（Layer 1，必须遵守）")
+        if forced_valuation["force_valuation"]:
+            prog_lines.append(f"**⛔ 强制约束**：{forced_valuation['reason']}")
+            if forced_valuation["forbid_pe"]:
+                prog_lines.append(
+                    f"→ `target_pe_range` **必须**填 `[null, null]`，**禁止**强行套 PE 公式"
+                )
+            allowed = forced_valuation.get("allowed_primary_methods")
+            if allowed:
+                prog_lines.append(
+                    f"→ `primary_method` **必须**从 `{allowed}` 中选（推荐 `{forced_valuation['forced_primary_method']}`）"
+                )
+        else:
+            eps_str = f"{eps_ttm_val:.2f}" if eps_ttm_val is not None else "未抽到"
+            prog_lines.append(f"EPS_TTM = {eps_str}，盈利股，PE 估值可用。如行业属银行/保险/REIT/公用事业，仍需走 PB/DDM。")
+
+        # === Layer 2: 数据参照（喂给 LLM 当估值锚定参照，不强制）===
+        prog_lines.append("")
+        prog_lines.append("## 估值锚定三源参照（Layer 2，LLM 主选但要透明）")
+        prog_lines.append("")
+        prog_lines.append("**三源 PE 参照值**（用于 `target_pe_range` 决策）：")
+        if sell_side_pe_range:
+            prog_lines.append(f"- 卖方一致预期 PE: [{sell_side_pe_range[0]:.1f}, {sell_side_pe_range[1]:.1f}]（来自 news 报告）")
+        else:
+            prog_lines.append("- 卖方一致预期 PE: 未抽到（news 报告无明确卖方一致 PE 区间）")
+        if self_pe_p80:
+            prog_lines.append(f"- 自身历史 1Y PE 80% 分位: {self_pe_p80:.1f}")
+        else:
+            prog_lines.append("- 自身历史 1Y PE 80% 分位: 不适用（亏损或数据不足）")
+        if peer_pe_median:
+            if pe_ttm_fallback is not None:
+                prog_lines.append(
+                    f"- 同业/行业 PE 中位数: {peer_pe_median:.1f}（**⚠️ Layer 2 三源全 null，用 PE_TTM×0.7 = "
+                    f"{pe_ttm_fallback:.1f}×0.7 兜底**）"
+                )
+            else:
+                prog_lines.append(f"- 同业/行业 PE 中位数: {peer_pe_median:.1f}（来自 news/fundamentals）")
+        else:
+            prog_lines.append("- 同业/行业 PE 中位数: 未抽到（且 PE_TTM 也抽不到，无任何兜底锚）")
+
+        # ---- Layer 2 三源全 null 时的硬约束（防 213401 类 "宽锚伪 HOLD" 漂移）----
+        if layer2_all_null:
+            prog_lines.append("")
+            prog_lines.append("⛔ **Layer 2 数据缺失硬约束（防漂移）**：")
+            prog_lines.append("Layer 2 三源（卖方一致 / 自身历史 P80 / 同业 PE）全部为 null。")
+            if peer_pe_median:
+                pe_cap = pe_ttm_fallback * 0.6
+                prog_lines.append(
+                    f"- 已用 PE_TTM = {pe_ttm_fallback:.1f} 做最后兜底锚（peer_pe_median 字段填 {peer_pe_median:.1f}）"
+                )
+                prog_lines.append(
+                    f"- **target_pe_high 严禁超过 PE_TTM × 0.6 = {pe_cap:.1f}**"
+                    f"（机构 PM `无外部锚定时保守`原则——禁止 LLM 在数据缺失时自由发挥给宽 PE）"
+                )
+            else:
+                prog_lines.append("- PE_TTM 也抽不到，无任何外部锚")
+                prog_lines.append(
+                    "- **target_pe_range 必须填 [null, null]**，primary_method 必须从 [pb, ps, ev_ebitda] 选"
+                )
+            prog_lines.append(
+                "- 这是为了避免 `数据没抓到时 LLM 自由发挥给乐观 target_pe → 评级被宽锚漂移` 的 bug"
+            )
+
+        prog_lines.append("")
+        prog_lines.append("**主题阶段量化推断（参照值，LLM 可不采纳但要解释）**：")
+        prog_lines.append(f"- `theme_stage_inferred` = **{theme_inferred}**")
+        prog_lines.append(f"- 推断依据: {theme_reason}")
+
+        prog_lines.append("")
+        prog_lines.append("**默认 premium_tolerance_pct（按 theme_stage 查表 + 龙头溢价 + 宏观）**：")
+        prog_lines.append(f"- `default_premium_pct` = **{default_premium_pct}**")
+        prog_lines.append(f"- 计算公式: {default_premium_formula}")
+        if leadership_bonus_pct > 0:
+            prog_lines.append(f"- 龙头溢价识别: +{leadership_bonus_pct}% （{leadership_reason}）")
+        if sector_rs_30d is not None:
+            prog_lines.append(f"- 板块 RS 30d: {sector_rs_30d:+.1f}%（来自 sector_comparison）")
+
+        # === Layer 3: 透明化标注要求 ===
+        prog_lines.append("")
+        prog_lines.append("## 透明化标注（Layer 3，YAML 末尾 TRANSPARENCY 段必填）")
+        prog_lines.append("你的 target_pe_range 和 premium_tolerance_pct 可在 Layer 2 参照值基础上自由调，**但必须在 YAML 末尾透明标注偏离程度**——下游 RM/PM 会按你的偏离幅度调 Conviction。")
+
         programmatic_block = "\n".join(prog_lines)
+
+        # 给 LLM YAML 模板填空用的中间变量（避免 f-string 模板里复杂取值）
+        sell_side_low_str = f"{sell_side_pe_range[0]:.1f}" if sell_side_pe_range else "null"
+        sell_side_high_str = f"{sell_side_pe_range[1]:.1f}" if sell_side_pe_range else "null"
+        self_p80_str = f"{self_pe_p80:.1f}" if self_pe_p80 else "null"
+        peer_median_str = f"{peer_pe_median:.1f}" if peer_pe_median else "null"
 
         prompt = f"""【语言要求】你必须使用中文撰写以下分析。股票代码和技术指标名称可保留英文。
 
@@ -453,7 +596,41 @@ THEMATIC_PREMIUM:
   theme_stage: {'peak（已被 Peak 信号强制锁定）' if peak_check['force_peak'] else 'initiation / acceleration / peak / fading / none'}
   premium_tolerance_pct: <整数>
   rationale: <1-2 句话，引用具体信号>
+
+# Layer 3 透明化标注（强制必填，用于下游 RM/PM Conviction 校准）
+TRANSPARENCY:
+  # —— 估值锚定偏离度（target_pe_range 高位 vs 三源参照）——
+  target_pe_high_vs_sell_side_pct: <整数百分比，如 +35 表示 LLM 选的 target_pe_high 比卖方一致 PE 高 35%；卖方未抽到时填 null>
+  target_pe_high_vs_self_p80_pct: <整数百分比；自身历史 P80 未抽到时填 null>
+  target_pe_high_vs_peer_median_pct: <整数百分比；同业 PE 未抽到时填 null>
+  # —— 主题阶段是否与量化推断一致 ——
+  theme_stage_inferred_by_data: {theme_inferred}
+  theme_stage_llm_chosen: <你最终选的 theme_stage>
+  theme_divergence_reason: <若 inferred 与 chosen 不同，必填理由；一致填 "consistent">
+  # —— premium 偏离默认模板 ——
+  premium_default_template: {default_premium_pct}
+  premium_llm_chosen: <你最终选的 premium_tolerance_pct>
+  premium_divergence_reason: <若偏离 default ±15 以上，必填理由；否则填 "within_default_range">
+  # —— 参照值原始数据（Python 已算好，直接抄）——
+  sell_side_pe_low_ref: {sell_side_low_str}
+  sell_side_pe_high_ref: {sell_side_high_str}
+  self_pe_p80_ref: {self_p80_str}
+  peer_pe_median_ref: {peer_median_str}
+  leadership_bonus_pct: {leadership_bonus_pct}
+  sector_rs_30d_pct: {sector_rs_30d if sector_rs_30d is not None else 'null'}
 ```
+
+**TRANSPARENCY 字段填写规则**：
+1. 偏离百分比按 LLM 自选值 vs 参照值算：`(llm_chosen - reference) / reference × 100`
+2. 参照值缺失（null）时对应偏离字段填 null，**不要编造**
+3. `theme_divergence_reason` 和 `premium_divergence_reason` 是给下游 RM/PM 看的——超共识时必须有产业证据支撑（如"刚出 H100 量产订单 / Q1 业绩超预期 60% / 主题情绪急速升温"），否则下游会自动降 Conviction
+
+⛔ **TRANSPARENCY schema 封闭约束**：
+- TRANSPARENCY 段**字段集严格封闭**——只能输出上述模板列出的字段名
+- **禁止**自创字段（如 `_v2` / `_corrected` / `_adjusted` 后缀，或任何其他自定义字段名）
+- 偏离值如有不同算法解释，统一在对应 `_reason` 字段的文字里说明，不要新增字段
+- YAML 字段顺序按模板出现顺序，不要重排
+- 这是下游 Python 程序化解析依赖的固定 schema，schema 漂移会导致归档失败
 """
 
         response = llm.invoke(prompt)
