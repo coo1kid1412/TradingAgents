@@ -766,42 +766,68 @@ def compute_peer_anchored_pe_cap(
     pe_ttm: Optional[float],
     net_profit_growth: Optional[float],
     leadership_bonus_pct: int = 0,
+    target_peg: float = 1.0,
 ) -> Optional[dict]:
-    """计算 target_pe_high 的硬天花板（同业锚 + PEG 有界溢价 + 绝对上限 PE_TTM）。
+    """计算 target_pe_high 的硬天花板（两腿取友好者 + 绝对上限 PE_TTM）。
 
-    投研团队做法：目标 PE 锚同业中位，成长更快者给"有界溢价"（PEG 逻辑），
-    但绝不超过当前 PE_TTM（不能用现价的贵倍数来证明目标价）。
+    投研团队做法：目标 PE 锚同业，成长更快者按 PEG 给溢价；但绝不超过当前 PE_TTM
+    （不能用现价的贵倍数来证明目标价——那是无观点的循环）。
 
-    溢价上限 = PEG 证据封顶：
-    - 增速可得且 > 同业隐含增速代理时，允许溢价，但封顶 +30%
-    - 龙头地位再给最多 +10%（leadership_bonus 已在别处算，这里只取其是否>0）
-    - 总溢价封顶 +40%
+    两腿取 max（让超高增长股不被同业 comps 死压）：
+    - 腿 A（comps）：peer_median × (1+有界溢价)，溢价按超额增速给、封顶 +40%
+    - 腿 B（PEG 正当化）：min(增速,100%) × target_peg —— 增速 100% 的票可正当化到 PE≈100
+      （增速封顶 100% 防一次性暴增正当化离谱 PE；target_peg=1.0 即 PEG=1 公允不偏贵）
+
+    绝对上限：两腿结果都 ≤ PE_TTM（防漂移核心护栏；PEG 给空间但不许超现价倍数）。
 
     返回 None 表示 peer 锚不可用（交由调用方走全-null 兜底）。
-    返回 dict: {cap, premium_pct_used, formula}
+    返回 dict: {cap, premium_pct_used, anchor_used, formula}
     """
     if not peer_pe_median or peer_pe_median <= 0:
         return None
 
-    # PEG 有界溢价：增速越高允许的溢价越大，但封顶
+    # --- 腿 A：同业 comps 锚 + 有界溢价（增速越高溢价越大，封顶 +40%）---
     premium_pct = 0
     if net_profit_growth is not None and net_profit_growth > 0:
-        # 经验映射：增速每超同业基准（这里用 25% 作为行业一般成长基准）10pp，给 +10% 溢价
+        # 经验映射：增速每超同业基准（25% 作为行业一般成长基准）10pp，给 +10% 溢价
         excess = (net_profit_growth - 0.25) * 100.0  # 单位 pp
         if excess > 0:
             premium_pct = min(30, int(excess / 10.0) * 10)
     if leadership_bonus_pct > 0:
         premium_pct = min(40, premium_pct + 10)
+    comps_anchor = peer_pe_median * (1 + premium_pct / 100.0)
 
-    cap = peer_pe_median * (1 + premium_pct / 100.0)
-    formula = f"peer_median {peer_pe_median:.1f} × (1+{premium_pct}%)"
+    # --- 腿 B：PEG 正当化 PE（高增长股的该有溢价，不被 comps 死压）---
+    peg_anchor = None
+    if net_profit_growth is not None and net_profit_growth > 0:
+        g_pct = min(net_profit_growth * 100.0, 100.0)  # 增速封顶 100%
+        peg_anchor = g_pct * target_peg
 
-    # 绝对上限：不得超过当前 PE_TTM（堵死"目标=现价贵倍数"漂移）
+    # 取两腿更友好者
+    if peg_anchor is not None and peg_anchor > comps_anchor:
+        cap = peg_anchor
+        anchor_used = "peg"
+        formula = (
+            f"PEG 正当化 = min(增速,100%)×PEG{target_peg:g} = {peg_anchor:.1f}"
+            f"（> comps 锚 {comps_anchor:.1f}）"
+        )
+    else:
+        cap = comps_anchor
+        anchor_used = "comps"
+        formula = f"peer_median {peer_pe_median:.1f}×(1+{premium_pct}%) = {comps_anchor:.1f}"
+
+    # --- 绝对上限：≤ PE_TTM（堵死"目标=现价贵倍数"漂移）---
     if pe_ttm is not None and pe_ttm > 0 and cap > pe_ttm:
         cap = pe_ttm
-        formula += f"，绝对上限 ≤ PE_TTM {pe_ttm:.1f}"
+        anchor_used += "+pe_ttm_capped"
+        formula += f"；绝对上限 ≤ PE_TTM {pe_ttm:.1f}"
 
-    return {"cap": cap, "premium_pct_used": premium_pct, "formula": formula}
+    return {
+        "cap": cap,
+        "premium_pct_used": premium_pct,
+        "anchor_used": anchor_used,
+        "formula": formula,
+    }
 
 
 def parse_sector_rs_30d(sector_str: str) -> Optional[float]:
