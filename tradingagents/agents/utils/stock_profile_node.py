@@ -534,6 +534,25 @@ def create_stock_profile_node(llm):
                 "禁止用『现价的贵倍数』反推目标价（绝对上限 ≤ PE_TTM）"
             )
 
+        # ---- EPS 口径锁定（所有分支通用；修"TTM 倍数 × 前瞻 EPS"双重计入，澜起派发期被错抬成 OW 的根因）----
+        if not (forced_valuation["force_valuation"] and forced_valuation["forbid_pe"]):
+            eps_ttm_disp = f"{eps_ttm_val:.2f}" if eps_ttm_val is not None else "未抽到"
+            prog_lines.append("")
+            prog_lines.append("⛔ **EPS 口径锁定（防 TTM 倍数 × 前瞻 EPS 双重计入）**：")
+            prog_lines.append(f"- **EPS_TTM = {eps_ttm_disp} 元**（系统给值；下游 RM 直接用，禁止重算/换口径）")
+            if eps_ttm_val is not None and net_profit_growth is not None:
+                fwd_eps = eps_ttm_val * (1 + net_profit_growth)
+                prog_lines.append(
+                    f"- 前瞻 EPS 参考 ≈ {fwd_eps:.2f} 元（= EPS_TTM×(1+增速{net_profit_growth*100:.0f}%)，**仅 PEG 腿用**）"
+                )
+            prog_lines.append(
+                "- **铁律**：`target_pe_range` / 同业中位 / `PE_TTM×0.x` 全是 **TTM 倍数** → 下游 RM 的 "
+                "`PE×EPS` 腿 和 `同业可比` 腿 **必须乘 EPS_TTM**；**只有 PEG 腿配前瞻 EPS**。"
+            )
+            prog_lines.append(
+                "- ❌ 严禁：同业中位(TTM) × 前瞻/2026E EPS（双重计入成长 → 目标价虚高 ~50% → 高估值股被错抬成强买）。"
+            )
+
         prog_lines.append("")
         prog_lines.append("**主题阶段量化推断（参照值，LLM 可不采纳但要解释）**：")
         prog_lines.append(f"- `theme_stage_inferred` = **{theme_inferred}**")
