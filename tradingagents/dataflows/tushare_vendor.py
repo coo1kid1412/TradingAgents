@@ -8,7 +8,7 @@ import os
 import re
 import time
 import logging
-from typing import Annotated
+from typing import Annotated, Optional
 from datetime import datetime, timedelta
 
 import pandas as pd
@@ -752,3 +752,272 @@ def get_insider_transactions(
         f"# Data retrieved on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
     )
     return header + csv_string
+
+
+# ---------------------------------------------------------------------------
+# 10. get_capital_flow —— 资金流主力/超大/大/中/小单 + 流通市值 + 龙虎榜 30 日计数
+# ---------------------------------------------------------------------------
+def get_capital_flow(
+    symbol: Annotated[str, "ticker symbol"],
+    end_date: Annotated[str, "current trading date YYYY-mm-dd"],
+    lookback_days: Annotated[int, "trading-day lookback window for moneyflow"] = 120,
+) -> dict:
+    """资金流原始数据装配（tushare 主路径）。
+
+    返回结构化 dict（注意：与现有 get_stock/get_fundamentals 等返回 str 的接口风格不同——
+    这里需要保留 DataFrame 给下游 capital_flow_utils 做派生计算，避免格式化-反序列化的精度丢失）。
+
+    内部串联 3 个 tushare 接口：
+    - moneyflow_dc       : 主力/超大/大/中/小单净额 + 散户成交占比（rate 字段）
+    - bak_daily          : 流通市值（亿元，单位是亿元，不是万元 —— 已在 5 只股 dry-run 中验证）
+    - top_list           : 龙虎榜上榜记录 → 派生 30 日上榜次数
+
+    任何子调用失败都不阻塞，对应字段返回 None，让 capital_flow_utils 用「数据不足」逻辑兜底。
+    完全不可用时（pro 未初始化）抛 TushareUnavailableError 触发 fallback。
+
+    Returns:
+        dict 含字段（全名）：
+        - moneyflow_df              : DataFrame（按 trade_date 升序），含 capital_flow_utils
+                                       要求的标准列名（main_force_net_amount_yi 等）
+        - circulating_market_value_yi : float 或 None
+        - lhb_count_30d             : int 或 None
+        - latest_trade_date         : 最新交易日 YYYYMMDD，用于北向新鲜度判断
+        - data_source_breakdown     : dict 标注每个子项实际数据来源（"tushare" / "missing"）
+    """
+    pro = _get_tushare_api()
+    ts_code = to_tushare_format(symbol)
+    end_compact = to_akshare_date(end_date)
+
+    end_dt = datetime.strptime(end_date, "%Y-%m-%d")
+    start_dt = end_dt - timedelta(days=lookback_days * 2)  # ×2 抵消周末/节假日缩水
+    start_compact = to_akshare_date(start_dt.strftime("%Y-%m-%d"))
+
+    out: dict = {
+        "moneyflow_df": None,
+        "circulating_market_value_yi": None,
+        "lhb_count_30d": None,
+        "lhb_inst_net_buy_30d_yi": None,
+        "latest_trade_date": end_compact,
+        "data_source_breakdown": {
+            "moneyflow": "missing",
+            "circ_mv": "missing",
+            "lhb": "missing",
+            "lhb_inst": "missing",
+        },
+    }
+
+    # 子调用 1: moneyflow_dc（主力/超大/大/中/小单 + rate 字段）
+    try:
+        mf_raw = _safe_call(
+            pro.moneyflow_dc,
+            ts_code=ts_code,
+            start_date=start_compact,
+            end_date=end_compact,
+            api_name="moneyflow_dc",
+        )
+        if mf_raw is not None and not mf_raw.empty:
+            mf = mf_raw.sort_values("trade_date").reset_index(drop=True)
+            # 单位换算：tushare moneyflow_dc 的 *_amount 字段单位都是「万元」
+            normalized = pd.DataFrame({
+                "trade_date":                  mf["trade_date"].astype(str),
+                "main_force_net_amount_yi":    (mf["net_amount"].astype(float) * 1e-4).round(4)
+                    if "net_amount" in mf.columns else None,
+                "extra_large_net_amount_yi":   (mf["buy_elg_amount"].astype(float) * 1e-4).round(4)
+                    if "buy_elg_amount" in mf.columns else None,
+                "large_net_amount_yi":         (mf["buy_lg_amount"].astype(float) * 1e-4).round(4)
+                    if "buy_lg_amount" in mf.columns else None,
+                "medium_buy_amount_rate_pct":  mf["buy_md_amount_rate"].astype(float)
+                    if "buy_md_amount_rate" in mf.columns else None,
+                "small_buy_amount_rate_pct":   mf["buy_sm_amount_rate"].astype(float)
+                    if "buy_sm_amount_rate" in mf.columns else None,
+                "close":                       mf["close"].astype(float)
+                    if "close" in mf.columns else None,
+            })
+            # 取最新交易日（用于北向新鲜度对照）
+            out["latest_trade_date"] = str(normalized["trade_date"].iloc[-1])
+            # 子调用 1.b：再补一次 daily 拿 amount，用于 ddz_like_20d_pct 分母
+            try:
+                daily = _safe_call(
+                    pro.daily,
+                    ts_code=ts_code,
+                    start_date=start_compact,
+                    end_date=end_compact,
+                    fields="trade_date,amount",
+                    api_name="daily",
+                )
+                if daily is not None and not daily.empty:
+                    daily = daily.sort_values("trade_date").reset_index(drop=True)
+                    # daily.amount 单位为千元 → 亿元（除以 1e5）
+                    daily["daily_amount_yi"] = (daily["amount"].astype(float) * 1e-5).round(4)
+                    normalized = normalized.merge(
+                        daily[["trade_date", "daily_amount_yi"]],
+                        on="trade_date", how="left",
+                    )
+            except (TushareUnavailableError, TushareRateLimitError) as e:
+                logger.info("get_capital_flow: pro.daily amount 调用失败，ddz_like_20d_pct 将不可计算: %s", e)
+            out["moneyflow_df"] = normalized
+            out["data_source_breakdown"]["moneyflow"] = "tushare"
+    except (TushareUnavailableError, TushareRateLimitError) as e:
+        logger.warning("get_capital_flow: moneyflow_dc 不可用: %s", e)
+
+    # 子调用 2: bak_daily 拿流通市值（亿元，单位已是亿元，不限流）
+    try:
+        # 取最近 5 个交易日，避免节假日空数据
+        bak_start = (end_dt - timedelta(days=10)).strftime("%Y%m%d")
+        bak = _safe_call(
+            pro.bak_daily,
+            ts_code=ts_code,
+            start_date=bak_start,
+            end_date=end_compact,
+            fields="trade_date,close,float_mv",
+            api_name="bak_daily",
+        )
+        if bak is not None and not bak.empty:
+            bak = bak.sort_values("trade_date")
+            mv = bak.iloc[-1].get("float_mv")
+            if pd.notna(mv) and float(mv) > 0:
+                # bak_daily.float_mv 单位 = 亿元（dry-run 已验证：close × float_share）
+                out["circulating_market_value_yi"] = round(float(mv), 2)
+                out["data_source_breakdown"]["circ_mv"] = "tushare"
+    except (TushareUnavailableError, TushareRateLimitError) as e:
+        logger.warning("get_capital_flow: bak_daily 不可用: %s", e)
+
+    # 子调用 3: top_list（龙虎榜 30 日上榜次数）
+    try:
+        lhb_start = (end_dt - timedelta(days=30)).strftime("%Y%m%d")
+        # top_list 是按交易日批量查询，但支持 ts_code 过滤；fallback 直接 ts_code 单股查询
+        lhb = _safe_call(
+            pro.top_list,
+            ts_code=ts_code,
+            start_date=lhb_start,
+            end_date=end_compact,
+            api_name="top_list",
+        )
+        if lhb is not None and not lhb.empty:
+            # 同一天可能有多条记录（多个上榜原因），按 trade_date 去重
+            unique_days = lhb["trade_date"].astype(str).nunique() if "trade_date" in lhb.columns else len(lhb)
+            out["lhb_count_30d"] = int(unique_days)
+            out["data_source_breakdown"]["lhb"] = "tushare"
+        else:
+            # 30 天内未上榜 → 0 次（不是 missing）
+            out["lhb_count_30d"] = 0
+            out["data_source_breakdown"]["lhb"] = "tushare"
+    except (TushareUnavailableError, TushareRateLimitError) as e:
+        logger.info("get_capital_flow: top_list 不可用: %s", e)
+
+    # 子调用 4: top_inst（龙虎榜机构成交明细 → 30 日机构席位净买，判方向）
+    # 机构出货/游资派发同样会上榜，所以方向看机构净买，不看上榜次数。
+    try:
+        inst_start = (end_dt - timedelta(days=30)).strftime("%Y%m%d")
+        inst = _safe_call(
+            pro.top_inst,
+            ts_code=ts_code,
+            start_date=inst_start,
+            end_date=end_compact,
+            api_name="top_inst",
+        )
+        if inst is not None and not inst.empty and "net_buy" in inst.columns:
+            # tushare top_inst.net_buy 单位为元 → 亿元（×1e-8）。方向取符号、不依赖精确单位；
+            # 阈值在 capital_flow_utils 以亿元计，单位若有出入只影响"持平带"宽度（TODO: 首跑校准）。
+            net_buy_yi = float(inst["net_buy"].astype(float).sum()) * 1e-8
+            out["lhb_inst_net_buy_30d_yi"] = round(net_buy_yi, 4)
+            out["data_source_breakdown"]["lhb_inst"] = "tushare"
+        elif inst is not None and inst.empty:
+            # 30 天内无机构席位明细 → 0（不是 missing）
+            out["lhb_inst_net_buy_30d_yi"] = 0.0
+            out["data_source_breakdown"]["lhb_inst"] = "tushare"
+    except (TushareUnavailableError, TushareRateLimitError) as e:
+        logger.info("get_capital_flow: top_inst 不可用: %s", e)
+
+    # 主路径不可用时（moneyflow + circ_mv 都为空）抛错触发 fallback
+    if out["moneyflow_df"] is None and out["circulating_market_value_yi"] is None:
+        raise TushareUnavailableError(
+            f"Tushare get_capital_flow 主路径全部失败 ({symbol})，触发 akshare fallback"
+        )
+
+    return out
+
+
+# ---------------------------------------------------------------------------
+# 11. get_holder_number —— 季报股东户数（stk_holdernumber）
+# ---------------------------------------------------------------------------
+def get_holder_number(
+    symbol: Annotated[str, "ticker symbol"],
+    lookback_quarters: Annotated[int, "number of recent quarters"] = 8,
+) -> Optional[pd.DataFrame]:
+    """季报股东户数序列（按 end_date 升序）。
+
+    Returns:
+        DataFrame，含字段：
+        - end_date     报告期 YYYYMMDD
+        - holder_num   股东户数（单位：户）
+        无数据返回 None；接口不可用抛 TushareUnavailableError。
+    """
+    pro = _get_tushare_api()
+    ts_code = to_tushare_format(symbol)
+
+    df = _safe_call(
+        pro.stk_holdernumber,
+        ts_code=ts_code,
+        api_name="stk_holdernumber",
+    )
+    if df is None or df.empty:
+        return None
+
+    if "end_date" not in df.columns or "holder_num" not in df.columns:
+        return None
+
+    df = df.dropna(subset=["holder_num"])
+    if df.empty:
+        return None
+
+    df = df.sort_values("end_date").tail(lookback_quarters).reset_index(drop=True)
+    return df[["end_date", "holder_num"]].copy()
+
+
+# ---------------------------------------------------------------------------
+# 12. get_north_hold —— 北向（港股通）个股持股序列
+# ---------------------------------------------------------------------------
+def get_north_hold(
+    symbol: Annotated[str, "ticker symbol"],
+    end_date: Annotated[str, "current trading date YYYY-mm-dd"],
+    lookback_days: Annotated[int, "trading-day lookback window"] = 30,
+) -> Optional[pd.DataFrame]:
+    """北向资金个股持股序列（tushare hk_hold）。
+
+    注意：自 2024-08-16 起中证取消日度个股北向持股披露，akshare 接口完全停滞；
+    tushare hk_hold 同样可能返回空或只有历史快照。capital_flow_utils 的
+    compute_northbound_metrics 会通过 latest_trade_date 与 northbound_latest_date
+    对比新鲜度（>7 天判 stale），stale 时不参与 5 维投票。
+
+    Returns:
+        DataFrame，含字段：
+        - trade_date          YYYYMMDD
+        - hold_share_count    持股量（股）
+        无数据返回 None；接口不可用抛 TushareUnavailableError。
+    """
+    pro = _get_tushare_api()
+    ts_code = to_tushare_format(symbol)
+    end_compact = to_akshare_date(end_date)
+    start_compact = to_akshare_date(
+        (datetime.strptime(end_date, "%Y-%m-%d") - timedelta(days=lookback_days * 2)).strftime("%Y-%m-%d")
+    )
+
+    df = _safe_call(
+        pro.hk_hold,
+        code=ts_code,
+        start_date=start_compact,
+        end_date=end_compact,
+        api_name="hk_hold",
+    )
+    if df is None or df.empty:
+        return None
+
+    if "trade_date" not in df.columns or "vol" not in df.columns:
+        return None
+
+    df = df.sort_values("trade_date").reset_index(drop=True)
+    return pd.DataFrame({
+        "trade_date":       df["trade_date"].astype(str),
+        "hold_share_count": df["vol"].astype(float),
+    })

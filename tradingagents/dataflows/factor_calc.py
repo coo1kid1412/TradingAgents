@@ -7,12 +7,13 @@
 - 复合分数 = 6 因子加权平均（GARP 风格默认权重）
 
 因子组与权重（默认）：
-- Momentum 动量      15%   R3M + R6M + R12M
-- Value 价值          25%   PE(TTM) + PB + 行业相对 PE
-- Quality 质量        25%   ROE + 毛利率 + 净利率
-- Growth 成长         20%   营收 YoY + 净利 YoY
+- Momentum 动量      12%   R3M + R6M + R12M
+- Value 价值          22%   PE(TTM) + PB + 行业相对 PE
+- Quality 质量        22%   ROE + 毛利率 + 净利率
+- Growth 成长         18%   营收 YoY + 净利 YoY
 - LowVol 低波动       5%    30 日年化波动率
-- AntiCrowding 反拥挤 10%   60 日累计收益 + 换手率加速度
+- AntiCrowding 反拥挤  9%   60 日累计收益 + 换手率加速度
+- Capital Flow 资金流  12%  capital_flow_score（由 Capital Flow Officer 预计算）
 
 复合分数解读：
 - 0-30   显著负面，quant 信号建议规避
@@ -302,12 +303,13 @@ def anticrowding_score(
 # Composite
 # ---------------------------------------------------------------------------
 DEFAULT_FACTOR_WEIGHTS = {
-    "momentum": 0.15,
-    "value": 0.25,
-    "quality": 0.25,
-    "growth": 0.20,
-    "lowvol": 0.05,
-    "anticrowding": 0.10,
+    "momentum": 0.12,       # was 0.15, -3% → 给 capital_flow 腾权重
+    "value": 0.22,          # was 0.25, 等比缩
+    "quality": 0.22,        # was 0.25, 等比缩
+    "growth": 0.18,         # was 0.20, 等比缩
+    "lowvol": 0.05,         # 不动（已是最小）
+    "anticrowding": 0.09,   # was 0.10, 等比缩
+    "capital_flow": 0.12,   # 新：Capital Flow Officer 的 capital_flow_score (0-100)
 }
 
 
@@ -357,6 +359,8 @@ def compute_quant_score(
     # AntiCrowding inputs
     r60d_pct: Optional[float] = None,
     turnover_ratio_30d_to_90d: Optional[float] = None,
+    # Capital Flow (第 7 因子，由 Capital Flow Officer 预计算，直接传入 0-100 分)
+    capital_flow_score_input: Optional[float] = None,
     # Optional weight override
     weights: Optional[dict] = None,
 ) -> QuantScoreResult:
@@ -392,6 +396,19 @@ def compute_quant_score(
     s, bd = anticrowding_score(r60d_pct, turnover_ratio_30d_to_90d)
     factor_scores["anticrowding"] = s
     factor_breakdowns["anticrowding"] = bd
+
+    # Capital Flow（第 7 因子）：分数由 capital_flow_utils 已计算好，此处直接注册
+    if capital_flow_score_input is not None:
+        # clamp 到 [0, 100] 保护
+        cf_clamped = max(0.0, min(100.0, capital_flow_score_input))
+        factor_scores["capital_flow"] = round(cf_clamped, 1)
+        factor_breakdowns["capital_flow"] = {
+            "capital_flow_score_raw": round(capital_flow_score_input, 2),
+            "note": "由 Capital Flow Officer 预计算（5 维投票 + regime 硬约束）",
+        }
+    else:
+        factor_scores["capital_flow"] = None
+        factor_breakdowns["capital_flow"] = {"note": "capital_flow_score 不可用（非 A 股或数据缺失）"}
 
     # 复合分数（缺失因子从权重分母扣除）
     available = [(k, v) for k, v in factor_scores.items() if v is not None]

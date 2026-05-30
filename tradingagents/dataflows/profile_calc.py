@@ -833,6 +833,108 @@ def compute_peer_anchored_pe_cap(
     }
 
 
+def compute_valuation_regime(
+    *,
+    momentum_score: Optional[float] = None,
+    rsi_percentile_1y: Optional[float] = None,
+    has_peak_signal: bool = False,
+    capital_flow_regime: Optional[str] = None,
+    main_force_streak_days: Optional[int] = None,
+    lhb_inst_direction: Optional[int] = None,
+    net_profit_growth: Optional[float] = None,
+    retail_concentration_signal: Optional[str] = None,
+    theme_stage_inferred: Optional[str] = None,
+    quant_anticrowding: Optional[float] = None,
+) -> dict:
+    """客观估值 regime（骑趋势 / 中性 / 收纪律）——五路分析师信号合成，纯 Python 确定性。
+
+    对标投研：决定"贵要不要紧 / 骑还是收"的不是估值本身，而是基本面盈利动能 + 技术趋势 +
+    资金面方向 + 舆情拥挤 + 主题阶段的合成。估值锚只回答"贵不贵"，姿态由此 regime 定。
+
+    五路，每路投 +1(ride)/0/-1(discipline)：
+      1 技术/动量：强趋势且未极端超买 → +1；破位/弱 或 极端超买顶 → -1
+      2 资金面  ：强势/机构净买/主力连续净流入 → +1；恶化/机构净卖/主力连续净流出 → -1
+      3 盈利动能：高增速(≥40%) → +1；增速停滞(<10%) → -1（TODO: 换成卖方上修方向更准）
+      4 舆情拥挤：不拥挤(anticrowding≥60) → +1；拥挤+散户高接盘 → -1
+      5 主题阶段：acceleration → +1；peak/fading 或 peak信号 → -1
+
+    合成：净分 ≥ +2 → ride；≤ -2 → discipline；其余 neutral。
+    peak 信号强制触发时，ride 降级为 neutral（不骑进顶部）。
+
+    Returns: {valuation_regime, score, legs:{...}, reasoning}
+    """
+    legs: dict[str, int] = {}
+
+    # 1 技术/动量
+    if momentum_score is not None:
+        overbought = rsi_percentile_1y is not None and rsi_percentile_1y >= 85
+        if momentum_score >= 65 and not overbought and not has_peak_signal:
+            legs["tech"] = 1
+        elif momentum_score <= 35 or has_peak_signal:
+            legs["tech"] = -1
+        else:
+            legs["tech"] = 0
+
+    # 2 资金面
+    cap_vote = 0
+    if capital_flow_regime == "强势" or lhb_inst_direction == 1 or (
+        main_force_streak_days is not None and main_force_streak_days >= 3):
+        cap_vote = 1
+    if capital_flow_regime == "恶化" or lhb_inst_direction == -1 or (
+        main_force_streak_days is not None and main_force_streak_days <= -3):
+        cap_vote = -1  # 派发信号优先（恶化/机构净卖/主力连续流出）
+    if (capital_flow_regime is not None or lhb_inst_direction is not None
+            or main_force_streak_days is not None):
+        legs["capital"] = cap_vote
+
+    # 3 盈利动能（代理：增速水平；TODO 换卖方上修/QoQ 趋势）
+    if net_profit_growth is not None:
+        if net_profit_growth >= 0.40:
+            legs["earnings"] = 1
+        elif net_profit_growth < 0.10:
+            legs["earnings"] = -1
+        else:
+            legs["earnings"] = 0
+
+    # 4 舆情拥挤
+    crowd_vote = 0
+    if retail_concentration_signal == "散户高接盘" or (
+        quant_anticrowding is not None and quant_anticrowding <= 30):
+        crowd_vote = -1
+    elif quant_anticrowding is not None and quant_anticrowding >= 60:
+        crowd_vote = 1
+    if retail_concentration_signal is not None or quant_anticrowding is not None:
+        legs["crowding"] = crowd_vote
+
+    # 5 主题阶段
+    if theme_stage_inferred is not None or has_peak_signal:
+        ts = theme_stage_inferred or ""
+        if has_peak_signal or "peak" in ts or "fading" in ts:
+            legs["theme"] = -1
+        elif ts == "acceleration":  # 仅精确确认的加速；"none_or_acceleration"/"initiation_or_acceleration"
+            legs["theme"] = 1       # 是模糊二选一(LLM定)，不算明确加速，投 0（防误投 ride）
+        else:
+            legs["theme"] = 0
+
+    score = sum(legs.values())
+    # 有效路 < 3 → 数据不足，给 neutral（不轻易骑/收）
+    if len(legs) < 3:
+        regime = "neutral"
+    elif score >= 2:
+        regime = "ride"
+    elif score <= -2:
+        regime = "discipline"
+    else:
+        regime = "neutral"
+
+    # peak 信号不允许 ride
+    if has_peak_signal and regime == "ride":
+        regime = "neutral"
+
+    reasoning = f"五路净分={score}（{legs}）→ {regime}" + ("；peak信号压制不骑" if has_peak_signal else "")
+    return {"valuation_regime": regime, "score": score, "legs": legs, "reasoning": reasoning}
+
+
 def parse_sector_rs_30d(sector_str: str) -> Optional[float]:
     """从 sector_comparison 报告抽本股 vs 主题 ETF (或行业 ETF) 的 30d RS。"""
     import re

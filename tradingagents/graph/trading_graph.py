@@ -368,6 +368,7 @@ class TradingAgentsGraph:
 
         # 阶段进度映射：state 字段 → 阶段标签
         _PHASE_LABELS = {
+            "capital_flow_report": "资金流官",
             "market_report": "市场分析师",
             "sentiment_report": "舆情分析师",
             "news_report": "新闻分析师",
@@ -383,6 +384,7 @@ class TradingAgentsGraph:
         }
         # 阶段排序（用于显示序号）
         _PHASE_ORDER = [
+            "capital_flow_report",
             "market_report", "sentiment_report", "news_report", "fundamentals_report",
             "quant_score",
             "macro_context",
@@ -444,6 +446,8 @@ class TradingAgentsGraph:
         self.log_states_dict[str(trade_date)] = {
             "company_of_interest": final_state["company_of_interest"],
             "trade_date": final_state["trade_date"],
+            "capital_flow_report": final_state.get("capital_flow_report", ""),
+            "capital_flow_yaml": final_state.get("capital_flow_yaml", ""),
             "market_report": final_state["market_report"],
             "sentiment_report": final_state["sentiment_report"],
             "news_report": final_state["news_report"],

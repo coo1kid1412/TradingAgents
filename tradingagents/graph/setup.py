@@ -11,6 +11,7 @@ from tradingagents.agents.utils.stock_profile_node import create_stock_profile_n
 from tradingagents.agents.utils.macro_context_node import create_macro_context_node
 from tradingagents.agents.utils.quant_score_node import create_quant_score_node
 from tradingagents.agents.utils.sector_comparison_node import create_sector_comparison_node
+from tradingagents.agents.utils.capital_flow_node import create_capital_flow_node
 
 from .conditional_logic import ConditionalLogic
 
@@ -111,6 +112,11 @@ class GraphSetup:
         # Quant Score Officer: deterministic 6-factor 0-100 composite (no LLM), runs before macro
         quant_score_officer_node = create_quant_score_node()
 
+        # Capital Flow Officer: deterministic capital flow regime + capital_flow_score (no LLM)
+        # 先于所有分析师运行：资金面是基础数据，market_analyst 第四节会消费 capital_flow_yaml；
+        # quant_score_node 第 7 因子也消费 capital_flow_score
+        capital_flow_officer_node = create_capital_flow_node()
+
         # Macro Strategist: identifies rate cycle, liquidity, geopolitical risks, sector relative impact
         macro_context_officer_node = create_macro_context_node(self.quick_thinking_llm)
 
@@ -152,6 +158,7 @@ class GraphSetup:
 
         # Add other nodes
         workflow.add_node("Quant Score Officer", quant_score_officer_node)
+        workflow.add_node("Capital Flow Officer", capital_flow_officer_node)
         workflow.add_node("Macro Context Officer", macro_context_officer_node)
         workflow.add_node("Stock Profile Officer", stock_profile_officer_node)
         workflow.add_node("Sector Comparison Officer", sector_comparison_officer_node)
@@ -166,9 +173,10 @@ class GraphSetup:
         workflow.add_node("Portfolio Manager", portfolio_manager_node)
 
         # Define edges
-        # Start with the first analyst
+        # Capital Flow Officer 先于所有分析师（资金面是基础数据，market_analyst 第四节会消费 capital_flow_yaml）
         first_analyst = selected_analysts[0]
-        workflow.add_edge(START, f"{first_analyst.capitalize()} Analyst")
+        workflow.add_edge(START, "Capital Flow Officer")
+        workflow.add_edge("Capital Flow Officer", f"{first_analyst.capitalize()} Analyst")
 
         # Connect analysts in sequence
         for i, analyst_type in enumerate(selected_analysts):
@@ -189,6 +197,7 @@ class GraphSetup:
                 workflow.add_edge(current_analyst, current_clear)
 
             # Connect to next analyst, or to Quant Score Officer if this is the last analyst
+            # （Capital Flow Officer 已提前到 START 之后，此处不再衔接）
             if i < len(selected_analysts) - 1:
                 next_analyst = f"{selected_analysts[i+1].capitalize()} Analyst"
                 workflow.add_edge(current_clear, next_analyst)

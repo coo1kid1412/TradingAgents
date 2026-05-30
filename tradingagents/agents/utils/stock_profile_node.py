@@ -49,6 +49,7 @@ from tradingagents.dataflows.profile_calc import (
     parse_pe_ttm_from_fundamentals,
     parse_net_profit_growth,
     compute_peer_anchored_pe_cap,
+    compute_valuation_regime,
 )
 
 logger = logging.getLogger(__name__)
@@ -156,6 +157,64 @@ def _fetch_fundamentals_raw(ticker: str, trade_date: str) -> str:
         return ""
 
 
+def _parse_capital_flow_signals(cf_yaml: str) -> dict:
+    """从 capital_flow_yaml 抽 valuation_regime 需要的资金面信号（容错，缺失返回 None）。"""
+    out = {"regime": None, "streak": None, "lhb_inst_dir": None, "retail_signal": None}
+    if not cf_yaml:
+        return out
+
+    def _grab(key):
+        # 抓 key 后到行尾（. 不跨行），去引号/空白；null/空 → None
+        m = re.search(rf'{key}:\s*(.+)', cf_yaml)
+        if not m:
+            return None
+        v = m.group(1).strip().strip('"').strip()
+        return None if v in ("null", "") else v
+
+    def _grab_int(key):
+        v = _grab(key)
+        if v is None:
+            return None
+        try:
+            return int(v)
+        except ValueError:
+            return None
+
+    out["regime"] = _grab("capital_flow_regime")  # 注：capital_flow_regime_reasoning 的"_"≠":"，不会误匹配
+    out["streak"] = _grab_int("net_inflow_streak_days")
+    out["lhb_inst_dir"] = _grab_int("lhb_inst_direction")
+    out["retail_signal"] = _grab("retail_concentration_signal")
+    return out
+
+
+def _enforce_target_pe_cap(content: str, cap: float) -> str:
+    """出口处硬截断 LLM 输出的 target_pe_range 高位到 cap（防 LLM 无视 prompt 软约束）。
+
+    背景：cap 原本只在 prompt 里"软约束"，LLM 有时无视（如澜起 172516 给 [89.6,116.5]
+    却无视 PE_TTM×0.6=72.4 上限 → 目标价漂到 294 → 误评 OVERWEIGHT）。此处把它变成
+    程序化硬天花板：只改 YAML 的 target_pe_range 数值字段（下游 RM 据此提取），不动散文。
+
+    仅处理 [low, high] 数值形式；[null, null]（亏损/无锚）不匹配、跳过。
+    """
+    pat = re.compile(r"(target_pe_range:\s*\[\s*)([0-9.]+)\s*,\s*([0-9.]+)(\s*\])")
+
+    def _repl(m: "re.Match") -> str:
+        low, high = float(m.group(2)), float(m.group(3))
+        if high <= cap + 1e-6:
+            return m.group(0)  # 未超上限，不动
+        new_high = round(cap, 1)
+        new_low = round(min(low, new_high), 1)
+        if new_low >= new_high:  # 防退化成单点，保留一个窄带
+            new_low = round(new_high * 0.9, 1)
+        logger.warning(
+            "stock_profile target_pe 出口硬截断: [%.1f, %.1f] → [%.1f, %.1f] (cap=%.1f)",
+            low, high, new_low, new_high, cap,
+        )
+        return f"{m.group(1)}{new_low}, {new_high}{m.group(4)}  # ⚠️出口硬截断 high≤{cap:.1f}"
+
+    return pat.sub(_repl, content)
+
+
 # ---------------------------------------------------------------------------
 # 主节点
 # ---------------------------------------------------------------------------
@@ -173,6 +232,7 @@ def create_stock_profile_node(llm):
         macro_context = state.get("macro_context", "")
         quant_score_md = state.get("quant_score", "")
         sector_comparison_md = state.get("sector_comparison", "")
+        capital_flow_yaml = state.get("capital_flow_yaml", "")
 
         # === 程序化判定开始 ===
         is_etf = is_etf_ticker(ticker)
@@ -223,9 +283,10 @@ def create_stock_profile_node(llm):
         peer_pe_median = parse_peer_pe_median(news_report, fundamentals_report)
         peer_pe_source = "report_scrape" if peer_pe_median is not None else None
 
-        # ---- 兄弟股可比 PE（优先源，质量高于报告抠数）：news+sentiment 共现挖掘 + 行业校验 + ≥2家中位 ----
-        # 仅 A 股（PE 快照/兄弟表都是 A 股口径）；取数失败或有效 peer 不足时保持原 peer_pe_median 不变。
+        # ---- 兄弟股可比 PE（优先源，质量高于报告抠数）：news+sentiment 共现挖掘 + 行业校验 + ≥1家中位 ----
+        # 仅 A 股（PE 快照/兄弟表都是 A 股口径）；取数失败或 0 家有效时保持原 peer_pe_median 不变。
         brother_pe = None
+        brother_single_comp = False  # 单标的(n=1)低置信 → 下游 Conviction 减一档
         if is_a_share(ticker):
             code_m = re.search(r"\d{6}", ticker)
             if code_m:
@@ -240,9 +301,11 @@ def create_stock_profile_node(llm):
             if brother_pe:
                 peer_pe_median = brother_pe["median"]
                 peer_pe_source = "brother_comps"
+                brother_single_comp = (brother_pe.get("confidence") == "low")
                 logger.info(
-                    "兄弟股可比 PE 命中: median=%.1f, used=%s",
-                    brother_pe["median"], brother_pe.get("used"),
+                    "兄弟股可比 PE 命中: median=%.1f, n_valid=%s, conf=%s, used=%s",
+                    brother_pe["median"], brother_pe.get("n_valid"),
+                    brother_pe.get("confidence"), brother_pe.get("used"),
                 )
 
         # ---- Layer 2 兜底：三源全 null 时用 PE_TTM × 0.7 做最后锚（机构 PM "无锚定时保守" 原则）----
@@ -288,6 +351,24 @@ def create_stock_profile_node(llm):
             macro_adjustment_pct=0,
         )
 
+        # 客观估值 regime（五路合成：技术/资金/盈利/拥挤/主题 → ride/neutral/discipline）
+        # 决定估值姿态（cap 松紧）的是这五路分析师，不是估值锚本身
+        cf_sig = _parse_capital_flow_signals(capital_flow_yaml)
+        regime_info = compute_valuation_regime(
+            momentum_score=momentum_score,
+            rsi_percentile_1y=price_signals.get("rsi_percentile_1y"),
+            has_peak_signal=peak_check["force_peak"],
+            capital_flow_regime=cf_sig["regime"],
+            main_force_streak_days=cf_sig["streak"],
+            lhb_inst_direction=cf_sig["lhb_inst_dir"],
+            net_profit_growth=net_profit_growth,
+            retail_concentration_signal=cf_sig["retail_signal"],
+            theme_stage_inferred=theme_inferred,
+            quant_anticrowding=quant_yaml.get("anticrowding"),
+        )
+        valuation_regime = regime_info["valuation_regime"]
+        logger.info("valuation_regime: %s | %s", valuation_regime, regime_info["reasoning"])
+
         # === 程序化判定结束 ===
 
         # 拼装"已确定字段"展示段，喂给 LLM 当 ground truth
@@ -313,6 +394,11 @@ def create_stock_profile_node(llm):
         )
         prog_lines.append(
             f"| instrument_type | **{'etf' if is_etf else 'a_share_stock'}** | 代码模式识别 |"
+        )
+        prog_lines.append(
+            f"| valuation_regime | **{valuation_regime}**（ride骑趋势/neutral中性/discipline收纪律）| "
+            f"五路合成(技术/资金/盈利/拥挤/主题)：{regime_info['reasoning']}。"
+            f"→ ride 放松估值 cap、骑趋势；discipline 收紧 cap、均值回归；下游 RM/PM 据此定姿态 |"
         )
 
         # peak 检测
@@ -391,10 +477,15 @@ def create_stock_profile_node(llm):
                 )
             else:
                 src_label = {
-                    "brother_comps": "兄弟股可比中位（共现挖掘+行业校验+≥2家，tushare 实测 PE）",
+                    "brother_comps": "兄弟股可比中位（共现挖掘+行业校验，tushare 实测 PE）",
                     "report_scrape": "来自 news/fundamentals",
                 }.get(peer_pe_source, "来自 news/fundamentals")
                 prog_lines.append(f"- 同业/行业 PE 中位数: {peer_pe_median:.1f}（{src_label}）")
+                if brother_single_comp:
+                    prog_lines.append(
+                        "  - ⚠️ **兄弟股可比仅 1 家（单标的低置信）**：无第二家纠偏，估值锚可靠性打折。"
+                        "→ 下游 RM/PM **Conviction 必须减一档**（见 TRANSPARENCY.peer_anchor_single_comp）。"
+                    )
         else:
             prog_lines.append("- 同业/行业 PE 中位数: 未抽到（且 PE_TTM 也抽不到，无任何兜底锚）")
 
@@ -443,6 +534,25 @@ def create_stock_profile_node(llm):
                 "禁止用『现价的贵倍数』反推目标价（绝对上限 ≤ PE_TTM）"
             )
 
+        # ---- EPS 口径锁定（所有分支通用；修"TTM 倍数 × 前瞻 EPS"双重计入，澜起派发期被错抬成 OW 的根因）----
+        if not (forced_valuation["force_valuation"] and forced_valuation["forbid_pe"]):
+            eps_ttm_disp = f"{eps_ttm_val:.2f}" if eps_ttm_val is not None else "未抽到"
+            prog_lines.append("")
+            prog_lines.append("⛔ **EPS 口径锁定（防 TTM 倍数 × 前瞻 EPS 双重计入）**：")
+            prog_lines.append(f"- **EPS_TTM = {eps_ttm_disp} 元**（系统给值；下游 RM 直接用，禁止重算/换口径）")
+            if eps_ttm_val is not None and net_profit_growth is not None:
+                fwd_eps = eps_ttm_val * (1 + net_profit_growth)
+                prog_lines.append(
+                    f"- 前瞻 EPS 参考 ≈ {fwd_eps:.2f} 元（= EPS_TTM×(1+增速{net_profit_growth*100:.0f}%)，**仅 PEG 腿用**）"
+                )
+            prog_lines.append(
+                "- **铁律**：`target_pe_range` / 同业中位 / `PE_TTM×0.x` 全是 **TTM 倍数** → 下游 RM 的 "
+                "`PE×EPS` 腿 和 `同业可比` 腿 **必须乘 EPS_TTM**；**只有 PEG 腿配前瞻 EPS**。"
+            )
+            prog_lines.append(
+                "- ❌ 严禁：同业中位(TTM) × 前瞻/2026E EPS（双重计入成长 → 目标价虚高 ~50% → 高估值股被错抬成强买）。"
+            )
+
         prog_lines.append("")
         prog_lines.append("**主题阶段量化推断（参照值，LLM 可不采纳但要解释）**：")
         prog_lines.append(f"- `theme_stage_inferred` = **{theme_inferred}**")
@@ -469,6 +579,8 @@ def create_stock_profile_node(llm):
         sell_side_high_str = f"{sell_side_pe_range[1]:.1f}" if sell_side_pe_range else "null"
         self_p80_str = f"{self_pe_p80:.1f}" if self_pe_p80 else "null"
         peer_median_str = f"{peer_pe_median:.1f}" if peer_pe_median else "null"
+        peer_anchor_source_str = peer_pe_source or "none"
+        peer_single_comp_str = "true" if brother_single_comp else "false"
 
         prompt = f"""【语言要求】你必须使用中文撰写以下分析。股票代码和技术指标名称可保留英文。
 
@@ -684,6 +796,8 @@ TRANSPARENCY:
   sell_side_pe_high_ref: {sell_side_high_str}
   self_pe_p80_ref: {self_p80_str}
   peer_pe_median_ref: {peer_median_str}
+  peer_anchor_source: {peer_anchor_source_str}        # brother_comps / report_scrape / none（Python 预填，直接抄）
+  peer_anchor_single_comp: {peer_single_comp_str}     # true=兄弟股仅1家(低置信)→下游 Conviction 减一档（Python 预填，直接抄）
   leadership_bonus_pct: {leadership_bonus_pct}
   sector_rs_30d_pct: {sector_rs_30d if sector_rs_30d is not None else 'null'}
 ```
@@ -702,6 +816,25 @@ TRANSPARENCY:
 """
 
         response = llm.invoke(prompt)
-        return {"stock_profile": response.content}
+        content = response.content
+
+        # 出口硬截断 target_pe_high —— regime 条件化（修"主升浪被低 cap 压死"）
+        # discipline/neutral：用纪律 cap（同业锚 / PE_TTM×0.6）；
+        # ride（主升浪）：解除纪律 cap，仅用 PE_TTM 兜底（不许超当前贵倍数、但不向下压，允许倍数不收缩）
+        if is_a_share_stock:
+            discipline_cap = None
+            if peer_pe_cap:
+                discipline_cap = peer_pe_cap["cap"]
+            elif layer2_all_null and pe_ttm_fallback:
+                discipline_cap = pe_ttm_fallback * 0.6
+
+            eff_cap = pe_ttm_actual if valuation_regime == "ride" else discipline_cap
+            if eff_cap is not None:
+                content = _enforce_target_pe_cap(content, eff_cap)
+                logger.info(
+                    "target_pe 出口 cap: regime=%s → eff_cap=%.1f", valuation_regime, eff_cap,
+                )
+
+        return {"stock_profile": content}
 
     return stock_profile_node

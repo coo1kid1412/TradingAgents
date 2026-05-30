@@ -63,6 +63,17 @@ class AgentState(MessagesState):
         str, "Quant factor score report (momentum/value/quality/growth/lowvol/anticrowding), 0-100 composite + breakdown"
     ]
 
+    # capital flow (deterministic capital flow regime + score, runs after market_analyst, before quant_score)
+    capital_flow_yaml: Annotated[
+        str, "Capital flow YAML: DDX/DDY/DDZ-like, northbound, holder number, regime, capital_flow_score"
+    ]
+    capital_flow_report: Annotated[
+        str, "Capital flow markdown report (capital_flow.md)"
+    ]
+    capital_flow_metrics: Annotated[
+        dict, "Capital flow structured metrics dict (full descriptive field names, consumed by quant_score & RM)"
+    ]
+
     # macro context (synthesized after analysts, before stock_profile)
     macro_context: Annotated[
         str, "Macro context: rate cycle stage, liquidity tightness, geopolitical risk, sector relative impact"

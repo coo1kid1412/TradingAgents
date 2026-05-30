@@ -99,6 +99,7 @@ def build_report_context(state) -> str:
         ("market_report", "[置信度:中高] Market research report"),
         ("news_report", "[置信度:中] Latest world affairs news"),
         ("sentiment_report", "[置信度:中低] Social media sentiment report"),
+        ("capital_flow_report", "[置信度:高/确定性] Capital Flow Officer（资金流综合分析，纯 Python 计算）"),
     ]:
         data = state.get(key, "")
         if data:

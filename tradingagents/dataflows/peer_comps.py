@@ -15,7 +15,9 @@
 
 PE 中位数清洗规则（用户定）：
 - 剔除亏损（PE ≤ 0）、剔除 PE > 250（近谷底微利的失真高 PE）
-- 至少 **2** 家有效 peer，否则返回 None（交回上层走兜底）
+- 至少 **1** 家有效 peer（宁缺毋滥的严筛在"选兄弟"阶段已做：频次≥3+行业校验）；
+  **单标的(n=1)标记 confidence="low"**，下游 Conviction 减一档（无第二家纠偏）；
+  ≥2 家则 confidence="normal"。0 家返回 None 走兜底。
 """
 
 from __future__ import annotations
@@ -44,7 +46,7 @@ _BROTHER_MAP_PATH = os.path.join(os.path.dirname(__file__), "brother_peer_map.js
 # 清洗阈值
 _PE_LOW = 0.0       # PE ≤ 0 剔除（亏损）
 _PE_HIGH_CAP = 250.0  # PE > 250 剔除（近谷底失真）
-_MIN_VALID_PEERS = 2  # 至少 2 家有效才算中位数
+_MIN_VALID_PEERS = 1  # 至少 1 家有效（单标的→低置信，下游 Conviction 减一档）
 _MIN_COMENTION_FREQ = 3  # 共现频次门槛
 
 # 券商/财经平台黑名单（研报来源噪音，名字不含"证券"的那部分）
@@ -152,6 +154,16 @@ def get_pe_snapshot(trade_date: str) -> dict[str, Optional[float]]:
     """
     _ensure_cache_dir()
     ymd = trade_date.replace("-", "")
+    # 周末用纯日期计算回退到上周五（零接口调用，避免 daily_basic 在非交易日返回空）；
+    # 节假日仍由下方"最近缓存"兜底。
+    try:
+        from datetime import datetime, timedelta
+        d = datetime.strptime(ymd, "%Y%m%d")
+        if d.weekday() >= 5:  # 5=周六 6=周日
+            d = d - timedelta(days=d.weekday() - 4)
+            ymd = d.strftime("%Y%m%d")
+    except ValueError:
+        pass
     path = os.path.join(_CACHE_DIR, f"pe_{ymd}.json")
     if os.path.exists(path):
         try:
@@ -255,10 +267,14 @@ def peer_pe_median(
             used.append((code, pe))
     if len(used) < min_valid:
         return None
+    n_valid = len(used)
     return {
         "median": statistics.median(pe for _, pe in used),
         "used": used,
         "dropped": dropped,
+        "n_valid": n_valid,
+        # 单标的 = 低置信（无第二家纠偏），下游 Conviction 应减一档
+        "confidence": "low" if n_valid == 1 else "normal",
     }
 
 

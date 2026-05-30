@@ -39,6 +39,9 @@ from .akshare_vendor import (
     get_announcements as get_akshare_announcements,
     get_cls_telegraph as get_akshare_cls_telegraph,
     get_research_reports as get_akshare_research_reports,
+    get_capital_flow as get_akshare_capital_flow,
+    get_holder_number as get_akshare_holder_number,
+    get_north_hold as get_akshare_north_hold,
 )
 from .tushare_vendor import (
     get_stock as get_tushare_stock,
@@ -50,6 +53,9 @@ from .tushare_vendor import (
     get_news as get_tushare_news,
     get_global_news as get_tushare_global_news,
     get_insider_transactions as get_tushare_insider_transactions,
+    get_capital_flow as get_tushare_capital_flow,
+    get_holder_number as get_tushare_holder_number,
+    get_north_hold as get_tushare_north_hold,
 )
 from .alpha_vantage_common import AlphaVantageRateLimitError
 from .vendor_errors import VendorRateLimitError, VendorUnavailableError
@@ -101,6 +107,14 @@ TOOLS_CATEGORIES = {
             "get_cls_telegraph",
             "get_research_reports",
         ]
+    },
+    "capital_flow_data": {
+        "description": "Capital flow (DDX/DDY/DDZ-like) + holder number + northbound",
+        "tools": [
+            "get_capital_flow",
+            "get_holder_number",
+            "get_north_hold",
+        ]
     }
 }
 
@@ -126,6 +140,10 @@ _A_SHARE_METHOD_VENDOR_ORDER = {
     "get_cashflow": _A_SHARE_MARKET_FINANCE_ORDER,
     "get_income_statement": _A_SHARE_MARKET_FINANCE_ORDER,
     "get_insider_transactions": _A_SHARE_MARKET_FINANCE_ORDER,
+    # 资金流类（tushare 主路径，akshare fallback）
+    "get_capital_flow": _A_SHARE_MARKET_FINANCE_ORDER,
+    "get_holder_number": _A_SHARE_MARKET_FINANCE_ORDER,
+    "get_north_hold": _A_SHARE_MARKET_FINANCE_ORDER,
     # 新闻/公告类
     "get_news": _A_SHARE_NEWS_ORDER,
     "get_global_news": _A_SHARE_NEWS_ORDER,
@@ -205,6 +223,21 @@ VENDOR_METHODS = {
     # research reports (个股研报)
     "get_research_reports": {
         "akshare": get_akshare_research_reports,
+    },
+    # capital flow (主力/超大/大/中/小单 + 流通市值 + 龙虎榜) — A 股专属
+    "get_capital_flow": {
+        "tushare": get_tushare_capital_flow,
+        "akshare": get_akshare_capital_flow,
+    },
+    # holder number (季报股东户数) — A 股专属
+    "get_holder_number": {
+        "tushare": get_tushare_holder_number,
+        "akshare": get_akshare_holder_number,
+    },
+    # north hold (北向沪深港通持股) — A 股专属
+    "get_north_hold": {
+        "tushare": get_tushare_north_hold,
+        "akshare": get_akshare_north_hold,
     },
 }
 

@@ -107,6 +107,27 @@ def create_market_analyst(llm):
             ticker, state.get("company_name", "")
         )
 
+        # Capital Flow Officer 上游已产出权威资金面数据（YAML），直接注入 prompt，
+        # 不再让 LLM 自己散落整合（防止口径漂移与幻觉）
+        capital_flow_yaml = state.get("capital_flow_yaml") or ""
+        if capital_flow_yaml:
+            capital_flow_block = (
+                "\n\n## 上游 Capital Flow Officer 已产出的权威资金面数据（请直接引用，禁止臆造）\n"
+                "下方 YAML 由资金流官（Capital Flow Officer，纯 Python 计算，无 LLM）"
+                "基于 tushare/akshare 真实数据计算输出，所有字段名为下游程序化字段全名。"
+                "请在第四节中**仅基于这份 YAML** 解读，不要再尝试从 news_report 中"
+                "猜测或整合资金面数据：\n"
+                "```yaml\n"
+                f"{capital_flow_yaml}\n"
+                "```\n"
+            )
+        else:
+            capital_flow_block = (
+                "\n\n## ⚠️ 上游 Capital Flow Officer 未产出资金面数据\n"
+                "第四节请输出'数据不足，无法判定资金面'，并在 SUMMARY 中将 "
+                "capital_flow_state 等字段填为 null。\n"
+            )
+
         tools = [
             get_stock_data,
             get_indicators,
@@ -184,17 +205,32 @@ def create_market_analyst(llm):
             "| **量价齐升** | 量价同向放大，温和上涨 | 健康上行 |\n"
             "| **正常** | 不符合上述任一模式 | 中性 |\n\n"
             "输出该标的**当前量价模式**+ 一句话解读。\n\n"
-            "### 四、A 股资金面分析（仅 A 股，对资金面驱动的标的极重要）\n"
-            "如果当前标的是 A 股（代码以 6/0/3/688/8 等开头），必须分析以下资金面维度。**这些数据可能散落在 news_report 或市场报告里，请提取整合**：\n\n"
-            "- **北向资金（沪深港通）**：近 5/10/20 个交易日净流入/流出，持股比例变化方向\n"
-            "- **融资融券**：融资余额绝对值 + 占流通市值比例 + 近期变化方向（增加/减少）\n"
-            "- **龙虎榜**：近期是否登榜，机构席位/游资席位的多空方向\n"
-            "- **大宗交易**：近 30 日大宗交易笔数、折溢价情况（折价 > 5% 通常是抛压）\n"
-            "- **主力资金流向**：近 5 日特大单/大单的净流入/流出累计值\n\n"
-            "**资金面综合判断**（必输出）：\n"
-            "- ✅ 强势资金面：多维度协同净流入（如北向+融资双增 + 主力净流入）\n"
-            "- ⚠️ 资金面分化：部分流入部分流出（如机构减仓+融资增加 = 散户接盘）\n"
-            "- ❌ 资金面恶化：多维度协同净流出\n\n"
+            "### 四、A 股资金面分析（仅 A 股，基于上游 Capital Flow Officer 的权威 YAML）\n"
+            "本节**严禁**自行从 news_report / 公告中拼凑资金面数据。**仅基于 system prompt 中"
+            "已注入的 `CAPITAL_FLOW:` YAML 块**做解读。若该 YAML 缺失或 `capital_flow_regime` "
+            "为 `非A股不适用` / `数据不足`，则本节标注'不适用'或'数据不足'并跳过。\n\n"
+            "**4.1 主力资金核心指标解读**（直接引用全名字段）：\n"
+            "- `main_force_net_inflow_5d_yi` / `main_force_net_inflow_20d_yi`（5日/20日主力净流入，单位亿元）\n"
+            "- `ddx_like_5d_pct` 与 `ddx_like_5d_pct_1y`（DDX-like 强度及 1 年百分位）\n"
+            "- `large_order_net_inflow_5d_yi`（5日大单累计净流入，亿元）/ `ddz_like_20d_pct`（20日主力强度比，非经典DDZ库存）\n"
+            "- `net_inflow_streak_days`（连续净流入/流出天数；正数=净流入连续，负数=净流出连续）\n"
+            "  ⚠️ DDX/DDY/DDZ 按单笔大小推断主力/散户，受算法拆单影响，**辅助参考**；"
+            "方向以机构出处信号（北向、龙虎榜机构席位）为重。\n\n"
+            "**4.2 散户参与度**：\n"
+            "- `retail_buy_amount_rate_5d_pct`（散户=小单+中单买入成交占比 5 日均值）\n"
+            "- `retail_concentration_signal`（散户接盘信号：`散户高接盘`=主力持续派发(streak≤-3)+散户买占比≥65%，看空增强；`中性`=否）\n\n"
+            "**4.3 北向资金（如可用）**：\n"
+            "- `northbound_5d_direction` / `northbound_20d_direction`（5日/20日方向：净流入/净流出/平衡/数据停滞）\n"
+            "- `northbound_data_status`：若为 `数据停滞`（akshare 公开口径 2024-08-16 后停更），"
+            "   仅作参考、不进资金面综合判定\n\n"
+            "**4.4 龙虎榜与股东户数（筹码集中度）**：\n"
+            "- `lhb_count_30d`（30日上榜次数）\n"
+            "- `holder_num_latest` / `holder_num_qoq_pct`（最新股东户数及环比变化%）\n"
+            "- `chip_concentration_signal`（筹码集中信号：集中/分散/平稳）\n\n"
+            "**4.5 资金面综合判定**（必输出，**直接引用** `capital_flow_regime` 字段，不要自创判定）：\n"
+            "- `capital_flow_regime` ∈ {强势, 分化, 恶化, 中性, 数据不足, 非A股不适用}\n"
+            "- `capital_flow_score`（0-100 连续打分，由 5 维投票综合而成）\n"
+            "- 引用 `capital_flow_regime_reasoning`（判定理由）做一句话解读\n\n"
             "*若是非 A 股（港股/美股/ETF），本节标注'不适用，跳过'。*\n\n"
             "### 五、综合研判与交易建议\n"
             "多空力量对比表、关键价位表（支撑位/阻力位）、操作建议与评级（BUY/HOLD/SELL）\n\n"
@@ -219,8 +255,9 @@ def create_market_analyst(llm):
             "  atr_pct: <0-100>\n"
             "  volume_state: 放量 / 缩量 / 正常\n"
             "  volume_price_pattern: 放量上涨 / 放量下跌 / 缩量整理 / 无量背离 / 量价齐升 / 正常   # 量价配合诊断\n"
-            "  capital_flow_state: 强势 / 分化 / 恶化 / 不适用    # A 股资金面综合（非 A 股填'不适用'）\n"
-            "  northbound_net_flow: 净流入 / 净流出 / 平衡 / 不适用\n"
+            "  capital_flow_regime: 强势 / 分化 / 恶化 / 中性 / 数据不足 / 非A股不适用    # 直接引用上游 Capital Flow Officer 的 capital_flow_regime\n"
+            "  capital_flow_score: <0-100 或 null>      # 直接引用上游 capital_flow_score（数据不足时为 null）\n"
+            "  northbound_5d_direction: 净流入 / 净流出 / 平衡 / 数据停滞 / 不适用      # 引用 northbound_5d_direction\n"
             "  margin_change: 增加 / 减少 / 平稳 / 不适用\n"
             "  rating: BUY / HOLD / SELL                # 措辞评级（保守表达）\n"
             "  data_implied_direction: 偏多 / 偏空 / 中性  # 数据真实隐含方向（穿透措辞）\n"
@@ -235,6 +272,7 @@ def create_market_analyst(llm):
             "**重要**：股票代码（如 AAPL）、技术指标名称（如 RSI、MACD、SMA、EMA、ATR、VWMA 等）、"
             "以及评级关键词（BUY/SELL/HOLD）请保留英文原文。Markdown 表格的表头请使用中文。\n\n"
             + RISK_DEBATE_PHRASING_RULES
+            + capital_flow_block
             + get_language_instruction()
         )
 
