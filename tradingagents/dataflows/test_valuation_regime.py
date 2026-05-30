@@ -4,7 +4,11 @@
 
 运行：python tradingagents/dataflows/test_valuation_regime.py
 """
-from tradingagents.dataflows.profile_calc import compute_valuation_regime
+from tradingagents.dataflows.profile_calc import (
+    compute_valuation_regime,
+    parse_growth_deceleration,
+    parse_distribution_signals,
+)
 from tradingagents.agents.utils.stock_profile_node import (
     _parse_capital_flow_signals,
     _enforce_target_pe_cap,
@@ -89,6 +93,70 @@ def test_ride_relaxes():
     """中际旭创式 ride：cap=PE_TTM(≈120) → [89.6,116.5] 不被压低（保留趋势倍数）。"""
     out = _enforce_target_pe_cap(_LLM_OUT, 120.0)
     assert "[89.6, 116.5]" in out, out  # 未触顶，原样保留
+
+
+# ---------------------------------------------------------------------------
+# Phase 3：减速 earnings 腿 + 派发腿
+# ---------------------------------------------------------------------------
+def test_earnings_decelerating_votes_negative():
+    """减速：即使增速水平高(58%)，growth_direction=decelerating → earnings 投 -1。"""
+    r = compute_valuation_regime(
+        momentum_score=55, net_profit_growth=0.58, growth_direction="decelerating",
+        capital_flow_regime="中性", theme_stage_inferred="none")
+    assert r["legs"]["earnings"] == -1, r
+
+
+def test_earnings_accelerating_votes_positive():
+    r = compute_valuation_regime(
+        momentum_score=55, net_profit_growth=0.58, growth_direction="accelerating",
+        capital_flow_regime="中性", theme_stage_inferred="none")
+    assert r["legs"]["earnings"] == 1, r
+
+
+def test_distribution_leg():
+    r = compute_valuation_regime(
+        momentum_score=55, net_profit_growth=0.2, capital_flow_regime="中性",
+        theme_stage_inferred="none", distribution_detected=True)
+    assert r["legs"]["distribution"] == -1, r
+
+
+def test_lanqi_full_discipline():
+    """澜起式：减速 + 主力流出 + 减持 → discipline（之前误判 ride/neutral 的根因都补上）。"""
+    r = compute_valuation_regime(
+        momentum_score=95, rsi_percentile_1y=88, has_peak_signal=False,
+        capital_flow_regime="中性", main_force_streak_days=-4, lhb_inst_direction=None,
+        net_profit_growth=0.588, growth_direction="decelerating",
+        retail_concentration_signal="中性", theme_stage_inferred="none_or_acceleration",
+        quant_anticrowding=37.0, distribution_detected=True)
+    assert r["valuation_regime"] == "discipline", r
+    assert r["legs"]["earnings"] == -1 and r["legs"]["distribution"] == -1, r
+
+
+def test_ride_threshold_needs_plus3():
+    """六路阈值：净 +2 仍 neutral（保守），需 +3 才 ride。"""
+    r = compute_valuation_regime(
+        momentum_score=80, net_profit_growth=0.5, growth_direction="accelerating",
+        capital_flow_regime="中性", theme_stage_inferred="none")  # tech+1, earnings+1 = +2
+    assert r["score"] == 2 and r["valuation_regime"] == "neutral", r
+
+
+# ---------------------------------------------------------------------------
+# 新 parser
+# ---------------------------------------------------------------------------
+def test_parse_growth_deceleration():
+    decel = "| **营收同比增速** | +19.51% | **+49.94%** | +57.83% | Q1放缓 |"
+    assert parse_growth_deceleration(decel) == "decelerating"
+    accel = "| 营收同比增速 | +52% | +49% | |"
+    assert parse_growth_deceleration(accel) == "accelerating"
+    assert parse_growth_deceleration("无相关行") is None
+
+
+def test_parse_distribution_signals():
+    news = '第五大股东通过询价转让方式"折价8%"出让，套现约30.58亿元；170余家机构在Q1已披露减持'
+    d = parse_distribution_signals(news)
+    assert d["detected"] and len(d["reasons"]) >= 2, d
+    # 否定语境不误报
+    assert parse_distribution_signals("未发现明显治理红旗（无高管密集减持）")["detected"] is False
 
 
 if __name__ == "__main__":

@@ -833,6 +833,75 @@ def compute_peer_anchored_pe_cap(
     }
 
 
+def parse_growth_deceleration(fund_str: str) -> Optional[str]:
+    """从 fundamentals 抽营收增速方向（最近季 vs 年度）→ 减速/加速/平稳。
+
+    格式：`| 营收同比增速 | +19.51% | +49.94% | ... |`（列序：最近季 / 年度 / 上年度）。
+    澜起：Q1 19.5% << 年度 49.9% → 减速（盈利动能转弱，regime earnings 腿据此投负）。
+
+    Returns: "decelerating" / "accelerating" / "stable" / None（抽不到）
+    """
+    import re
+    if not fund_str:
+        return None
+    # 营收同比增速行，抓前两个百分比（最近季、年度）；标签前后可能带 **
+    m = re.search(
+        r"营(?:业收入|收)同比\s*(?:增速|增长率)?\s*\*{0,2}\s*\|\s*"
+        r"\*{0,2}([+-]?[0-9.]+)%\*{0,2}\s*\|\s*\*{0,2}([+-]?[0-9.]+)%",
+        fund_str,
+    )
+    if not m:
+        return None
+    try:
+        q, annual = float(m.group(1)), float(m.group(2))
+    except ValueError:
+        return None
+    if annual <= 0:
+        return None
+    if q < annual * 0.6:        # 最近季显著低于年度 → 减速
+        return "decelerating"
+    if q >= annual * 0.95:      # 最近季持平/高于年度 → 加速/平稳高位
+        return "accelerating"
+    return "stable"
+
+
+# 减持/机构减仓正向证据词（排除否定语境）
+_DISTRIBUTION_PATTERNS = (
+    r"询价转让[^。\n]{0,20}折价",
+    r"折价[^。\n]{0,8}转让",
+    r"[0-9]+\s*余?家机构[^。\n]{0,10}(?:减持|减仓)",
+    r"机构[^。\n]{0,6}(?:大幅|集中)?(?:减持|减仓)",
+    r"套现[^。\n]{0,6}[0-9.]+\s*亿",
+    r"大股东[^。\n]{0,8}减持",
+    r"股东户数[^。\n]{0,10}(?:增加|上升|持续增)",
+)
+_DISTRIBUTION_NEGATION = (r"未(?:发现|出现)[^。\n]{0,20}减持", r"无[^。\n]{0,10}减持")
+
+
+def parse_distribution_signals(news_str: str, fund_str: str = "", sentiment_str: str = "") -> dict:
+    """检测"大股东/机构派发"硬证据（减持/折价询价转让/机构减仓/筹码分散）。
+
+    这是澜起式派发股最硬的看空信号，但散落在 news/fundamentals/sentiment，
+    之前没喂进 regime。返回 {detected: bool, reasons: [...]}（用于 regime 的 distribution 腿投负）。
+    """
+    import re
+    text = "\n".join([news_str or "", fund_str or "", sentiment_str or ""])
+    if not text.strip():
+        return {"detected": False, "reasons": []}
+    reasons = []
+    for pat in _DISTRIBUTION_PATTERNS:
+        for m in re.finditer(pat, text):
+            seg = m.group(0)
+            # 否定语境跳过（如"未发现高管密集减持"）
+            ctx = text[max(0, m.start() - 8):m.start()]
+            if any(re.search(neg, ctx + seg) for neg in _DISTRIBUTION_NEGATION):
+                continue
+            reasons.append(seg.strip())
+    # 去重
+    reasons = list(dict.fromkeys(reasons))[:5]
+    return {"detected": len(reasons) > 0, "reasons": reasons}
+
+
 def compute_valuation_regime(
     *,
     momentum_score: Optional[float] = None,
@@ -842,23 +911,26 @@ def compute_valuation_regime(
     main_force_streak_days: Optional[int] = None,
     lhb_inst_direction: Optional[int] = None,
     net_profit_growth: Optional[float] = None,
+    growth_direction: Optional[str] = None,
     retail_concentration_signal: Optional[str] = None,
     theme_stage_inferred: Optional[str] = None,
     quant_anticrowding: Optional[float] = None,
+    distribution_detected: bool = False,
 ) -> dict:
-    """客观估值 regime（骑趋势 / 中性 / 收纪律）——五路分析师信号合成，纯 Python 确定性。
+    """客观估值 regime（骑趋势 / 中性 / 收纪律）——六路分析师信号合成，纯 Python 确定性。
 
     对标投研：决定"贵要不要紧 / 骑还是收"的不是估值本身，而是基本面盈利动能 + 技术趋势 +
-    资金面方向 + 舆情拥挤 + 主题阶段的合成。估值锚只回答"贵不贵"，姿态由此 regime 定。
+    资金面方向 + 舆情拥挤 + 主题阶段 + 派发证据 的合成。估值锚只回答"贵不贵"，姿态由此 regime 定。
 
-    五路，每路投 +1(ride)/0/-1(discipline)：
+    六路，每路投 +1(ride)/0/-1(discipline)：
       1 技术/动量：强趋势且未极端超买 → +1；破位/弱 或 极端超买顶 → -1
       2 资金面  ：强势/机构净买/主力连续净流入 → +1；恶化/机构净卖/主力连续净流出 → -1
-      3 盈利动能：高增速(≥40%) → +1；增速停滞(<10%) → -1（TODO: 换成卖方上修方向更准）
+      3 盈利动能：高增速且不减速 → +1；**减速** 或 增速停滞(<10%) → -1（用 growth_direction，比纯水平准）
       4 舆情拥挤：不拥挤(anticrowding≥60) → +1；拥挤+散户高接盘 → -1
       5 主题阶段：acceleration → +1；peak/fading 或 peak信号 → -1
+      6 派发证据：大股东/机构减持、折价询价转让、筹码分散 → -1（澜起式最硬看空证据；只投负）
 
-    合成：净分 ≥ +2 → ride；≤ -2 → discipline；其余 neutral。
+    合成：净分 ≥ +3 → ride（需 3 路净正才放松 cap，保守）；≤ -2 → discipline；其余 neutral。
     peak 信号强制触发时，ride 降级为 neutral（不骑进顶部）。
 
     Returns: {valuation_regime, score, legs:{...}, reasoning}
@@ -887,14 +959,17 @@ def compute_valuation_regime(
             or main_force_streak_days is not None):
         legs["capital"] = cap_vote
 
-    # 3 盈利动能（代理：增速水平；TODO 换卖方上修/QoQ 趋势）
-    if net_profit_growth is not None:
-        if net_profit_growth >= 0.40:
-            legs["earnings"] = 1
-        elif net_profit_growth < 0.10:
-            legs["earnings"] = -1
+    # 3 盈利动能（用增速方向，不再纯看水平——澜起 58% 但减速，旧逻辑误投 +1）
+    if net_profit_growth is not None or growth_direction is not None:
+        if growth_direction == "decelerating" or (
+                net_profit_growth is not None and net_profit_growth < 0.10):
+            legs["earnings"] = -1            # 减速 / 停滞 → 收
+        elif growth_direction == "accelerating" or (
+                growth_direction is None and net_profit_growth is not None
+                and net_profit_growth >= 0.40):
+            legs["earnings"] = 1             # 加速 或 (无方向数据时)高增速 → 骑
         else:
-            legs["earnings"] = 0
+            legs["earnings"] = 0             # 平稳 / 增速中等
 
     # 4 舆情拥挤
     crowd_vote = 0
@@ -916,11 +991,15 @@ def compute_valuation_regime(
         else:
             legs["theme"] = 0
 
+    # 6 派发证据（减持/机构减仓/折价询价转让 → 只投负，澜起最硬看空证据）
+    if distribution_detected:
+        legs["distribution"] = -1
+
     score = sum(legs.values())
     # 有效路 < 3 → 数据不足，给 neutral（不轻易骑/收）
     if len(legs) < 3:
         regime = "neutral"
-    elif score >= 2:
+    elif score >= 3:        # 六路：需净 +3（≥3 路同向偏多）才放松 cap，保守
         regime = "ride"
     elif score <= -2:
         regime = "discipline"
@@ -931,7 +1010,7 @@ def compute_valuation_regime(
     if has_peak_signal and regime == "ride":
         regime = "neutral"
 
-    reasoning = f"五路净分={score}（{legs}）→ {regime}" + ("；peak信号压制不骑" if has_peak_signal else "")
+    reasoning = f"六路净分={score}（{legs}）→ {regime}" + ("；peak信号压制不骑" if has_peak_signal else "")
     return {"valuation_regime": regime, "score": score, "legs": legs, "reasoning": reasoning}
 
 

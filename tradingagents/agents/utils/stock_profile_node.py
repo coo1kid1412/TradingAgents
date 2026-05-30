@@ -50,6 +50,8 @@ from tradingagents.dataflows.profile_calc import (
     parse_net_profit_growth,
     compute_peer_anchored_pe_cap,
     compute_valuation_regime,
+    parse_growth_deceleration,
+    parse_distribution_signals,
 )
 
 logger = logging.getLogger(__name__)
@@ -351,9 +353,11 @@ def create_stock_profile_node(llm):
             macro_adjustment_pct=0,
         )
 
-        # 客观估值 regime（五路合成：技术/资金/盈利/拥挤/主题 → ride/neutral/discipline）
-        # 决定估值姿态（cap 松紧）的是这五路分析师，不是估值锚本身
+        # 客观估值 regime（六路合成：技术/资金/盈利/拥挤/主题/派发 → ride/neutral/discipline）
+        # 决定估值姿态（cap 松紧）的是这六路分析师，不是估值锚本身
         cf_sig = _parse_capital_flow_signals(capital_flow_yaml)
+        growth_dir = parse_growth_deceleration(fundamentals_report + "\n" + fund_raw)
+        dist_sig = parse_distribution_signals(news_report, fundamentals_report, sentiment_report)
         regime_info = compute_valuation_regime(
             momentum_score=momentum_score,
             rsi_percentile_1y=price_signals.get("rsi_percentile_1y"),
@@ -362,11 +366,15 @@ def create_stock_profile_node(llm):
             main_force_streak_days=cf_sig["streak"],
             lhb_inst_direction=cf_sig["lhb_inst_dir"],
             net_profit_growth=net_profit_growth,
+            growth_direction=growth_dir,
             retail_concentration_signal=cf_sig["retail_signal"],
             theme_stage_inferred=theme_inferred,
             quant_anticrowding=quant_yaml.get("anticrowding"),
+            distribution_detected=dist_sig["detected"],
         )
         valuation_regime = regime_info["valuation_regime"]
+        if dist_sig["detected"]:
+            logger.info("派发证据: %s", dist_sig["reasons"][:3])
         logger.info("valuation_regime: %s | %s", valuation_regime, regime_info["reasoning"])
 
         # === 程序化判定结束 ===
@@ -397,7 +405,7 @@ def create_stock_profile_node(llm):
         )
         prog_lines.append(
             f"| valuation_regime | **{valuation_regime}**（ride骑趋势/neutral中性/discipline收纪律）| "
-            f"五路合成(技术/资金/盈利/拥挤/主题)：{regime_info['reasoning']}。"
+            f"六路合成(技术/资金/盈利/拥挤/主题/派发)：{regime_info['reasoning']}。"
             f"→ ride 放松估值 cap、骑趋势；discipline 收紧 cap、均值回归；下游 RM/PM 据此定姿态 |"
         )
 
