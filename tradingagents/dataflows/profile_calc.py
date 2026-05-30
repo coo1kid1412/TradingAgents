@@ -911,8 +911,8 @@ def compute_valuation_regime(
         ts = theme_stage_inferred or ""
         if has_peak_signal or "peak" in ts or "fading" in ts:
             legs["theme"] = -1
-        elif "acceleration" in ts:
-            legs["theme"] = 1
+        elif ts == "acceleration":  # 仅精确确认的加速；"none_or_acceleration"/"initiation_or_acceleration"
+            legs["theme"] = 1       # 是模糊二选一(LLM定)，不算明确加速，投 0（防误投 ride）
         else:
             legs["theme"] = 0
 
