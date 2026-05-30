@@ -582,13 +582,16 @@ def _build_regime_reasoning(regime: str, votes: dict, metrics: dict) -> str:
 def compute_capital_flow_score(metrics: dict, regime: str) -> tuple[Optional[float], dict]:
     """capital_flow_score 公式（第 7 因子）：
 
-    cf_score (0-100) =
-        0.40 × ddx_like_5d_pct_1y
-      + 0.30 × normalize(ddz_like_20d_pct, [-3, +3], [0, 100])
-      + 0.20 × clip_normalize(net_inflow_streak_days, [-10, +10], [0, 100])
-      + 0.10 × inv_normalize(retail_buy_amount_rate_5d_pct, [50, 75] → [100, 0])
+    cf_score (0-100) = 加权（对标投研资金面权重排序：机构出处 > DDE 推断）
+        0.25 × ddx_like_5d_pct_1y                        （DDE 推断，降权）
+      + 0.20 × normalize(ddz_like_20d_pct, [-3, +3], [0, 100])  （DDE 推断）
+      + 0.15 × clip_normalize(net_inflow_streak_days, [-10, +10], [0, 100])（DDE 推断）
+      + 0.20 × dir_to_score(northbound_5d_direction)    （真机构北向；停滞则按比例缩权剔除）
+      + 0.15 × dir_to_score(lhb_inst_direction)         （真机构龙虎榜席位）
+      + 0.05 × inv_normalize(retail_buy_amount_rate_5d_pct, [50, 75] → [100, 0])（辅助）
 
-    缺失子项时按比例缩放剩余权重。
+    DDE（按单笔大小分主力/散户）是散户级启发式、受算法拆单削弱，故降权；机构出处信号提权。
+    缺失子项时按比例缩放剩余权重（total_w 归一），北向停滞时其 0.20 自动剔除、不留空洞。
 
     Regime 硬约束（业内"双轨制"）：
     - regime == "恶化" → cf_score 强制 ≤ 40
@@ -605,34 +608,55 @@ def compute_capital_flow_score(metrics: dict, regime: str) -> tuple[Optional[flo
     ddz_20d = metrics.get("ddz_like_20d_pct")
     streak = metrics.get("net_inflow_streak_days")
     retail_rate = metrics.get("retail_buy_amount_rate_5d_pct")
+    nb_dir = metrics.get("northbound_5d_direction")
+    nb_status = metrics.get("northbound_data_status", "missing")
+    lhb_inst_dir = metrics.get("lhb_inst_direction")
 
     parts: list[tuple[float, float]] = []  # (sub_score, weight)
     breakdown: dict = {}
 
-    # 子分 1: ddx_like_5d_pct_1y（已是 0-100，权重 0.40）
+    # 方向(-1/0/+1) → 0-100 子分：-1→0, 0→50, +1→100
+    def _dir_to_score(d: int) -> float:
+        return 50.0 + 50.0 * float(d)
+
+    # 子分 1: ddx_like_5d_pct_1y（已是 0-100，权重 0.25；DDE 推断降权）
     if ddx_pct is not None:
-        parts.append((float(ddx_pct), 0.40))
+        parts.append((float(ddx_pct), 0.25))
         breakdown["ddx_like_5d_pct_1y"] = round(ddx_pct, 1)
 
-    # 子分 2: ddz_like_20d_pct → 线性映射 [-3, +3] → [0, 100]，权重 0.30
+    # 子分 2: ddz_like_20d_pct → 线性映射 [-3, +3] → [0, 100]，权重 0.20
     if ddz_20d is not None:
         sub = _linear_map(float(ddz_20d), -3.0, 3.0)
-        parts.append((sub, 0.30))
+        parts.append((sub, 0.20))
         breakdown["ddz_like_20d_pct"] = round(ddz_20d, 2)
         breakdown["ddz_sub_score"] = round(sub, 1)
 
-    # 子分 3: net_inflow_streak_days → 截断 [-10,+10] 后线性映射，权重 0.20
+    # 子分 5: 北向 5 日方向（真机构，权重 0.20）；停滞/缺失时跳过 → total_w 自动缩权
+    if nb_dir is not None and nb_status == "fresh":
+        sub = _dir_to_score(nb_dir)
+        parts.append((sub, 0.20))
+        breakdown["northbound_5d_direction"] = int(nb_dir)
+        breakdown["northbound_sub_score"] = round(sub, 1)
+
+    # 子分 6: 龙虎榜机构席位方向（真机构，权重 0.15）；缺失时跳过
+    if lhb_inst_dir is not None:
+        sub = _dir_to_score(lhb_inst_dir)
+        parts.append((sub, 0.15))
+        breakdown["lhb_inst_direction"] = int(lhb_inst_dir)
+        breakdown["lhb_inst_sub_score"] = round(sub, 1)
+
+    # 子分 3: net_inflow_streak_days → 截断 [-10,+10] 后线性映射，权重 0.15
     if streak is not None:
         sub = _linear_map(float(streak), -10.0, 10.0)
-        parts.append((sub, 0.20))
+        parts.append((sub, 0.15))
         breakdown["net_inflow_streak_days"] = int(streak)
         breakdown["streak_sub_score"] = round(sub, 1)
 
-    # 子分 4: 散户买占比（真实小单+中单）→ 反向归一化（占比越高=派发期接盘越重→打分越低），权重 0.10
+    # 子分 4: 散户买占比（真实小单+中单）→ 反向归一化（占比越高=派发期接盘越重→打分越低），权重 0.05
     # 50% → 100；75% → 0；映射区间 [50,75]（A 股散户买占比常态区间）
     if retail_rate is not None:
         sub = _linear_map(float(retail_rate), 50.0, 75.0, dst_lo=100.0, dst_hi=0.0)
-        parts.append((sub, 0.10))
+        parts.append((sub, 0.05))
         breakdown["retail_buy_amount_rate_5d_pct"] = round(retail_rate, 2)
         breakdown["retail_sub_score"] = round(sub, 1)
 
