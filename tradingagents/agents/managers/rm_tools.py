@@ -93,16 +93,18 @@ def compute_score_difference(bull_score: float, bear_score: float) -> dict:
 @tool
 def compute_pe_eps_target_price(eps: float, target_pe_low: float,
                                   target_pe_high: float) -> dict:
-    """PE × EPS 估值法：给定 EPS 和目标 PE 区间，输出目标价区间。
+    """PE × EPS 估值法（**TTM 口径**）：目标 PE(TTM) × EPS_TTM → 目标价区间。
 
     Args:
-        eps: 预期 EPS（元/股），通常用 2026E EPS 中位数
-        target_pe_low: 目标 PE 区间下沿
-        target_pe_high: 目标 PE 区间上沿
+        eps: **必须用 EPS_TTM**（元/股；stock_profile 已给值，直接用）。
+             ⚠️ 不得用前瞻/2026E EPS——因为 target_pe 来自 stock_profile（锚自同业 TTM 中位 /
+             PE_TTM×0.x）是 **TTM 倍数**；TTM 倍数 × 前瞻 EPS 会**双重计入成长**、目标价虚高 ~50%
+             （高估值股被错抬成强买，澜起历史 bug 根因）。前瞻增长由 compute_peg_target_price 单独体现。
+        target_pe_low: 目标 PE 区间下沿（TTM 口径）
+        target_pe_high: 目标 PE 区间上沿（TTM 口径）
 
     Returns:
-        dict: {"low": 区间下沿目标价, "mid": 区间中位数, "high": 区间上沿,
-               "method": "PE × EPS"}
+        dict: {"low", "mid", "high", "method", "eps_basis": "TTM"}
     """
     low = round(eps * target_pe_low, 2)
     high = round(eps * target_pe_high, 2)
@@ -112,6 +114,7 @@ def compute_pe_eps_target_price(eps: float, target_pe_low: float,
         "mid": mid,
         "high": high,
         "method": "PE × EPS",
+        "eps_basis": "TTM",  # 口径标记：本法用 EPS_TTM，前瞻增长归 PEG 法
         "inputs": {"eps": eps, "pe_range": [target_pe_low, target_pe_high]},
     }
 
