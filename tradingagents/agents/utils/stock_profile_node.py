@@ -223,9 +223,10 @@ def create_stock_profile_node(llm):
         peer_pe_median = parse_peer_pe_median(news_report, fundamentals_report)
         peer_pe_source = "report_scrape" if peer_pe_median is not None else None
 
-        # ---- 兄弟股可比 PE（优先源，质量高于报告抠数）：news+sentiment 共现挖掘 + 行业校验 + ≥2家中位 ----
-        # 仅 A 股（PE 快照/兄弟表都是 A 股口径）；取数失败或有效 peer 不足时保持原 peer_pe_median 不变。
+        # ---- 兄弟股可比 PE（优先源，质量高于报告抠数）：news+sentiment 共现挖掘 + 行业校验 + ≥1家中位 ----
+        # 仅 A 股（PE 快照/兄弟表都是 A 股口径）；取数失败或 0 家有效时保持原 peer_pe_median 不变。
         brother_pe = None
+        brother_single_comp = False  # 单标的(n=1)低置信 → 下游 Conviction 减一档
         if is_a_share(ticker):
             code_m = re.search(r"\d{6}", ticker)
             if code_m:
@@ -240,9 +241,11 @@ def create_stock_profile_node(llm):
             if brother_pe:
                 peer_pe_median = brother_pe["median"]
                 peer_pe_source = "brother_comps"
+                brother_single_comp = (brother_pe.get("confidence") == "low")
                 logger.info(
-                    "兄弟股可比 PE 命中: median=%.1f, used=%s",
-                    brother_pe["median"], brother_pe.get("used"),
+                    "兄弟股可比 PE 命中: median=%.1f, n_valid=%s, conf=%s, used=%s",
+                    brother_pe["median"], brother_pe.get("n_valid"),
+                    brother_pe.get("confidence"), brother_pe.get("used"),
                 )
 
         # ---- Layer 2 兜底：三源全 null 时用 PE_TTM × 0.7 做最后锚（机构 PM "无锚定时保守" 原则）----
@@ -391,10 +394,15 @@ def create_stock_profile_node(llm):
                 )
             else:
                 src_label = {
-                    "brother_comps": "兄弟股可比中位（共现挖掘+行业校验+≥2家，tushare 实测 PE）",
+                    "brother_comps": "兄弟股可比中位（共现挖掘+行业校验，tushare 实测 PE）",
                     "report_scrape": "来自 news/fundamentals",
                 }.get(peer_pe_source, "来自 news/fundamentals")
                 prog_lines.append(f"- 同业/行业 PE 中位数: {peer_pe_median:.1f}（{src_label}）")
+                if brother_single_comp:
+                    prog_lines.append(
+                        "  - ⚠️ **兄弟股可比仅 1 家（单标的低置信）**：无第二家纠偏，估值锚可靠性打折。"
+                        "→ 下游 RM/PM **Conviction 必须减一档**（见 TRANSPARENCY.peer_anchor_single_comp）。"
+                    )
         else:
             prog_lines.append("- 同业/行业 PE 中位数: 未抽到（且 PE_TTM 也抽不到，无任何兜底锚）")
 
@@ -469,6 +477,8 @@ def create_stock_profile_node(llm):
         sell_side_high_str = f"{sell_side_pe_range[1]:.1f}" if sell_side_pe_range else "null"
         self_p80_str = f"{self_pe_p80:.1f}" if self_pe_p80 else "null"
         peer_median_str = f"{peer_pe_median:.1f}" if peer_pe_median else "null"
+        peer_anchor_source_str = peer_pe_source or "none"
+        peer_single_comp_str = "true" if brother_single_comp else "false"
 
         prompt = f"""【语言要求】你必须使用中文撰写以下分析。股票代码和技术指标名称可保留英文。
 
@@ -684,6 +694,8 @@ TRANSPARENCY:
   sell_side_pe_high_ref: {sell_side_high_str}
   self_pe_p80_ref: {self_p80_str}
   peer_pe_median_ref: {peer_median_str}
+  peer_anchor_source: {peer_anchor_source_str}        # brother_comps / report_scrape / none（Python 预填，直接抄）
+  peer_anchor_single_comp: {peer_single_comp_str}     # true=兄弟股仅1家(低置信)→下游 Conviction 减一档（Python 预填，直接抄）
   leadership_bonus_pct: {leadership_bonus_pct}
   sector_rs_30d_pct: {sector_rs_30d if sector_rs_30d is not None else 'null'}
 ```
