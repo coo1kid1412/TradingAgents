@@ -152,6 +152,16 @@ def get_pe_snapshot(trade_date: str) -> dict[str, Optional[float]]:
     """
     _ensure_cache_dir()
     ymd = trade_date.replace("-", "")
+    # 周末用纯日期计算回退到上周五（零接口调用，避免 daily_basic 在非交易日返回空）；
+    # 节假日仍由下方"最近缓存"兜底。
+    try:
+        from datetime import datetime, timedelta
+        d = datetime.strptime(ymd, "%Y%m%d")
+        if d.weekday() >= 5:  # 5=周六 6=周日
+            d = d - timedelta(days=d.weekday() - 4)
+            ymd = d.strftime("%Y%m%d")
+    except ValueError:
+        pass
     path = os.path.join(_CACHE_DIR, f"pe_{ymd}.json")
     if os.path.exists(path):
         try:
