@@ -49,6 +49,7 @@ from tradingagents.dataflows.profile_calc import (
     parse_pe_ttm_from_fundamentals,
     parse_net_profit_growth,
     compute_peer_anchored_pe_cap,
+    compute_valuation_regime,
 )
 
 logger = logging.getLogger(__name__)
@@ -156,6 +157,36 @@ def _fetch_fundamentals_raw(ticker: str, trade_date: str) -> str:
         return ""
 
 
+def _parse_capital_flow_signals(cf_yaml: str) -> dict:
+    """从 capital_flow_yaml 抽 valuation_regime 需要的资金面信号（容错，缺失返回 None）。"""
+    out = {"regime": None, "streak": None, "lhb_inst_dir": None, "retail_signal": None}
+    if not cf_yaml:
+        return out
+
+    def _grab(key):
+        # 抓 key 后到行尾（. 不跨行），去引号/空白；null/空 → None
+        m = re.search(rf'{key}:\s*(.+)', cf_yaml)
+        if not m:
+            return None
+        v = m.group(1).strip().strip('"').strip()
+        return None if v in ("null", "") else v
+
+    def _grab_int(key):
+        v = _grab(key)
+        if v is None:
+            return None
+        try:
+            return int(v)
+        except ValueError:
+            return None
+
+    out["regime"] = _grab("capital_flow_regime")  # 注：capital_flow_regime_reasoning 的"_"≠":"，不会误匹配
+    out["streak"] = _grab_int("net_inflow_streak_days")
+    out["lhb_inst_dir"] = _grab_int("lhb_inst_direction")
+    out["retail_signal"] = _grab("retail_concentration_signal")
+    return out
+
+
 def _enforce_target_pe_cap(content: str, cap: float) -> str:
     """出口处硬截断 LLM 输出的 target_pe_range 高位到 cap（防 LLM 无视 prompt 软约束）。
 
@@ -201,6 +232,7 @@ def create_stock_profile_node(llm):
         macro_context = state.get("macro_context", "")
         quant_score_md = state.get("quant_score", "")
         sector_comparison_md = state.get("sector_comparison", "")
+        capital_flow_yaml = state.get("capital_flow_yaml", "")
 
         # === 程序化判定开始 ===
         is_etf = is_etf_ticker(ticker)
@@ -319,6 +351,24 @@ def create_stock_profile_node(llm):
             macro_adjustment_pct=0,
         )
 
+        # 客观估值 regime（五路合成：技术/资金/盈利/拥挤/主题 → ride/neutral/discipline）
+        # 决定估值姿态（cap 松紧）的是这五路分析师，不是估值锚本身
+        cf_sig = _parse_capital_flow_signals(capital_flow_yaml)
+        regime_info = compute_valuation_regime(
+            momentum_score=momentum_score,
+            rsi_percentile_1y=price_signals.get("rsi_percentile_1y"),
+            has_peak_signal=peak_check["force_peak"],
+            capital_flow_regime=cf_sig["regime"],
+            main_force_streak_days=cf_sig["streak"],
+            lhb_inst_direction=cf_sig["lhb_inst_dir"],
+            net_profit_growth=net_profit_growth,
+            retail_concentration_signal=cf_sig["retail_signal"],
+            theme_stage_inferred=theme_inferred,
+            quant_anticrowding=quant_yaml.get("anticrowding"),
+        )
+        valuation_regime = regime_info["valuation_regime"]
+        logger.info("valuation_regime: %s | %s", valuation_regime, regime_info["reasoning"])
+
         # === 程序化判定结束 ===
 
         # 拼装"已确定字段"展示段，喂给 LLM 当 ground truth
@@ -344,6 +394,11 @@ def create_stock_profile_node(llm):
         )
         prog_lines.append(
             f"| instrument_type | **{'etf' if is_etf else 'a_share_stock'}** | 代码模式识别 |"
+        )
+        prog_lines.append(
+            f"| valuation_regime | **{valuation_regime}**（ride骑趋势/neutral中性/discipline收纪律）| "
+            f"五路合成(技术/资金/盈利/拥挤/主题)：{regime_info['reasoning']}。"
+            f"→ ride 放松估值 cap、骑趋势；discipline 收紧 cap、均值回归；下游 RM/PM 据此定姿态 |"
         )
 
         # peak 检测
@@ -744,16 +799,22 @@ TRANSPARENCY:
         response = llm.invoke(prompt)
         content = response.content
 
-        # 出口硬截断 target_pe_high（把 prompt 软约束变成程序化硬天花板，防 LLM 绕过）
-        # 生效条件（仅 A 股）：① 有同业锚 cap → 用 peer_pe_cap；② 全-null 兜底 → 用 PE_TTM×0.6
-        hard_cap = None
+        # 出口硬截断 target_pe_high —— regime 条件化（修"主升浪被低 cap 压死"）
+        # discipline/neutral：用纪律 cap（同业锚 / PE_TTM×0.6）；
+        # ride（主升浪）：解除纪律 cap，仅用 PE_TTM 兜底（不许超当前贵倍数、但不向下压，允许倍数不收缩）
         if is_a_share_stock:
+            discipline_cap = None
             if peer_pe_cap:
-                hard_cap = peer_pe_cap["cap"]
+                discipline_cap = peer_pe_cap["cap"]
             elif layer2_all_null and pe_ttm_fallback:
-                hard_cap = pe_ttm_fallback * 0.6
-        if hard_cap is not None:
-            content = _enforce_target_pe_cap(content, hard_cap)
+                discipline_cap = pe_ttm_fallback * 0.6
+
+            eff_cap = pe_ttm_actual if valuation_regime == "ride" else discipline_cap
+            if eff_cap is not None:
+                content = _enforce_target_pe_cap(content, eff_cap)
+                logger.info(
+                    "target_pe 出口 cap: regime=%s → eff_cap=%.1f", valuation_regime, eff_cap,
+                )
 
         return {"stock_profile": content}
 
