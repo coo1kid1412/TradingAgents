@@ -718,29 +718,31 @@ def parse_net_profit_growth(fund_str: str) -> Optional[float]:
     2. 提示下游 RM：目标 PE 应配"前瞻 EPS = EPS_TTM×(1+g)"，而非 TTM EPS
 
     口径优先级（年度优先于单季，避开 Q1 淡季噪音）：
-    1. "归母净利润增速/增长率 ... 年度 ... +XX%"
-    2. 表格行 "归母净利润增长率 | +XX% | ..." / "净利润增速(年度) | +XX%"
-    3. 文字 "净利润同比 +XX%" / "归母净利润同比增长 XX%"
+    1. 归母口径（最可靠，不会误抓扣非/营收）——"润"字可选、"同比"可选、增速/增长率/增长
+       覆盖：归母净利润增速 / 归母净利润增长率 / 归母净利同比增速 / 归母净利增速
+    2. "净利润增速(年度) | +XX%"（无归母前缀的年度表格）
+    3. 兜底："净利润同比 +XX%"（排除扣非）
 
-    标签会漂（增速/增长率、归母前缀有无），故用弹性正则。
+    标签每跑必漂（增速/增长率、归母前缀、润字有无、同比插入），故用弹性正则。
     """
     import re
 
     if not fund_str:
         return None
 
-    # 优先匹配显式"年度"口径，避免抓到 Q1 单季增速
-    annual_patterns = [
-        r"净利润增速\s*[(（]\s*年度\s*[)）]\s*\|\s*\*{0,2}\s*([+-]?[0-9.]+)\s*%",
-        r"(?:归母)?净利润(?:增速|增长率)[^\n]{0,12}年度[^\n]{0,12}?([+-]?[0-9.]+)\s*%",
-        r"年度[^\n]{0,12}(?:归母)?净利润(?:增速|增长率)[^\n]{0,8}?([+-]?[0-9.]+)\s*%",
+    # 归母口径（首选）：归母 + 净利(润可选) + (同比可选) + 增速/增长率/增长；表格或紧邻散文
+    gm_label = r"归母净利(?:润)?(?:同比)?\s*(?:增速|增长率|增长)"
+    gm_patterns = [
+        gm_label + r"\s*\|\s*\*{0,2}\s*([+-]?[0-9.]+)\s*%",        # 表格行
+        gm_label + r"[^\n%]{0,6}?\*{0,2}\+?([+-]?[0-9.]+)\s*%",    # 散文/冒号紧邻
     ]
-    # 通用口径（表格行 / 文字同比），作为年度抓不到时的兜底
-    generic_patterns = [
-        r"归母净利润(?:增速|增长率)\s*\|\s*\*{0,2}\s*([+-]?[0-9.]+)\s*%",
-        r"净利润(?:增速|增长率)\s*\|\s*\*{0,2}\s*([+-]?[0-9.]+)\s*%",
-        r"归母净利润同比(?:增长)?\s*[:：]?\s*\+?([+-]?[0-9.]+)\s*%",
-        r"净利润同比(?:增长)?\s*[:：]?\s*\+?([+-]?[0-9.]+)\s*%",
+    # 年度表格（无归母前缀）
+    annual_patterns = [
+        r"净利(?:润)?\s*(?:增速|增长率)\s*[(（]\s*年度\s*[)）]\s*\|\s*\*{0,2}\s*([+-]?[0-9.]+)\s*%",
+    ]
+    # 兜底：净利润同比（排除"扣非净利"——负向断言前一字不是"非"）
+    fallback_patterns = [
+        r"(?<!非)净利润\s*(?:同比)?\s*(?:增速|增长率|增长)\s*[:：|]?\s*\*{0,2}\+?([+-]?[0-9.]+)\s*%",
     ]
 
     def _first_valid(patterns):
@@ -755,10 +757,11 @@ def parse_net_profit_growth(fund_str: str) -> Optional[float]:
                     return pct / 100.0
         return None
 
-    val = _first_valid(annual_patterns)
-    if val is None:
-        val = _first_valid(generic_patterns)
-    return val
+    for group in (gm_patterns, annual_patterns, fallback_patterns):
+        val = _first_valid(group)
+        if val is not None:
+            return val
+    return None
 
 
 def compute_peer_anchored_pe_cap(
