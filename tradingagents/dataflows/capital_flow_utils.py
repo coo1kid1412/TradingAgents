@@ -26,6 +26,17 @@ YI_TO_WAN = 1e4   # 亿元 → 万元
 
 
 # ---------------------------------------------------------------------------
+# 投票/打分阈值（提议默认，可用真实数据校准 —— TODO: calibrate）
+# ---------------------------------------------------------------------------
+# 散户高承接：小单+中单买入成交占比 ≥ 此值（A 股该占比常 50-70%，>65 偏高）
+_RETAIL_HIGH_RATE_PCT = 65.0
+# 主力派发：连续净流出 ≥ 3 日（收紧自旧逻辑的 streak<0，消除 streak=-1 虚假票）
+_STREAK_DISTRIBUTION = -3
+# 龙虎榜机构净买方向阈值：30 日机构净买额绝对值 ≥ 此值（亿元）才算明确方向，否则 0（去零附近噪音）
+_LHB_INST_NET_THRESHOLD_YI = 0.05
+
+
+# ---------------------------------------------------------------------------
 # 工具函数：归一化（线性区间映射到 0-100）
 # ---------------------------------------------------------------------------
 def _clip(v: float, lo: float, hi: float) -> float:
@@ -66,20 +77,23 @@ def compute_dde_like_metrics(
         - main_force_net_inflow_20d_yi     : 20 日主力累计净流入
         - ddx_like_5d_pct                  : 5 日超大单净额 / 流通市值 × 100（%）
         - ddx_like_5d_pct_1y               : ddx_like_5d_pct 的 1 年百分位（0-100）
-        - ddy_like_5d_yi                   : 5 日大单净额（亿元）
-        - ddz_like_20d_pct                 : 20 日主力净额 / 20 日成交额 × 100（%）
+        - large_order_net_inflow_5d_yi     : 5 日大单累计净额（亿元，展示用，不进打分/投票）
+                                             （旧称 ddy_like；实为大单净额，非经典 DDY「涨跌动因/主动性」）
+        - ddz_like_20d_pct                 : 20 日主力净额 / 20 日成交额 × 100（%，20日主力强度比，
+                                             非经典 DDZ「主力库存」累计量）
         - net_inflow_streak_days           : 连续净流入(+) / 净流出(-) 天数（截断 ±10）
-        - retail_takeover_ratio            : 散户接盘度，仅主力净流出时计算；范围 [0, 5]
+
+    注：散户接盘度不在此函数算——旧的 retail_takeover_ratio 用"零和近似"恒等 1.0（零信息），
+    已废弃。散户信号改由 compute_retail_amount_rate 的真实小单+中单买占比驱动（见 assemble）。
     """
     out: dict = {
         "main_force_net_inflow_5d_yi": None,
         "main_force_net_inflow_20d_yi": None,
         "ddx_like_5d_pct": None,
         "ddx_like_5d_pct_1y": None,
-        "ddy_like_5d_yi": None,
+        "large_order_net_inflow_5d_yi": None,
         "ddz_like_20d_pct": None,
         "net_inflow_streak_days": None,
-        "retail_takeover_ratio": None,
     }
 
     if moneyflow_df is None or len(moneyflow_df) == 0:
@@ -127,9 +141,9 @@ def compute_dde_like_metrics(
             below = (history <= current).sum()
             out["ddx_like_5d_pct_1y"] = round(float(below) / len(history) * 100, 1)
 
-    # DDY-like 5 日：大单累计净额
+    # 大单 5 日累计净额（旧称 DDY-like；实为大单净额，非经典 DDY「涨跌动因/主动性」，故诚实命名）
     if "large_net_amount_yi" in df.columns and n >= 1:
-        out["ddy_like_5d_yi"] = round(float(df["large_net_amount_yi"].tail(5).sum()), 2)
+        out["large_order_net_inflow_5d_yi"] = round(float(df["large_net_amount_yi"].tail(5).sum()), 2)
 
     # DDZ-like 20 日：20 日主力净额 / 20 日成交额
     if (
@@ -146,21 +160,28 @@ def compute_dde_like_metrics(
     if "main_force_net_amount_yi" in df.columns and n >= 1:
         out["net_inflow_streak_days"] = _compute_streak_days(df["main_force_net_amount_yi"])
 
-    # 散户接盘度：仅在主力净流出时有意义
-    # retail_takeover_ratio = 散户净流入 / |主力净流出|
-    # 散户净流入 ≈ -（主力净额）(因为零和；近似处理)
-    if (
-        "main_force_net_amount_yi" in df.columns
-        and out["main_force_net_inflow_5d_yi"] is not None
-        and out["main_force_net_inflow_5d_yi"] < 0
-    ):
-        # 散户接盘 = -主力净额（市场零和近似）
-        retail_inflow = -out["main_force_net_inflow_5d_yi"]
-        main_outflow = abs(out["main_force_net_inflow_5d_yi"])
-        if main_outflow > 0:
-            out["retail_takeover_ratio"] = round(_clip(retail_inflow / main_outflow, 0.0, 5.0), 3)
-
     return out
+
+
+def compute_retail_concentration_signal(
+    retail_buy_amount_rate_5d_pct: Optional[float],
+    net_inflow_streak_days: Optional[int],
+) -> Optional[str]:
+    """散户接盘信号（替代恒等 1.0 的旧 retail_takeover_ratio）。
+
+    真接盘 = 主力持续派发（streak ≤ -3）+ 散户高承接（小单+中单买占比 ≥ 65%）。
+    与"主力流出 + 散户也跑（踩踏）"区分开。
+
+    Returns: "散户高接盘" / "中性" / None（数据缺失）
+    """
+    if retail_buy_amount_rate_5d_pct is None or net_inflow_streak_days is None:
+        return None
+    if (
+        retail_buy_amount_rate_5d_pct >= _RETAIL_HIGH_RATE_PCT
+        and net_inflow_streak_days <= _STREAK_DISTRIBUTION
+    ):
+        return "散户高接盘"
+    return "中性"
 
 
 def _compute_streak_days(series: pd.Series, max_streak: int = 10) -> int:
@@ -343,19 +364,40 @@ def compute_holder_number_metrics(holder_df: Optional[pd.DataFrame]) -> dict:
 # ---------------------------------------------------------------------------
 # 4. 龙虎榜计数（30 天）
 # ---------------------------------------------------------------------------
-def compute_lhb_metrics(lhb_count_30d: Optional[int]) -> dict:
-    """龙虎榜上榜次数（30 天累计）。
+def compute_lhb_metrics(
+    lhb_count_30d: Optional[int],
+    lhb_inst_net_buy_30d_yi: Optional[float] = None,
+) -> dict:
+    """龙虎榜：上榜次数（关注度）+ 机构席位净买方向（真方向信号）。
+
+    上榜次数本身是"异动/关注度"，不代表方向（机构出货/游资派发同样上榜）。
+    方向由机构专用席位 30 日净买额定：净买→+1 / 净卖→-1 / 持平→0 / 缺失→None。
 
     Args:
-        lhb_count_30d: 30 天上榜次数；缺失返回 None
+        lhb_count_30d: 30 天上榜次数；缺失返回 None（仅作关注度展示）
+        lhb_inst_net_buy_30d_yi: 30 天龙虎榜机构席位净买额（亿元）；缺失 None
 
     Returns:
         dict:
-        - lhb_count_30d : int 或 None
+        - lhb_count_30d            : int 或 None（关注度，不投方向）
+        - lhb_inst_net_buy_30d_yi  : float 或 None
+        - lhb_inst_direction       : -1 / 0 / +1 / None（投票依据）
     """
-    if lhb_count_30d is None:
-        return {"lhb_count_30d": None}
-    return {"lhb_count_30d": int(lhb_count_30d)}
+    out: dict = {
+        "lhb_count_30d": int(lhb_count_30d) if lhb_count_30d is not None else None,
+        "lhb_inst_net_buy_30d_yi": (
+            round(float(lhb_inst_net_buy_30d_yi), 4) if lhb_inst_net_buy_30d_yi is not None else None
+        ),
+        "lhb_inst_direction": None,
+    }
+    if lhb_inst_net_buy_30d_yi is not None:
+        if lhb_inst_net_buy_30d_yi > _LHB_INST_NET_THRESHOLD_YI:
+            out["lhb_inst_direction"] = 1
+        elif lhb_inst_net_buy_30d_yi < -_LHB_INST_NET_THRESHOLD_YI:
+            out["lhb_inst_direction"] = -1
+        else:
+            out["lhb_inst_direction"] = 0
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -403,8 +445,9 @@ def compute_capital_flow_regime(metrics: dict) -> dict:
     1. streak（连续天数）：≥+3 投 +；≤-3 投 -；≤-5 单维度即可触发"恶化独立票"
     2. ddx_pct_1y（DDX 1 年分位）：≥80 投 +；≤20 投 -
     3. northbound_5d_direction：+1 投 +；-1 投 -；0 投 0；data_status=stale/missing 投 X
-    4. lhb_count_30d：≥2 投 +（短线资金活跃，倾向多头解读）；缺失投 X
-    5. retail_takeover_ratio：≥0.8 且 streak<0 → 投 -（散户接盘）；其他 0
+    4. lhb_inst_direction（龙虎榜机构席位净买方向）：+1 投 +；-1 投 -；0 投 0；缺失投 X
+       （上榜次数 lhb_count_30d 仅作关注度展示，不投方向）
+    5. retail（小单+中单买占比）：≥65% 且 streak≤-3 → 投 -（散户高接盘）；其他 0
 
     Regime 判定：
     - 数据不足：valid 维度数（非 X）< 3
@@ -463,15 +506,18 @@ def compute_capital_flow_regime(metrics: dict) -> dict:
         else:
             votes["northbound"] = "0"
 
-    # 4. lhb（30 日上榜数 ≥2 倾向多头活跃）
-    lhb = metrics.get("lhb_count_30d")
-    if lhb is not None:
-        votes["lhb"] = "+" if lhb >= 2 else "0"
+    # 4. lhb（机构席位方向：净买→+ / 净卖→- / 持平→0 / 缺失→X）
+    #    不再用"上榜次数≥2→多头"——上榜是异动/关注度，不是方向
+    lhb_dir = metrics.get("lhb_inst_direction")
+    if lhb_dir is not None:
+        votes["lhb"] = "+" if lhb_dir > 0 else ("-" if lhb_dir < 0 else "0")
 
-    # 5. retail_takeover（散户接盘度 + streak 负向 → 投 -）
-    retail = metrics.get("retail_takeover_ratio")
-    if retail is not None and streak is not None:
-        if retail >= 0.8 and streak < 0:
+    # 5. retail（散户高接盘：主力派发 streak≤-3 + 散户买占比≥65% → 投 -）
+    #    用真实小单+中单买占比，不再用恒等 1.0 的旧 retail_takeover_ratio；
+    #    收紧到 streak≤-3（不是 <0），消除"主力流出一天"的虚假票
+    retail_rate = metrics.get("retail_buy_amount_rate_5d_pct")
+    if retail_rate is not None and streak is not None:
+        if retail_rate >= _RETAIL_HIGH_RATE_PCT and streak <= _STREAK_DISTRIBUTION:
             votes["retail_takeover"] = "-"
         else:
             votes["retail_takeover"] = "0"
@@ -538,13 +584,16 @@ def _build_regime_reasoning(regime: str, votes: dict, metrics: dict) -> str:
 def compute_capital_flow_score(metrics: dict, regime: str) -> tuple[Optional[float], dict]:
     """capital_flow_score 公式（第 7 因子）：
 
-    cf_score (0-100) =
-        0.40 × ddx_like_5d_pct_1y
-      + 0.30 × normalize(ddz_like_20d_pct, [-3, +3], [0, 100])
-      + 0.20 × clip_normalize(net_inflow_streak_days, [-10, +10], [0, 100])
-      + 0.10 × inv_normalize(retail_takeover_ratio)
+    cf_score (0-100) = 加权（对标投研资金面权重排序：机构出处 > DDE 推断）
+        0.25 × ddx_like_5d_pct_1y                        （DDE 推断，降权）
+      + 0.20 × normalize(ddz_like_20d_pct, [-3, +3], [0, 100])  （DDE 推断）
+      + 0.15 × clip_normalize(net_inflow_streak_days, [-10, +10], [0, 100])（DDE 推断）
+      + 0.20 × dir_to_score(northbound_5d_direction)    （真机构北向；停滞则按比例缩权剔除）
+      + 0.15 × dir_to_score(lhb_inst_direction)         （真机构龙虎榜席位）
+      + 0.05 × inv_normalize(retail_buy_amount_rate_5d_pct, [50, 75] → [100, 0])（辅助）
 
-    缺失子项时按比例缩放剩余权重。
+    DDE（按单笔大小分主力/散户）是散户级启发式、受算法拆单削弱，故降权；机构出处信号提权。
+    缺失子项时按比例缩放剩余权重（total_w 归一），北向停滞时其 0.20 自动剔除、不留空洞。
 
     Regime 硬约束（业内"双轨制"）：
     - regime == "恶化" → cf_score 强制 ≤ 40
@@ -560,37 +609,57 @@ def compute_capital_flow_score(metrics: dict, regime: str) -> tuple[Optional[flo
     ddx_pct = metrics.get("ddx_like_5d_pct_1y")
     ddz_20d = metrics.get("ddz_like_20d_pct")
     streak = metrics.get("net_inflow_streak_days")
-    retail = metrics.get("retail_takeover_ratio")
+    retail_rate = metrics.get("retail_buy_amount_rate_5d_pct")
+    nb_dir = metrics.get("northbound_5d_direction")
+    nb_status = metrics.get("northbound_data_status", "missing")
+    lhb_inst_dir = metrics.get("lhb_inst_direction")
 
     parts: list[tuple[float, float]] = []  # (sub_score, weight)
     breakdown: dict = {}
 
-    # 子分 1: ddx_like_5d_pct_1y（已是 0-100，权重 0.40）
+    # 方向(-1/0/+1) → 0-100 子分：-1→0, 0→50, +1→100
+    def _dir_to_score(d: int) -> float:
+        return 50.0 + 50.0 * float(d)
+
+    # 子分 1: ddx_like_5d_pct_1y（已是 0-100，权重 0.25；DDE 推断降权）
     if ddx_pct is not None:
-        parts.append((float(ddx_pct), 0.40))
+        parts.append((float(ddx_pct), 0.25))
         breakdown["ddx_like_5d_pct_1y"] = round(ddx_pct, 1)
 
-    # 子分 2: ddz_like_20d_pct → 线性映射 [-3, +3] → [0, 100]，权重 0.30
+    # 子分 2: ddz_like_20d_pct → 线性映射 [-3, +3] → [0, 100]，权重 0.20
     if ddz_20d is not None:
         sub = _linear_map(float(ddz_20d), -3.0, 3.0)
-        parts.append((sub, 0.30))
+        parts.append((sub, 0.20))
         breakdown["ddz_like_20d_pct"] = round(ddz_20d, 2)
         breakdown["ddz_sub_score"] = round(sub, 1)
 
-    # 子分 3: net_inflow_streak_days → 截断 [-10,+10] 后线性映射，权重 0.20
+    # 子分 5: 北向 5 日方向（真机构，权重 0.20）；停滞/缺失时跳过 → total_w 自动缩权
+    if nb_dir is not None and nb_status == "fresh":
+        sub = _dir_to_score(nb_dir)
+        parts.append((sub, 0.20))
+        breakdown["northbound_5d_direction"] = int(nb_dir)
+        breakdown["northbound_sub_score"] = round(sub, 1)
+
+    # 子分 6: 龙虎榜机构席位方向（真机构，权重 0.15）；缺失时跳过
+    if lhb_inst_dir is not None:
+        sub = _dir_to_score(lhb_inst_dir)
+        parts.append((sub, 0.15))
+        breakdown["lhb_inst_direction"] = int(lhb_inst_dir)
+        breakdown["lhb_inst_sub_score"] = round(sub, 1)
+
+    # 子分 3: net_inflow_streak_days → 截断 [-10,+10] 后线性映射，权重 0.15
     if streak is not None:
         sub = _linear_map(float(streak), -10.0, 10.0)
-        parts.append((sub, 0.20))
+        parts.append((sub, 0.15))
         breakdown["net_inflow_streak_days"] = int(streak)
         breakdown["streak_sub_score"] = round(sub, 1)
 
-    # 子分 4: retail_takeover_ratio → 反向归一化（接盘越严重打分越低），权重 0.10
-    # ratio 0 → 100；ratio 2.0 → 0；超过 2 截断
-    if retail is not None:
-        clipped = _clip(float(retail), 0.0, 2.0)
-        sub = _linear_map(clipped, 0.0, 2.0, dst_lo=100.0, dst_hi=0.0)
-        parts.append((sub, 0.10))
-        breakdown["retail_takeover_ratio"] = round(retail, 3)
+    # 子分 4: 散户买占比（真实小单+中单）→ 反向归一化（占比越高=派发期接盘越重→打分越低），权重 0.05
+    # 50% → 100；75% → 0；映射区间 [50,75]（A 股散户买占比常态区间）
+    if retail_rate is not None:
+        sub = _linear_map(float(retail_rate), 50.0, 75.0, dst_lo=100.0, dst_hi=0.0)
+        parts.append((sub, 0.05))
+        breakdown["retail_buy_amount_rate_5d_pct"] = round(retail_rate, 2)
         breakdown["retail_sub_score"] = round(sub, 1)
 
     if not parts:
@@ -625,6 +694,7 @@ def assemble_capital_flow_metrics(
     holder_df: Optional[pd.DataFrame] = None,
     circulating_market_value_yi: Optional[float] = None,
     lhb_count_30d: Optional[int] = None,
+    lhb_inst_net_buy_30d_yi: Optional[float] = None,
     latest_trade_date: Optional[str] = None,
 ) -> dict:
     """一次性组装所有资金流字段（含 regime 与 cf_score）。
@@ -643,8 +713,14 @@ def assemble_capital_flow_metrics(
     metrics.update(compute_dde_like_metrics(moneyflow_df, circulating_market_value_yi))
     metrics.update(compute_northbound_metrics(north_df, latest_trade_date=latest_trade_date))
     metrics.update(compute_holder_number_metrics(holder_df))
-    metrics.update(compute_lhb_metrics(lhb_count_30d))
+    metrics.update(compute_lhb_metrics(lhb_count_30d, lhb_inst_net_buy_30d_yi))
     metrics.update(compute_retail_amount_rate(moneyflow_df))
+
+    # 散户接盘信号（真实小单+中单买占比 + 主力派发，替代恒等 1.0 的旧 ratio）
+    metrics["retail_concentration_signal"] = compute_retail_concentration_signal(
+        metrics.get("retail_buy_amount_rate_5d_pct"),
+        metrics.get("net_inflow_streak_days"),
+    )
 
     regime_info = compute_capital_flow_regime(metrics)
     metrics.update(regime_info)
@@ -664,16 +740,18 @@ FIELD_LABEL_ZH: dict[str, str] = {
     "main_force_net_inflow_20d_yi":     "20日主力净流入(亿)",
     "ddx_like_5d_pct":                  "DDX-like 5日(%)",
     "ddx_like_5d_pct_1y":               "DDX 1年分位(0-100)",
-    "ddy_like_5d_yi":                   "DDY-like 5日(亿)",
-    "ddz_like_20d_pct":                 "DDZ-like 20日(%)",
+    "large_order_net_inflow_5d_yi":     "大单净流入5日(亿)",
+    "ddz_like_20d_pct":                 "20日主力强度比(%)",
     "net_inflow_streak_days":           "连续净流入/流出天数",
-    "retail_takeover_ratio":            "散户接盘度",
     "retail_buy_amount_rate_5d_pct":    "散户买入成交占比5日均值(%)",
+    "retail_concentration_signal":      "散户接盘信号",
     "northbound_5d_direction":          "北向资金5日方向",
     "northbound_20d_direction":         "北向资金20日方向",
     "northbound_data_status":           "北向数据状态",
     "northbound_latest_date":           "北向最新数据日期",
-    "lhb_count_30d":                    "龙虎榜30日上榜次数",
+    "lhb_count_30d":                    "龙虎榜30日上榜次数(关注度)",
+    "lhb_inst_net_buy_30d_yi":          "龙虎榜机构30日净买(亿)",
+    "lhb_inst_direction":               "龙虎榜机构净买方向",
     "holder_num_latest":                "最新股东户数",
     "holder_num_qoq_pct":               "户数环比变化(%)",
     "holder_num_4q_trend":              "户数4季度趋势",

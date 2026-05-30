@@ -93,13 +93,13 @@ _REPORT_FIELD_GROUPS: list[tuple[str, list[str]]] = [
         "main_force_net_inflow_20d_yi",
         "ddx_like_5d_pct",
         "ddx_like_5d_pct_1y",
-        "ddy_like_5d_yi",
+        "large_order_net_inflow_5d_yi",
         "ddz_like_20d_pct",
         "net_inflow_streak_days",
     ]),
     ("二、散户参与度", [
-        "retail_takeover_ratio",
         "retail_buy_amount_rate_5d_pct",
+        "retail_concentration_signal",
     ]),
     ("三、北向资金", [
         "northbound_5d_direction",
@@ -109,6 +109,8 @@ _REPORT_FIELD_GROUPS: list[tuple[str, list[str]]] = [
     ]),
     ("四、龙虎榜与股东户数", [
         "lhb_count_30d",
+        "lhb_inst_net_buy_30d_yi",
+        "lhb_inst_direction",
         "holder_num_latest",
         "holder_num_qoq_pct",
         "holder_num_4q_trend",
@@ -273,6 +275,7 @@ def create_capital_flow_node():
             holder_df=holder_df,
             circulating_market_value_yi=cap_data.get("circulating_market_value_yi"),
             lhb_count_30d=cap_data.get("lhb_count_30d"),
+            lhb_inst_net_buy_30d_yi=cap_data.get("lhb_inst_net_buy_30d_yi"),
             latest_trade_date=cap_data.get("latest_trade_date"),
         )
 

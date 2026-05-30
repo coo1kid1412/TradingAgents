@@ -796,11 +796,13 @@ def get_capital_flow(
         "moneyflow_df": None,
         "circulating_market_value_yi": None,
         "lhb_count_30d": None,
+        "lhb_inst_net_buy_30d_yi": None,
         "latest_trade_date": end_compact,
         "data_source_breakdown": {
             "moneyflow": "missing",
             "circ_mv": "missing",
             "lhb": "missing",
+            "lhb_inst": "missing",
         },
     }
 
@@ -902,6 +904,30 @@ def get_capital_flow(
             out["data_source_breakdown"]["lhb"] = "tushare"
     except (TushareUnavailableError, TushareRateLimitError) as e:
         logger.info("get_capital_flow: top_list 不可用: %s", e)
+
+    # 子调用 4: top_inst（龙虎榜机构成交明细 → 30 日机构席位净买，判方向）
+    # 机构出货/游资派发同样会上榜，所以方向看机构净买，不看上榜次数。
+    try:
+        inst_start = (end_dt - timedelta(days=30)).strftime("%Y%m%d")
+        inst = _safe_call(
+            pro.top_inst,
+            ts_code=ts_code,
+            start_date=inst_start,
+            end_date=end_compact,
+            api_name="top_inst",
+        )
+        if inst is not None and not inst.empty and "net_buy" in inst.columns:
+            # tushare top_inst.net_buy 单位为元 → 亿元（×1e-8）。方向取符号、不依赖精确单位；
+            # 阈值在 capital_flow_utils 以亿元计，单位若有出入只影响"持平带"宽度（TODO: 首跑校准）。
+            net_buy_yi = float(inst["net_buy"].astype(float).sum()) * 1e-8
+            out["lhb_inst_net_buy_30d_yi"] = round(net_buy_yi, 4)
+            out["data_source_breakdown"]["lhb_inst"] = "tushare"
+        elif inst is not None and inst.empty:
+            # 30 天内无机构席位明细 → 0（不是 missing）
+            out["lhb_inst_net_buy_30d_yi"] = 0.0
+            out["data_source_breakdown"]["lhb_inst"] = "tushare"
+    except (TushareUnavailableError, TushareRateLimitError) as e:
+        logger.info("get_capital_flow: top_inst 不可用: %s", e)
 
     # 主路径不可用时（moneyflow + circ_mv 都为空）抛错触发 fallback
     if out["moneyflow_df"] is None and out["circulating_market_value_yi"] is None:
