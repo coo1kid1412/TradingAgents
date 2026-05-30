@@ -156,6 +156,34 @@ def _fetch_fundamentals_raw(ticker: str, trade_date: str) -> str:
         return ""
 
 
+def _enforce_target_pe_cap(content: str, cap: float) -> str:
+    """出口处硬截断 LLM 输出的 target_pe_range 高位到 cap（防 LLM 无视 prompt 软约束）。
+
+    背景：cap 原本只在 prompt 里"软约束"，LLM 有时无视（如澜起 172516 给 [89.6,116.5]
+    却无视 PE_TTM×0.6=72.4 上限 → 目标价漂到 294 → 误评 OVERWEIGHT）。此处把它变成
+    程序化硬天花板：只改 YAML 的 target_pe_range 数值字段（下游 RM 据此提取），不动散文。
+
+    仅处理 [low, high] 数值形式；[null, null]（亏损/无锚）不匹配、跳过。
+    """
+    pat = re.compile(r"(target_pe_range:\s*\[\s*)([0-9.]+)\s*,\s*([0-9.]+)(\s*\])")
+
+    def _repl(m: "re.Match") -> str:
+        low, high = float(m.group(2)), float(m.group(3))
+        if high <= cap + 1e-6:
+            return m.group(0)  # 未超上限，不动
+        new_high = round(cap, 1)
+        new_low = round(min(low, new_high), 1)
+        if new_low >= new_high:  # 防退化成单点，保留一个窄带
+            new_low = round(new_high * 0.9, 1)
+        logger.warning(
+            "stock_profile target_pe 出口硬截断: [%.1f, %.1f] → [%.1f, %.1f] (cap=%.1f)",
+            low, high, new_low, new_high, cap,
+        )
+        return f"{m.group(1)}{new_low}, {new_high}{m.group(4)}  # ⚠️出口硬截断 high≤{cap:.1f}"
+
+    return pat.sub(_repl, content)
+
+
 # ---------------------------------------------------------------------------
 # 主节点
 # ---------------------------------------------------------------------------
@@ -714,6 +742,19 @@ TRANSPARENCY:
 """
 
         response = llm.invoke(prompt)
-        return {"stock_profile": response.content}
+        content = response.content
+
+        # 出口硬截断 target_pe_high（把 prompt 软约束变成程序化硬天花板，防 LLM 绕过）
+        # 生效条件（仅 A 股）：① 有同业锚 cap → 用 peer_pe_cap；② 全-null 兜底 → 用 PE_TTM×0.6
+        hard_cap = None
+        if is_a_share_stock:
+            if peer_pe_cap:
+                hard_cap = peer_pe_cap["cap"]
+            elif layer2_all_null and pe_ttm_fallback:
+                hard_cap = pe_ttm_fallback * 0.6
+        if hard_cap is not None:
+            content = _enforce_target_pe_cap(content, hard_cap)
+
+        return {"stock_profile": content}
 
     return stock_profile_node
