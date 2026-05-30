@@ -113,7 +113,8 @@ class GraphSetup:
         quant_score_officer_node = create_quant_score_node()
 
         # Capital Flow Officer: deterministic capital flow regime + capital_flow_score (no LLM)
-        # Runs after analysts, before Quant Score Officer (because Quant Score 7th factor consumes capital_flow_score)
+        # 先于所有分析师运行：资金面是基础数据，market_analyst 第四节会消费 capital_flow_yaml；
+        # quant_score_node 第 7 因子也消费 capital_flow_score
         capital_flow_officer_node = create_capital_flow_node()
 
         # Macro Strategist: identifies rate cycle, liquidity, geopolitical risks, sector relative impact
@@ -172,9 +173,10 @@ class GraphSetup:
         workflow.add_node("Portfolio Manager", portfolio_manager_node)
 
         # Define edges
-        # Start with the first analyst
+        # Capital Flow Officer 先于所有分析师（资金面是基础数据，market_analyst 第四节会消费 capital_flow_yaml）
         first_analyst = selected_analysts[0]
-        workflow.add_edge(START, f"{first_analyst.capitalize()} Analyst")
+        workflow.add_edge(START, "Capital Flow Officer")
+        workflow.add_edge("Capital Flow Officer", f"{first_analyst.capitalize()} Analyst")
 
         # Connect analysts in sequence
         for i, analyst_type in enumerate(selected_analysts):
@@ -194,15 +196,15 @@ class GraphSetup:
                 # Analyst with programmatic data fetching: direct edge
                 workflow.add_edge(current_analyst, current_clear)
 
-            # Connect to next analyst, or to Capital Flow Officer if this is the last analyst
+            # Connect to next analyst, or to Quant Score Officer if this is the last analyst
+            # （Capital Flow Officer 已提前到 START 之后，此处不再衔接）
             if i < len(selected_analysts) - 1:
                 next_analyst = f"{selected_analysts[i+1].capitalize()} Analyst"
                 workflow.add_edge(current_clear, next_analyst)
             else:
-                workflow.add_edge(current_clear, "Capital Flow Officer")
+                workflow.add_edge(current_clear, "Quant Score Officer")
 
-        # Capital Flow → Quant Score → Macro → Stock Profile → Sector Comparison → Consensus → Bull Researcher
-        workflow.add_edge("Capital Flow Officer", "Quant Score Officer")
+        # Quant Score → Macro → Stock Profile → Sector Comparison → Consensus → Bull Researcher
         workflow.add_edge("Quant Score Officer", "Macro Context Officer")
         workflow.add_edge("Macro Context Officer", "Stock Profile Officer")
         workflow.add_edge("Stock Profile Officer", "Sector Comparison Officer")
