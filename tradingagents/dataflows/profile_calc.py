@@ -730,6 +730,18 @@ def parse_net_profit_growth(fund_str: str) -> Optional[float]:
     if not fund_str:
         return None
 
+    # 最高优先：确定性 SYS_GROWTH_YOY（tushare fina_indicator，固定格式，不受 LLM 散文漂移影响）
+    m_sys = re.search(r"SYS_GROWTH_YOY[^\n]*?归母净利YoY[^\n]*?年度=([+-]?[0-9.]+)%", fund_str)
+    if not m_sys:  # 年度=NA 时退用单季
+        m_sys = re.search(r"SYS_GROWTH_YOY[^\n]*?归母净利YoY\s*单季=([+-]?[0-9.]+)%", fund_str)
+    if m_sys:
+        try:
+            v = float(m_sys.group(1))
+            if -90.0 <= v <= 500.0:
+                return v / 100.0
+        except ValueError:
+            pass
+
     # 归母口径（首选）：归母 + 净利(润可选) + (同比可选) + 增速/增长率/增长；表格或紧邻散文
     gm_label = r"归母净利(?:润)?(?:同比)?\s*(?:增速|增长率|增长)"
     gm_patterns = [
@@ -844,6 +856,30 @@ def parse_growth_deceleration(fund_str: str) -> Optional[str]:
     import re
     if not fund_str:
         return None
+
+    # 路径0（最高优先）：确定性 SYS_GROWTH_YOY（tushare fina_indicator）
+    msys = re.search(
+        r"SYS_GROWTH_YOY[^\n]*?营收YoY\s*单季=([+-]?[0-9.]+)%\s*年度=([+-]?[0-9.]+)%", fund_str)
+    if msys:
+        try:
+            q, annual = float(msys.group(1)), float(msys.group(2))
+            if annual > 0:
+                if q < annual * 0.6:
+                    return "decelerating"
+                if q >= annual * 0.95:
+                    return "accelerating"
+                return "stable"
+        except ValueError:
+            pass
+    # SYS 行只有单季（年度=NA）→ 用单季绝对水平
+    msq = re.search(r"SYS_GROWTH_YOY[^\n]*?营收YoY\s*单季=([+-]?[0-9.]+)%\s*年度=NA", fund_str)
+    if msq:
+        try:
+            q = float(msq.group(1))
+            return "decelerating" if q < 15.0 else ("accelerating" if q >= 45.0 else "stable")
+        except ValueError:
+            pass
+
     # 路径1：营收同比增速 两列（最近季 | 年度），比较得方向
     m = re.search(
         r"营(?:业收入|收)同比\s*(?:增速|增长率)?\s*\*{0,2}\s*\|\s*"

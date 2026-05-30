@@ -346,6 +346,47 @@ def _compute_ttm_revenue_per_share_fina(
     )
 
 
+def _format_growth_indicators(fina) -> str:
+    """从 fina_indicator df 抽确定性增速指标，输出固定格式行供 stock_profile parser 直读。
+
+    字段（tushare fina_indicator 标准列）：
+    - q_sales_yoy / q_netprofit_yoy：单季营收 / 归母净利 同比增速（%）
+    - or_yoy / netprofit_yoy：累计营收 / 归母净利 同比增速（%，最近 1231 期≈年度）
+    防御式：列缺失或解析失败 → 返回空（上层 parser 退回散文兜底）。
+    """
+    try:
+        df = fina.sort_values("end_date")
+        latest = df.iloc[-1]
+        annual = df[df["end_date"].astype(str).str.endswith("1231")]
+        annual_row = annual.iloc[-1] if not annual.empty else latest
+
+        def _g(row, col):
+            v = row.get(col) if hasattr(row, "get") else None
+            try:
+                return float(v) if v is not None and v == v else None
+            except (ValueError, TypeError):
+                return None
+
+        rev_q = _g(latest, "q_sales_yoy")
+        np_q = _g(latest, "q_netprofit_yoy")
+        rev_a = _g(annual_row, "or_yoy")
+        np_a = _g(annual_row, "netprofit_yoy")
+        if all(x is None for x in (rev_q, np_q, rev_a, np_a)):
+            return ""
+
+        def _f(v):
+            return f"{v:.2f}" if v is not None else "NA"
+
+        return (
+            "\n【SYS_GROWTH_YOY｜tushare fina_indicator 确定性增速，下游直读勿改】 "
+            f"营收YoY 单季={_f(rev_q)}% 年度={_f(rev_a)}% | "
+            f"归母净利YoY 单季={_f(np_q)}% 年度={_f(np_a)}%\n"
+        )
+    except Exception as e:
+        logger.debug("_format_growth_indicators 失败: %s", e)
+        return ""
+
+
 def get_fundamentals(
     ticker: Annotated[str, "ticker symbol of the company"],
     curr_date: Annotated[str, "current date"] = None,
@@ -405,6 +446,11 @@ def get_fundamentals(
             has_data = True
             sections.append("## 财务指标（最近4期）")
             sections.append(extract_and_format(fina, TUSHARE_FUNDAMENTALS_MAP, period_col="end_date", limit=5))
+            # 确定性增速指标（复用本次 fina_indicator，不额外调接口）——供 stock_profile parser 直读，
+            # 不再依赖 LLM 把增速写成各种散文格式（之前 parser 反复抓不到的根因）
+            growth_line = _format_growth_indicators(fina)
+            if growth_line:
+                sections.append(growth_line)
     except (TushareUnavailableError, TushareRateLimitError) as e:
         logger.warning("获取财务指标失败（接口限流或不可用），跳过: %s", e)
     except Exception as e:
