@@ -77,8 +77,10 @@ def compute_dde_like_metrics(
         - main_force_net_inflow_20d_yi     : 20 日主力累计净流入
         - ddx_like_5d_pct                  : 5 日超大单净额 / 流通市值 × 100（%）
         - ddx_like_5d_pct_1y               : ddx_like_5d_pct 的 1 年百分位（0-100）
-        - ddy_like_5d_yi                   : 5 日大单净额（亿元）
-        - ddz_like_20d_pct                 : 20 日主力净额 / 20 日成交额 × 100（%）
+        - large_order_net_inflow_5d_yi     : 5 日大单累计净额（亿元，展示用，不进打分/投票）
+                                             （旧称 ddy_like；实为大单净额，非经典 DDY「涨跌动因/主动性」）
+        - ddz_like_20d_pct                 : 20 日主力净额 / 20 日成交额 × 100（%，20日主力强度比，
+                                             非经典 DDZ「主力库存」累计量）
         - net_inflow_streak_days           : 连续净流入(+) / 净流出(-) 天数（截断 ±10）
 
     注：散户接盘度不在此函数算——旧的 retail_takeover_ratio 用"零和近似"恒等 1.0（零信息），
@@ -89,7 +91,7 @@ def compute_dde_like_metrics(
         "main_force_net_inflow_20d_yi": None,
         "ddx_like_5d_pct": None,
         "ddx_like_5d_pct_1y": None,
-        "ddy_like_5d_yi": None,
+        "large_order_net_inflow_5d_yi": None,
         "ddz_like_20d_pct": None,
         "net_inflow_streak_days": None,
     }
@@ -139,9 +141,9 @@ def compute_dde_like_metrics(
             below = (history <= current).sum()
             out["ddx_like_5d_pct_1y"] = round(float(below) / len(history) * 100, 1)
 
-    # DDY-like 5 日：大单累计净额
+    # 大单 5 日累计净额（旧称 DDY-like；实为大单净额，非经典 DDY「涨跌动因/主动性」，故诚实命名）
     if "large_net_amount_yi" in df.columns and n >= 1:
-        out["ddy_like_5d_yi"] = round(float(df["large_net_amount_yi"].tail(5).sum()), 2)
+        out["large_order_net_inflow_5d_yi"] = round(float(df["large_net_amount_yi"].tail(5).sum()), 2)
 
     # DDZ-like 20 日：20 日主力净额 / 20 日成交额
     if (
@@ -738,8 +740,8 @@ FIELD_LABEL_ZH: dict[str, str] = {
     "main_force_net_inflow_20d_yi":     "20日主力净流入(亿)",
     "ddx_like_5d_pct":                  "DDX-like 5日(%)",
     "ddx_like_5d_pct_1y":               "DDX 1年分位(0-100)",
-    "ddy_like_5d_yi":                   "DDY-like 5日(亿)",
-    "ddz_like_20d_pct":                 "DDZ-like 20日(%)",
+    "large_order_net_inflow_5d_yi":     "大单净流入5日(亿)",
+    "ddz_like_20d_pct":                 "20日主力强度比(%)",
     "net_inflow_streak_days":           "连续净流入/流出天数",
     "retail_buy_amount_rate_5d_pct":    "散户买入成交占比5日均值(%)",
     "retail_concentration_signal":      "散户接盘信号",

@@ -93,7 +93,7 @@ _REPORT_FIELD_GROUPS: list[tuple[str, list[str]]] = [
         "main_force_net_inflow_20d_yi",
         "ddx_like_5d_pct",
         "ddx_like_5d_pct_1y",
-        "ddy_like_5d_yi",
+        "large_order_net_inflow_5d_yi",
         "ddz_like_20d_pct",
         "net_inflow_streak_days",
     ]),

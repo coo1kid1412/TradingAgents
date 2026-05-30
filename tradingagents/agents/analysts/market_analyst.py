@@ -212,7 +212,7 @@ def create_market_analyst(llm):
             "**4.1 主力资金核心指标解读**（直接引用全名字段）：\n"
             "- `main_force_net_inflow_5d_yi` / `main_force_net_inflow_20d_yi`（5日/20日主力净流入，单位亿元）\n"
             "- `ddx_like_5d_pct` 与 `ddx_like_5d_pct_1y`（DDX-like 强度及 1 年百分位）\n"
-            "- `ddy_like_5d_yi`（5日大单净流入，单位亿元）/ `ddz_like_20d_pct`（20日资金流强度）\n"
+            "- `large_order_net_inflow_5d_yi`（5日大单累计净流入，亿元）/ `ddz_like_20d_pct`（20日主力强度比，非经典DDZ库存）\n"
             "- `net_inflow_streak_days`（连续净流入/流出天数；正数=净流入连续，负数=净流出连续）\n"
             "  ⚠️ DDX/DDY/DDZ 按单笔大小推断主力/散户，受算法拆单影响，**辅助参考**；"
             "方向以机构出处信号（北向、龙虎榜机构席位）为重。\n\n"
