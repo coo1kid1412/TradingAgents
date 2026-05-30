@@ -1,12 +1,13 @@
 """Quant Score Officer 节点（纯 Python，无 LLM）
 
-在 4 个 analyst 完成后、Macro Context Officer 之前运行。
-通过 6 类因子（动量/价值/质量/成长/低波/反拥挤）输出 0-100 量化综合分，
+在 Capital Flow Officer 完成后、Macro Context Officer 之前运行。
+通过 7 类因子（动量/价值/质量/成长/低波/反拥挤/资金流）输出 0-100 量化综合分，
 作为下游 RM 在 Step 6 评级映射时的"独立量化锚"。
 
 设计原则：
 - **无 LLM**：所有数值由 Python 确定性计算，复跑同股得到同分
 - **数据自取**：直接调 route_to_vendor，不依赖 analyst 已生成的 markdown 报告
+- **第 7 因子外部注入**：capital_flow_score 由 Capital Flow Officer 预计算（state.capital_flow_metrics）
 - **缺失容错**：单个因子取不到数据时归零权重，剩余因子按比例补全
 - **输出标准化**：markdown 报告 + YAML 摘要，供 RM/PM 引用
 """
@@ -222,6 +223,7 @@ def _factor_label(name: str) -> str:
         "growth": "成长 Growth",
         "lowvol": "低波 LowVol",
         "anticrowding": "反拥挤 AntiCrowding",
+        "capital_flow": "资金流 CapitalFlow",
     }.get(name, name)
 
 
@@ -266,7 +268,7 @@ def _format_report(
     lines.append("| 因子 | 权重 | 分数 (0-100) | 状态 |")
     lines.append("|------|------|-------------|------|")
     weights = result.weights_used
-    for name in ["momentum", "value", "quality", "growth", "lowvol", "anticrowding"]:
+    for name in ["momentum", "value", "quality", "growth", "lowvol", "anticrowding", "capital_flow"]:
         score = result.factor_scores.get(name)
         w = weights.get(name, 0)
         status = "✅" if score is not None else "⚠ 数据缺失"
@@ -274,7 +276,7 @@ def _format_report(
         lines.append(f"| {_factor_label(name)} | {w*100:.0f}% | {score_str} | {status} |")
     lines.append("")
     lines.append(
-        f"> 覆盖率：{len(result.coverage['available'])} / 6 因子有数据，"
+        f"> 覆盖率：{len(result.coverage['available'])} / 7 因子有数据，"
         f"实际使用权重和 = {result.coverage['total_weight_used']:.2f}"
     )
     lines.append("")
@@ -282,7 +284,7 @@ def _format_report(
     # 因子明细
     lines.append("## 三、因子明细（原始输入 + 子分）")
     lines.append("")
-    for name in ["momentum", "value", "quality", "growth", "lowvol", "anticrowding"]:
+    for name in ["momentum", "value", "quality", "growth", "lowvol", "anticrowding", "capital_flow"]:
         bd = result.factor_breakdowns.get(name, {})
         if not bd:
             continue
@@ -331,7 +333,7 @@ def _format_report(
     lines.append(f"  composite: {composite if composite is not None else 'null'}")
     lines.append(f'  interpretation: "{interp}"')
     lines.append("  factor_scores:")
-    for name in ["momentum", "value", "quality", "growth", "lowvol", "anticrowding"]:
+    for name in ["momentum", "value", "quality", "growth", "lowvol", "anticrowding", "capital_flow"]:
         v = result.factor_scores.get(name)
         lines.append(f"    {name}: {v if v is not None else 'null'}")
     lines.append("  weights:")
@@ -355,6 +357,10 @@ def create_quant_score_node():
         ticker = state["company_of_interest"]
         company_name = state.get("company_name", "")
         trade_date = state.get("trade_date", "")
+
+        # 从 Capital Flow Officer 读取第 7 因子分数（可能为 None / 空 dict）
+        cf_metrics = state.get("capital_flow_metrics") or {}
+        capital_flow_score_input = cf_metrics.get("capital_flow_score")  # 0-100 or None
 
         # 1. 拉取原始数据
         price_df = _fetch_price_df(ticker, trade_date)
@@ -389,6 +395,7 @@ def create_quant_score_node():
             net_margin_pct=fund_inputs["net_margin_pct"],
             revenue_yoy_pct=fund_inputs["revenue_yoy_pct"],
             net_profit_yoy_pct=fund_inputs["net_profit_yoy_pct"],
+            capital_flow_score_input=capital_flow_score_input,
         )
 
         # 6. 组装审计用原始输入表
