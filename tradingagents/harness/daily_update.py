@@ -103,12 +103,26 @@ def run_daily_update(db_path=None) -> dict:
     fetch_summary = _truth.fetch_all_pending(db_path, update_benchmarks=False)
     logger.info("真值采集统计：%s", fetch_summary)
 
+    # Step 6: 预热兄弟股可比 PE 快照 + stock_basic（盘后单次 daily_basic，限流安全；
+    #          供次日各标的分析共用，避免分析时现拉撞 1次/分钟 & 5次/天 限流）
+    pe_snapshot_n = 0
+    try:
+        from datetime import date
+        from tradingagents.dataflows import peer_comps
+        peer_comps.get_stock_basic()  # 7 天 TTL，命中则不实际调用
+        snap = peer_comps.get_pe_snapshot(date.today().strftime("%Y-%m-%d"))
+        pe_snapshot_n = len(snap)
+        logger.info("兄弟股可比 PE 快照预热：%d 只", pe_snapshot_n)
+    except Exception as e:
+        logger.warning("PE 快照预热失败（不影响 daily_update 主流程）: %s", str(e)[:120])
+
     return {
         "recent_tickers_count": len(tickers),
         "ticker_cache_stats": ticker_stats,
         "benchmark_cache_stats": bench_stats,
         "fetch_summary": fetch_summary,
         "price_cache_stats": _pcache.get_cache_stats(db_path),
+        "pe_snapshot_n": pe_snapshot_n,
     }
 
 

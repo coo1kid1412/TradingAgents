@@ -221,6 +221,29 @@ def create_stock_profile_node(llm):
         sell_side_pe_range = parse_sell_side_pe_consensus(news_report)
         self_pe_p80 = compute_self_pe_p80(price_df, eps_ttm_val)
         peer_pe_median = parse_peer_pe_median(news_report, fundamentals_report)
+        peer_pe_source = "report_scrape" if peer_pe_median is not None else None
+
+        # ---- 兄弟股可比 PE（优先源，质量高于报告抠数）：news+sentiment 共现挖掘 + 行业校验 + ≥2家中位 ----
+        # 仅 A 股（PE 快照/兄弟表都是 A 股口径）；取数失败或有效 peer 不足时保持原 peer_pe_median 不变。
+        brother_pe = None
+        if is_a_share(ticker):
+            code_m = re.search(r"\d{6}", ticker)
+            if code_m:
+                try:
+                    from tradingagents.dataflows.peer_comps import get_brother_pe_median
+                    comention_text = (news_report or "") + "\n" + (sentiment_report or "")
+                    brother_pe = get_brother_pe_median(
+                        code_m.group(0), trade_date, comention_text, company_name,
+                    )
+                except Exception as e:
+                    logger.warning("兄弟股可比 PE 取数失败: %s", str(e)[:120])
+            if brother_pe:
+                peer_pe_median = brother_pe["median"]
+                peer_pe_source = "brother_comps"
+                logger.info(
+                    "兄弟股可比 PE 命中: median=%.1f, used=%s",
+                    brother_pe["median"], brother_pe.get("used"),
+                )
 
         # ---- Layer 2 兜底：三源全 null 时用 PE_TTM × 0.7 做最后锚（机构 PM "无锚定时保守" 原则）----
         # 这里的 0.7 = "向卖方一致 PE 方向收敛"——A 股 PE 通常比卖方目标 PE 高 30-50%，
@@ -367,7 +390,11 @@ def create_stock_profile_node(llm):
                     f"{pe_ttm_fallback:.1f}×0.7 兜底**）"
                 )
             else:
-                prog_lines.append(f"- 同业/行业 PE 中位数: {peer_pe_median:.1f}（来自 news/fundamentals）")
+                src_label = {
+                    "brother_comps": "兄弟股可比中位（共现挖掘+行业校验+≥2家，tushare 实测 PE）",
+                    "report_scrape": "来自 news/fundamentals",
+                }.get(peer_pe_source, "来自 news/fundamentals")
+                prog_lines.append(f"- 同业/行业 PE 中位数: {peer_pe_median:.1f}（{src_label}）")
         else:
             prog_lines.append("- 同业/行业 PE 中位数: 未抽到（且 PE_TTM 也抽不到，无任何兜底锚）")
 
