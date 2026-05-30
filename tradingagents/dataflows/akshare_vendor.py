@@ -5,7 +5,7 @@
 """
 
 import logging
-from typing import Annotated
+from typing import Annotated, Optional
 from datetime import datetime, timedelta
 
 import pandas as pd
@@ -1110,3 +1110,206 @@ def get_research_reports(
         f"# Data retrieved on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
     )
     return header + csv_string
+
+
+# ---------------------------------------------------------------------------
+# 13. get_capital_flow（fallback）—— akshare 资金流 + 流通市值 + 龙虎榜计数
+# ---------------------------------------------------------------------------
+def get_capital_flow(
+    symbol: Annotated[str, "ticker symbol"],
+    end_date: Annotated[str, "current trading date YYYY-mm-dd"],
+    lookback_days: Annotated[int, "trading-day lookback window for moneyflow"] = 120,
+) -> dict:
+    """资金流装配（akshare fallback 路径）。
+
+    与 tushare_vendor.get_capital_flow 完全同名同签名同返回，
+    但内部使用 akshare 的 stock_individual_fund_flow / stock_zh_a_spot_em /
+    stock_lhb_stock_detail_em 实现。
+
+    注意 akshare 数据特点：
+    - stock_individual_fund_flow 单位 = 元（需 × 1e-8 → 亿元）
+    - 中/小单字段是「净流入占比」而非 tushare 的「买入成交占比」，含义略有不同但都反映散户参与度
+    - 流通市值通过 stock_zh_a_spot_em 全市场快照拿，可能瞬断（已在 dry-run 中遇到）
+    - 不提供 daily_amount_yi → ddz_like_20d_pct 将无法计算（capital_flow_utils 会兜底）
+
+    Returns:
+        dict（结构与 tushare 路径一致）：
+        - moneyflow_df, circulating_market_value_yi, lhb_count_30d,
+          latest_trade_date, data_source_breakdown
+    """
+    ak = _import_akshare()
+    code = to_akshare_format(symbol)
+    end_compact = to_akshare_date(end_date)
+
+    out: dict = {
+        "moneyflow_df": None,
+        "circulating_market_value_yi": None,
+        "lhb_count_30d": None,
+        "latest_trade_date": end_compact,
+        "data_source_breakdown": {
+            "moneyflow": "missing",
+            "circ_mv": "missing",
+            "lhb": "missing",
+        },
+    }
+
+    # 子调用 1: 个股资金流（akshare 一次性返回最近 ~100 个交易日，单位：元）
+    try:
+        market = "sh" if code.startswith(("60", "68")) else "sz"
+        mf_raw = ak.stock_individual_fund_flow(stock=code, market=market)
+        if mf_raw is not None and not mf_raw.empty:
+            df = mf_raw.copy()
+            # akshare 列名：日期、收盘价、涨跌幅、主力净流入-净额、超大单净流入-净额、
+            #              大单净流入-净额、中单净流入-净额、小单净流入-净额、
+            #              中单净流入-净占比、小单净流入-净占比 等
+            df = df.sort_values("日期").reset_index(drop=True).tail(lookback_days)
+            normalized = pd.DataFrame({
+                "trade_date": df["日期"].astype(str).str.replace("-", ""),
+                "main_force_net_amount_yi": (df["主力净流入-净额"].astype(float) * 1e-8).round(4)
+                    if "主力净流入-净额" in df.columns else None,
+                "extra_large_net_amount_yi": (df["超大单净流入-净额"].astype(float) * 1e-8).round(4)
+                    if "超大单净流入-净额" in df.columns else None,
+                "large_net_amount_yi": (df["大单净流入-净额"].astype(float) * 1e-8).round(4)
+                    if "大单净流入-净额" in df.columns else None,
+                "medium_buy_amount_rate_pct": df["中单净流入-净占比"].astype(float)
+                    if "中单净流入-净占比" in df.columns else None,
+                "small_buy_amount_rate_pct": df["小单净流入-净占比"].astype(float)
+                    if "小单净流入-净占比" in df.columns else None,
+                "close": df["收盘价"].astype(float)
+                    if "收盘价" in df.columns else None,
+            })
+            out["moneyflow_df"] = normalized
+            out["latest_trade_date"] = str(normalized["trade_date"].iloc[-1])
+            out["data_source_breakdown"]["moneyflow"] = "akshare"
+    except Exception as e:
+        logger.warning("get_capital_flow(akshare): stock_individual_fund_flow 失败: %s", e)
+
+    # 子调用 2: 流通市值（spot 全市场快照）
+    try:
+        spot = ak.stock_zh_a_spot_em()
+        if spot is not None and not spot.empty:
+            row = spot[spot["代码"].astype(str) == code]
+            if not row.empty and "流通市值" in row.columns:
+                # akshare 流通市值单位 = 元；× 1e-8 → 亿元
+                mv = float(row.iloc[0]["流通市值"])
+                if mv > 0:
+                    out["circulating_market_value_yi"] = round(mv * 1e-8, 2)
+                    out["data_source_breakdown"]["circ_mv"] = "akshare"
+    except Exception as e:
+        logger.warning("get_capital_flow(akshare): stock_zh_a_spot_em 失败（瞬断频繁）: %s", e)
+
+    # 子调用 3: 龙虎榜 30 日计数（个股专属接口）
+    try:
+        lhb = ak.stock_lhb_stock_detail_em(symbol=code) if hasattr(ak, "stock_lhb_stock_detail_em") else None
+        end_dt = datetime.strptime(end_date, "%Y-%m-%d")
+        start_dt = end_dt - timedelta(days=30)
+        if lhb is not None and not lhb.empty and "上榜日" in lhb.columns:
+            lhb["上榜日"] = pd.to_datetime(lhb["上榜日"], errors="coerce")
+            recent = lhb[(lhb["上榜日"] >= start_dt) & (lhb["上榜日"] <= end_dt)]
+            out["lhb_count_30d"] = int(recent["上榜日"].nunique())
+            out["data_source_breakdown"]["lhb"] = "akshare"
+        else:
+            # 接口返回空也视作 0（30 日内未上榜）
+            out["lhb_count_30d"] = 0
+            out["data_source_breakdown"]["lhb"] = "akshare"
+    except Exception as e:
+        logger.info("get_capital_flow(akshare): 龙虎榜接口失败: %s", e)
+
+    if out["moneyflow_df"] is None and out["circulating_market_value_yi"] is None:
+        raise AKShareError(
+            f"AKShare get_capital_flow 全部子调用失败 ({symbol})"
+        )
+
+    return out
+
+
+# ---------------------------------------------------------------------------
+# 14. get_holder_number（fallback）—— 季报股东户数
+# ---------------------------------------------------------------------------
+def get_holder_number(
+    symbol: Annotated[str, "ticker symbol"],
+    lookback_quarters: Annotated[int, "number of recent quarters"] = 8,
+) -> Optional[pd.DataFrame]:
+    """季报股东户数（akshare fallback）。
+
+    使用 ak.stock_zh_a_gdhs_detail_em（个股股东户数明细）。
+    """
+    ak = _import_akshare()
+    code = to_akshare_format(symbol)
+
+    try:
+        df = ak.stock_zh_a_gdhs_detail_em(symbol=code)
+    except Exception as e:
+        logger.warning("get_holder_number(akshare): stock_zh_a_gdhs_detail_em 失败: %s", e)
+        return None
+
+    if df is None or df.empty:
+        return None
+
+    # akshare 列名（不同版本可能略有差异）：「股东户数统计截止日」「股东户数-本次」
+    date_col = None
+    num_col = None
+    for c in df.columns:
+        if "截止日" in c or "公告日期" in c:
+            date_col = c
+        if c == "股东户数-本次" or "股东户数" == c:
+            num_col = c
+    if date_col is None or num_col is None:
+        # 退而求其次：取 col 名含「股东户数」的第一个
+        for c in df.columns:
+            if "股东户数" in c and num_col is None:
+                num_col = c
+    if date_col is None or num_col is None:
+        return None
+
+    out = pd.DataFrame({
+        "end_date": pd.to_datetime(df[date_col], errors="coerce").dt.strftime("%Y%m%d"),
+        "holder_num": pd.to_numeric(df[num_col], errors="coerce"),
+    })
+    out = out.dropna(subset=["holder_num", "end_date"])
+    if out.empty:
+        return None
+
+    return out.sort_values("end_date").tail(lookback_quarters).reset_index(drop=True)
+
+
+# ---------------------------------------------------------------------------
+# 15. get_north_hold（fallback）—— 北向（沪深港通）个股持股
+# ---------------------------------------------------------------------------
+def get_north_hold(
+    symbol: Annotated[str, "ticker symbol"],
+    end_date: Annotated[str, "current trading date YYYY-mm-dd"],
+    lookback_days: Annotated[int, "trading-day lookback window"] = 30,
+) -> Optional[pd.DataFrame]:
+    """北向资金个股持股（akshare fallback）。
+
+    重要：自 2024-08-16 起 akshare stock_hsgt_individual_em 数据停滞，
+    capital_flow_utils.compute_northbound_metrics 会通过新鲜度判断进入 stale 状态，
+    届时北向维度不投票。本函数仍返回数据让上游知道实际最新日期。
+    """
+    ak = _import_akshare()
+    code = to_akshare_format(symbol)
+
+    try:
+        df = ak.stock_hsgt_individual_em(stock=code)
+    except Exception as e:
+        logger.info("get_north_hold(akshare): stock_hsgt_individual_em 失败: %s", e)
+        return None
+
+    if df is None or df.empty or "持股日期" not in df.columns:
+        return None
+
+    df = df.copy()
+    df["trade_date"] = pd.to_datetime(df["持股日期"], errors="coerce").dt.strftime("%Y%m%d")
+    if "持股数量" in df.columns:
+        df["hold_share_count"] = pd.to_numeric(df["持股数量"], errors="coerce")
+    elif "持股股数" in df.columns:
+        df["hold_share_count"] = pd.to_numeric(df["持股股数"], errors="coerce")
+    else:
+        return None
+
+    df = df.dropna(subset=["trade_date", "hold_share_count"])
+    if df.empty:
+        return None
+
+    return df[["trade_date", "hold_share_count"]].sort_values("trade_date").reset_index(drop=True)
