@@ -11,6 +11,7 @@ from tradingagents.agents.utils.stock_profile_node import create_stock_profile_n
 from tradingagents.agents.utils.macro_context_node import create_macro_context_node
 from tradingagents.agents.utils.quant_score_node import create_quant_score_node
 from tradingagents.agents.utils.sector_comparison_node import create_sector_comparison_node
+from tradingagents.agents.utils.capital_flow_node import create_capital_flow_node
 
 from .conditional_logic import ConditionalLogic
 
@@ -111,6 +112,10 @@ class GraphSetup:
         # Quant Score Officer: deterministic 6-factor 0-100 composite (no LLM), runs before macro
         quant_score_officer_node = create_quant_score_node()
 
+        # Capital Flow Officer: deterministic capital flow regime + capital_flow_score (no LLM)
+        # Runs after analysts, before Quant Score Officer (because Quant Score 7th factor consumes capital_flow_score)
+        capital_flow_officer_node = create_capital_flow_node()
+
         # Macro Strategist: identifies rate cycle, liquidity, geopolitical risks, sector relative impact
         macro_context_officer_node = create_macro_context_node(self.quick_thinking_llm)
 
@@ -152,6 +157,7 @@ class GraphSetup:
 
         # Add other nodes
         workflow.add_node("Quant Score Officer", quant_score_officer_node)
+        workflow.add_node("Capital Flow Officer", capital_flow_officer_node)
         workflow.add_node("Macro Context Officer", macro_context_officer_node)
         workflow.add_node("Stock Profile Officer", stock_profile_officer_node)
         workflow.add_node("Sector Comparison Officer", sector_comparison_officer_node)
@@ -188,14 +194,15 @@ class GraphSetup:
                 # Analyst with programmatic data fetching: direct edge
                 workflow.add_edge(current_analyst, current_clear)
 
-            # Connect to next analyst, or to Quant Score Officer if this is the last analyst
+            # Connect to next analyst, or to Capital Flow Officer if this is the last analyst
             if i < len(selected_analysts) - 1:
                 next_analyst = f"{selected_analysts[i+1].capitalize()} Analyst"
                 workflow.add_edge(current_clear, next_analyst)
             else:
-                workflow.add_edge(current_clear, "Quant Score Officer")
+                workflow.add_edge(current_clear, "Capital Flow Officer")
 
-        # Quant Score → Macro → Stock Profile → Sector Comparison → Consensus → Bull Researcher
+        # Capital Flow → Quant Score → Macro → Stock Profile → Sector Comparison → Consensus → Bull Researcher
+        workflow.add_edge("Capital Flow Officer", "Quant Score Officer")
         workflow.add_edge("Quant Score Officer", "Macro Context Officer")
         workflow.add_edge("Macro Context Officer", "Stock Profile Officer")
         workflow.add_edge("Stock Profile Officer", "Sector Comparison Officer")
