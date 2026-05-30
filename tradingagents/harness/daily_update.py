@@ -106,15 +106,28 @@ def run_daily_update(db_path=None) -> dict:
     # Step 6: 预热兄弟股可比 PE 快照 + stock_basic（盘后单次 daily_basic，限流安全；
     #          供次日各标的分析共用，避免分析时现拉撞 1次/分钟 & 5次/天 限流）
     pe_snapshot_n = 0
+    brother_canary = "未跑"
     try:
         from datetime import date
         from tradingagents.dataflows import peer_comps
+        today = date.today().strftime("%Y-%m-%d")
         peer_comps.get_stock_basic()  # 7 天 TTL，命中则不实际调用
-        snap = peer_comps.get_pe_snapshot(date.today().strftime("%Y-%m-%d"))
+        snap = peer_comps.get_pe_snapshot(today)
         pe_snapshot_n = len(snap)
         logger.info("兄弟股可比 PE 快照预热：%d 只", pe_snapshot_n)
+        # 金丝雀自检：用天孚通信(300394，种子表有3个兄弟)验证端到端是否真能算出中位数
+        canary = peer_comps.get_brother_pe_median("300394", today)
+        if canary and canary.get("median"):
+            brother_canary = (
+                f"✅通过 天孚 median={canary['median']:.1f} "
+                f"used={[(c, round(p, 1)) for c, p in canary['used']]}"
+            )
+        else:
+            brother_canary = "⚠️未算出（PE快照可能为空/有效peer不足，检查 tushare 额度）"
+        logger.info("兄弟股可比 PE 自检：%s", brother_canary)
     except Exception as e:
-        logger.warning("PE 快照预热失败（不影响 daily_update 主流程）: %s", str(e)[:120])
+        brother_canary = f"❌异常 {str(e)[:80]}"
+        logger.warning("PE 快照预热/自检失败（不影响 daily_update 主流程）: %s", str(e)[:120])
 
     return {
         "recent_tickers_count": len(tickers),
@@ -123,6 +136,7 @@ def run_daily_update(db_path=None) -> dict:
         "fetch_summary": fetch_summary,
         "price_cache_stats": _pcache.get_cache_stats(db_path),
         "pe_snapshot_n": pe_snapshot_n,
+        "brother_canary": brother_canary,
     }
 
 
