@@ -26,8 +26,11 @@ DEFAULT_CONFIG = {
     "openai_reasoning_effort": None,    # "medium", "high", "low"
     "anthropic_effort": None,           # "high", "medium", "low"
     "minimax_max_tokens": 8192,         # MiniMax default max_tokens (upstream default 256 too small)
+    "portfolio_manager_max_tokens": 16384,  # PM 报告 14 章节较长，需高于全局 minimax_max_tokens 防截断
     # LLM request timeout (seconds); prevents indefinite hangs when API is unresponsive
-    "llm_timeout": 180,
+    "llm_timeout": 300,
+    # LLM API retry count; handles transient 429/5xx errors (e.g., MiniMax 529 peak-hour overload)
+    "llm_max_retries": 3,
     # Temperature settings for different agent roles
     "temperature_market": 0.2,          # 市场分析师：纯量化数据解读，最低随机性确保结论一致性
     "temperature_sentiment": 0.4,       # 舆情分析师：适度创意理解复杂情绪
@@ -44,6 +47,10 @@ DEFAULT_CONFIG = {
     "temperature_neutral_risk": 0.4,        # 中立风控分析师：降低随机性，更稳定判断
     # 使用 deep think 模型作为分析师和交易员（True=deep_think_llm, False=quick_think_llm）
     "use_deep_think_for_analysts": True,
+    # 性能优化配置
+    "use_deep_for_trader": False,           # True 时 trader 用 deep_think_llm（rollback 用）。默认 False=quick_think，因优化01后trader只做执行评估
+    "use_deep_for_bull_researcher": False,  # True 时 bull researcher 用 deep_think_llm。默认 False=quick_think，辩论修辞密度高但推理深度低
+    "use_deep_for_bear_researcher": False,  # True 时 bear researcher 用 deep_think_llm。默认 False=quick_think，同 bull
     # Output language for analyst reports and final decision
     # Internal agent debate stays in English for reasoning quality
     "output_language": "Chinese",

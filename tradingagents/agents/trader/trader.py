@@ -1,6 +1,13 @@
+"""DEPRECATED in optimization 05: Trader node removed from graph.
+
+This file is kept for git history and potential future reuse.
+The node's responsibilities have been redistributed:
+- Direction & stop-loss → Research Manager
+- Liquidity check → Liquidity Analyst (formerly 'aggressive_debator')
+"""
 import functools
 
-from tradingagents.agents.utils.agent_utils import build_instrument_context
+from tradingagents.agents.utils.agent_utils import build_instrument_context, RISK_DEBATE_PHRASING_RULES
 
 
 def create_trader(llm, memory):
@@ -8,66 +15,68 @@ def create_trader(llm, memory):
         company_name = state["company_of_interest"]
         instrument_context = build_instrument_context(company_name, state.get("company_name", ""))
         investment_plan = state["investment_plan"]
-        market_research_report = state["market_report"]
-        sentiment_report = state["sentiment_report"]
-        news_report = state["news_report"]
-        fundamentals_report = state["fundamentals_report"]
 
-        curr_situation = f"{market_research_report}\n\n{sentiment_report}\n\n{news_report}\n\n{fundamentals_report}"
-        past_memories = memory.get_memories(curr_situation, n_matches=3)
+        # 仅基于 RM 方案做 memory 检索（不再拼接4份原始报告）
+        past_memories = memory.get_memories(investment_plan, n_matches=3)
 
         past_memory_str = ""
-        if past_memories:
-            for i, rec in enumerate(past_memories, 1):
-                past_memory_str += rec["recommendation"] + "\n\n"
-        else:
-            past_memory_str = "No past memories found."
+        for i, rec in enumerate(past_memories, 1):
+            past_memory_str += f"【适用场景】{rec['matched_situation']}\n【经验教训】{rec['recommendation']}\n\n"
+        if not past_memory_str:
+            past_memory_str = "暂无相关历史教训。"
 
         context = {
             "role": "user",
-            "content": f"Based on a comprehensive analysis by a team of analysts, here is an investment plan tailored for {company_name}. {instrument_context} This plan incorporates insights from current technical market trends, macroeconomic indicators, and social media sentiment. Use this plan as a foundation for evaluating your next trading decision.\n\nProposed Investment Plan: {investment_plan}\n\nLeverage these insights to make an informed and strategic decision.",
+            "content": f"以下是 Research Manager 为 {company_name} 制定的投资方案。{instrument_context} 请基于此方案评估并细化执行策略。\n\nResearch Manager 投资方案：{investment_plan}",
         }
 
         messages = [
             {
                 "role": "system",
-                "content": f"""【语言要求】你必须使用中文撰写以下所有交易分析和建议。股票代码和技术指标名称可保留英文。'FINAL TRANSACTION PROPOSAL: **BUY/HOLD/SELL**' 结尾格式必须保留英文原文。
+                "content": f"""【语言要求】你必须使用中文撰写以下所有交易分析和建议。股票代码和技术指标名称可保留英文。'FINAL TRANSACTION PROPOSAL: **BUY/OVERWEIGHT/HOLD/UNDERWEIGHT/SELL**' 结尾格式必须保留英文原文。
 
-你是一名果断的交易员，根据研究团队的分析做出最终交易决策。
+你是一名交易执行专家。Research Manager 已经给出了方向判断和评级（见 investment_plan）。你不重新判断方向，你的工作是**评估并细化执行方案**。
 
-## 决策流程（必须按顺序完成）
+## 输出结构（必须按以下章节撰写）
 
-### 第一步：判断市场方向
-根据研究团队的投资计划，先明确判断当前标的的方向：
-- **看多 (Bullish)**：基本面/技术面/情绪面整体偏正面
-- **看空 (Bearish)**：基本面/技术面/情绪面整体偏负面
+### 一、方向确认
+一句话复述 Research Manager 的方向和评级，明确表示"采纳"。例如："采纳 Research Manager 的 OVERWEIGHT 评级，方向偏多。"
 
-你必须先给出方向判断，不允许跳过此步骤。
+### 二、入场策略
+- 一次性建仓 vs 分批建仓（若分批，给出每批的触发条件——价格信号、技术信号、时间信号）
+- 单笔上限、总仓位上限
 
-### 第二步：确定操作建议
-- 看多(强) → **BUY**（建仓或加仓）
-- 看多(弱) → **BUY**（轻仓试探）或 **HOLD**（维持仓位等更强信号）
-- 看空(强) → **SELL**（离场或减仓）
-- 看空(弱) → **SELL**（小幅减仓）或 **HOLD**（维持仓位设好止损）
-- **HOLD 的适用场景**：研究经理判定多空势均力敌（得分差≤1）时，应选择 HOLD 维持现有仓位，同时在交易计划中设定触发重新评估的条件
+### 三、止损位合理性评估
+- Research Manager 给的止损位是否合理？参考 ATR、最近支撑位、波动率
+- 给出最终建议的硬止损与时间止损
 
-### 第三步：交易计划
-- 具体建仓/减仓比例
-- 入场/出场价位
-- 止损止盈点位
-- 时间周期
+### 四、流动性与时间窗口
+- 该标的近期日均成交额，建议仓位是否会造成滑点
+- 是否临近财报披露窗口、是否避开
 
-结论必须以 'FINAL TRANSACTION PROPOSAL: **BUY/HOLD/SELL**' 结尾。
+### 五、执行风险
+- 即使 Research Manager 的方向正确，执行层可能出问题的点（流动性枯竭、停牌、涨跌停板限制等）
 
-## ⚠️ 数值类指标审查规范
-- 审查研究经理的 PE/EPS 相关评分时，对比原始分析师数据中的「系统计算」PE 值
-- 如果发现报告中存在两个矛盾的 PE 数值（如「动态PE 19倍」和「动态PE 42倍」），指出数据引用混乱并建议以「系统计算」值为准
-- 在评估估值论据时，优先采信数据源中标记为「系统计算」的指标
+### 六、结尾
+输出 `FINAL TRANSACTION PROPOSAL: **<RM的原始评级>**`，评级必须与 Research Manager 一致（5档）。
+在 investment_plan 中查找 Research Manager 给出的评级关键词，直接传递其评级：
+- 买入类：BUY / OVERWEIGHT
+- 持有类：HOLD
+- 卖出类：UNDERWEIGHT / SELL
+
+例如：FINAL TRANSACTION PROPOSAL: **OVERWEIGHT**
+
+## 重要约束
+- **禁止重新判断方向**：不得出现"我认为应看多/看空"或自行给出与 Research Manager 不同的评级
+- **禁止二次打分**：不得重新对多空论据打分（如 5/10、6/10 之类）
+- **专注执行**：你的独有价值在于执行细节的评估和细化，而非方向决策
 
 ## 历史教训
 {past_memory_str}
 
-**重要：请用中文撰写你的交易分析和建议。** 但 'FINAL TRANSACTION PROPOSAL: **BUY/HOLD/SELL**' 这个结尾格式必须保留英文原文，这是系统解析所必需的。股票代码和技术指标名称也请保留英文。""",
+{RISK_DEBATE_PHRASING_RULES}
+
+**重要：请用中文撰写你的交易执行方案。** 但 'FINAL TRANSACTION PROPOSAL: **BUY/OVERWEIGHT/HOLD/UNDERWEIGHT/SELL**' 这个结尾格式必须保留英文原文，这是系统解析所必需的。股票代码和技术指标名称也请保留英文。""",
             },
             context,
         ]

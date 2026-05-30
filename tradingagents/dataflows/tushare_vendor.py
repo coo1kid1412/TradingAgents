@@ -13,6 +13,8 @@ from datetime import datetime, timedelta
 
 import pandas as pd
 
+from tradingagents.dataflows.valuation_utils import compute_ttm_eps, compute_ttm_revenue_per_share
+
 from .ticker_utils import to_tushare_format, to_akshare_date, to_standard_date, is_etf_or_lof
 from .vendor_errors import TushareRateLimitError, TushareUnavailableError
 from .financial_field_maps import (
@@ -26,6 +28,12 @@ from .financial_field_maps import (
 logger = logging.getLogger(__name__)
 
 _ts_api = None
+
+# ---------------------------------------------------------------------------
+# 权限/限流缓存：记录已确认无权限或小时/天级限流的 Tushare 接口
+# 避免同一运行周期内重复调用已知不可用的接口，直接触发 fallback
+# ---------------------------------------------------------------------------
+_DENIED_APIS: set[str] = set()
 
 
 def _get_tushare_api():
@@ -101,14 +109,23 @@ def _parse_retry_delay(error_msg: str) -> int | None:
 _RATE_LIMIT_MAX_RETRIES = 2  # 最大重试次数
 
 
-def _safe_call(func, *args, **kwargs):
+def _safe_call(func, *args, api_name: str = "", **kwargs):
     """包装 Tushare API 调用，捕获频率限制和权限错误。
 
     限流时自动重试：从错误消息中解析限流频率（如 "1次/分钟"→等65秒），
     计算合适的等待时间后重试，最多重试 _RATE_LIMIT_MAX_RETRIES 次。
     小时/天级限流不重试，直接抛异常触发 fallback。
     仅对分钟级频率限制重试，权限/积分类错误不重试。
+
+    权限缓存：当接口返回权限不足或小时/天级限流时，将 api_name 记入
+    _DENIED_APIS，后续调用直接跳过，避免重复无效请求。
     """
+    # 预检：如果此接口已确认无权限或高级别限流，直接跳过
+    if api_name and api_name in _DENIED_APIS:
+        raise TushareUnavailableError(
+            f"Tushare 接口 {api_name} 已确认不可用（权限不足或高级别限流），跳过调用"
+        )
+
     retries = 0
 
     while True:
@@ -123,10 +140,15 @@ def _safe_call(func, *args, **kwargs):
             if any(kw in msg_lower for kw in ("每分钟", "rate", "频率", "too many", "每小时", "每天")):
                 delay = _parse_retry_delay(msg)
                 if delay is None:
-                    # 小时/天级限流，重试无意义，直接抛异常触发 fallback
+                    # 小时/天级限流，重试无意义，缓存并直接抛异常触发 fallback
+                    if api_name:
+                        _DENIED_APIS.add(api_name)
                     raise TushareRateLimitError(
                         f"Tushare 限流级别过高（小时/天），跳过重试：{e}"
                     )
+
+                # 分钟级限流：即使等待时间超过壁钟超时（60s），也优先等待重试
+                # 因为 Tushare 的 A 股数据质量通常优于 AKShare 和 yfinance
                 if retries < _RATE_LIMIT_MAX_RETRIES:
                     retries += 1
                     logger.warning(
@@ -140,6 +162,10 @@ def _safe_call(func, *args, **kwargs):
                 )
 
             if any(kw in msg_lower for kw in ("积分", "权限", "point", "permission")):
+                # 权限/积分不足：缓存此接口，后续直接跳过
+                if api_name:
+                    _DENIED_APIS.add(api_name)
+                    logger.info("已将 Tushare 接口 %s 加入不可用缓存", api_name)
                 raise TushareUnavailableError(f"Tushare 积分不足或权限不够：{e}")
 
             raise TushareUnavailableError(f"Tushare API 调用失败：{e}")
@@ -172,6 +198,7 @@ def get_stock(
         ts_code=ts_code,
         start_date=to_akshare_date(start_date),
         end_date=to_akshare_date(end_date),
+        api_name="fund_daily" if is_fund else "daily",
     )
 
     if df is None or df.empty:
@@ -220,13 +247,15 @@ def get_indicator(
     ts_code = to_tushare_format(symbol)
 
     curr_dt = datetime.strptime(curr_date, "%Y-%m-%d")
-    hist_start = curr_dt - timedelta(days=365)
+    # 获取 look_back_days 天的数据（加上一些缓冲用于指标计算），而不是固定 365 天
+    hist_start = curr_dt - timedelta(days=look_back_days + 60)
 
     df = _safe_call(
         pro.daily,
         ts_code=ts_code,
         start_date=to_akshare_date(hist_start.strftime("%Y-%m-%d")),
         end_date=to_akshare_date(curr_date),
+        api_name="daily",
     )
 
     if df is None or df.empty:
@@ -276,49 +305,45 @@ def get_indicator(
 def _compute_ttm_eps(fina_df: pd.DataFrame) -> float | None:
     """从 fina_indicator 累计数据计算 TTM（滚动12个月）每股收益。
 
-    TTM_EPS = 最新年报EPS - 上年同期Q1_EPS + 今年Q1_EPS
-
-    中国财报披露规则:
-      Q1(单季) → H1(累计) → 9M(累计) → Annual(累计)
-      fina_indicator 的 eps 字段为累计值，故:
-      TTM = Annual_EPS - prev_Q1_EPS + curr_Q1_EPS
+    已移至 valuation_utils.compute_ttm_eps，此函数保留为兼容入口。
     """
-    if fina_df is None or fina_df.empty or "eps" not in fina_df.columns:
+    return compute_ttm_eps(fina_df, eps_col="eps", date_col="end_date")
+
+
+def _compute_ttm_revenue_per_share_fina(
+    fina_df: pd.DataFrame,
+    total_shares: float,
+) -> float | None:
+    """从 fina_indicator 累计数据计算 TTM 每股营业收入。
+
+    Tushare 的 fina_indicator 包含 tob_operate_income（营业总收入）字段，
+    使用与 compute_ttm_eps 相同的逻辑计算 TTM 营收，再除以总股本得到每股营收。
+
+    Args:
+        fina_df: fina_indicator 返回的 DataFrame
+        total_shares: 总股本（单位：股）
+
+    Returns:
+        TTM 每股营业收入（元/股），计算失败返回 None
+    """
+    if fina_df is None or fina_df.empty:
         return None
-    if "end_date" not in fina_df.columns:
+    if total_shares is None or total_shares <= 0:
         return None
 
-    df = fina_df.sort_values("end_date").copy()
-    df["end_date"] = df["end_date"].astype(str)
-
-    # 最新年报 EPS
-    annual_mask = df["end_date"].str.endswith("1231")
-    annual_rows = df[annual_mask]
-    if annual_rows.empty:
-        return None
-    latest_annual = annual_rows.iloc[-1]
-    annual_eps = latest_annual.get("eps", None)
-    if annual_eps is None or annual_eps <= 0:
+    # 检查是否存在营业总收入字段
+    revenue_col = "tob_operate_income"
+    if revenue_col not in fina_df.columns:
+        logger.debug("fina_indicator 中未找到 %s 字段，无法计算 PS(TTM)", revenue_col)
         return None
 
-    ttm_eps = float(annual_eps)
-
-    # + 最新 Q1 EPS
-    q1_mask = df["end_date"].str.endswith("0331")
-    if q1_mask.any():
-        latest_q1 = df[q1_mask].iloc[-1]
-        latest_q1_eps = latest_q1.get("eps", None)
-        if latest_q1_eps is not None:
-            ttm_eps = ttm_eps + float(latest_q1_eps)
-
-    # - 上年同期 Q1 EPS
-    if q1_mask.sum() >= 2:
-        prev_q1 = df[q1_mask].iloc[-2]
-        prev_q1_eps = prev_q1.get("eps", None)
-        if prev_q1_eps is not None:
-            ttm_eps = ttm_eps - float(prev_q1_eps)
-
-    return ttm_eps if ttm_eps > 0 else None
+    # 复用 valuation_utils 的计算逻辑
+    return compute_ttm_revenue_per_share(
+        fina_df,
+        revenue_col=revenue_col,
+        date_col="end_date",
+        total_shares=total_shares,
+    )
 
 
 def get_fundamentals(
@@ -330,7 +355,19 @@ def get_fundamentals(
     三个子接口（stock_basic / fina_indicator / daily_basic）独立获取，
     单个接口限流或不可用时不阻塞其他接口——这样即使 stock_basic 限流，
     daily_basic 仍可返回 PE/PB/PS 等估值指标。
+
+    当所有关键子接口均已确认不可用（权限不足或高级别限流）时，
+    直接抛出 TushareUnavailableError 触发 fallback 到 AKShare，
+    避免逐一尝试浪费时间。
     """
+    # 预检：如果所有关键子接口都已确认不可用，直接触发 fallback
+    _FUNDAMENTALS_CRITICAL_APIS = {"stock_basic", "fina_indicator", "daily_basic"}
+    if _FUNDAMENTALS_CRITICAL_APIS.issubset(_DENIED_APIS):
+        raise TushareUnavailableError(
+            f"Tushare get_fundamentals 所有关键子接口已确认不可用"
+            f"（{_FUNDAMENTALS_CRITICAL_APIS}），直接 fallback"
+        )
+
     pro = _get_tushare_api()
     ts_code = to_tushare_format(ticker)
     sections: list[str] = []
@@ -343,6 +380,7 @@ def get_fundamentals(
             pro.stock_basic,
             ts_code=ts_code,
             fields="ts_code,symbol,name,area,industry,market,list_date",
+            api_name="stock_basic",
         )
         if basic is not None and not basic.empty:
             has_data = True
@@ -362,7 +400,7 @@ def get_fundamentals(
 
     # 财务指标（精选关键字段，消除列名歧义）
     try:
-        fina = _safe_call(pro.fina_indicator, ts_code=ts_code, limit=5)
+        fina = _safe_call(pro.fina_indicator, ts_code=ts_code, limit=5, api_name="fina_indicator")
         if fina is not None and not fina.empty:
             has_data = True
             sections.append("## 财务指标（最近4期）")
@@ -371,6 +409,19 @@ def get_fundamentals(
         logger.warning("获取财务指标失败（接口限流或不可用），跳过: %s", e)
     except Exception as e:
         sections.append(f"# 获取财务指标出错：{e}\n")
+
+    # 利润表（用于 PS(TTM) 计算 fallback：当 fina_indicator 无 tob_operate_income 时使用）
+    income_for_ps = None
+    try:
+        if fina is None or fina.empty or "tob_operate_income" not in fina.columns:
+            logger.debug("fina_indicator 无 tob_operate_income 字段，尝试从 income 接口获取营业收入")
+            income_for_ps = _safe_call(pro.income, ts_code=ts_code, limit=5, api_name="income")
+            if income_for_ps is not None and not income_for_ps.empty:
+                logger.debug("成功从 income 接口获取营业收入数据，可用于 PS(TTM) 计算")
+    except (TushareUnavailableError, TushareRateLimitError) as e:
+        logger.warning("获取利润表失败（接口限流或不可用），PS(TTM) 可能无法计算: %s", e)
+    except Exception as e:
+        logger.debug("获取利润表出错，PS(TTM) 可能无法计算: %s", e)
 
     # 估值指标（PE / PB 等）—— 系统计算 PE，不依赖 API 的 pe_ttm
     close_price = None
@@ -382,13 +433,14 @@ def get_fundamentals(
                 pro.daily_basic,
                 ts_code=ts_code,
                 trade_date=to_akshare_date(curr_date),
+                api_name="daily_basic",
             )
         else:
-            daily_basic = _safe_call(pro.daily_basic, ts_code=ts_code, limit=1)
+            daily_basic = _safe_call(pro.daily_basic, ts_code=ts_code, limit=1, api_name="daily_basic")
         # 非交易日时 trade_date 查询返回空，自动回退到 limit=1 获取最近交易日
         if (daily_basic is None or daily_basic.empty) and curr_date:
             logger.info("daily_basic 指定日期无数据（可能是非交易日），回退到 limit=1: %s", ts_code)
-            daily_basic = _safe_call(pro.daily_basic, ts_code=ts_code, limit=1)
+            daily_basic = _safe_call(pro.daily_basic, ts_code=ts_code, limit=1, api_name="daily_basic")
         if daily_basic is not None and not daily_basic.empty:
             has_data = True
             r = daily_basic.iloc[0]
@@ -435,11 +487,69 @@ def get_fundamentals(
                 deviation = round(abs(api_pe_ttm - calc_pe) / calc_pe * 100)
                 sections.append(f"⚠️ PE偏差警告: API值与系统计算值偏差 {deviation}%，以系统计算值为准")
 
-        # PB / PS / 市值
+        sections.append("")
+
+    except Exception as e:
+        logger.warning("系统计算 PE 出错: %s", e)
+
+    # 系统计算 PS(TTM)（核心修复：不再依赖 Tushare ps_ttm，自行计算确保准确性）
+    try:
+        sections.append("## PS(TTM)估值（系统计算）")
+
+        # 从 daily_basic 获取总股本（单位：股）
+        total_shares = None
+        if daily_basic is not None and not daily_basic.empty:
+            r = daily_basic.iloc[0]
+            # Tushare daily_basic 返回的 total_share 单位为股
+            total_shares = float(r["total_share"]) if pd.notna(r.get("total_share")) else None
+
+        # 系统计算 PS(TTM)：优先用 fina_indicator.tob_operate_income，fallback 到 income.revenue
+        ttm_rev_ps = _compute_ttm_revenue_per_share_fina(fina, total_shares)
+        revenue_source = "fina_indicator.tob_operate_income"
+        if ttm_rev_ps is None and income_for_ps is not None and not income_for_ps.empty:
+            # Fallback: 从 income 接口的 revenue 字段计算
+            from tradingagents.dataflows.valuation_utils import compute_ttm_revenue_per_share
+            if "revenue" in income_for_ps.columns:
+                ttm_rev_ps = compute_ttm_revenue_per_share(
+                    income_for_ps,
+                    revenue_col="revenue",
+                    date_col="end_date",
+                    total_shares=total_shares,
+                )
+                revenue_source = "income.revenue(fallback)"
+            elif "OPERATE_INCOME" in income_for_ps.columns:
+                ttm_rev_ps = compute_ttm_revenue_per_share(
+                    income_for_ps,
+                    revenue_col="OPERATE_INCOME",
+                    date_col="end_date",
+                    total_shares=total_shares,
+                )
+                revenue_source = "income.OPERATE_INCOME(fallback)"
+
+        if close_price and ttm_rev_ps:
+            calc_ps = round(close_price / ttm_rev_ps, 2)
+            sections.append(f"PS(TTM/系统计算): {calc_ps} (公式: 收盘价/TTM_每股营业收入, 数据源: {revenue_source})")
+        else:
+            sections.append(f"PS(TTM/系统计算): N/A (缺少收盘价、总股本或营业收入数据)")
+
+        # API 参考值（仅供对比，不作为主要依据）
+        if daily_basic is not None and not daily_basic.empty:
+            r = daily_basic.iloc[0]
+            api_ps_ttm = float(r["ps_ttm"]) if pd.notna(r.get("ps_ttm")) else None
+            if api_ps_ttm is not None:
+                sections.append(f"PS(TTM/API参考): {round(api_ps_ttm, 4)} (Tushare daily_basic 直接返回，仅供参考)")
+
+        # 偏差警告
+        if close_price and ttm_rev_ps and api_ps_ttm is not None:
+            calc_ps = close_price / ttm_rev_ps
+            if calc_ps > 0 and abs(api_ps_ttm - calc_ps) / calc_ps > 0.15:
+                deviation = round(abs(api_ps_ttm - calc_ps) / calc_ps * 100)
+                sections.append(f"⚠️ PS偏差警告: API值与系统计算值偏差 {deviation}%，以系统计算值为准")
+
+        # PB / 市值（从 daily_basic 获取）
         if daily_basic is not None and not daily_basic.empty:
             r = daily_basic.iloc[0]
             sections.append(f"PB: {r.get('pb', 'N/A')}")
-            sections.append(f"PS(TTM): {r.get('ps_ttm', 'N/A')}")
             total_mv = r.get('total_mv', None)
             sections.append(f"总市值(万元): {total_mv if total_mv is not None else 'N/A'}")
             if total_mv is not None and pd.notna(total_mv):
@@ -447,7 +557,7 @@ def get_fundamentals(
             sections.append(f"流通市值(万元): {r.get('circ_mv', 'N/A')}")
         sections.append("")
     except Exception as e:
-        logger.warning("系统计算 PE 出错: %s", e)
+        logger.warning("系统计算 PS(TTM) 出错: %s", e)
 
     # 如果三个接口全部失败，抛出异常让 route_to_vendor fallback 到 AKShare
     if not has_data:
@@ -476,7 +586,7 @@ def get_balance_sheet(
     ts_code = to_tushare_format(ticker)
 
     limit = 4 if freq == "quarterly" else 2
-    df = _safe_call(pro.balancesheet, ts_code=ts_code, limit=limit)
+    df = _safe_call(pro.balancesheet, ts_code=ts_code, limit=limit, api_name="balancesheet")
 
     if df is None or df.empty:
         return f"未找到股票 '{ticker}' 的资产负债表数据"
@@ -503,7 +613,7 @@ def get_cashflow(
     ts_code = to_tushare_format(ticker)
 
     limit = 4 if freq == "quarterly" else 2
-    df = _safe_call(pro.cashflow, ts_code=ts_code, limit=limit)
+    df = _safe_call(pro.cashflow, ts_code=ts_code, limit=limit, api_name="cashflow")
 
     if df is None or df.empty:
         return f"未找到股票 '{ticker}' 的现金流量表数据"
@@ -530,7 +640,7 @@ def get_income_statement(
     ts_code = to_tushare_format(ticker)
 
     limit = 4 if freq == "quarterly" else 2
-    df = _safe_call(pro.income, ts_code=ts_code, limit=limit)
+    df = _safe_call(pro.income, ts_code=ts_code, limit=limit, api_name="income")
 
     if df is None or df.empty:
         return f"未找到股票 '{ticker}' 的利润表数据"
@@ -562,6 +672,7 @@ def get_news(
             start_date=to_akshare_date(start_date),
             end_date=to_akshare_date(end_date),
             limit=20,
+            api_name="news",
         )
     except (TushareUnavailableError, TushareRateLimitError):
         raise
@@ -599,6 +710,7 @@ def get_global_news(
             start_date=to_akshare_date(start_dt.strftime("%Y-%m-%d")),
             end_date=to_akshare_date(curr_date),
             limit=limit,
+            api_name="news",
         )
     except (TushareUnavailableError, TushareRateLimitError):
         raise
@@ -626,7 +738,7 @@ def get_insider_transactions(
     ts_code = to_tushare_format(symbol)
 
     try:
-        df = _safe_call(pro.stk_holdertrade, ts_code=ts_code, limit=20)
+        df = _safe_call(pro.stk_holdertrade, ts_code=ts_code, limit=20, api_name="stk_holdertrade")
     except (TushareUnavailableError, TushareRateLimitError):
         raise
 

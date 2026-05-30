@@ -168,14 +168,22 @@ def get_stock_stats_indicators_window(
         current_dt = curr_date_dt
         date_values = []
         
+        # 数据完整性判断：如果 indicator_data 为空，说明 yfinance 根本没拿到该 ticker 的数据
+        # （常见于 A 股代码未带 .SS/.SZ 后缀导致 yfinance 404）
+        no_data_at_all = not indicator_data and not first_available_date
+
         while current_dt >= before:
             date_str = current_dt.strftime('%Y-%m-%d')
-            
+
             # Look up the indicator value for this date
             if date_str in indicator_data:
                 indicator_value = indicator_data[date_str]
             elif first_available_date and date_str < first_available_date:
                 indicator_value = "N/A: No historical data available (stock may be newly listed)"
+            elif no_data_at_all:
+                # 全表 N/A：yfinance 拿不到该 ticker 的数据，多半是 ticker 格式不被支持
+                # （A 股需要 .SS/.SZ 后缀，例如 688008 → 688008.SS）
+                indicator_value = "N/A: yfinance returned no data for this ticker (A-share codes need .SS/.SZ suffix)"
             else:
                 indicator_value = "N/A: Not a trading day (weekend or holiday)"
             

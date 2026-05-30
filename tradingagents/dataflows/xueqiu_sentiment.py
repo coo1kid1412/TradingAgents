@@ -30,6 +30,8 @@ _XUEQIU_BASE = "https://xueqiu.com"
 _SEARCH_API = f"{_XUEQIU_BASE}/query/v1/search/status.json"
 _COMMENTS_API = f"{_XUEQIU_BASE}/statuses/comments.json"
 
+_USER_TIMELINE_API = f"{_XUEQIU_BASE}/statuses/user_timeline.json"
+
 _MAX_POSTS = 30
 _MAX_COMMENTS = 20
 _POST_CONTENT_LIMIT = 650
@@ -37,12 +39,25 @@ _COMMENT_CONTENT_LIMIT = 150
 _PLAYWRIGHT_TIMEOUT_MS = 90_000
 _MAX_LOOKBACK_DAYS = 15
 
+# 已知活跃大V列表（与 xueqiu-attention skill 对齐）
+_KOL_USER_IDS = ["8469219487", "1192466154"]
+
 
 def _get_token() -> str:
-    """Retrieve Xueqiu token from env or config."""
+    """Retrieve Xueqiu token from env or config, with dotenv fallback."""
     token = os.environ.get("XUEQIU_TOKEN", "").strip()
     if not token:
         token = get_config().get("xueqiu_token", "").strip()
+    if not token:
+        try:
+            from dotenv import load_dotenv
+            from pathlib import Path
+            env_path = Path(__file__).resolve().parents[2] / ".env"
+            if env_path.exists():
+                load_dotenv(env_path, override=False)
+                token = os.environ.get("XUEQIU_TOKEN", "").strip()
+        except ImportError:
+            pass
     return token
 
 
@@ -247,8 +262,107 @@ def _try_http_comments(status_id, token: str) -> List[dict]:
 
 
 # ---------------------------------------------------------------------------
+# HTTP user_timeline fallback (WAF-resistant)
+# ---------------------------------------------------------------------------
+def _keyword_filter(posts: List[dict], query: str) -> List[dict]:
+    """Filter posts by matching query keyword against text and title.
+
+    Supports stock codes (e.g. '601138'), company names, and slang terms.
+    Also matches SH/SZ prefixed codes like 'SH601138'.
+    """
+    q = query.strip().lower()
+    if not q:
+        return posts
+
+    # Build match patterns: raw query + SH/SZ prefixed variant
+    patterns = [q]
+    if re.match(r"^\d{6}$", q):
+        patterns.append(f"sh{q}")
+        patterns.append(f"sz{q}")
+
+    filtered = []
+    for post in posts:
+        text = (post.get("text", "") or "").lower()
+        title = (post.get("title", "") or "").lower()
+        combined = f"{title} {text}"
+        if any(p in combined for p in patterns):
+            filtered.append(post)
+    return filtered
+
+
+def _parse_timeline_item(item: dict) -> dict:
+    """Parse a single status item from user_timeline API response."""
+    user = item.get("user", {}) or {}
+    return {
+        "id": item.get("id"),
+        "user_id": item.get("user_id") or user.get("id"),
+        "screen_name": user.get("screen_name", "匿名用户"),
+        "title": _strip_html(item.get("title", "")),
+        "text": _strip_html(item.get("text", "") or item.get("description", "")),
+        "created_at": _ts_to_datetime(item.get("created_at")),
+        "reply_count": item.get("reply_count", 0),
+        "like_count": item.get("like_count", 0),
+        "target": f"{_XUEQIU_BASE}{item.get('target', '')}",
+    }
+
+
+def _try_http_user_timeline(query: str, token: str) -> List[dict]:
+    """Fetch posts from known KOLs via user_timeline API, then filter locally.
+
+    The user_timeline.json (v3) endpoint is NOT blocked by Aliyun WAF,
+    unlike the search and comments APIs. This serves as a reliable
+    intermediate fallback between search API and full Playwright.
+    """
+    session = requests.Session()
+    session.cookies.set("xq_a_token", token, domain=".xueqiu.com", path="/")
+    session.headers.update(_get_headers(token))
+
+    try:
+        session.get(_XUEQIU_BASE, timeout=10)
+    except requests.RequestException:
+        pass
+
+    all_posts: List[dict] = []
+    for user_id in _KOL_USER_IDS:
+        try:
+            resp = session.get(
+                _USER_TIMELINE_API,
+                params={"user_id": user_id, "page": 1, "count": 25},
+                timeout=15,
+            )
+            if resp.status_code in (403, 401, 429):
+                continue
+            ct = resp.headers.get("Content-Type", "")
+            if "text/html" in ct or resp.text.lstrip().startswith("<"):
+                continue  # WAF blocked
+            data = resp.json()
+            if isinstance(data, dict) and data.get("error_code"):
+                continue
+            for item in data.get("statuses", []):
+                all_posts.append(_parse_timeline_item(item))
+        except Exception:
+            continue
+
+    return _keyword_filter(all_posts, query)
+
+
+# ---------------------------------------------------------------------------
 # Playwright browser fallback
 # ---------------------------------------------------------------------------
+def _safe_goto(page, url: str, timeout_ms: int = 30_000) -> None:
+    """Navigate to URL with safe wait strategy that handles WAF JS challenges.
+
+    Using wait_until='domcontentloaded' avoids the 'Execution context was
+    destroyed' error caused by Aliyun WAF JS challenges triggering page
+    navigations during the 'networkidle' wait.
+    """
+    page.goto(url, wait_until="domcontentloaded")
+    try:
+        page.wait_for_load_state("networkidle", timeout=timeout_ms)
+    except Exception:
+        pass  # WAF challenge may cause timeout; page might still be usable
+
+
 def _try_playwright(query: str, token: str) -> List[dict]:
     """Search Xueqiu via headless browser. Returns list of post dicts with comments.
 
@@ -292,7 +406,7 @@ def _try_playwright(query: str, token: str) -> List[dict]:
             page.set_default_timeout(_PLAYWRIGHT_TIMEOUT_MS)
 
             # --- Step 1: Visit homepage to establish session / pass WAF ---
-            page.goto(_XUEQIU_BASE + "/", wait_until="networkidle")
+            _safe_goto(page, _XUEQIU_BASE + "/")
             _time.sleep(2)
 
             # --- Step 2: Use the search input to type query and submit ---
@@ -302,7 +416,7 @@ def _try_playwright(query: str, token: str) -> List[dict]:
             search_input.click()
             search_input.fill(query)
             _time.sleep(0.5)
-            search_input.press("Enter")
+            page.keyboard.press("Enter")
             _time.sleep(4)
 
             # --- Step 3: Click the 讨论 tab ---
@@ -370,7 +484,7 @@ def _try_playwright(query: str, token: str) -> List[dict]:
                 if not post.get("target"):
                     continue
                 try:
-                    page.goto(post["target"], wait_until="domcontentloaded")
+                    _safe_goto(page, post["target"])
                     _time.sleep(3)
 
                     # Full post content
@@ -394,8 +508,11 @@ def _try_playwright(query: str, token: str) -> List[dict]:
                         except Exception:
                             break
 
-                    # Extract comments
-                    comment_items = page.query_selector_all(".comment__item")
+                    # Extract comments (use broader selectors for compatibility)
+                    comment_items = page.query_selector_all(
+                        ".comment__item, .comment-item, "
+                        "[class*='comment'] > [class*='item']"
+                    )
                     for ci in comment_items[:_MAX_COMMENTS]:
                         try:
                             c_author_el = ci.query_selector(
@@ -545,15 +662,15 @@ def fetch_xueqiu_posts(query: str, start_date: str, end_date: str) -> str:
     posts: List[dict] = []
     used_browser = False
 
-    # --- Phase 1: Try HTTP API ---
+    # --- Phase 1a: Try HTTP search API (likely blocked by Aliyun WAF) ---
     try:
         posts = _try_http_search(query, token)
     except _XueqiuAPIBlocked:
-        posts = []  # will fall through to Playwright
+        posts = []
     except Exception:
         posts = []
 
-    # Fetch comments for API-returned posts
+    # Fetch comments for search API-returned posts
     if posts:
         for post in posts[:_MAX_POSTS]:
             if post.get("id"):
@@ -562,7 +679,11 @@ def fetch_xueqiu_posts(query: str, start_date: str, end_date: str) -> str:
                 except (_XueqiuAPIBlocked, Exception):
                     post["comments"] = []
 
-    # --- Phase 2: Playwright fallback if API returned nothing ---
+    # --- Phase 1b: user_timeline fallback (WAF-resistant, KOL posts filtered locally) ---
+    if not posts:
+        posts = _try_http_user_timeline(query, token)
+
+    # --- Phase 2: Playwright fallback if both HTTP paths returned nothing ---
     if not posts:
         try:
             posts = _try_playwright(query, token)

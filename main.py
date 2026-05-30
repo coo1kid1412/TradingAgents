@@ -287,6 +287,130 @@ def _run_harness_post_hook(ticker: str, report_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+#  飞书推送 hook（Open Platform API 走 open_id 私聊，发文件类型保留 markdown 渲染）
+# ---------------------------------------------------------------------------
+def _send_decision_to_feishu_as_file(report_path: Path) -> None:
+    """把 PM decision.md 以文件形式推送到飞书。
+
+    关键设计：
+    - disk 上 decision.md 文件名**不动**（harness archive/extractor 等依赖该字面值）
+    - 飞书展示名按 `{ticker}_{company_name}_{rating}_{MM-DD}.md` 自定义
+    - rating 从 PM_SUMMARY YAML 的 pm_rating 字段提取；抓不到降级为 UNKNOWN
+    - 目录名不规范时降级为原始 decision.md 名
+    - 所有错误静默吞，不阻塞主流程
+    - 凭证从 .env 读：FEISHU_APP_ID / FEISHU_APP_SECRET / FEISHU_USER_OPEN_ID
+    """
+    import json as _json
+    import re as _re
+    import urllib.request as _ur
+    import uuid as _uuid
+
+    decision_file = report_path / "5_portfolio" / "decision.md"
+    if not decision_file.exists():
+        print(f"[{report_path.name}] ⚠ decision.md 不存在，跳过飞书推送", flush=True)
+        return
+
+    app_id = os.environ.get("FEISHU_APP_ID")
+    app_secret = os.environ.get("FEISHU_APP_SECRET")
+    open_id = os.environ.get("FEISHU_USER_OPEN_ID")
+    if not (app_id and app_secret and open_id):
+        print(f"[{report_path.name}] ⚠ 飞书凭证未配置（FEISHU_APP_ID/APP_SECRET/USER_OPEN_ID），跳过推送", flush=True)
+        return
+
+    # ---- 构造飞书展示名 ----
+    # 目录名格式：{ticker}_{company_name}_{YYYYMMDD}_{HHMMSS}
+    m = _re.match(r"^(\w+)_(.+?)_(\d{8})_(\d{6})$", report_path.name)
+    if m:
+        ticker, company_name, ymd, _ = m.groups()
+        month_day = f"{ymd[4:6]}-{ymd[6:8]}"
+        try:
+            body_text = decision_file.read_text(encoding="utf-8")
+        except Exception as e:
+            print(f"[{report_path.name}] ⚠ 读 decision.md 失败：{e}", flush=True)
+            return
+        rating_m = _re.search(
+            r"^\s*pm_rating[:\s]+(BUY|SELL|HOLD|OVERWEIGHT|UNDERWEIGHT)",
+            body_text, _re.MULTILINE | _re.IGNORECASE,
+        )
+        rating = rating_m.group(1).upper() if rating_m else "UNKNOWN"
+        feishu_filename = f"{ticker}_{company_name}_{rating}_{month_day}.md"
+    else:
+        feishu_filename = "decision.md"
+        body_text = None  # 降级路径，不需要 rating
+
+    try:
+        file_bytes = decision_file.read_bytes()
+    except Exception as e:
+        print(f"[{report_path.name}] ⚠ 读 decision.md 字节失败：{e}", flush=True)
+        return
+
+    print(f"[{report_path.name}] ↻ 推送飞书（{feishu_filename}，{len(file_bytes)} bytes）...", flush=True)
+
+    try:
+        # 1. tenant_access_token
+        req = _ur.Request(
+            "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal",
+            data=_json.dumps({"app_id": app_id, "app_secret": app_secret}).encode(),
+            headers={"Content-Type": "application/json"},
+        )
+        resp = _json.loads(_ur.urlopen(req, timeout=10).read())
+        if resp.get("code") != 0:
+            print(f"[{report_path.name}] ⚠ 拿 token 失败：{resp}", flush=True)
+            return
+        token = resp["tenant_access_token"]
+
+        # 2. multipart 上传文件
+        boundary = f"----FeishuBoundary{_uuid.uuid4().hex}"
+        parts = []
+        def _field(name, val):
+            parts.append(f"--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{val}\r\n".encode())
+        def _file_field(name, fn, content):
+            parts.append(f"--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"; filename=\"{fn}\"\r\nContent-Type: application/octet-stream\r\n\r\n".encode())
+            parts.append(content)
+            parts.append(b"\r\n")
+
+        _field("file_type", "stream")
+        _field("file_name", feishu_filename)
+        _file_field("file", feishu_filename, file_bytes)
+        parts.append(f"--{boundary}--\r\n".encode())
+
+        req = _ur.Request(
+            "https://open.feishu.cn/open-apis/im/v1/files",
+            data=b"".join(parts),
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": f"multipart/form-data; boundary={boundary}",
+            },
+        )
+        resp = _json.loads(_ur.urlopen(req, timeout=30).read())
+        if resp.get("code") != 0:
+            print(f"[{report_path.name}] ⚠ 上传文件失败：{resp}", flush=True)
+            return
+        file_key = resp["data"]["file_key"]
+
+        # 3. 发文件消息
+        req = _ur.Request(
+            "https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=open_id",
+            data=_json.dumps({
+                "receive_id": open_id,
+                "msg_type": "file",
+                "content": _json.dumps({"file_key": file_key}),
+            }).encode(),
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json; charset=utf-8",
+            },
+        )
+        resp = _json.loads(_ur.urlopen(req, timeout=20).read())
+        if resp.get("code") == 0:
+            print(f"[{report_path.name}] ✓ 飞书已发送（{feishu_filename}）", flush=True)
+        else:
+            print(f"[{report_path.name}] ⚠ 发送消息失败：{resp}", flush=True)
+    except Exception as e:
+        print(f"[{report_path.name}] ⚠ 飞书推送异常（不影响主流程）：{e}", flush=True)
+
+
+# ---------------------------------------------------------------------------
 #  单支股票分析函数（在独立进程中执行）
 # ---------------------------------------------------------------------------
 def analyze_single_stock(ticker: str, analysis_date: str, config: dict) -> Tuple[str, bool, str]:
@@ -356,6 +480,9 @@ def analyze_single_stock(ticker: str, analysis_date: str, config: dict) -> Tuple
 
             # Harness 自动化：归档本次报告 + 顺手更新所有 pending 真值（失败不阻塞主流程）
             _run_harness_post_hook(ticker, report_path)
+
+            # 飞书推送 PM 决策（文件形式，自定义展示名，disk 上 decision.md 不动）
+            _send_decision_to_feishu_as_file(report_path)
 
             return (ticker, True, str(report_path))
 

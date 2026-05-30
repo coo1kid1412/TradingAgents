@@ -111,7 +111,12 @@ class TradingAgentsGraph:
         self.trader_llm = self._create_templllm(self.config.get("temperature_trader", 0.3), use_deep_think=self.config.get("use_deep_for_trader", False))
         # RM/PM：固定 deep_think，最终决策推理需要深度
         self.research_manager_llm = self._create_templllm(self.config.get("temperature_research_manager", 0.3), use_deep_think=True)
-        self.portfolio_manager_llm = self._create_templllm(self.config.get("temperature_portfolio_manager", 0.3), use_deep_think=True)
+        # PM 单独提升 max_tokens：14 章节报告 + Trade Ticket 决策卡输出长，全局 8192 频繁截断
+        self.portfolio_manager_llm = self._create_templllm(
+            self.config.get("temperature_portfolio_manager", 0.3),
+            use_deep_think=True,
+            max_tokens_override=self.config.get("portfolio_manager_max_tokens"),
+        )
         # 多/空研究员：默认 quick_think（修辞密度高但推理深度低），可通过 config flag 回退
         self.bull_researcher_llm = self._create_templllm(self.config.get("temperature_bull_researcher", 0.5), use_deep_think=self.config.get("use_deep_for_bull_researcher", False))
         self.bear_researcher_llm = self._create_templllm(self.config.get("temperature_bear_researcher", 0.5), use_deep_think=self.config.get("use_deep_for_bear_researcher", False))
@@ -208,17 +213,27 @@ class TradingAgentsGraph:
 
         return kwargs
 
-    def _create_templllm(self, temperature: float, use_deep_think: bool = True) -> Any:
+    def _create_templllm(
+        self,
+        temperature: float,
+        use_deep_think: bool = True,
+        max_tokens_override: int | None = None,
+    ) -> Any:
         """Create an LLM instance with a specific temperature.
-        
+
         Args:
             temperature: Temperature value for controlling randomness (0.0-1.0)
             use_deep_think: If True, use deep_think_llm; otherwise use quick_think_llm
-            
+            max_tokens_override: If set, overrides provider default max_tokens.
+                Only providers that support max_tokens (MiniMax / Anthropic) actually use it;
+                others (OpenAI Responses API) silently ignore.
+
         Returns:
             Configured LLM instance with the specified temperature
         """
         llm_kwargs = self._get_provider_kwargs()
+        if max_tokens_override is not None:
+            llm_kwargs["max_tokens"] = max_tokens_override
         if self.callbacks:
             llm_kwargs["callbacks"] = self.callbacks
         

@@ -128,9 +128,11 @@ def create_portfolio_manager(llm, memory):
 
 ---
 
-## 决策流程（必须严格按顺序）
+## 决策流程（仅内部思考使用，**禁止把流程章节写入最终报告**）
 
-### 第一步：吸收股票画像 + 上下文
+⚠️ **关键格式约束**：以下"第一步～第八步"是你**内部思考流程**，不是报告章节。**最终 decision.md 必须直接以 `## Trade Ticket 决策卡` 开头**，禁止出现"第一步：吸收股票画像"、"第二步：评级微调" 等流程性标题。所有思考结果直接体现在"完整报告结构"列出的十六个正式章节里。
+
+### 第一步：吸收股票画像 + 上下文（内部思考，不输出章节）
 
 从画像识别官的输出（在"输入资料"区"股票画像"段）提取并显式列出：
 - **决策风格**（value_anchor / catalyst_driven / momentum / event_driven）
@@ -146,24 +148,14 @@ def create_portfolio_manager(llm, memory):
 | **momentum 动量** | 1-3 月 | 突破/回踩均线建仓 | 紧 TP（1R 立刻减半），紧 SL（0.7R） | RSI、MACD、成交量、舆情拥挤度 |
 | **event_driven 事件驱动** | 至事件结束（1-2 月）| 事件前 1 周内 | 事件后立即清仓（无视价位） | 事件日历、政策细则、公告 |
 
-**从 RM thesis 中提取**（RM 已重构为 8 步 COT 流程，评级是综合判断产出而非公式输出）：
+**从 RM thesis 中提取**（RM 8 步 COT 综合判断产出）：
 
-| 字段 | RM 输出位置 | 你的用途 |
-|------|-----------|---------|
-| **最终评级 R** | 一、评级与置信度 | 默认采纳，仅可 ±1 档微调 |
-| **Conviction 置信度** | 一、评级与置信度 | 映射到 Conviction 五星制 + 仓位 |
-| **综合目标价区间** | 一、评级与置信度（[低], [高]）| 作为 P_up 上界、P_dn 下界 |
-| **Base case 目标价 + 概率** | 一、评级与置信度 | 你的情景分布的 Base case 直接采用 |
-| **Bull / Bear case 目标价 + 概率** | Step 5 三情景 | 你的情景分布的乐观/悲观档直接采用 |
-| **业绩拐点判断 + 下一检验点** | Step 3 | 用作 Time Stop 触发条件 |
-| **行业框架 + 决策风格** | Step 1 + stock_profile | 决定操作节奏（紧/松 TP/SL）|
-| **风险清单** | 六、风控审查指引 | 直接映射到风控辩论缓释表 |
-| **多空辩论 Bull/Bear Score 和 d** | 辅助分析（仅作 Conviction 参考）| 不影响评级方向，仅供你看争议程度 |
-
-**重要**：
-- 旧版 RM 输出的 R0/R1/R2/赔率 R/期望 E **已废弃**，新版只输出"最终评级 R + Conviction + 三情景目标价"
-- 三情景目标价由 RM 给出，你的"情景概率分布"段可直接复用 RM 的 Bull/Base/Bear，只需再加"黑天鹅"一档（5-15%）即可
-- 综合目标价区间是 RM 多元估值交叉的输出，比单一 P_up/P_dn 更可靠，你的 1R 计算应基于此区间
+- **最终评级 R + Conviction**（RM 一、评级与置信度）→ 默认采纳，仅 ±1 档微调；Conviction 映射五星 + 仓位
+- **综合目标价区间 + Bull/Base/Bear 目标价 + 概率**（RM 一 / Step 5）→ 直接复用为情景分布三档，1R 基于综合区间
+- **业绩拐点 + 下一检验点**（RM Step 3）→ Time Stop 触发条件
+- **行业框架 + 决策风格**（RM Step 1 + stock_profile）→ 操作节奏（紧/松 TP/SL）
+- **风险清单**（RM 六）→ 映射到风控辩论缓释表
+- **多空辩论 Bull/Bear/d**（RM 辅助分析）→ 仅作 Conviction 参考，不影响方向
 
 **从 quant_score 提取**（Python 确定性输出，独立第二眼）：
 
@@ -188,6 +180,29 @@ def create_portfolio_manager(llm, memory):
 例：
 - "板块 RS 30d +12% 跑赢大盘 + 主题内排名第 2/5，板块β 仍正向，CONDITIONAL（等回调）"
 - "板块 RS 30d -8% 跑输 + 主题内倒数 → 板块走弱强化卖出信号，DON'T BUY"
+
+**⚠️ stock_profile TRANSPARENCY 段（Layer 3 标注）必读**：
+
+stock_profile 末尾的 `TRANSPARENCY:` 段标注了"超共识程度"，按以下规则用于 **Conviction 五星调档**：
+
+| 触发条件 | Conviction 调档 |
+|---------|----------------|
+| `target_pe_high_vs_sell_side_pct` > +50 且 `premium_divergence_reason` 无 ≥2 条产业证据 | -1 档 |
+| `target_pe_high_vs_sell_side_pct` > +100 | 强制 ≤ 3★ Medium |
+| `theme_stage_llm_chosen` ≠ `theme_stage_inferred_by_data` 且 `theme_divergence_reason` 不充分 | -1 档 |
+| `premium_llm_chosen` > `premium_default_template` + 30 | -1 档 |
+| 三源 PE 全部 null | 强制 ≤ 2★ Low |
+
+**Trade Ticket Key Risks 段**：若 TRANSPARENCY 任一字段触发降档，必须在 Key Risks 写入"超共识溢价风险（vs 卖方/同业偏离 N%）"作为独立一条。
+
+**核心理念（机构对照）**：跟 IC 复议要求"超共识 target 必须 defend 产业证据"完全一致。这里不强制改评级方向，只通过 Conviction 调档间接压仓位——机构 PM 内部 risk dashboard 标准做法。
+
+⛔ **显式引用要求**（强制留痕，否则视为未应用 Layer 4）：
+- 当任一 TRANSPARENCY 字段触发上表中的 Conviction 调档规则时，必须在 **第三步 Conviction Score 五星制** 段显式写出引用，格式：
+  > "TRANSPARENCY.target_pe_high_vs_sell_side_pct = +N% 且 stock_profile.premium_divergence_reason 仅 1 条证据 → Conviction -1"
+- 即使所有 TRANSPARENCY 字段都在阈值内（不触发调档），也必须显式输出一行：
+  > "TRANSPARENCY 检查：vs_sell_side=__%, vs_self_p80=__%, vs_peer=__%, premium_chosen vs default=__pp，均在阈值内，Conviction 不调"
+- 不允许"隐式应用规则"——下游 harness 审计必须能从 decision.md 文本里 grep 到具体 TRANSPARENCY 字段名
 
 ### 第二步：评级微调（含对 RM thesis 的反向质疑）
 
@@ -329,11 +344,7 @@ PM 必须明确"thesis 兑现"的具体里程碑（如"Q2 营收增速 >25%"、"
 
 防止 anchoring bias。如果你当前是 UNDERWEIGHT，**什么条件能让你翻为 BUY/OVERWEIGHT**？
 
-⚠️ **核心约束（必读）**：参考真实头部投研团队（高盛/摩根/桥水/Citadel）做法——**反向证伪只描述触发条件，禁止给具体价位区间**。原因：
-
-1. **避免价位矛盾**：减仓表里的清仓位（如 230 元）如果同时出现在反向证伪建仓里（"回调至 220-230 建仓"），会让读者困惑——同一价位既要清仓又要建仓
-2. **触发后重新评估**：评级翻转条件触发后，报告会**重新生成**，届时综合估值会重新计算，新的 entry/exit 由那时市场状态决定，不应在当前报告里"预定"未来价位
-3. **现实做法**：机构 PM 内部 Position Sheet 把"持仓决策"和"观察池"物理分离，**不在同一份报告同一价位发"清仓+建仓"两个指令**
+⚠️ **核心约束**：**反向证伪只描述触发条件，禁止给具体价位区间**——否则会与减仓表的清仓位冲突（同一价位既要清仓又要建仓）。评级翻转后报告会重新生成，新 Entry/TP/SL 届时重算。
 
 #### 输出格式（强制：只写触发条件 + 时间窗口 + 翻转后的评级方向）
 
@@ -341,18 +352,11 @@ PM 必须明确"thesis 兑现"的具体里程碑（如"Q2 营收增速 >25%"、"
 |---|---------------------------------------------|---------|----------|
 | 1 | 例：Q2 营收同比 >35% + 净利率 >50% + 公告 CXL 量产订单 | 2026 年 Q2 财报 | BUY |
 | 2 | 例：技术面经过 ≥5 个交易日企稳 + 日线连续 2 日收阳 + 成交量缩至 20 日均量 60% 以下 + RSI 跌至 30 分位以下 | 任意时点（技术反弹）| OVERWEIGHT |
-| 3 | 例：CXL 量产订单 >5 亿元（季）公告 | 任意时点 | OVERWEIGHT |
 
 **末尾必须加一行**：
 > ⚠️ 评级翻转后报告将重新生成，综合估值区间会重新计算，**届时给出新的 Entry/TP/SL 价位，不在本报告里预定**。
 
-⛔ **错误示例（禁止）**：
-- ❌ "股价回调至 220-230 元区间 + RSI<35"——给了具体价位，与减仓表的清仓位 230 冲突
-- ❌ "深度回调至 180 元附近建仓"——给了具体价位，预设未来市场状态
-
-✅ **正确示例**：
-- ✅ "技术面 RSI 跌至 30 分位以下 + 日线企稳 + 量缩"——只写信号特征
-- ✅ "基本面：Q2 营收 >X% + 净利率 >Y%"——只写业绩门槛
+⛔ 触发条件只写信号特征（如 "RSI<30 + 日线企稳 + 量缩"）和业绩门槛（如 "Q2 营收 >X%"），不写"回调至 220-230 建仓"这种具体价位。
 
 ---
 
@@ -406,7 +410,10 @@ PM 必须明确"thesis 兑现"的具体里程碑（如"Q2 营收增速 >25%"、"
 - 评级为 HOLD/UNDERWEIGHT/SELL 时：
   - Entry 填 "—"（不建仓）
   - Action 填 "WAIT @<回调位>" 或 "REDUCE -X%" 或 "EXIT @<价位>"
-  - TP1/TP2/TP3 仍按 R-multiple 计算（针对已持有者）
+  - ⛔ **TP1/TP2/TP3/SL_soft/SL_hard 仍必须按 R-multiple 计算具体价位（针对已持有者）**，**禁止填 "—"**
+  - 1R 取当前价 P_0 作为 Entry 基准（而非空仓者建仓价）：`1R = P_0 − SL_hard`
+  - 例：HOLD 评级当前价 271.83 元，SL_hard 选 215 元，则 1R=56.83，TP1=328.66，TP2=385.49，TP3=442.32，SL_soft=237.74
+  - 同步在 PM_SUMMARY YAML 中 pm_tp1/pm_tp2/pm_tp3/pm_sl_soft/pm_sl_hard **必须填具体数字，禁止填 null**
 - BUY/OVERWEIGHT 时 Entry 必须给具体区间
 
 ---
@@ -468,42 +475,26 @@ PM 必须明确"thesis 兑现"的具体里程碑（如"Q2 营收增速 >25%"、"
 12. **十一、历史教训应用自检** —— 第九步定义的对照表
 13. **十二、价位逻辑一致性自检** —— 强制输出（见下方"价位一致性自检规则"）
 14. **十三、评级调整说明**（仅当与 RM 不同时）
+15. **十四、PM_SUMMARY YAML**（见末尾强制输出格式）
+
+⛔ **输出终止约束**：以上 1-15 个章节完整输出一次后**立即结束**。**禁止**：
+- 在 PM_SUMMARY YAML 之后重复输出任何之前出现过的章节标题（如再次出现 `## 一、投资判断`）
+- 在结尾处补充"评级微调反向质疑"等 prompt 内提到但不在 1-15 章节列表里的额外段落
+- 在 PM_SUMMARY YAML 后追加任何内容（包括总结 / 致谢 / 备注）
 
 ---
 
 ## 价位一致性自检规则（强制输出于报告末尾）
 
-参考机构 PM Position Sheet 的"Position vs Watch List 物理分离"做法。报告写完后必须输出以下对照表，让 LLM **自检**没有"同价位发相反指令"：
+报告末尾必须输出"十二、价位一致性自检"，列出当前价 / Entry / TP1-3 / SL_soft / SL_hard / Scenario B 减仓位 / 反向证伪（只写触发条件）的角色对照表，并逐条回答下列清单（结论 [全部通过 / N 项冲突已修正]）：
 
-```markdown
-## 十二、价位一致性自检
+1. 同一价位是否同时出现在"持仓清仓"和"空仓建仓"两个角色？（如是必须修一处，推荐让反向证伪不给价位）
+2. 反向证伪段是否给了具体价位区间？（如是改为触发条件）
+3. Scenario A（空仓者）是否混入"清仓/减仓"指令？（如是删除）
+4. Scenario B（持仓者）是否混入"建仓/加仓"指令？（如是删除）
+5. 三档 cost basis 分支是否相互独立？
 
-| 价位 | 角色 | 适用对象 | 来源段落 |
-|------|------|---------|---------|
-| __ 元 | 当前价 P_0 | — | 决策卡 |
-| __ 元 | Entry 入场区间 | 空仓者（仅 BUY/OVERWEIGHT 评级时填）| Trade Ticket |
-| __ 元 | TP1/TP2/TP3 | 持仓者止盈 | Trade Ticket |
-| __ 元 | SL_soft 软止损 | 持仓者预警减半 | Trade Ticket |
-| __ 元 | SL_hard 硬止损 | 持仓者全清 | Trade Ticket |
-| __ 元 | Scenario B 减仓位 | 持仓者按 cost basis 分支 | 操作动作表 |
-| 反向证伪触发条件（**禁止给具体价位**）| 评级翻转 | 触发后重新评估 | 第八步 |
-
-**一致性检查清单（必须逐条回答）**：
-
-1. 是否存在同一价位同时出现在"持仓清仓"和"空仓建仓"两个角色？是 / 否
-   - 如是 → 必须修改其中之一（推荐：让反向证伪改为只写触发条件，不给价位）
-2. 反向证伪段是否给了具体价位区间？是 / 否
-   - 如是 → 改为触发条件（如 "RSI <30 + 日线企稳" 而非 "回调至 220-230"）
-3. Scenario A（空仓者）section 是否混入了"清仓/减仓"指令？是 / 否
-   - 如是 → 删除（空仓者无仓可减）
-4. Scenario B（持仓者）section 是否混入了"建仓/加仓"指令？是 / 否
-   - 如是 → 删除（持仓者不讨论新建仓）
-5. 三档 cost basis 分支是否相互独立（深度盈利 / 持平 / 深度套牢）？是 / 否
-
-**结论**：[全部通过] / [存在 N 项冲突，已修正]
-```
-
-这是参考真实头部投研团队（高盛/桥水/Citadel）做法的关键约束——**没有这个自检，LLM 会反复出现"230 元清仓 + 230 元建仓"的逻辑矛盾**。
+⚠️ 没有这个自检，过往报告反复出现"230 元清仓 + 230 元建仓"的逻辑矛盾。
 
 ---
 
@@ -561,13 +552,6 @@ PM 必须明确推荐其中之一，并解释理由。
 
 ---
 
-## 关键原则
-
-- **事实校验**：风控辩论各方对同一数据有不同解读时，以 RM 引用数据为准
-- **PE/EPS 估值**：以分析师报告中"系统计算"值为准
-- **数学优先**：R-multiple、Conviction、情景概率必须显式计算，禁止凭感觉
-- **完整性**：所有 11 个章节必须输出，HOLD/UNDERWEIGHT/SELL 时 Entry 字段填 "—" 但其他不准省略
-
 {RISK_DEBATE_PHRASING_RULES}
 
 **重要**：请用中文撰写。评级关键词、股票代码、交易术语（Action/Size/R/TP/SL/Time Stop）保留英文但带中文注释。
@@ -593,11 +577,11 @@ PM_SUMMARY:
   pm_size_high_pct: <float>              # 仓位区间上沿百分比
   pm_entry_low: <float or null>          # BUY/OVERWEIGHT 时必填；HOLD/UNDERWEIGHT/SELL 填 null
   pm_entry_high: <float or null>
-  pm_tp1: <float or null>                # 持仓者止盈位 1（针对所有评级都计算 R-multiple）
-  pm_tp2: <float or null>
-  pm_tp3: <float or null>
-  pm_sl_soft: <float or null>
-  pm_sl_hard: <float or null>
+  pm_tp1: <float>                        # ⛔ 持仓者止盈位 1（所有评级都必填具体数字，禁止 null）
+  pm_tp2: <float>                        # ⛔ 持仓者止盈位 2（所有评级都必填具体数字，禁止 null）
+  pm_tp3: <float>                        # ⛔ 持仓者止盈位 3（所有评级都必填具体数字，禁止 null）
+  pm_sl_soft: <float>                    # ⛔ 软止损（所有评级都必填具体数字，禁止 null）
+  pm_sl_hard: <float>                    # ⛔ 硬止损（所有评级都必填具体数字，禁止 null）
   pm_horizon_months_low: <int>           # Time Stop 时间窗口下沿（月）
   pm_horizon_months_high: <int>          # Time Stop 时间窗口上沿
   pm_rating_adjusted_from_rm: <bool>     # PM 是否相对 RM 评级做了 ±1 档微调

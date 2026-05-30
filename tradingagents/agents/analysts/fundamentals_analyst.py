@@ -249,39 +249,15 @@ def create_fundamentals_analyst(llm):
 ### 八、成长性分析
 分析营收增长率、净利润增长率等成长指标的近几期变化，判断成长性趋势及可持续性。
 
-⚠️ **growth_yoy_revenue / growth_yoy_profit 计算要求（必读）**：
-
-- **优先采用 raw_data 中现成的"营收/净利润同比增长率"字段**（如 fundamentals 报告里的"营业收入同比增长率(%)"、"净利润同比增长率(%)"）
-- **若现成字段缺失**（如 fundamentals.SUMMARY 里 growth_yoy_profit 是 null），**必须自行计算**：
-  - 公式：`同比增速 = (本期数 − 去年同期数) / |去年同期数| × 100%`
-  - 数据来源：raw_data 中的 income_statement（利润表，应包含多个报告期）
-  - 同比基期：Q1 对去年 Q1、年度对去年年度
-  - 显式展开：'营业收入 2026Q1 = X 亿元 vs 2025Q1 = Y 亿元，同比 +Z%'
-- **只有当 raw_data 中确实没有去年同期数据时才填 null**（例如新上市不满一年的标的）
-- ⛔ **禁止偷懒填 null**：当 income_statement 中明显有多期数据时，必须自算并填具体数值
-- 若涉及扣非净利润，**必须区分**：growth_yoy_profit_reported（归母净利润同比）vs growth_yoy_profit_recurring（扣非净利润同比）
-
-**growth_yoy_profit_recurring（扣非净利润同比）计算要求**：
-- raw_data 中通常包含"扣非每股收益(元)"字段（多个报告期）
-- **自算方式**：扣非净利润 = 扣非每股收益 × 总股本（总股本可从 fundamentals 报告"总股本"或 share_capital 字段获取）
-- 同比公式：`(本期扣非净利 − 去年同期扣非净利) / |去年同期扣非净利| × 100%`
-- 显式展开：'扣非净利 2026Q1 = 扣非 EPS X × 总股本 N = Y 亿元 vs 2025Q1 = Z 亿元，同比 +W%'
-- 仅当扣非每股收益字段缺失时才填 null
-- ⛔ **禁止偷懒填 null**：raw_data 里几乎一定有扣非 EPS 数据，没数据再填 null
+⚠️ **同比增速计算（强制）**：
+- 优先采用 raw_data 现成的"营收/净利润同比增长率"字段；缺失时**必须**调 `compute_yoy_growth`（公式 `(本期 − 去年同期)/|去年同期|×100%`，基期 Q1 对 Q1、年度对年度），并显式展开 'X 亿元 vs Y 亿元，同比 +Z%'
+- 区分 `growth_yoy_profit_reported`（归母）vs `growth_yoy_profit_recurring`（扣非，调 `compute_recurring_profit_yoy`：扣非 EPS × 总股本 → 同比）
+- ⛔ raw_data 里几乎一定有多期数据和扣非 EPS，**禁止偷懒填 null**——只有真没有去年同期数据时才允许 null
 
 ### 九、现金流分析
 分析经营性现金流、投资性现金流、筹资性现金流的规模和趋势，重点关注经营性现金流与净利润的匹配度（盈利质量）。
 
-**自由现金流（FCF）计算要求**（必读）：
-- FCF 是衡量公司"赚到真钱"能力的核心指标——下游 RM 估值时会用到
-- raw_data 的 cashflow 报告中通常**两个关键字段都有**：
-  - 经营性现金流净额（OCF）：cashflow 报告里"经营活动产生的现金流量净额"
-  - 资本开支（CapEx）：cashflow 报告里"购建固定资产、无形资产和其他长期资产支付的现金"
-- **自算公式**：`FCF = OCF − CapEx`
-- 显式展开：'FCF 2026Q1 = OCF X 亿 − CapEx Y 亿 = Z 亿元'
-- 若多个季度都能算，给出 TTM 自由现金流（4 季度累加）和环比趋势
-- ⛔ **禁止偷懒填"数据不可用，需计算"**：raw_data 的 cashflow 几乎一定有 OCF 和 CapEx 两个字段，必须自算
-- 仅当 cashflow 报告整段为空（如 ETF）时才填"不适用"
+**FCF 计算（强制）**：必须调 `compute_fcf`（公式 `FCF = OCF − CapEx`，分别取 cashflow 里"经营活动现金流量净额"和"购建固定资产/无形资产/其他长期资产支付的现金"），显式展开 'FCF Q = OCF X − CapEx Y = Z 亿'，多季度时给 TTM 累加和环比。⛔ raw_data 几乎一定有 OCF/CapEx 两字段，**禁止填"数据不可用"**——只有 cashflow 整段为空（如 ETF）才允许"不适用"。
 
 ### 十、投资建议与风险提示
 基于以上分析，给出明确的基本面判断（正面/中性/负面），列出 2-3 个核心支撑论据和 1-2 个主要风险点。

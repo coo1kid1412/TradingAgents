@@ -1,6 +1,7 @@
 import logging
 import queue
 import threading
+import time
 from typing import Annotated
 
 # Import from vendor-specific modules
@@ -266,7 +267,14 @@ def route_to_vendor(method: str, *args, **kwargs):
 
     每个供应商调用受 _VENDOR_CALL_TIMEOUT 秒壁钟超时保护，
     超时后自动 fallback 到下一个供应商，防止进程无限阻塞。
+
+    Tushare 限流时会自动等待并重试（如1次/分钟限流→等待65秒后重试），
+    即使等待时间超过壁钟超时，也优先保证从 Tushare 获取高质量数据。
+    限流重试最多 2 次，全部失败后才降级到下一个供应商。
+    但基本面数据方法的限流重试在 _safe_call 内部处理。
     """
+    import time as _time  # 函数内导入，避免模块级缓存问题
+
     if method not in VENDOR_METHODS:
         raise ValueError(f"Method '{method}' not supported")
 
@@ -295,6 +303,16 @@ def route_to_vendor(method: str, *args, **kwargs):
             if vendor not in fallback_vendors:
                 fallback_vendors.append(vendor)
 
+    # 重试配置
+    _RETRY_WAIT = 3  # 重试前等待秒数
+
+    # 基本面数据方法不重试 Tushare（失败通常是权限/积分不足，重试无意义）
+    _NO_TUSHARE_RETRY_METHODS = {
+        "get_fundamentals", "get_balance_sheet",
+        "get_cashflow", "get_income_statement",
+        "get_insider_transactions",  # stk_holdertrade 需要 2000+ 积分权限
+    }
+
     last_error = None
     for vendor in fallback_vendors:
         if vendor not in VENDOR_METHODS[method]:
@@ -303,24 +321,73 @@ def route_to_vendor(method: str, *args, **kwargs):
         vendor_impl = VENDOR_METHODS[method][vendor]
         impl_func = vendor_impl[0] if isinstance(vendor_impl, list) else vendor_impl
 
-        try:
-            return _call_with_timeout(
-                impl_func, _VENDOR_CALL_TIMEOUT, *args, **kwargs
-            )
-        except TimeoutError as e:
-            last_error = e
-            logger.warning(
-                "[route_to_vendor] %s → %s 超时（%ds），fallback 到下一个供应商",
-                method, vendor, _VENDOR_CALL_TIMEOUT,
-            )
-            continue
-        except (AlphaVantageRateLimitError, VendorRateLimitError,
-                VendorUnavailableError, YFRateLimitError) as e:
-            last_error = e
-            continue  # 限流或不可用时 fallback 到下一个供应商
-        except Exception as e:
-            last_error = e
-            continue  # 其他异常（参数错误、网络超时等）也 fallback
+        # Tushare 允许重试 1 次，但基本面方法不重试；其他供应商不重试
+        if vendor == "tushare" and method not in _NO_TUSHARE_RETRY_METHODS:
+            max_attempts = 2
+        else:
+            max_attempts = 1
+
+        for attempt in range(max_attempts):
+            _t_vendor_start = _time.time()
+            try:
+                _result = _call_with_timeout(
+                    impl_func, _VENDOR_CALL_TIMEOUT, *args, **kwargs
+                )
+                # 记录成功的 vendor 调用耗时
+                try:
+                    from tradingagents.profiling import record_vendor
+                    record_vendor(method, vendor, _time.time() - _t_vendor_start, ok=True)
+                except Exception:
+                    pass
+                return _result
+            except TimeoutError as e:
+                last_error = e
+                try:
+                    from tradingagents.profiling import record_vendor
+                    record_vendor(method, vendor, _time.time() - _t_vendor_start, ok=False)
+                except Exception:
+                    pass
+                if attempt < max_attempts - 1:
+                    logger.warning(
+                        "[route_to_vendor] %s → %s 超时（%ds），重试 %d/1",
+                        method, vendor, _VENDOR_CALL_TIMEOUT, attempt + 1,
+                    )
+                    _time.sleep(_RETRY_WAIT)
+                    continue
+                logger.warning(
+                    "[route_to_vendor] %s → %s 超时（%ds），fallback 到下一个供应商",
+                    method, vendor, _VENDOR_CALL_TIMEOUT,
+                )
+            except (AlphaVantageRateLimitError, VendorRateLimitError,
+                    VendorUnavailableError, YFRateLimitError) as e:
+                last_error = e
+                try:
+                    from tradingagents.profiling import record_vendor
+                    record_vendor(method, vendor, _time.time() - _t_vendor_start, ok=False)
+                except Exception:
+                    pass
+                if attempt < max_attempts - 1:
+                    logger.warning(
+                        "[route_to_vendor] %s → %s 限流/不可用，重试 %d/1: %s",
+                        method, vendor, attempt + 1, e,
+                    )
+                    _time.sleep(_RETRY_WAIT)
+                    continue
+            except Exception as e:
+                last_error = e
+                try:
+                    from tradingagents.profiling import record_vendor
+                    record_vendor(method, vendor, _time.time() - _t_vendor_start, ok=False)
+                except Exception:
+                    pass
+                if attempt < max_attempts - 1:
+                    logger.warning(
+                        "[route_to_vendor] %s → %s 失败，重试 %d/1: %s",
+                        method, vendor, attempt + 1, e,
+                    )
+                    _time.sleep(_RETRY_WAIT)
+                    continue
+            break  # 跳出 attempt 循环，进入下一个 vendor
 
     raise RuntimeError(
         f"方法 '{method}' 所有数据供应商均失败"
