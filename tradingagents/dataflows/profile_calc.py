@@ -844,25 +844,47 @@ def parse_growth_deceleration(fund_str: str) -> Optional[str]:
     import re
     if not fund_str:
         return None
-    # 营收同比增速行，抓前两个百分比（最近季、年度）；标签前后可能带 **
+    # 路径1：营收同比增速 两列（最近季 | 年度），比较得方向
     m = re.search(
         r"营(?:业收入|收)同比\s*(?:增速|增长率)?\s*\*{0,2}\s*\|\s*"
         r"\*{0,2}([+-]?[0-9.]+)%\*{0,2}\s*\|\s*\*{0,2}([+-]?[0-9.]+)%",
         fund_str,
     )
-    if not m:
-        return None
-    try:
-        q, annual = float(m.group(1)), float(m.group(2))
-    except ValueError:
-        return None
-    if annual <= 0:
-        return None
-    if q < annual * 0.6:        # 最近季显著低于年度 → 减速
-        return "decelerating"
-    if q >= annual * 0.95:      # 最近季持平/高于年度 → 加速/平稳高位
-        return "accelerating"
-    return "stable"
+    if m:
+        try:
+            q, annual = float(m.group(1)), float(m.group(2))
+            if annual > 0:
+                if q < annual * 0.6:
+                    return "decelerating"
+                if q >= annual * 0.95:
+                    return "accelerating"
+                return "stable"
+        except ValueError:
+            pass
+
+    # 路径2：只有最近季（单季）增速——格式如 "营收同比增速(Q1单季) | 4.58%" 或散文 "Q1营收仅同比+4.58%"
+    # 没有年度基线时，用绝对水平判：单季营收增速 <15% = 弱/减速（高 PE 成长股的红旗）；≥45% = 强
+    # 用 [^0-9%\n] 排除数字，避免贪婪回溯误抓单个数字（如把 +58% 抓成 8）
+    mq = re.search(
+        r"(?:Q[1-4]|单季|最近季)[^0-9%\n]{0,8}营(?:业收入|收)[^0-9%\n]{0,8}同比[^0-9%\n]{0,4}([+-]?[0-9.]+)%",
+        fund_str,
+    )
+    if not mq:
+        mq = re.search(
+            r"营(?:业收入|收)同比增速\s*[(（]\s*Q[1-4]\s*单季\s*[)）]\s*\|\s*\*{0,2}([+-]?[0-9.]+)%",
+            fund_str,
+        )
+    if mq:
+        try:
+            q1 = float(mq.group(1))
+            if q1 < 15.0:
+                return "decelerating"   # 单季营收个位数/十几→弱（澜起 4.58% 即此）
+            if q1 >= 45.0:
+                return "accelerating"
+            return "stable"
+        except ValueError:
+            pass
+    return None
 
 
 # 减持/机构减仓正向证据词（排除否定语境）

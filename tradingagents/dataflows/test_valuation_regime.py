@@ -149,6 +149,10 @@ def test_parse_growth_deceleration():
     accel = "| 营收同比增速 | +52% | +49% | |"
     assert parse_growth_deceleration(accel) == "accelerating"
     assert parse_growth_deceleration("无相关行") is None
+    # 单季格式（无年度基线）：低单季增速 → 弱/减速（澜起 005034 真实格式）
+    assert parse_growth_deceleration("| 营收同比增速(Q1单季) | 4.58% | — |") == "decelerating"
+    assert parse_growth_deceleration("Q1营收仅同比+4.58%，显著低于") == "decelerating"
+    assert parse_growth_deceleration("Q1营收同比+58%") == "accelerating"
 
 
 def test_parse_distribution_signals():
