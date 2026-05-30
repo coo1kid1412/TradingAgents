@@ -1145,11 +1145,13 @@ def get_capital_flow(
         "moneyflow_df": None,
         "circulating_market_value_yi": None,
         "lhb_count_30d": None,
+        "lhb_inst_net_buy_30d_yi": None,
         "latest_trade_date": end_compact,
         "data_source_breakdown": {
             "moneyflow": "missing",
             "circ_mv": "missing",
             "lhb": "missing",
+            "lhb_inst": "missing",
         },
     }
 
@@ -1214,6 +1216,29 @@ def get_capital_flow(
             out["data_source_breakdown"]["lhb"] = "akshare"
     except Exception as e:
         logger.info("get_capital_flow(akshare): 龙虎榜接口失败: %s", e)
+
+    # 子调用 4: 龙虎榜机构 30 日净买（机构买卖每日统计，按机构净额判方向）
+    # 防御式：akshare 接口名/列名偶有变动，对不上则留 None（投票走 X，不阻塞）。
+    try:
+        end_dt = datetime.strptime(end_date, "%Y-%m-%d")
+        start_compact = (end_dt - timedelta(days=30)).strftime("%Y%m%d")
+        jg = (
+            ak.stock_lhb_jgmmtj_em(start_date=start_compact, end_date=end_compact)
+            if hasattr(ak, "stock_lhb_jgmmtj_em") else None
+        )
+        if jg is not None and not jg.empty and "代码" in jg.columns:
+            rows = jg[jg["代码"].astype(str) == code]
+            net_col = next((c for c in ("机构买入净额", "净额", "机构净买额") if c in rows.columns), None)
+            if not rows.empty and net_col is not None:
+                # akshare 该接口金额单位为元 → 亿元
+                net_yi = float(rows[net_col].astype(float).sum()) * 1e-8
+                out["lhb_inst_net_buy_30d_yi"] = round(net_yi, 4)
+                out["data_source_breakdown"]["lhb_inst"] = "akshare"
+            elif rows.empty:
+                out["lhb_inst_net_buy_30d_yi"] = 0.0
+                out["data_source_breakdown"]["lhb_inst"] = "akshare"
+    except Exception as e:
+        logger.info("get_capital_flow(akshare): 机构买卖统计接口失败: %s", e)
 
     if out["moneyflow_df"] is None and out["circulating_market_value_yi"] is None:
         raise AKShareError(

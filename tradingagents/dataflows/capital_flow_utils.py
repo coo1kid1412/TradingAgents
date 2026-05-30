@@ -32,6 +32,8 @@ YI_TO_WAN = 1e4   # 亿元 → 万元
 _RETAIL_HIGH_RATE_PCT = 65.0
 # 主力派发：连续净流出 ≥ 3 日（收紧自旧逻辑的 streak<0，消除 streak=-1 虚假票）
 _STREAK_DISTRIBUTION = -3
+# 龙虎榜机构净买方向阈值：30 日机构净买额绝对值 ≥ 此值（亿元）才算明确方向，否则 0（去零附近噪音）
+_LHB_INST_NET_THRESHOLD_YI = 0.05
 
 
 # ---------------------------------------------------------------------------
@@ -360,19 +362,40 @@ def compute_holder_number_metrics(holder_df: Optional[pd.DataFrame]) -> dict:
 # ---------------------------------------------------------------------------
 # 4. 龙虎榜计数（30 天）
 # ---------------------------------------------------------------------------
-def compute_lhb_metrics(lhb_count_30d: Optional[int]) -> dict:
-    """龙虎榜上榜次数（30 天累计）。
+def compute_lhb_metrics(
+    lhb_count_30d: Optional[int],
+    lhb_inst_net_buy_30d_yi: Optional[float] = None,
+) -> dict:
+    """龙虎榜：上榜次数（关注度）+ 机构席位净买方向（真方向信号）。
+
+    上榜次数本身是"异动/关注度"，不代表方向（机构出货/游资派发同样上榜）。
+    方向由机构专用席位 30 日净买额定：净买→+1 / 净卖→-1 / 持平→0 / 缺失→None。
 
     Args:
-        lhb_count_30d: 30 天上榜次数；缺失返回 None
+        lhb_count_30d: 30 天上榜次数；缺失返回 None（仅作关注度展示）
+        lhb_inst_net_buy_30d_yi: 30 天龙虎榜机构席位净买额（亿元）；缺失 None
 
     Returns:
         dict:
-        - lhb_count_30d : int 或 None
+        - lhb_count_30d            : int 或 None（关注度，不投方向）
+        - lhb_inst_net_buy_30d_yi  : float 或 None
+        - lhb_inst_direction       : -1 / 0 / +1 / None（投票依据）
     """
-    if lhb_count_30d is None:
-        return {"lhb_count_30d": None}
-    return {"lhb_count_30d": int(lhb_count_30d)}
+    out: dict = {
+        "lhb_count_30d": int(lhb_count_30d) if lhb_count_30d is not None else None,
+        "lhb_inst_net_buy_30d_yi": (
+            round(float(lhb_inst_net_buy_30d_yi), 4) if lhb_inst_net_buy_30d_yi is not None else None
+        ),
+        "lhb_inst_direction": None,
+    }
+    if lhb_inst_net_buy_30d_yi is not None:
+        if lhb_inst_net_buy_30d_yi > _LHB_INST_NET_THRESHOLD_YI:
+            out["lhb_inst_direction"] = 1
+        elif lhb_inst_net_buy_30d_yi < -_LHB_INST_NET_THRESHOLD_YI:
+            out["lhb_inst_direction"] = -1
+        else:
+            out["lhb_inst_direction"] = 0
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -420,7 +443,8 @@ def compute_capital_flow_regime(metrics: dict) -> dict:
     1. streak（连续天数）：≥+3 投 +；≤-3 投 -；≤-5 单维度即可触发"恶化独立票"
     2. ddx_pct_1y（DDX 1 年分位）：≥80 投 +；≤20 投 -
     3. northbound_5d_direction：+1 投 +；-1 投 -；0 投 0；data_status=stale/missing 投 X
-    4. lhb_count_30d：≥2 投 +（短线资金活跃，倾向多头解读）；缺失投 X
+    4. lhb_inst_direction（龙虎榜机构席位净买方向）：+1 投 +；-1 投 -；0 投 0；缺失投 X
+       （上榜次数 lhb_count_30d 仅作关注度展示，不投方向）
     5. retail（小单+中单买占比）：≥65% 且 streak≤-3 → 投 -（散户高接盘）；其他 0
 
     Regime 判定：
@@ -480,10 +504,11 @@ def compute_capital_flow_regime(metrics: dict) -> dict:
         else:
             votes["northbound"] = "0"
 
-    # 4. lhb（30 日上榜数 ≥2 倾向多头活跃）
-    lhb = metrics.get("lhb_count_30d")
-    if lhb is not None:
-        votes["lhb"] = "+" if lhb >= 2 else "0"
+    # 4. lhb（机构席位方向：净买→+ / 净卖→- / 持平→0 / 缺失→X）
+    #    不再用"上榜次数≥2→多头"——上榜是异动/关注度，不是方向
+    lhb_dir = metrics.get("lhb_inst_direction")
+    if lhb_dir is not None:
+        votes["lhb"] = "+" if lhb_dir > 0 else ("-" if lhb_dir < 0 else "0")
 
     # 5. retail（散户高接盘：主力派发 streak≤-3 + 散户买占比≥65% → 投 -）
     #    用真实小单+中单买占比，不再用恒等 1.0 的旧 retail_takeover_ratio；
@@ -643,6 +668,7 @@ def assemble_capital_flow_metrics(
     holder_df: Optional[pd.DataFrame] = None,
     circulating_market_value_yi: Optional[float] = None,
     lhb_count_30d: Optional[int] = None,
+    lhb_inst_net_buy_30d_yi: Optional[float] = None,
     latest_trade_date: Optional[str] = None,
 ) -> dict:
     """一次性组装所有资金流字段（含 regime 与 cf_score）。
@@ -661,7 +687,7 @@ def assemble_capital_flow_metrics(
     metrics.update(compute_dde_like_metrics(moneyflow_df, circulating_market_value_yi))
     metrics.update(compute_northbound_metrics(north_df, latest_trade_date=latest_trade_date))
     metrics.update(compute_holder_number_metrics(holder_df))
-    metrics.update(compute_lhb_metrics(lhb_count_30d))
+    metrics.update(compute_lhb_metrics(lhb_count_30d, lhb_inst_net_buy_30d_yi))
     metrics.update(compute_retail_amount_rate(moneyflow_df))
 
     # 散户接盘信号（真实小单+中单买占比 + 主力派发，替代恒等 1.0 的旧 ratio）
@@ -697,7 +723,9 @@ FIELD_LABEL_ZH: dict[str, str] = {
     "northbound_20d_direction":         "北向资金20日方向",
     "northbound_data_status":           "北向数据状态",
     "northbound_latest_date":           "北向最新数据日期",
-    "lhb_count_30d":                    "龙虎榜30日上榜次数",
+    "lhb_count_30d":                    "龙虎榜30日上榜次数(关注度)",
+    "lhb_inst_net_buy_30d_yi":          "龙虎榜机构30日净买(亿)",
+    "lhb_inst_direction":               "龙虎榜机构净买方向",
     "holder_num_latest":                "最新股东户数",
     "holder_num_qoq_pct":               "户数环比变化(%)",
     "holder_num_4q_trend":              "户数4季度趋势",

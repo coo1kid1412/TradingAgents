@@ -109,6 +109,8 @@ _REPORT_FIELD_GROUPS: list[tuple[str, list[str]]] = [
     ]),
     ("四、龙虎榜与股东户数", [
         "lhb_count_30d",
+        "lhb_inst_net_buy_30d_yi",
+        "lhb_inst_direction",
         "holder_num_latest",
         "holder_num_qoq_pct",
         "holder_num_4q_trend",
@@ -273,6 +275,7 @@ def create_capital_flow_node():
             holder_df=holder_df,
             circulating_market_value_yi=cap_data.get("circulating_market_value_yi"),
             lhb_count_30d=cap_data.get("lhb_count_30d"),
+            lhb_inst_net_buy_30d_yi=cap_data.get("lhb_inst_net_buy_30d_yi"),
             latest_trade_date=cap_data.get("latest_trade_date"),
         )
 
