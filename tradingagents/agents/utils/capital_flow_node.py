@@ -98,8 +98,8 @@ _REPORT_FIELD_GROUPS: list[tuple[str, list[str]]] = [
         "net_inflow_streak_days",
     ]),
     ("二、散户参与度", [
-        "retail_takeover_ratio",
         "retail_buy_amount_rate_5d_pct",
+        "retail_concentration_signal",
     ]),
     ("三、北向资金", [
         "northbound_5d_direction",
