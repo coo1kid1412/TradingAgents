@@ -234,6 +234,28 @@ def test_recurring_loss_kills_earnings_leg():
     assert r["legs"]["earnings"] == -1, r
 
 
+def test_growth_quality_uses_latest_period_dedt():
+    """_format_growth_indicators：年报扣非为正但最新一期扣非转亏 → recurring_loss=yes（捕捉近期恶化）。"""
+    import pandas as pd
+    from tradingagents.dataflows.tushare_vendor import _format_growth_indicators
+    # 淳中式：FY2024 扣非 +2.8亿 / Q1 2026 最新一期扣非 -0.35亿
+    df = pd.DataFrame([
+        {"end_date": "20241231", "q_sales_yoy": 10, "q_netprofit_yoy": 195, "or_yoy": 20,
+         "netprofit_yoy": 235, "dt_netprofit_yoy": 195, "profit_dedt": 2.8e8},
+        {"end_date": "20260331", "q_sales_yoy": 14, "q_netprofit_yoy": -50, "or_yoy": 14,
+         "netprofit_yoy": -50, "dt_netprofit_yoy": -120, "profit_dedt": -0.35e8},
+    ])
+    assert "recurring_loss=yes" in _format_growth_indicators(df)
+    # 健康公司：年报+最新均正 → no
+    df2 = pd.DataFrame([
+        {"end_date": "20241231", "q_sales_yoy": 40, "q_netprofit_yoy": 50, "or_yoy": 40,
+         "netprofit_yoy": 50, "dt_netprofit_yoy": 48, "profit_dedt": 20e8},
+        {"end_date": "20260331", "q_sales_yoy": 45, "q_netprofit_yoy": 55, "or_yoy": 45,
+         "netprofit_yoy": 55, "dt_netprofit_yoy": 52, "profit_dedt": 6e8},
+    ])
+    assert "recurring_loss=no" in _format_growth_indicators(df2)
+
+
 def test_parse_growth_quality():
     sysline = ("【SYS_GROWTH_QUALITY｜扣非口径成长质量，下游前瞻路由/盈利腿直读】 "
                "扣非净利=-0.35亿(负) | recurring_loss=yes | 扣非净利YoY年度=-12.00%\n")
