@@ -974,21 +974,26 @@ def compute_valuation_regime(
     theme_stage_inferred: Optional[str] = None,
     quant_anticrowding: Optional[float] = None,
     distribution_detected: bool = False,
+    capital_flow_score: Optional[float] = None,
 ) -> dict:
     """客观估值 regime（骑趋势 / 中性 / 收纪律）——六路分析师信号合成，纯 Python 确定性。
 
-    对标投研：决定"贵要不要紧 / 骑还是收"的不是估值本身，而是基本面盈利动能 + 技术趋势 +
-    资金面方向 + 舆情拥挤 + 主题阶段 + 派发证据 的合成。估值锚只回答"贵不贵"，姿态由此 regime 定。
+    原则：每条腿**客观反映该信号本意**（对标投研），不带"该升该降"先验。
+    决定"贵要不要紧 / 骑还是收"的不是估值本身，而是 盈利动能 + 技术趋势 + 资金面 +
+    舆情拥挤 + 主题阶段 + 派发证据 的合成。
 
     六路，每路投 +1(ride)/0/-1(discipline)：
       1 技术/动量：强趋势且未极端超买 → +1；破位/弱 或 极端超买顶 → -1
-      2 资金面  ：强势/机构净买/主力连续净流入 → +1；恶化/机构净卖/主力连续净流出 → -1
-      3 盈利动能：高增速且不减速 → +1；**减速** 或 增速停滞(<10%) → -1（用 growth_direction，比纯水平准）
+      2 资金面  ：用连续 capital_flow_score(≥60→+1/≤40→-1) + 强势/机构净买/主力连续净流入(+1)、
+                  恶化/机构净卖/主力连续净流出(-1)；流出优先
+      3 盈利动能：高增速(≥40%)且不减速 → +1（含高位稳定增长，投研认可可持续高增）；
+                  减速 或 停滞(<10%) → -1
       4 舆情拥挤：不拥挤(anticrowding≥60) → +1；拥挤+散户高接盘 → -1
       5 主题阶段：acceleration → +1；peak/fading 或 peak信号 → -1
-      6 派发证据：大股东/机构减持、折价询价转让、筹码分散 → -1（澜起式最硬看空证据；只投负）
+      6 派发证据：大股东/机构减持等 → -1；**但当下资金面强流入时视为已被吸收/陈旧，不投**
+                  （净当前持仓口径：smart money 在吸筹时，旧减持非红旗）
 
-    合成：净分 ≥ +3 → ride（需 3 路净正才放松 cap，保守）；≤ -2 → discipline；其余 neutral。
+    合成：净分 ≥ +2 → ride；≤ -2 → discipline；其余 neutral（对称，无方向先验）。
     peak 信号强制触发时，ride 降级为 neutral（不骑进顶部）。
 
     Returns: {valuation_regime, score, legs:{...}, reasoning}
@@ -1005,29 +1010,37 @@ def compute_valuation_regime(
         else:
             legs["tech"] = 0
 
-    # 2 资金面
+    # 2 资金面：用连续 score（信息量大于"强势/恶化"标签）+ 方向/streak/机构 共同判
+    strong_inflow = (
+        capital_flow_regime == "强势" or lhb_inst_direction == 1
+        or (main_force_streak_days is not None and main_force_streak_days >= 3)
+        or (capital_flow_score is not None and capital_flow_score >= 60)
+    )
+    strong_outflow = (
+        capital_flow_regime == "恶化" or lhb_inst_direction == -1
+        or (main_force_streak_days is not None and main_force_streak_days <= -3)
+        or (capital_flow_score is not None and capital_flow_score <= 40)
+    )
     cap_vote = 0
-    if capital_flow_regime == "强势" or lhb_inst_direction == 1 or (
-        main_force_streak_days is not None and main_force_streak_days >= 3):
+    if strong_inflow:
         cap_vote = 1
-    if capital_flow_regime == "恶化" or lhb_inst_direction == -1 or (
-        main_force_streak_days is not None and main_force_streak_days <= -3):
-        cap_vote = -1  # 派发信号优先（恶化/机构净卖/主力连续流出）
+    if strong_outflow:
+        cap_vote = -1  # 流出优先
     if (capital_flow_regime is not None or lhb_inst_direction is not None
-            or main_force_streak_days is not None):
+            or main_force_streak_days is not None or capital_flow_score is not None):
         legs["capital"] = cap_vote
 
-    # 3 盈利动能（用增速方向，不再纯看水平——澜起 58% 但减速，旧逻辑误投 +1）
+    # 3 盈利动能（方向优先；高增速且不减速 → +1，含高位稳定增长）
     if net_profit_growth is not None or growth_direction is not None:
         if growth_direction == "decelerating" or (
                 net_profit_growth is not None and net_profit_growth < 0.10):
-            legs["earnings"] = -1            # 减速 / 停滞 → 收
+            legs["earnings"] = -1
         elif growth_direction == "accelerating" or (
-                growth_direction is None and net_profit_growth is not None
-                and net_profit_growth >= 0.40):
-            legs["earnings"] = 1             # 加速 或 (无方向数据时)高增速 → 骑
+                net_profit_growth is not None and net_profit_growth >= 0.40
+                and growth_direction != "decelerating"):
+            legs["earnings"] = 1   # 加速 OR 高增速(≥40%)且未减速（高位稳定也算偏多）
         else:
-            legs["earnings"] = 0             # 平稳 / 增速中等
+            legs["earnings"] = 0
 
     # 4 舆情拥挤
     crowd_vote = 0
@@ -1044,20 +1057,21 @@ def compute_valuation_regime(
         ts = theme_stage_inferred or ""
         if has_peak_signal or "peak" in ts or "fading" in ts:
             legs["theme"] = -1
-        elif ts == "acceleration":  # 仅精确确认的加速；"none_or_acceleration"/"initiation_or_acceleration"
-            legs["theme"] = 1       # 是模糊二选一(LLM定)，不算明确加速，投 0（防误投 ride）
+        elif ts == "acceleration":  # 仅精确确认的加速；模糊二选一不算
+            legs["theme"] = 1
         else:
             legs["theme"] = 0
 
-    # 6 派发证据（减持/机构减仓/折价询价转让 → 只投负，澜起最硬看空证据）
-    if distribution_detected:
+    # 6 派发证据（减持/机构减仓等）→ -1；但当下资金面强流入时视为已被吸收/陈旧，不投
+    #   (净当前持仓口径：天孚主力净流入33亿时，舆情里的旧减仓不是红旗)
+    if distribution_detected and not strong_inflow:
         legs["distribution"] = -1
 
     score = sum(legs.values())
     # 有效路 < 3 → 数据不足，给 neutral（不轻易骑/收）
     if len(legs) < 3:
         regime = "neutral"
-    elif score >= 3:        # 六路：需净 +3（≥3 路同向偏多）才放松 cap，保守
+    elif score >= 2:        # 对称阈值（无方向先验）：净 +2 → ride，-2 → discipline
         regime = "ride"
     elif score <= -2:
         regime = "discipline"

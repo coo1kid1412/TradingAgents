@@ -71,7 +71,8 @@ def test_parse_capital_flow_signals():
          '  net_inflow_streak_days: -6\n  lhb_inst_direction: -1\n'
          '  retail_concentration_signal: "散户高接盘"')
     s = _parse_capital_flow_signals(y)
-    assert s == {"regime": "恶化", "streak": -6, "lhb_inst_dir": -1, "retail_signal": "散户高接盘"}, s
+    assert (s["regime"] == "恶化" and s["streak"] == -6 and s["lhb_inst_dir"] == -1
+            and s["retail_signal"] == "散户高接盘"), s
     # null / 空 容错
     assert _parse_capital_flow_signals("")["regime"] is None
     assert _parse_capital_flow_signals("  retail_concentration_signal: null")["retail_signal"] is None
@@ -132,12 +133,46 @@ def test_lanqi_full_discipline():
     assert r["legs"]["earnings"] == -1 and r["legs"]["distribution"] == -1, r
 
 
-def test_ride_threshold_needs_plus3():
-    """六路阈值：净 +2 仍 neutral（保守），需 +3 才 ride。"""
+def test_ride_threshold_symmetric_plus2():
+    """对称阈值：净 +2 → ride（无方向先验）。"""
     r = compute_valuation_regime(
         momentum_score=80, net_profit_growth=0.5, growth_direction="accelerating",
         capital_flow_regime="中性", theme_stage_inferred="none")  # tech+1, earnings+1 = +2
-    assert r["score"] == 2 and r["valuation_regime"] == "neutral", r
+    assert r["score"] == 2 and r["valuation_regime"] == "ride", r
+
+
+def test_capital_leg_uses_score():
+    """资金面用连续 score：68→+1（即使标签是中性），26→-1。"""
+    up = compute_valuation_regime(momentum_score=55, capital_flow_regime="中性",
+        capital_flow_score=68.0, net_profit_growth=0.2, theme_stage_inferred="none")
+    assert up["legs"]["capital"] == 1, up
+    dn = compute_valuation_regime(momentum_score=55, capital_flow_regime="中性",
+        capital_flow_score=26.0, net_profit_growth=0.2, theme_stage_inferred="none")
+    assert dn["legs"]["capital"] == -1, dn
+
+
+def test_earnings_high_stable_positive():
+    """高位稳定增长(45%, stable)→ +1（不只 accelerating）。"""
+    r = compute_valuation_regime(momentum_score=55, net_profit_growth=0.4579,
+        growth_direction="stable", capital_flow_regime="中性", theme_stage_inferred="none")
+    assert r["legs"]["earnings"] == 1, r
+
+
+def test_distribution_gated_by_inflow():
+    """天孚式：舆情有旧减仓 + 当下主力强流入(score68) → 派发腿不投（已被吸收）。"""
+    r = compute_valuation_regime(
+        momentum_score=80, rsi_percentile_1y=82, capital_flow_regime="中性",
+        capital_flow_score=68.0, main_force_streak_days=4, net_profit_growth=0.4579,
+        growth_direction="stable", theme_stage_inferred="none_or_acceleration",
+        quant_anticrowding=37, distribution_detected=True)
+    assert "distribution" not in r["legs"], r          # 被强流入 gate 掉
+    assert r["valuation_regime"] == "ride", r           # 真趋势票不被误杀
+    # 对照：澜起式无强流入 → 派发腿正常投负
+    r2 = compute_valuation_regime(
+        momentum_score=95, capital_flow_score=26.4, main_force_streak_days=-4,
+        growth_direction="decelerating", net_profit_growth=0.588,
+        theme_stage_inferred="none", distribution_detected=True)
+    assert r2["legs"]["distribution"] == -1 and r2["valuation_regime"] == "discipline", r2
 
 
 # ---------------------------------------------------------------------------

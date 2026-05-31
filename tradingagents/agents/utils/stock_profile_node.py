@@ -161,7 +161,7 @@ def _fetch_fundamentals_raw(ticker: str, trade_date: str) -> str:
 
 def _parse_capital_flow_signals(cf_yaml: str) -> dict:
     """从 capital_flow_yaml 抽 valuation_regime 需要的资金面信号（容错，缺失返回 None）。"""
-    out = {"regime": None, "streak": None, "lhb_inst_dir": None, "retail_signal": None}
+    out = {"regime": None, "streak": None, "lhb_inst_dir": None, "retail_signal": None, "score": None}
     if not cf_yaml:
         return out
 
@@ -186,6 +186,11 @@ def _parse_capital_flow_signals(cf_yaml: str) -> dict:
     out["streak"] = _grab_int("net_inflow_streak_days")
     out["lhb_inst_dir"] = _grab_int("lhb_inst_direction")
     out["retail_signal"] = _grab("retail_concentration_signal")
+    sc = _grab("capital_flow_score")
+    try:
+        out["score"] = float(sc) if sc is not None else None
+    except ValueError:
+        out["score"] = None
     return out
 
 
@@ -371,6 +376,7 @@ def create_stock_profile_node(llm):
             theme_stage_inferred=theme_inferred,
             quant_anticrowding=quant_yaml.get("anticrowding"),
             distribution_detected=dist_sig["detected"],
+            capital_flow_score=cf_sig["score"],
         )
         valuation_regime = regime_info["valuation_regime"]
         if dist_sig["detected"]:
