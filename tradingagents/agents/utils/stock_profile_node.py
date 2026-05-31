@@ -38,6 +38,7 @@ from tradingagents.dataflows.profile_calc import (
     # Layer 1: 硬规则
     parse_eps_ttm,
     detect_forced_valuation_method,
+    recommend_growth_primary_method,
     # Layer 2: 数据参照
     parse_sell_side_pe_consensus,
     compute_self_pe_p80,
@@ -383,6 +384,13 @@ def create_stock_profile_node(llm):
             logger.info("派发证据: %s", dist_sig["reasons"][:3])
         logger.info("valuation_regime: %s | %s", valuation_regime, regime_info["reasoning"])
 
+        # 成长股目标价口径路由：high_beta_growth → 前瞻 PEG 主导（只改权重，不改各腿 EPS 口径）
+        growth_method = recommend_growth_primary_method(
+            style=style, net_profit_growth=net_profit_growth,
+            forced_valuation=forced_valuation, valuation_regime=valuation_regime)
+        logger.info("成长股前瞻路由: recommend=%s | %s",
+                    growth_method["recommend"], growth_method["reason"])
+
         # === 程序化判定结束 ===
 
         # 拼装"已确定字段"展示段，喂给 LLM 当 ground truth
@@ -565,6 +573,23 @@ def create_stock_profile_node(llm):
             )
             prog_lines.append(
                 "- ❌ 严禁：同业中位(TTM) × 前瞻/2026E EPS（双重计入成长 → 目标价虚高 ~50% → 高估值股被错抬成强买）。"
+            )
+
+        # ---- 成长股前瞻路由（high_beta_growth → primary=peg；只改权重不改口径，与上面铁律不冲突）----
+        if growth_method["recommend"] == "peg":
+            prog_lines.append("")
+            prog_lines.append("⛔ **成长股目标价口径路由（high_beta_growth，必须遵守）**：")
+            prog_lines.append(
+                f"- `primary_method` **必须 = peg**（前瞻 EPS×PEG 主导，拿 50% 权重）；"
+                f"`secondary_methods` = [`pe_eps`(TTM，仅作下限参考), `同业可比`/卖方目标价]。"
+            )
+            prog_lines.append(
+                f"- **TTM 口径的 PE×EPS 腿权重压到 ≤20%**（它是后视镜，不该主导快速成长龙头的 12 个月目标）。"
+            )
+            prog_lines.append(f"- 依据：{growth_method['reason']}。权重提示：{growth_method['weight_hint']}。")
+            prog_lines.append(
+                "- ⚠️ 口径不变：PEG 腿仍用前瞻 EPS、PE×EPS/同业腿仍用 TTM EPS（不违反上面反双重计入铁律），"
+                "本路由只调**权重**，不调任何腿的 EPS 口径。PEG 倍数仍受同业锚 + PEG 有界溢价封顶。"
             )
 
         prog_lines.append("")
@@ -861,6 +886,16 @@ TRANSPARENCY:
             f"SYS_VALUATION_REGIME_REASON: {regime_info.get('reasoning', '')}\n"
         )
         logger.info("SYS_VALUATION_REGIME 已注入画像: %s", valuation_regime)
+
+        # 成长股前瞻路由 —— 机器可读，RM Step4 直读决定主方法/权重（防画像 LLM 漂移）
+        if growth_method["recommend"]:
+            content = content + (
+                f"\n<!-- ⚠️SYS_TARGET_PRIMARY｜Python 确定性目标价口径路由，下游 RM Step4 直读勿改 -->\n"
+                f"SYS_TARGET_PRIMARY_METHOD: {growth_method['recommend']}\n"
+                f"SYS_TARGET_WEIGHT_HINT: {growth_method['weight_hint']}\n"
+                f"SYS_TARGET_PRIMARY_REASON: {growth_method['reason']}\n"
+            )
+            logger.info("SYS_TARGET_PRIMARY 已注入画像: %s", growth_method["recommend"])
 
         return {"stock_profile": content}
 

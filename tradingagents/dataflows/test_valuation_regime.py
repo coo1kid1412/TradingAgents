@@ -8,6 +8,7 @@ from tradingagents.dataflows.profile_calc import (
     compute_valuation_regime,
     parse_growth_deceleration,
     parse_distribution_signals,
+    recommend_growth_primary_method,
 )
 from tradingagents.agents.utils.stock_profile_node import (
     _parse_capital_flow_signals,
@@ -188,6 +189,25 @@ def test_parse_growth_deceleration():
     assert parse_growth_deceleration("| 营收同比增速(Q1单季) | 4.58% | — |") == "decelerating"
     assert parse_growth_deceleration("Q1营收仅同比+4.58%，显著低于") == "decelerating"
     assert parse_growth_deceleration("Q1营收同比+58%") == "accelerating"
+
+
+def test_growth_primary_routing():
+    """成长股前瞻路由：high_beta_growth+正增速+非discipline → peg；其余不介入。"""
+    off = {"force_valuation": False}
+    # 中际旭创/天孚式 → peg
+    assert recommend_growth_primary_method("high_beta_growth", 1.0, off, "ride")["recommend"] == "peg"
+    assert recommend_growth_primary_method("high_beta_growth", 0.4579, off, "ride")["recommend"] == "peg"
+    assert recommend_growth_primary_method("high_beta_growth", 0.30, off, "neutral")["recommend"] == "peg"
+    # 负增速/缺失/低增速 → 不介入（防 PEG 失真）
+    assert recommend_growth_primary_method("high_beta_growth", -0.05, off, "ride")["recommend"] is None
+    assert recommend_growth_primary_method("high_beta_growth", None, off, "ride")["recommend"] is None
+    assert recommend_growth_primary_method("high_beta_growth", 0.10, off, "ride")["recommend"] is None
+    # discipline（基本面恶化）→ 不前瞻主导
+    assert recommend_growth_primary_method("high_beta_growth", 0.6, off, "discipline")["recommend"] is None
+    # 非成长 style → 不介入
+    assert recommend_growth_primary_method("blue_chip", 0.3, off, "ride")["recommend"] is None
+    # forced_valuation（亏损/银行）→ 不介入
+    assert recommend_growth_primary_method("high_beta_growth", 0.3, {"force_valuation": True}, "ride")["recommend"] is None
 
 
 def test_parse_distribution_signals():
