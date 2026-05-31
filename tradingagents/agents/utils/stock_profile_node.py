@@ -39,6 +39,7 @@ from tradingagents.dataflows.profile_calc import (
     parse_eps_ttm,
     detect_forced_valuation_method,
     recommend_growth_primary_method,
+    parse_growth_quality,
     # Layer 2: 数据参照
     parse_sell_side_pe_consensus,
     compute_self_pe_p80,
@@ -364,6 +365,7 @@ def create_stock_profile_node(llm):
         cf_sig = _parse_capital_flow_signals(capital_flow_yaml)
         growth_dir = parse_growth_deceleration(fundamentals_report + "\n" + fund_raw)
         dist_sig = parse_distribution_signals(news_report, fundamentals_report, sentiment_report)
+        gq = parse_growth_quality(fund_raw + "\n" + fundamentals_report)  # 扣非口径成长质量
         regime_info = compute_valuation_regime(
             momentum_score=momentum_score,
             rsi_percentile_1y=price_signals.get("rsi_percentile_1y"),
@@ -378,6 +380,7 @@ def create_stock_profile_node(llm):
             quant_anticrowding=quant_yaml.get("anticrowding"),
             distribution_detected=dist_sig["detected"],
             capital_flow_score=cf_sig["score"],
+            recurring_loss=gq["recurring_loss"],
         )
         valuation_regime = regime_info["valuation_regime"]
         if dist_sig["detected"]:
@@ -385,11 +388,13 @@ def create_stock_profile_node(llm):
         logger.info("valuation_regime: %s | %s", valuation_regime, regime_info["reasoning"])
 
         # 成长股目标价口径路由：high_beta_growth → 前瞻 PEG 主导（只改权重，不改各腿 EPS 口径）
+        # 先过"成长质量闸"：扣非亏损/基数效应增速 → 不走前瞻 PEG（防淳中式价值陷阱）
         growth_method = recommend_growth_primary_method(
             style=style, net_profit_growth=net_profit_growth,
-            forced_valuation=forced_valuation, valuation_regime=valuation_regime)
-        logger.info("成长股前瞻路由: recommend=%s | %s",
-                    growth_method["recommend"], growth_method["reason"])
+            forced_valuation=forced_valuation, valuation_regime=valuation_regime,
+            recurring_loss=gq["recurring_loss"], deducted_yoy=gq["deducted_yoy"])
+        logger.info("成长股前瞻路由: recommend=%s | 扣非亏损=%s | %s",
+                    growth_method["recommend"], gq["recurring_loss"], growth_method["reason"])
 
         # === 程序化判定结束 ===
 

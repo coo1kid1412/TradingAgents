@@ -352,6 +352,8 @@ def _format_growth_indicators(fina) -> str:
     字段（tushare fina_indicator 标准列）：
     - q_sales_yoy / q_netprofit_yoy：单季营收 / 归母净利 同比增速（%）
     - or_yoy / netprofit_yoy：累计营收 / 归母净利 同比增速（%，最近 1231 期≈年度）
+    - dt_netprofit_yoy：扣非净利同比增速（%）——成长质量闸用
+    - profit_dedt：扣除非经常性损益后净利润（绝对值）——判断主业是否亏损
     防御式：列缺失或解析失败 → 返回空（上层 parser 退回散文兜底）。
     """
     try:
@@ -371,17 +373,30 @@ def _format_growth_indicators(fina) -> str:
         np_q = _g(latest, "q_netprofit_yoy")
         rev_a = _g(annual_row, "or_yoy")
         np_a = _g(annual_row, "netprofit_yoy")
+        dt_a = _g(annual_row, "dt_netprofit_yoy")      # 扣非净利同比（年度）
+        dedt = _g(annual_row, "profit_dedt")           # 扣非净利绝对值（年度）
         if all(x is None for x in (rev_q, np_q, rev_a, np_a)):
             return ""
 
         def _f(v):
             return f"{v:.2f}" if v is not None else "NA"
 
-        return (
+        out = (
             "\n【SYS_GROWTH_YOY｜tushare fina_indicator 确定性增速，下游直读勿改】 "
             f"营收YoY 单季={_f(rev_q)}% 年度={_f(rev_a)}% | "
-            f"归母净利YoY 单季={_f(np_q)}% 年度={_f(np_a)}%\n"
+            f"归母净利YoY 单季={_f(np_q)}% 年度={_f(np_a)}% | "
+            f"扣非净利YoY 年度={_f(dt_a)}%\n"
         )
+        # 成长质量闸（扣非口径）：扣非亏损 / 扣非增速 → 下游判断是否走前瞻 PEG
+        if dedt is not None:
+            sign = "正" if dedt > 0 else ("负" if dedt < 0 else "零")
+            recurring_loss = "yes" if dedt <= 0 else "no"
+            out += (
+                "【SYS_GROWTH_QUALITY｜扣非口径成长质量，下游前瞻路由/盈利腿直读】 "
+                f"扣非净利={dedt/1e8:.2f}亿({sign}) | recurring_loss={recurring_loss} | "
+                f"扣非净利YoY年度={_f(dt_a)}%\n"
+            )
+        return out
     except Exception as e:
         logger.debug("_format_growth_indicators 失败: %s", e)
         return ""

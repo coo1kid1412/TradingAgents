@@ -9,6 +9,7 @@ from tradingagents.dataflows.profile_calc import (
     parse_growth_deceleration,
     parse_distribution_signals,
     recommend_growth_primary_method,
+    parse_growth_quality,
 )
 from tradingagents.agents.utils.stock_profile_node import (
     _parse_capital_flow_signals,
@@ -208,6 +209,41 @@ def test_growth_primary_routing():
     assert recommend_growth_primary_method("blue_chip", 0.3, off, "ride")["recommend"] is None
     # forced_valuation（亏损/银行）→ 不介入
     assert recommend_growth_primary_method("high_beta_growth", 0.3, {"force_valuation": True}, "ride")["recommend"] is None
+
+
+def test_growth_quality_gate():
+    """成长质量闸：扣非亏损 / 基数效应增速 → 不走前瞻 PEG（防淳中式价值陷阱）。"""
+    off = {"force_valuation": False}
+    # 扣非亏损 → 即使归母增速 226% 也不走 peg
+    r = recommend_growth_primary_method("high_beta_growth", 2.26, off, "neutral", recurring_loss=True)
+    assert r["recommend"] is None and "扣非" in r["reason"], r
+    # 基数效应：归母 +80% 但扣非仅 +5% → 不走 peg
+    r2 = recommend_growth_primary_method("high_beta_growth", 0.80, off, "neutral",
+                                         recurring_loss=False, deducted_yoy=0.05)
+    assert r2["recommend"] is None and "基数效应" in r2["reason"], r2
+    # 健康成长：扣非不亏 + 扣非增速也高 → 正常走 peg
+    r3 = recommend_growth_primary_method("high_beta_growth", 0.50, off, "neutral",
+                                         recurring_loss=False, deducted_yoy=0.48)
+    assert r3["recommend"] == "peg", r3
+
+
+def test_recurring_loss_kills_earnings_leg():
+    """扣非亏损 → regime 盈利腿投 -1（不被归母假高增抬成 +1）。"""
+    r = compute_valuation_regime(momentum_score=55, net_profit_growth=2.26,
+        capital_flow_regime="中性", theme_stage_inferred="none", recurring_loss=True)
+    assert r["legs"]["earnings"] == -1, r
+
+
+def test_parse_growth_quality():
+    sysline = ("【SYS_GROWTH_QUALITY｜扣非口径成长质量，下游前瞻路由/盈利腿直读】 "
+               "扣非净利=-0.35亿(负) | recurring_loss=yes | 扣非净利YoY年度=-12.00%\n")
+    q = parse_growth_quality(sysline)
+    assert q["recurring_loss"] is True and abs(q["deducted_yoy"] + 0.12) < 1e-9, q
+    ok = parse_growth_quality("【SYS_GROWTH_QUALITY】 recurring_loss=no | 扣非净利YoY年度=48.00%")
+    assert ok["recurring_loss"] is False and abs(ok["deducted_yoy"] - 0.48) < 1e-9, ok
+    # 散文兜底
+    assert parse_growth_quality("公司扣非净利润亏损3528万元")["recurring_loss"] is True
+    assert parse_growth_quality("无相关")["recurring_loss"] is None
 
 
 def test_parse_distribution_signals():
