@@ -40,6 +40,7 @@ from tradingagents.dataflows.profile_calc import (
     detect_forced_valuation_method,
     recommend_growth_primary_method,
     parse_growth_quality,
+    gate_premium_by_regime,
     # Layer 2: 数据参照
     parse_sell_side_pe_consensus,
     compute_self_pe_p80,
@@ -386,6 +387,10 @@ def create_stock_profile_node(llm):
         if dist_sig["detected"]:
             logger.info("派发证据: %s", dist_sig["reasons"][:3])
         logger.info("valuation_regime: %s | %s", valuation_regime, regime_info["reasoning"])
+
+        # 主题溢价容忍度按 regime 闸门：ride 满/neutral 半/discipline 零（确定性，防澜起式阈值飘）
+        premium_gated, premium_gate_note = gate_premium_by_regime(default_premium_pct, valuation_regime)
+        logger.info("主题溢价闸: %s → %s | %s", default_premium_pct, premium_gated, premium_gate_note)
 
         # 成长股目标价口径路由：high_beta_growth → 前瞻 PEG 主导（只改权重，不改各腿 EPS 口径）
         # 先过"成长质量闸"：扣非亏损/基数效应增速 → 不走前瞻 PEG（防淳中式价值陷阱）
@@ -891,6 +896,14 @@ TRANSPARENCY:
             f"SYS_VALUATION_REGIME_REASON: {regime_info.get('reasoning', '')}\n"
         )
         logger.info("SYS_VALUATION_REGIME 已注入画像: %s", valuation_regime)
+
+        # 主题溢价（regime 闸门后）—— 机器可读，RM Step6 动态阈值直读，禁止用 LLM 选的 theme_stage 重算
+        content = content + (
+            f"\n<!-- ⚠️SYS_THEME_PREMIUM｜Python 确定性主题溢价(已按 regime 闸门)，RM Step6 阈值直读勿改 -->\n"
+            f"SYS_THEME_PREMIUM_PCT: {premium_gated}\n"
+            f"SYS_THEME_PREMIUM_REASON: {premium_gate_note}\n"
+        )
+        logger.info("SYS_THEME_PREMIUM_PCT 已注入画像: %s", premium_gated)
 
         # 成长股前瞻路由 —— 机器可读，RM Step4 直读决定主方法/权重（防画像 LLM 漂移）
         if growth_method["recommend"]:

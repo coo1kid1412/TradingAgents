@@ -467,12 +467,14 @@ style 系数（来自 stock_profile.style）：
   high_beta_growth   × 1.5    （成长股容忍偏离）
   theme_speculation  × 2.0    （题材炒作大幅放宽）
 
-theme_premium_pct（来自 stock_profile.THEMATIC_PREMIUM）：
-  启动期 initiation   +30%
-  加速期 acceleration +50%    ← 主题最宽容
-  顶部期 peak         +20%    （开始警惕）
-  退潮期 fading       -20%    （主题反噬，反向收紧）
-  不在主题 none       +0%
+theme_premium_pct（**必须**直读 stock_profile 末尾 `SYS_THEME_PREMIUM_PCT:`，Python 确定性值）：
+  ⛔ **必须用 `SYS_THEME_PREMIUM_PCT` 这一行的数值**（它 = 主题阶段查表溢价，且已按 valuation_regime
+     闸门：ride 满 / neutral 半 / discipline 零）。**禁止**自己从 THEMATIC_PREMIUM.theme_stage 或
+     news 重新判断主题阶段去推 premium——那是评级在不同跑之间 SELL↔HOLD 乱摆的根源。
+  原理：主题溢价是"对高估值能被加速盈利长进去的容忍"，该容忍由基本面动能(regime)挣；
+  discipline(主力撤/减速/派发)时 SYS_THEME_PREMIUM_PCT 已被闸为 0，阈值不再被主题放宽。
+  （仅当全文搜不到 SYS_THEME_PREMIUM_PCT 时，才退回按 THEMATIC_PREMIUM.theme_stage 查表：
+    initiation +30 / acceleration +50 / peak +20 / fading −20 / none 0）
 ```
 
 #### 评级阈值表（按动态阈值映射）
@@ -505,7 +507,8 @@ theme_premium_pct（来自 stock_profile.THEMATIC_PREMIUM）：
 ```
 - stock_profile.style = __
 - THEMATIC_PREMIUM.theme_stage = __  / theme_name = __
-- 动态阈值计算：基础 35 × style __ × theme __ = ±__ / ±__
+- **SYS_THEME_PREMIUM_PCT = __**（直读画像末尾该行；已按 regime 闸门，theme 因子用它，不自行重算）
+- 动态阈值计算：基础 35 × style __ × theme(=SYS_THEME_PREMIUM_PCT) __ = ±__ / ±__
 - 当前偏离度 = (当前价 - 综合目标价中位) / 综合目标价中位 = ±__%
 - 触发评级方向：BUY/OVERWEIGHT/HOLD/UNDERWEIGHT/SELL
 - 是否触发硬上限保护：是/否（含原因）
