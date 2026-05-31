@@ -431,6 +431,56 @@ def detect_forced_valuation_method(
     }
 
 
+def recommend_growth_primary_method(
+    style: Optional[str],
+    net_profit_growth: Optional[float],
+    forced_valuation: dict,
+    valuation_regime: Optional[str] = None,
+) -> dict:
+    """成长股目标价口径路由：high_beta_growth 应以**前瞻 PEG** 为主方法，而非 TTM PE×EPS。
+
+    动机（实测两样本对标）：12 个月目标价对成长股本该前瞻（卖方做法 = 次年 EPS × 目标倍数）。
+    若主方法用 PE×EPS(TTM)（占 50% 权重），会把快速成长龙头的目标价系统性压低 15-25%
+    → 偏离度虚高、base-case 隐含负收益过大（中际旭创 300308 primary 误设 PE×EPS TTM →
+    目标 917 vs 卖方中位 ~1050，base -21%；而天孚 300394 正确用 PEG 前瞻）。
+
+    **口径安全**：本函数只改"主方法选谁"（→ 改各腿权重），**不**改任何腿的 EPS 口径——
+    PEG 腿仍用前瞻 EPS、PE×EPS/同业腿仍用 TTM EPS，不违反"反双重计入"铁律。
+    漂移护栏：PEG 腿倍数仍受同业锚 + PEG 有界溢价封顶（见 compute_peer_anchored_pe_cap）。
+
+    路由规则：
+    - forced_valuation 生效（亏损/银行/REIT 等）→ 不介入，沿用强制方法。
+    - high_beta_growth + 有正增速（≥15%）+ 非 discipline → 推荐 primary=peg（前瞻主导），
+      secondary=[pe_eps(TTM 作下限参考), 同业可比/卖方目标价]。
+    - 其余 style → 不强制（返回 recommend=None，沿用行业卡/现状）。
+
+    Returns:
+        dict: {"recommend": Optional[str], "weight_hint": str, "reason": str}
+    """
+    if forced_valuation.get("force_valuation"):
+        return {"recommend": None, "weight_hint": "",
+                "reason": "forced_valuation 生效，前瞻路由不介入"}
+
+    g = net_profit_growth
+    is_growth_style = style in ("high_beta_growth",)
+    has_growth = g is not None and g >= 0.15
+    not_discipline = (valuation_regime or "") != "discipline"
+
+    if is_growth_style and has_growth and not_discipline:
+        return {
+            "recommend": "peg",
+            "weight_hint": "PEG(前瞻) 50% / 卖方目标价或同业可比 30% / PE×EPS(TTM) ≤20%（仅作下限参考）",
+            "reason": (
+                f"high_beta_growth + 归母净利增速 {g*100:.0f}% → 12 个月目标按前瞻 EPS×PEG 主导"
+                f"（对标卖方做法）；TTM PE×EPS 腿降权当下限参考，避免系统性压低成长龙头目标价"
+            ),
+        }
+    # 高成长但减速/无增速数据 → 不强制前瞻，留给现状（防 PEG 在负增速下失真）
+    why = "非 high_beta_growth" if not is_growth_style else (
+        "增速数据缺失或<15%" if not has_growth else "regime=discipline（基本面恶化，不前瞻主导）")
+    return {"recommend": None, "weight_hint": "", "reason": f"前瞻路由不介入：{why}"}
+
+
 # ---------------------------------------------------------------------------
 # Layer 2: 数据参照 —— 三源 PE / 默认 premium / theme_inferred / leadership_bonus
 # ---------------------------------------------------------------------------
