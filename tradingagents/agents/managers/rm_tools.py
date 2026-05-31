@@ -377,8 +377,9 @@ def compute_step6_rating_mapping(
     threshold_dn_pct: float,
     threshold_up_pct: float,
     target_price_source: str = "",
+    valuation_regime: str = "",
 ) -> dict:
-    """Step 6 评级机械映射工具。
+    """Step 6 评级机械映射工具（估值定倾向 + regime 闸门控极端）。
 
     把"动态阈值 → 评级"这个机械计算从 LLM 端移到 Python 端，杜绝 LLM 通过
     "重新调整估值参数" 私改 target_price_mid 从而规避机械映射的漏洞。
@@ -390,12 +391,27 @@ def compute_step6_rating_mapping(
     - target_price_source 字段填写产生该中位数的工具调用 ID 或一句话来源（如
       "compute_weighted_target_price 工具结果"），便于审计
 
-    评级映射规则（与 Step 6 第一步动态阈值匹配）：
+    ── 两段式（对标头部投研台做法）──────────────────────────────
+    第一段「估值定倾向」（按偏离度的原始 5 档，与第一步动态阈值匹配）：
       偏离度 < -threshold_up   → BUY（深度低估）
       [-threshold_up, -threshold_dn]  → OVERWEIGHT
       [-threshold_dn, +threshold_dn]  → HOLD
       (+threshold_dn, +threshold_up]  → UNDERWEIGHT
       偏离度 > +threshold_up   → SELL（明显高估）
+
+    第二段「regime 闸门控极端」（valuation_regime 来自 stock_profile 五路合成）：
+      真台子不会仅凭"贵"就 Sell 优质成长股，也不会仅凭"便宜"就 Buy 基本面恶化股。
+      估值偏离只决定倾向，要不要升级到 BUY/SELL 极端，由基本面动能(regime)把关：
+      - ride（基本面强：流入/增速/趋势）→ 评级托底 HOLD：UNDERWEIGHT/SELL → HOLD
+        （强趋势票贵了也只是 Hold/骑，不因估值看空——防误杀；深度低估时 BUY 保留）
+      - discipline（基本面弱：减速/派发/流出）→ 评级封顶 HOLD：OVERWEIGHT/BUY → HOLD
+        （恶化票即便optically便宜也是价值陷阱，不追多；深度高估时 SELL 保留=真 Sell 场景）
+      - neutral（混合）→ 估值单独不触发极端：SELL→UNDERWEIGHT, BUY→OVERWEIGHT
+        （收敛到 OW/HOLD/UW 三档，极端留给有基本面背书的场景）
+      - 空串/未知 → 不做闸门，保持原始 5 档（向后兼容）
+    注：本闸门只设"regime 约束的基线"，看多侧的 +1「骑」升档仍由 Step 6 第六步
+        compute_step6_style_adjustment 负责（discipline 时其 composite/momentum 本就低，
+        不会误升；ride 时托底 HOLD 后正好交给它升 OW，无重复计分）。
 
     Args:
         current_price: 当前价 P_0
@@ -403,10 +419,12 @@ def compute_step6_rating_mapping(
         threshold_dn_pct: 动态阈值下沿百分比（如 27 表示 27%）
         threshold_up_pct: 动态阈值上沿百分比（如 63 表示 63%）
         target_price_source: 目标价来源说明（审计字段）
+        valuation_regime: ride / neutral / discipline（来自 stock_profile
+            valuation_regime 字段）；留空则不做 regime 闸门
 
     Returns:
-        dict: {"deviation_pct", "rating", "target_price_mid",
-               "target_price_source", "explanation"}
+        dict: {"deviation_pct", "rating", "rating_raw", "valuation_regime",
+               "target_price_mid", "target_price_source", "explanation"}
     """
     if target_price_mid <= 0:
         return {"error": f"target_price_mid 必须 > 0，当前={target_price_mid}"}
@@ -417,26 +435,50 @@ def compute_step6_rating_mapping(
 
     deviation_pct = (current_price - target_price_mid) / target_price_mid * 100
 
+    # 第一段：估值定倾向（原始 5 档）
     if deviation_pct < -threshold_up_pct:
-        rating = "BUY"
+        rating_raw = "BUY"
     elif deviation_pct < -threshold_dn_pct:
-        rating = "OVERWEIGHT"
+        rating_raw = "OVERWEIGHT"
     elif deviation_pct <= threshold_dn_pct:
-        rating = "HOLD"
+        rating_raw = "HOLD"
     elif deviation_pct <= threshold_up_pct:
-        rating = "UNDERWEIGHT"
+        rating_raw = "UNDERWEIGHT"
     else:
-        rating = "SELL"
+        rating_raw = "SELL"
+
+    # 第二段：regime 闸门控极端
+    reg = (valuation_regime or "").strip().lower()
+    if reg == "ride":          # 强基本面：托底 HOLD（不因贵看空），BUY 保留
+        rating = {"SELL": "HOLD", "UNDERWEIGHT": "HOLD"}.get(rating_raw, rating_raw)
+    elif reg == "discipline":  # 弱基本面：封顶 HOLD（防价值陷阱），SELL 保留
+        rating = {"BUY": "HOLD", "OVERWEIGHT": "HOLD"}.get(rating_raw, rating_raw)
+    elif reg == "neutral":     # 混合：估值单独不触发极端
+        rating = {"SELL": "UNDERWEIGHT", "BUY": "OVERWEIGHT"}.get(rating_raw, rating_raw)
+    else:                      # 未提供 regime → 保持旧行为
+        reg = ""
+        rating = rating_raw
+
+    gate_note = ""
+    if reg and rating != rating_raw:
+        _why = {"ride": "ride 强基本面托底 HOLD（不因贵看空）",
+                "discipline": "discipline 弱基本面封顶 HOLD（防价值陷阱）",
+                "neutral": "neutral 估值单独不触发极端，收敛三档"}[reg]
+        gate_note = f" | regime 闸门：{rating_raw} → {rating}（{_why}）"
+    elif reg:
+        gate_note = f" | regime={reg}，闸门无调整（{rating_raw} 在 regime 允许区内）"
 
     explanation = (
         f"偏离度 = (当前价 {current_price} - 目标价中位 {target_price_mid}) / {target_price_mid} = "
         f"{deviation_pct:+.2f}% | 动态阈值 ±{threshold_dn_pct}%/±{threshold_up_pct}% | "
-        f"机械映射 → {rating}"
+        f"估值倾向 → {rating_raw}{gate_note} | 最终 → {rating}"
     )
 
     return {
         "deviation_pct": round(deviation_pct, 2),
         "rating": rating,
+        "rating_raw": rating_raw,
+        "valuation_regime": reg or "（未提供，未做闸门）",
         "target_price_mid": target_price_mid,
         "target_price_source": target_price_source or "（未填写来源，需补充）",
         "explanation": explanation,
