@@ -181,6 +181,17 @@ def create_portfolio_manager(llm, memory):
 - "板块 RS 30d +12% 跑赢大盘 + 主题内排名第 2/5，板块β 仍正向，CONDITIONAL（等回调）"
 - "板块 RS 30d -8% 跑输 + 主题内倒数 → 板块走弱强化卖出信号，DON'T BUY"
 
+**从 CAPITAL_FLOW YAML 提取（资金流官的 Python 确定性输出，market_report 内）——填"资金面快照"行**：
+
+| 字段 | 用途 |
+|------|------|
+| `主力净流入(5日)` / `主力净流入(20日)` | 主力近期方向与力度（亿元） |
+| `capital_flow_score`（0-100）/ `capital_flow_regime` | 综合资金面强弱与定性 |
+| `net_inflow_streak_days` | 主力连续净流入(+)/净流出(−)天数 |
+| `retail_buy_amount_rate_5d_pct` / `retail_concentration_signal` | **散户参与度**（与主力对比：主力流出+散户高接盘=派发；主力流入+散户偏低=机构吸筹）|
+
+⚠️ **强制约束**：Trade Ticket"关键背景"的 **资金面快照（主力 vs 散户）行必填**，必须同时给出**主力**近 5/20 日净流入与 **散户**参与度，并点明**当前主导方是主力还是散户**（如"主力连续净流出 7 日、散户参与度偏低 → 主力主导且在撤离"）。数据缺失写"数据停滞/不可用"，不得留空。
+
 **⚠️ stock_profile TRANSPARENCY 段（Layer 3 标注）必读**：
 
 stock_profile 末尾的 `TRANSPARENCY:` 段标注了"超共识程度"，按以下规则用于 **Conviction 五星调档**：
@@ -400,6 +411,7 @@ PM 必须明确"thesis 兑现"的具体里程碑（如"Q2 营收增速 >25%"、"
 | 目标价区间 | P_dn <价位> ↔ P_up <价位> |
 | 当前赔率 | R = U/D = X.XX |
 | 概率加权期望收益 | E = X.XX% |
+| **资金面快照（主力 vs 散户）** | 主力近5日净流入 __亿/近20日 __亿（capital_flow_score __/100，regime __）；散户参与度 retail_buy_rate __%（__，如"偏低/高接盘"）；近 __ 日主力连续净流入/流出 → 主导方为 **主力/散户** |
 | Core Thesis 核心逻辑 | 1. __ 2. __ 3. __（每条 ≤30 字，单行编号）|
 | Key Risks 核心风险 | 1. __ 2. __ 3. __（每条 ≤30 字，单行编号）|
 

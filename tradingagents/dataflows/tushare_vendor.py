@@ -352,6 +352,8 @@ def _format_growth_indicators(fina) -> str:
     字段（tushare fina_indicator 标准列）：
     - q_sales_yoy / q_netprofit_yoy：单季营收 / 归母净利 同比增速（%）
     - or_yoy / netprofit_yoy：累计营收 / 归母净利 同比增速（%，最近 1231 期≈年度）
+    - dt_netprofit_yoy：扣非净利同比增速（%）——成长质量闸用
+    - profit_dedt：扣除非经常性损益后净利润（绝对值）——判断主业是否亏损
     防御式：列缺失或解析失败 → 返回空（上层 parser 退回散文兜底）。
     """
     try:
@@ -371,17 +373,37 @@ def _format_growth_indicators(fina) -> str:
         np_q = _g(latest, "q_netprofit_yoy")
         rev_a = _g(annual_row, "or_yoy")
         np_a = _g(annual_row, "netprofit_yoy")
+        dt_a = _g(annual_row, "dt_netprofit_yoy")      # 扣非净利同比（年度）
+        dedt_a = _g(annual_row, "profit_dedt")         # 扣非净利绝对值（最新年报，累计）
+        dedt_l = _g(latest, "profit_dedt")             # 扣非净利绝对值（最新一期，累计 YTD）
         if all(x is None for x in (rev_q, np_q, rev_a, np_a)):
             return ""
 
         def _f(v):
             return f"{v:.2f}" if v is not None else "NA"
 
-        return (
+        out = (
             "\n【SYS_GROWTH_YOY｜tushare fina_indicator 确定性增速，下游直读勿改】 "
             f"营收YoY 单季={_f(rev_q)}% 年度={_f(rev_a)}% | "
-            f"归母净利YoY 单季={_f(np_q)}% 年度={_f(np_a)}%\n"
+            f"归母净利YoY 单季={_f(np_q)}% 年度={_f(np_a)}% | "
+            f"扣非净利YoY 年度={_f(dt_a)}%\n"
         )
+        # 成长质量闸（扣非口径）：用「最新一期」扣非判主业是否亏损（捕捉近期恶化——
+        # 年报扣非可能为正但最新季报已转亏，如淳中 FY2024 扣非+2.8亿 vs Q1 2026 扣非亏损）。
+        # 最新一期 OR 最新年报 任一为亏 → recurring_loss=yes（宁谨慎，仅封顶前瞻 PEG、回退保守）。
+        dedt_use = dedt_l if dedt_l is not None else dedt_a
+        if dedt_use is not None or dedt_a is not None:
+            loss = ((dedt_l is not None and dedt_l <= 0)
+                    or (dedt_a is not None and dedt_a <= 0))
+            ref = dedt_l if dedt_l is not None else dedt_a
+            period = "最新一期" if dedt_l is not None else "最新年报"
+            sign = "正" if ref > 0 else ("负" if ref < 0 else "零")
+            out += (
+                "【SYS_GROWTH_QUALITY｜扣非口径成长质量，下游前瞻路由/盈利腿直读】 "
+                f"扣非净利({period})={ref/1e8:.2f}亿({sign}) | 年报扣非={_f(dedt_a/1e8 if dedt_a is not None else None)}亿 | "
+                f"recurring_loss={'yes' if loss else 'no'} | 扣非净利YoY年度={_f(dt_a)}%\n"
+            )
+        return out
     except Exception as e:
         logger.debug("_format_growth_indicators 失败: %s", e)
         return ""

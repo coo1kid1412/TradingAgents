@@ -431,11 +431,42 @@ def detect_forced_valuation_method(
     }
 
 
+def parse_growth_quality(fund_str: str) -> dict:
+    """从 SYS_GROWTH_QUALITY 行抽扣非口径成长质量（前瞻路由/盈利腿的质量闸）。
+
+    优先读 tushare 确定性行 `【SYS_GROWTH_QUALITY...】 ... recurring_loss=yes/no | 扣非净利YoY年度=X%`；
+    缺失时退回散文兜底（"扣非净利润亏损" / "扣非...为负" → recurring_loss）。
+
+    Returns:
+        dict: {"recurring_loss": Optional[bool], "deducted_yoy": Optional[float]}
+    """
+    import re
+    out = {"recurring_loss": None, "deducted_yoy": None}
+    if not fund_str:
+        return out
+    m = re.search(r"SYS_GROWTH_QUALITY.*?recurring_loss\s*=\s*(yes|no)", fund_str, re.S)
+    if m:
+        out["recurring_loss"] = (m.group(1) == "yes")
+        m2 = re.search(r"SYS_GROWTH_QUALITY.*?扣非净利YoY年度\s*=\s*(-?[0-9.]+)%", fund_str, re.S)
+        if m2:
+            try:
+                out["deducted_yoy"] = float(m2.group(1)) / 100.0
+            except ValueError:
+                pass
+        return out
+    # 散文兜底：扣非亏损/为负
+    if re.search(r"扣非[^。\n]{0,12}(亏损|为负|-?\d[\d.,]*\s*亿?元?\s*亏)", fund_str):
+        out["recurring_loss"] = True
+    return out
+
+
 def recommend_growth_primary_method(
     style: Optional[str],
     net_profit_growth: Optional[float],
     forced_valuation: dict,
     valuation_regime: Optional[str] = None,
+    recurring_loss: Optional[bool] = None,
+    deducted_yoy: Optional[float] = None,
 ) -> dict:
     """成长股目标价口径路由：high_beta_growth 应以**前瞻 PEG** 为主方法，而非 TTM PE×EPS。
 
@@ -460,6 +491,18 @@ def recommend_growth_primary_method(
     if forced_valuation.get("force_valuation"):
         return {"recommend": None, "weight_hint": "",
                 "reason": "forced_valuation 生效，前瞻路由不介入"}
+
+    # 成长质量闸（对标投研：不拿基数效应/非经常性增速 PEG 一个主业亏损的公司，防淳中式价值陷阱）
+    # ① 扣非亏损 → 主业实亏，归母高增速多为非经常性 → 不走前瞻 PEG
+    if recurring_loss is True:
+        return {"recommend": None, "weight_hint": "",
+                "reason": "成长质量闸：扣非净利亏损（主业实亏）→ 归母高增速多属非经常性/基数效应，不走前瞻 PEG，回退保守口径"}
+    # ② 头条高增速但扣非增速很弱（基数效应）→ 用扣非口径判断，不被归母假高增速误导
+    if (deducted_yoy is not None and net_profit_growth is not None
+            and net_profit_growth >= 0.50 and deducted_yoy < 0.15):
+        return {"recommend": None, "weight_hint": "",
+                "reason": (f"成长质量闸：归母增速 {net_profit_growth*100:.0f}% 但扣非增速仅 "
+                           f"{deducted_yoy*100:.0f}%（基数效应/非经常性主导）→ 不走前瞻 PEG")}
 
     g = net_profit_growth
     is_growth_style = style in ("high_beta_growth",)
@@ -1025,6 +1068,7 @@ def compute_valuation_regime(
     quant_anticrowding: Optional[float] = None,
     distribution_detected: bool = False,
     capital_flow_score: Optional[float] = None,
+    recurring_loss: Optional[bool] = None,
 ) -> dict:
     """客观估值 regime（骑趋势 / 中性 / 收纪律）——六路分析师信号合成，纯 Python 确定性。
 
@@ -1081,7 +1125,10 @@ def compute_valuation_regime(
         legs["capital"] = cap_vote
 
     # 3 盈利动能（方向优先；高增速且不减速 → +1，含高位稳定增长）
-    if net_profit_growth is not None or growth_direction is not None:
+    # 成长质量闸：扣非亏损（主业实亏）时，归母高增速多属非经常性/基数效应 → 不投 +1（防淳中式假高增）
+    if recurring_loss is True:
+        legs["earnings"] = -1   # 主业亏损直接判盈利动能为负
+    elif net_profit_growth is not None or growth_direction is not None:
         if growth_direction == "decelerating" or (
                 net_profit_growth is not None and net_profit_growth < 0.10):
             legs["earnings"] = -1
