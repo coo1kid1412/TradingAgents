@@ -849,6 +849,19 @@ TRANSPARENCY:
                     "target_pe 出口 cap: regime=%s → eff_cap=%.1f", valuation_regime, eff_cap,
                 )
 
+        # 机器可读 regime 行（Python 确定性兜底）：画像 LLM 重写"已确定字段"表时常把
+        # valuation_regime 行丢掉，导致下游 RM 拿不到 → 臆断 neutral → 评级闸门失效（天孚被误杀 SELL）。
+        # 这里把 regime 以固定 schema 追加到画像末尾，RM Step6 第三步**必须直读此行**填工具入参。
+        regime_legs = regime_info.get("legs", {})
+        content = content + (
+            f"\n\n<!-- ⚠️SYS_VALUATION_REGIME｜Python 六路合成确定性，下游 RM 直读勿改/勿臆断 -->\n"
+            f"SYS_VALUATION_REGIME: {valuation_regime}\n"
+            f"SYS_VALUATION_REGIME_NETSCORE: {regime_info.get('score')}\n"
+            f"SYS_VALUATION_REGIME_LEGS: {regime_legs}\n"
+            f"SYS_VALUATION_REGIME_REASON: {regime_info.get('reasoning', '')}\n"
+        )
+        logger.info("SYS_VALUATION_REGIME 已注入画像: %s", valuation_regime)
+
         return {"stock_profile": content}
 
     return stock_profile_node
