@@ -10,7 +10,24 @@ from tradingagents.dataflows.profile_calc import (
     parse_distribution_signals,
     recommend_growth_primary_method,
     parse_growth_quality,
+    gate_premium_by_regime,
 )
+
+
+def test_premium_regime_gate_cuts_both_ways():
+    """主题溢价 regime 闸门：ride 满/neutral 半/discipline 零——必须两头都切才不是结果倒推。"""
+    # acceleration 主题默认 +50%
+    assert gate_premium_by_regime(50, "ride")[0] == 50        # ride 全给（天孚/中际旭创受益）
+    assert gate_premium_by_regime(50, "neutral")[0] == 25      # neutral 减半
+    assert gate_premium_by_regime(50, "discipline")[0] == 0    # discipline 归零（澜起/淳中收紧）
+    # 负溢价(fading/宏观收紧)不被放松——收紧保留
+    assert gate_premium_by_regime(-20, "discipline")[0] == -20
+    assert gate_premium_by_regime(-20, "ride")[0] == -20
+    # 正负混合：只压正部分
+    assert gate_premium_by_regime(30, "neutral")[0] == 15
+    # regime 未知 → 不闸（向后兼容）
+    assert gate_premium_by_regime(50, None)[0] == 50
+    assert gate_premium_by_regime(None, "discipline")[0] is None
 from tradingagents.agents.utils.stock_profile_node import (
     _parse_capital_flow_signals,
     _enforce_target_pe_cap,

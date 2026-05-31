@@ -724,6 +724,35 @@ def compute_default_premium(
     return total, formula
 
 
+_REGIME_PREMIUM_FACTOR = {"ride": 1.0, "neutral": 0.5, "discipline": 0.0}
+
+
+def gate_premium_by_regime(
+    premium_pct: Optional[int], valuation_regime: Optional[str],
+) -> tuple[Optional[int], str]:
+    """按 regime 闸门"主题溢价容忍度"：ride 满 / neutral 半 / discipline 零。
+
+    依据（对标投研，非结果倒推）：主题溢价 = 对"今天的高估值会被加速的盈利长进去"的容忍。
+    这个容忍该由**基本面动能**(regime)来挣，而不是由"在不在热门赛道"来发——给一只基本面
+    恶化的票发主题容忍，正是"买热门赛道里已掉头的票"那类错误的根源。
+    - ride（基本面强，能长进去）        → 容忍全给（×1.0）
+    - neutral（多空混杂）              → 容忍减半（×0.5）
+    - discipline（恶化，长不进去，纯贵）→ 容忍归零（×0.0）
+
+    只压"正溢价"(放宽容忍)；负溢价(fading / 宏观收紧)原样保留——收紧不放松，避免反向松绑。
+    regime 未知时不介入（向后兼容）。
+
+    Returns: (gated_premium_pct, 说明)
+    """
+    if premium_pct is None or valuation_regime not in _REGIME_PREMIUM_FACTOR:
+        return premium_pct, "regime 未知或溢价缺失 → 不闸"
+    factor = _REGIME_PREMIUM_FACTOR[valuation_regime]
+    pos, neg = max(premium_pct, 0), min(premium_pct, 0)
+    gated = int(round(pos * factor)) + neg
+    return gated, (f"regime={valuation_regime} → 正溢价容忍 ×{factor}："
+                   f"max({premium_pct},0)×{factor}{f'+{neg}' if neg else ''} = {gated}")
+
+
 def infer_theme_stage_from_data(
     momentum_score: Optional[float],
     sector_rs_30d: Optional[float],
