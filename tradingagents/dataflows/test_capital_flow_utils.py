@@ -7,11 +7,42 @@ import pandas as pd
 
 from tradingagents.dataflows.capital_flow_utils import (
     compute_retail_concentration_signal,
+    compute_retail_amount_rate,
     compute_lhb_metrics,
     compute_capital_flow_regime,
     compute_capital_flow_score,
     assemble_capital_flow_metrics,
 )
+
+
+# ---------------------------------------------------------------------------
+# 散户净流入占比口径（akshare）—— 修"净占比当毛买占比"语义 bug
+# ---------------------------------------------------------------------------
+def test_retail_net_inflow_kogei_separated():
+    """akshare 净占比字段 → retail_net_inflow_rate_5d_pct（净），不污染毛买占比字段。"""
+    df = pd.DataFrame({
+        "medium_net_inflow_rate_pct": [2.0, 3.0, 1.0, 2.5, 1.5],
+        "small_net_inflow_rate_pct":  [1.0, 1.5, 0.5, 1.0, 0.5],
+    })
+    out = compute_retail_amount_rate(df)
+    assert out["retail_buy_amount_rate_5d_pct"] is None          # 毛口径无数据
+    assert out["retail_net_inflow_rate_5d_pct"] is not None       # 净口径有
+    # 毛口径（tushare buy rate）反过来
+    df2 = pd.DataFrame({"small_buy_amount_rate_pct": [60.0]*5, "medium_buy_amount_rate_pct": [5.0]*5})
+    out2 = compute_retail_amount_rate(df2)
+    assert out2["retail_buy_amount_rate_5d_pct"] == 65.0 and out2["retail_net_inflow_rate_5d_pct"] is None
+
+
+def test_retail_concentration_net_branch():
+    """净流入占比口径：≥+8% 且主力派发 → 散户高接盘；澜起式 +3.17% → 中性（小幅净买，不算高接盘）。"""
+    # 净流入 +12% + 连续派发 → 高接盘
+    assert compute_retail_concentration_signal(None, -4, retail_net_inflow_rate_5d_pct=12.0) == "散户高接盘"
+    # 澜起式：净流入仅 +3.17%（散户小幅净买，不是"只占3%"）→ 中性，不误判高接盘
+    assert compute_retail_concentration_signal(None, -4, retail_net_inflow_rate_5d_pct=3.17) == "中性"
+    # 散户净流出（踩踏）→ 中性
+    assert compute_retail_concentration_signal(None, -4, retail_net_inflow_rate_5d_pct=-5.0) == "中性"
+    # 净口径但 streak 缺失 → None
+    assert compute_retail_concentration_signal(None, None, retail_net_inflow_rate_5d_pct=12.0) is None
 
 
 # ---------------------------------------------------------------------------

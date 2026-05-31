@@ -1173,9 +1173,11 @@ def get_capital_flow(
                     if "超大单净流入-净额" in df.columns else None,
                 "large_net_amount_yi": (df["大单净流入-净额"].astype(float) * 1e-8).round(4)
                     if "大单净流入-净额" in df.columns else None,
-                "medium_buy_amount_rate_pct": df["中单净流入-净占比"].astype(float)
+                # ⚠️ akshare 个股资金流只有「净流入-净占比」(NET)，没有毛买盘占比。
+                # 映射到 *_net_inflow_rate_pct（净口径），下游按净口径处理，禁止当作毛买占比。
+                "medium_net_inflow_rate_pct": df["中单净流入-净占比"].astype(float)
                     if "中单净流入-净占比" in df.columns else None,
-                "small_buy_amount_rate_pct": df["小单净流入-净占比"].astype(float)
+                "small_net_inflow_rate_pct": df["小单净流入-净占比"].astype(float)
                     if "小单净流入-净占比" in df.columns else None,
                 "close": df["收盘价"].astype(float)
                     if "收盘价" in df.columns else None,

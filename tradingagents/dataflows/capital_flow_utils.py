@@ -29,7 +29,8 @@ YI_TO_WAN = 1e4   # 亿元 → 万元
 # 投票/打分阈值（提议默认，可用真实数据校准 —— TODO: calibrate）
 # ---------------------------------------------------------------------------
 # 散户高承接：小单+中单买入成交占比 ≥ 此值（A 股该占比常 50-70%，>65 偏高）
-_RETAIL_HIGH_RATE_PCT = 65.0
+_RETAIL_HIGH_RATE_PCT = 65.0     # 毛买占比口径：散户买盘占比 ≥ 65% = 高承接
+_RETAIL_NET_HIGH_PCT = 8.0       # 净流入占比口径：散户(中+小单)净流入占比 ≥ +8% = 高承接
 # 主力派发：连续净流出 ≥ 3 日（收紧自旧逻辑的 streak<0，消除 streak=-1 虚假票）
 _STREAK_DISTRIBUTION = -3
 # 龙虎榜机构净买方向阈值：30 日机构净买额绝对值 ≥ 此值（亿元）才算明确方向，否则 0（去零附近噪音）
@@ -166,22 +167,31 @@ def compute_dde_like_metrics(
 def compute_retail_concentration_signal(
     retail_buy_amount_rate_5d_pct: Optional[float],
     net_inflow_streak_days: Optional[int],
+    retail_net_inflow_rate_5d_pct: Optional[float] = None,
 ) -> Optional[str]:
     """散户接盘信号（替代恒等 1.0 的旧 retail_takeover_ratio）。
 
-    真接盘 = 主力持续派发（streak ≤ -3）+ 散户高承接（小单+中单买占比 ≥ 65%）。
-    与"主力流出 + 散户也跑（踩踏）"区分开。
+    真接盘 = 主力持续派发（streak ≤ -3）+ 散户大举承接。两种数据口径分别判：
+    - 毛买占比口径（tushare）：散户买占比 ≥ 65%；
+    - 净流入占比口径（akshare）：散户(中+小单)净流入占比 ≥ +8%（散户在净买入接盘）。
+    与"主力流出 + 散户也跑（踩踏，净流入为负）"区分开。
 
     Returns: "散户高接盘" / "中性" / None（数据缺失）
     """
-    if retail_buy_amount_rate_5d_pct is None or net_inflow_streak_days is None:
+    if net_inflow_streak_days is None:
         return None
-    if (
-        retail_buy_amount_rate_5d_pct >= _RETAIL_HIGH_RATE_PCT
-        and net_inflow_streak_days <= _STREAK_DISTRIBUTION
-    ):
-        return "散户高接盘"
-    return "中性"
+    distributing = net_inflow_streak_days <= _STREAK_DISTRIBUTION
+    # 毛买占比口径优先
+    if retail_buy_amount_rate_5d_pct is not None:
+        if distributing and retail_buy_amount_rate_5d_pct >= _RETAIL_HIGH_RATE_PCT:
+            return "散户高接盘"
+        return "中性"
+    # 净流入占比口径（akshare）
+    if retail_net_inflow_rate_5d_pct is not None:
+        if distributing and retail_net_inflow_rate_5d_pct >= _RETAIL_NET_HIGH_PCT:
+            return "散户高接盘"
+        return "中性"
+    return None
 
 
 def _compute_streak_days(series: pd.Series, max_streak: int = 10) -> int:
@@ -404,34 +414,39 @@ def compute_lhb_metrics(
 # 5. 散户成交占比（日度，moneyflow_dc 内置 rate 字段）
 # ---------------------------------------------------------------------------
 def compute_retail_amount_rate(moneyflow_df: Optional[pd.DataFrame]) -> dict:
-    """从 moneyflow 的 rate 字段计算散户（中单+小单）5 日成交占比均值。
+    """从 moneyflow rate 字段计算散户（中单+小单）5 日占比均值——**区分毛买占比与净流入占比**。
+
+    两种数据源口径不同，严禁混用：
+    - 毛买盘占比（*_buy_amount_rate_pct，如 tushare buy_sm/md_amount_rate）：A 股常 50-70%；
+    - 净流入占比（*_net_inflow_rate_pct，如 akshare「中/小单净流入-净占比」）：通常 ±个位数。
 
     Args:
-        moneyflow_df: 含 medium_buy_amount_rate_pct / small_buy_amount_rate_pct 字段的 DataFrame
+        moneyflow_df: 含 *_buy_amount_rate_pct（毛）或 *_net_inflow_rate_pct（净）字段
 
     Returns:
         dict:
-        - retail_buy_amount_rate_5d_pct : 5 日散户买入成交占比均值（%）
+        - retail_buy_amount_rate_5d_pct  : 5 日散户毛买盘占比均值（%，仅毛口径源有）
+        - retail_net_inflow_rate_5d_pct  : 5 日散户净流入占比均值（%，仅净口径源有，可负）
     """
-    out = {"retail_buy_amount_rate_5d_pct": None}
+    out = {"retail_buy_amount_rate_5d_pct": None, "retail_net_inflow_rate_5d_pct": None}
     if moneyflow_df is None or len(moneyflow_df) == 0:
         return out
     df = moneyflow_df.copy().reset_index(drop=True)
 
-    has_md = "medium_buy_amount_rate_pct" in df.columns
-    has_sm = "small_buy_amount_rate_pct" in df.columns
-    if not (has_md or has_sm):
-        return out
+    def _sum5(col_md, col_sm):
+        parts = []
+        if col_md in df.columns:
+            parts.append(df[col_md].astype(float))
+        if col_sm in df.columns:
+            parts.append(df[col_sm].astype(float))
+        if not parts:
+            return None
+        return round(float(sum(parts).tail(5).mean()), 2)
 
-    parts = []
-    if has_md:
-        parts.append(df["medium_buy_amount_rate_pct"].astype(float))
-    if has_sm:
-        parts.append(df["small_buy_amount_rate_pct"].astype(float))
-
-    retail_series = sum(parts)
-    if len(retail_series) >= 1:
-        out["retail_buy_amount_rate_5d_pct"] = round(float(retail_series.tail(5).mean()), 2)
+    out["retail_buy_amount_rate_5d_pct"] = _sum5(
+        "medium_buy_amount_rate_pct", "small_buy_amount_rate_pct")      # 毛口径
+    out["retail_net_inflow_rate_5d_pct"] = _sum5(
+        "medium_net_inflow_rate_pct", "small_net_inflow_rate_pct")      # 净口径
     return out
 
 
@@ -654,12 +669,18 @@ def compute_capital_flow_score(metrics: dict, regime: str) -> tuple[Optional[flo
         breakdown["net_inflow_streak_days"] = int(streak)
         breakdown["streak_sub_score"] = round(sub, 1)
 
-    # 子分 4: 散户买占比（真实小单+中单）→ 反向归一化（占比越高=派发期接盘越重→打分越低），权重 0.05
-    # 50% → 100；75% → 0；映射区间 [50,75]（A 股散户买占比常态区间）
+    # 子分 4: 散户承接（散户接盘越重=派发期越偏空→打分越低），权重 0.05。两种口径分别归一化：
+    #   毛买占比[50,75]→[100,0]；净流入占比[-10,+10]→[100,0]（净流入越高=散户接盘越重→越空）
+    retail_net = metrics.get("retail_net_inflow_rate_5d_pct")
     if retail_rate is not None:
         sub = _linear_map(float(retail_rate), 50.0, 75.0, dst_lo=100.0, dst_hi=0.0)
         parts.append((sub, 0.05))
         breakdown["retail_buy_amount_rate_5d_pct"] = round(retail_rate, 2)
+        breakdown["retail_sub_score"] = round(sub, 1)
+    elif retail_net is not None:
+        sub = _linear_map(float(retail_net), -10.0, 10.0, dst_lo=100.0, dst_hi=0.0)
+        parts.append((sub, 0.05))
+        breakdown["retail_net_inflow_rate_5d_pct"] = round(retail_net, 2)
         breakdown["retail_sub_score"] = round(sub, 1)
 
     if not parts:
@@ -716,10 +737,11 @@ def assemble_capital_flow_metrics(
     metrics.update(compute_lhb_metrics(lhb_count_30d, lhb_inst_net_buy_30d_yi))
     metrics.update(compute_retail_amount_rate(moneyflow_df))
 
-    # 散户接盘信号（真实小单+中单买占比 + 主力派发，替代恒等 1.0 的旧 ratio）
+    # 散户接盘信号（散户承接 + 主力派发，替代恒等 1.0 的旧 ratio）——毛买占比/净流入占比两口径
     metrics["retail_concentration_signal"] = compute_retail_concentration_signal(
         metrics.get("retail_buy_amount_rate_5d_pct"),
         metrics.get("net_inflow_streak_days"),
+        retail_net_inflow_rate_5d_pct=metrics.get("retail_net_inflow_rate_5d_pct"),
     )
 
     regime_info = compute_capital_flow_regime(metrics)
@@ -743,7 +765,8 @@ FIELD_LABEL_ZH: dict[str, str] = {
     "large_order_net_inflow_5d_yi":     "大单净流入5日(亿)",
     "ddz_like_20d_pct":                 "20日主力强度比(%)",
     "net_inflow_streak_days":           "连续净流入/流出天数",
-    "retail_buy_amount_rate_5d_pct":    "散户买入成交占比5日均值(%)",
+    "retail_buy_amount_rate_5d_pct":    "散户毛买盘占比5日均值(%)",
+    "retail_net_inflow_rate_5d_pct":    "散户净流入占比5日均值(%,可负)",
     "retail_concentration_signal":      "散户接盘信号",
     "northbound_5d_direction":          "北向资金5日方向",
     "northbound_20d_direction":         "北向资金20日方向",
