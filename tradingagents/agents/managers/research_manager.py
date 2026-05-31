@@ -537,13 +537,17 @@ target_price_mid = Step 4 综合目标价中位
 threshold_dn_pct = 第一步算出的下沿阈值（如 27 表示 27%）
 threshold_up_pct = 第一步算出的上沿阈值（如 63 表示 63%）
 target_price_source = "compute_weighted_target_price #N 工具输出"（审计字段）
-valuation_regime = stock_profile 中 `valuation_regime` 字段的值
-                  → 取 ride / neutral / discipline 之一（照抄那一行的加粗值）
-                  → 若 stock_profile 未给出该字段，留空字符串 ""
+valuation_regime = stock_profile 末尾 `SYS_VALUATION_REGIME:` 行的值（Python 确定性注入）
+                  → **必须**照抄 `SYS_VALUATION_REGIME:` 冒号后的值（ride / neutral / discipline）
+                  → 这是 Python 六路合成的确定性结果，**严禁**用画像表里的措辞自行改判
+                  → 仅当全文确实搜不到 `SYS_VALUATION_REGIME:` 行时，才留空字符串 ""
 ```
 
 ⚠️ **valuation_regime 是这一步的关键**：它把"估值只定倾向、基本面动能(regime)控 BUY/SELL 极端"
-的投研做法落地——**严禁**自己臆断 regime，必须照抄 stock_profile 的 `valuation_regime` 字段。
+的投研做法落地。stock_profile 末尾有一行 `SYS_VALUATION_REGIME: <ride|neutral|discipline>`
+（Python 确定性注入，画像正文措辞不算数）——**严禁**自己臆断或从正文猜，必须照抄这一行的值。
+⛔ **严禁narrate**：你必须真正发起 `compute_step6_rating_mapping` 的工具调用并采用其返回值，
+**禁止**在正文里手写一段"工具返回 {...}"的伪 JSON 自圆其说——伪造的返回一律视为无效，评级作废。
 - regime=ride（基本面强）→ 工具会把 UNDERWEIGHT/SELL 托底为 HOLD（强趋势票贵了不看空，防误杀）
 - regime=discipline（基本面弱：减速/派发/流出）→ 工具会把 OVERWEIGHT/BUY 封顶为 HOLD，保留 SELL（贵+恶化=真 Sell）
 - regime=neutral → 估值单独不触发极端，收敛到 OW/HOLD/UW
