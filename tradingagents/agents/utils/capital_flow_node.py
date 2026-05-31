@@ -99,6 +99,7 @@ _REPORT_FIELD_GROUPS: list[tuple[str, list[str]]] = [
     ]),
     ("二、散户参与度", [
         "retail_buy_amount_rate_5d_pct",
+        "retail_net_inflow_rate_5d_pct",
         "retail_concentration_signal",
     ]),
     ("三、北向资金", [
