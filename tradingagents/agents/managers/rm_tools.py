@@ -1103,9 +1103,116 @@ def compute_step6_adjustment_synthesis(
     }
 
 
+@tool
+def compute_step6_trend_overlay(
+    rating_after_symmetric: str,
+    style: str,
+    composite_score: float | None = None,
+    momentum_score: float | None = None,
+    market_weight: float = 0.0,
+    news_weight: float = 0.0,
+    sentiment_weight: float = 0.0,
+    market_direction_vote: float = 0.0,
+    news_direction_vote: float = 0.0,
+    sentiment_direction_vote: float = 0.0,
+    sell_side_target_change_pct: float | None = None,
+    institutional_holding_change_pct: float | None = None,
+    northbound_flow_5d_direction: int | None = None,
+    kol_bullish_ratio_trend_pct: float | None = None,
+) -> dict:
+    """Step 6 第六步「趋势叠加」一次性合成（style + 方向票 + 催化动量 → 最终评级）。
+
+    **本工具把原本需要 4 次顺序调用的 6.1/6.2/6.3/6.4 合并成 1 次**，内部按
+    完全相同的顺序串调三类调整 + 合成，返回值与"分 4 次调用"逐位一致——
+    纯粹减少 LLM ↔ 工具往返轮数，不改任何打分/阈值/合成逻辑。
+
+    内部执行顺序（与历史 4 工具链严格一致）：
+      6.1 style_adjustment(R0)        → adj_style, R1
+      6.2 vote_adjustment(R1)         → adj_vote,  R2
+      6.3 catalyst_adjustment(R2)     → adj_catalyst
+      6.4 synthesis(R0, adj_style, adj_vote, adj_catalyst) → final_rating
+    （注意 6.4 用的是 R0=rating_after_symmetric，不是链式 R3——与原设计一致）
+
+    Args:
+        rating_after_symmetric: 第五步对称升降档后的评级（R0）
+        style / composite_score / momentum_score: 喂给 6.1
+        market_weight / news_weight / sentiment_weight + 三个 *_direction_vote: 喂给 6.2
+        sell_side_target_change_pct / institutional_holding_change_pct /
+            northbound_flow_5d_direction / kol_bullish_ratio_trend_pct: 喂给 6.3（缺失填 None）
+
+    Returns:
+        dict: {
+            "final_rating": 最终评级,
+            "final_adjustment": -1/0/+1,
+            "raw_sum": int,
+            "components": {"style": __, "vote": __, "catalyst": __},
+            "style_detail" / "vote_detail" / "catalyst_detail" / "synthesis_detail": 各步完整返回（留痕）,
+            "explanation": 串联说明,
+        }
+    """
+    r0 = rating_after_symmetric
+
+    style_res = compute_step6_style_adjustment.invoke({
+        "rating_after_mechanical": r0,
+        "style": style,
+        "composite_score": composite_score,
+        "momentum_score": momentum_score,
+    })
+    r1 = style_res.get("new_rating", r0)
+    adj_style = style_res.get("adjustment", 0)
+
+    vote_res = compute_step6_report_weighted_vote_adjustment.invoke({
+        "rating_after_style_adj": r1,
+        "market_weight": market_weight,
+        "news_weight": news_weight,
+        "sentiment_weight": sentiment_weight,
+        "market_direction_vote": market_direction_vote,
+        "news_direction_vote": news_direction_vote,
+        "sentiment_direction_vote": sentiment_direction_vote,
+    })
+    r2 = vote_res.get("new_rating", r1)
+    adj_vote = vote_res.get("adjustment", 0)
+
+    catalyst_res = compute_step6_catalyst_momentum_adjustment.invoke({
+        "rating_after_vote_adj": r2,
+        "sell_side_target_change_pct": sell_side_target_change_pct,
+        "institutional_holding_change_pct": institutional_holding_change_pct,
+        "northbound_flow_5d_direction": northbound_flow_5d_direction,
+        "kol_bullish_ratio_trend_pct": kol_bullish_ratio_trend_pct,
+    })
+    adj_catalyst = catalyst_res.get("adjustment", 0)
+
+    synth = compute_step6_adjustment_synthesis.invoke({
+        "rating_after_symmetric": r0,
+        "style_adjustment": adj_style,
+        "vote_adjustment": adj_vote,
+        "catalyst_adjustment": adj_catalyst,
+    })
+
+    return {
+        "final_rating": synth.get("new_rating", r0),
+        "final_adjustment": synth.get("final_adjustment", 0),
+        "raw_sum": synth.get("raw_sum", 0),
+        "components": {"style": adj_style, "vote": adj_vote, "catalyst": adj_catalyst},
+        "style_detail": style_res,
+        "vote_detail": vote_res,
+        "catalyst_detail": catalyst_res,
+        "synthesis_detail": synth,
+        "explanation": (
+            f"趋势叠加合成：style={adj_style:+d}（{style_res.get('rule_applied','-')}） "
+            f"+ vote={adj_vote:+d}（{vote_res.get('rule_applied','-')}） "
+            f"+ catalyst={adj_catalyst:+d}（{catalyst_res.get('rule_applied','-')}） "
+            f"→ {synth.get('explanation','')}"
+        ),
+    }
+
+
 # ============================================================================
 # 工具集合（供 research_manager.py 一次性绑定）
 # ============================================================================
+# 注：Step 6 第六步的 4 个子工具（style/vote/catalyst/synthesis）仍保留定义供合并
+# 工具内部复用，但**不再单独绑定给 RM**——RM 只调 compute_step6_trend_overlay 一次
+# （4 轮 → 1 轮）。这样工具调用轮数从 ~11-15 压到 ~8-11，远离 15 轮上限。
 
 RM_TOOLS = [
     compute_bull_bear_score,
@@ -1119,10 +1226,7 @@ RM_TOOLS = [
     compute_conviction_calibration,
     compute_step6_rating_mapping,
     compute_scenario_consistency_check,
-    compute_step6_style_adjustment,
-    compute_step6_report_weighted_vote_adjustment,
-    compute_step6_catalyst_momentum_adjustment,
-    compute_step6_adjustment_synthesis,
+    compute_step6_trend_overlay,
 ]
 
 
