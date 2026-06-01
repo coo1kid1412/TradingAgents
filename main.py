@@ -161,6 +161,18 @@ _AGENT_CN = {
 }
 
 
+# 确定性兜底：模型在自由组合的 markdown 表格里偶发写裸竖线绝对值（如 |d|=2.12、|R|>1.0），
+# 裸 | 会被当成表格列分隔符 → 该行错列。提示词已统一为 \|d\|，但 LLM 不保证遵守，
+# 故落盘前再正则转义一次：把未转义的 |d| / |D| / |R| 兜成 \|d\|（已转义的 \|d\| 不重复处理）。
+# 仅匹配"竖线+单字母 d/D/R+竖线"且无内部空格的绝对值记号，不会误伤真实表格分隔符（| d | 带空格）。
+_ABS_VALUE_PIPE_RE = re.compile(r"(?<!\\)\|([dDR])\|")
+
+
+def _escape_abs_value_pipes(md: str) -> str:
+    """把 markdown 里裸的 |d|/|D|/|R| 绝对值记号转义为 \\|d\\|，防止破坏表格渲染。"""
+    return _ABS_VALUE_PIPE_RE.sub(r"\\|\1\\|", md)
+
+
 def _save_report(state, ticker: str, save_path: Path):
     """Save complete analysis report to disk (mirrors CLI save_report_to_disk)."""
     save_path.mkdir(parents=True, exist_ok=True)
@@ -242,12 +254,13 @@ def _save_report(state, ticker: str, save_path: Path):
         if risk.get("judge_decision"):
             portfolio_dir = save_path / "5_portfolio"
             portfolio_dir.mkdir(exist_ok=True)
+            pm_md = _escape_abs_value_pipes(risk["judge_decision"])
             (portfolio_dir / "decision.md").write_text(
-                risk["judge_decision"], encoding="utf-8"
+                pm_md, encoding="utf-8"
             )
             sections.append(
                 f"## 五、投资组合管理决策\n\n### {cn('Portfolio Manager', '投资组合经理')}\n"
-                f"{risk['judge_decision']}"
+                f"{pm_md}"
             )
 
     # Write consolidated report

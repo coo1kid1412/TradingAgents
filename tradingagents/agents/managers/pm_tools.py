@@ -70,11 +70,11 @@ def compute_conviction_position_map(abs_d: float, odds_r: float = 1.0,
     严格规则（不允许自由发挥）：
     | Conviction | 触发条件 | 仓位上限 |
     |------------|---------|---------|
-    | 5★ Very High | |d| > 2.0 且 R > 2.0 且 anchor 不敏感 | 15-20% |
-    | 4★ High | |d| > 1.5 且 R > 1.5 | 8-12% |
-    | 3★ Medium | |d| > 1.0 且 R ≥ 1.0 | 4-6% |
-    | 2★ Low | |d| > 0.5 | 2-3% |
-    | 1★ Very Low | |d| ≤ 0.5 | ≤1% |
+    | 5★ Very High | \|d\| > 2.0 且 R > 2.0 且 anchor 不敏感 | 15-20% |
+    | 4★ High | \|d\| > 1.5 且 R > 1.5 | 8-12% |
+    | 3★ Medium | \|d\| > 1.0 且 R ≥ 1.0 | 4-6% |
+    | 2★ Low | \|d\| > 0.5 | 2-3% |
+    | 1★ Very Low | \|d\| ≤ 0.5 | ≤1% |
 
     Args:
         abs_d: |d| 绝对值
