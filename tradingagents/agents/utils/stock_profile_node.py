@@ -364,7 +364,11 @@ def create_stock_profile_node(llm):
         # 客观估值 regime（六路合成：技术/资金/盈利/拥挤/主题/派发 → ride/neutral/discipline）
         # 决定估值姿态（cap 松紧）的是这六路分析师，不是估值锚本身
         cf_sig = _parse_capital_flow_signals(capital_flow_yaml)
-        growth_dir = parse_growth_deceleration(fundamentals_report + "\n" + fund_raw)
+        # earnings 腿专用：只认确定性 SYS_GROWTH_YOY（strict），SYS 缺失则取 None →
+        # earnings 腿落 0（除非 recurring_loss 硬事实）。不再用散文增速喂这条腿——
+        # 散文跑跑之间漂会让 regime 在 discipline/neutral 间翻（澜起 SELL↔HOLD 摆动根源）。
+        growth_dir = parse_growth_deceleration(fundamentals_report + "\n" + fund_raw, strict=True)
+        net_growth_strict = parse_net_profit_growth(fundamentals_report + "\n" + fund_raw, strict=True)
         dist_sig = parse_distribution_signals(news_report, fundamentals_report, sentiment_report)
         gq = parse_growth_quality(fund_raw + "\n" + fundamentals_report)  # 扣非口径成长质量
         regime_info = compute_valuation_regime(
@@ -374,7 +378,7 @@ def create_stock_profile_node(llm):
             capital_flow_regime=cf_sig["regime"],
             main_force_streak_days=cf_sig["streak"],
             lhb_inst_direction=cf_sig["lhb_inst_dir"],
-            net_profit_growth=net_profit_growth,
+            net_profit_growth=net_growth_strict,
             growth_direction=growth_dir,
             retail_concentration_signal=cf_sig["retail_signal"],
             theme_stage_inferred=theme_inferred,

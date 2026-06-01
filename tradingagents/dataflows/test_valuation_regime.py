@@ -7,6 +7,7 @@
 from tradingagents.dataflows.profile_calc import (
     compute_valuation_regime,
     parse_growth_deceleration,
+    parse_net_profit_growth,
     parse_distribution_signals,
     recommend_growth_primary_method,
     parse_growth_quality,
@@ -207,6 +208,33 @@ def test_parse_growth_deceleration():
     assert parse_growth_deceleration("| 营收同比增速(Q1单季) | 4.58% | — |") == "decelerating"
     assert parse_growth_deceleration("Q1营收仅同比+4.58%，显著低于") == "decelerating"
     assert parse_growth_deceleration("Q1营收同比+58%") == "accelerating"
+
+
+def test_strict_earnings_signal_only_trusts_sys():
+    """earnings 腿确定性闸：strict 模式只认 SYS_GROWTH_YOY，散文一律 None。
+
+    澜起 SELL↔HOLD 摆动根源——同股不同跑，散文增速读出 减速 vs 加速 → earnings 腿翻
+    → regime 在 discipline/neutral 间翻 → 评级翻。strict 让 SYS 缺失时 earnings 腿落 0，
+    不再被散文带飘。
+    """
+    sys_line = ("【SYS_GROWTH_YOY｜tushare】 营收YoY 单季=+19.51% 年度=+49.94% | "
+                "归母净利YoY 年度=+58.84%")
+    prose_decel = "| 营收同比增速 | +4.58% | +49.94% | Q1放缓 |\n归母净利润增速 | +58.84%"
+
+    # 减速方向：SYS 在 → 确定判 decelerating；散文-only strict → None（不猜）
+    assert parse_growth_deceleration(sys_line, strict=True) == "decelerating"
+    assert parse_growth_deceleration(prose_decel, strict=True) is None
+    assert parse_growth_deceleration(prose_decel, strict=False) == "decelerating"  # 非strict向后兼容
+
+    # 净利增速：SYS 在 → 0.5884；散文-only strict → None
+    assert parse_net_profit_growth(sys_line, strict=True) == 0.5884
+    assert parse_net_profit_growth(prose_decel, strict=True) is None
+    assert abs(parse_net_profit_growth(prose_decel, strict=False) - 0.5884) < 1e-9
+
+    # 关键：SYS 缺失 + strict 双 None → earnings 腿落 0（除非 recurring_loss），regime 不被散文翻
+    assert compute_valuation_regime(
+        net_profit_growth=None, growth_direction=None, recurring_loss=False,
+    )["legs"].get("earnings", 0) == 0
 
 
 def test_growth_primary_routing():

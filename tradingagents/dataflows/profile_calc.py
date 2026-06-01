@@ -832,8 +832,12 @@ def parse_pe_ttm_from_fundamentals(fund_str: str) -> Optional[float]:
     return None
 
 
-def parse_net_profit_growth(fund_str: str) -> Optional[float]:
+def parse_net_profit_growth(fund_str: str, strict: bool = False) -> Optional[float]:
     """从 fundamentals 报告抽"归母净利润增速（年度）"，返回小数（如 +51.20% → 0.512）。
+
+    strict=True：只认确定性 SYS_GROWTH_YOY（tushare），抽不到直接返回 None，**不回退散文**。
+    用于 valuation_regime 的 earnings 腿——散文增速跑跑之间会漂，会让 regime 在 discipline/neutral
+    间乱翻（澜起式 SELL↔HOLD 摆动根源）。earnings 腿宁可"无信号取 0"也不靠散文猜。
 
     用途（不做循环 forward_pe = PE_TTM/(1+g) 公式——那是恒等式无观点）：
     1. PEG 校验：合理 PE ≈ 增速值（PEG=1），用来给同业锚一个有界溢价上限
@@ -863,6 +867,9 @@ def parse_net_profit_growth(fund_str: str) -> Optional[float]:
                 return v / 100.0
         except ValueError:
             pass
+
+    if strict:
+        return None  # 严格模式：SYS 抽不到就认输，不回退散文（防 earnings 腿漂移）
 
     # 归母口径（首选）：归母 + 净利(润可选) + (同比可选) + 增速/增长率/增长；表格或紧邻散文
     gm_label = r"归母净利(?:润)?(?:同比)?\s*(?:增速|增长率|增长)"
@@ -967,11 +974,14 @@ def compute_peer_anchored_pe_cap(
     }
 
 
-def parse_growth_deceleration(fund_str: str) -> Optional[str]:
+def parse_growth_deceleration(fund_str: str, strict: bool = False) -> Optional[str]:
     """从 fundamentals 抽营收增速方向（最近季 vs 年度）→ 减速/加速/平稳。
 
     格式：`| 营收同比增速 | +19.51% | +49.94% | ... |`（列序：最近季 / 年度 / 上年度）。
     澜起：Q1 19.5% << 年度 49.9% → 减速（盈利动能转弱，regime earnings 腿据此投负）。
+
+    strict=True：只认确定性 SYS_GROWTH_YOY（路径0），抽不到直接返回 None，**不回退散文**
+    （路径1/2 的散文抽取跑跑之间会漂，是 earnings 腿乱翻的根源）。
 
     Returns: "decelerating" / "accelerating" / "stable" / None（抽不到）
     """
@@ -1001,6 +1011,9 @@ def parse_growth_deceleration(fund_str: str) -> Optional[str]:
             return "decelerating" if q < 15.0 else ("accelerating" if q >= 45.0 else "stable")
         except ValueError:
             pass
+
+    if strict:
+        return None  # 严格模式：SYS 抽不到就认输，不回退散文（防 earnings 腿漂移）
 
     # 路径1：营收同比增速 两列（最近季 | 年度），比较得方向
     m = re.search(
