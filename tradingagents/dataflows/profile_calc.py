@@ -905,6 +905,69 @@ def parse_net_profit_growth(fund_str: str, strict: bool = False) -> Optional[flo
     return None
 
 
+def parse_sys_net_growth_components(fund_str: str) -> dict:
+    """从确定性 SYS_GROWTH_YOY 抽归母净利的「单季 / 年度」增速（小数）。抽不到为 None。
+
+    用于 PEG 确定性增速 + 低基数护栏（单季尖峰 vs 年度基线）。格式：
+    `归母净利YoY 单季=X% 年度=Y%`（X/Y 可为 NA）。
+    """
+    import re
+    res = {"annual": None, "quarter": None}
+    if not fund_str:
+        return res
+    m = re.search(
+        r"SYS_GROWTH_YOY[^\n]*?归母净利YoY\s*单季=([+-]?[0-9.]+|NA)%\s*年度=([+-]?[0-9.]+|NA)%",
+        fund_str)
+    if m:
+        for key, raw in (("quarter", m.group(1)), ("annual", m.group(2))):
+            if raw != "NA":
+                try:
+                    res[key] = float(raw) / 100.0
+                except ValueError:
+                    pass
+    return res
+
+
+_PEG_GROWTH_CAP = 0.60   # 可持续性封顶：>60% 增速极少长期持续（对标 RM 既有半衰公式封顶）
+_PEG_HALFLIFE = 0.5      # 半衰：trailing 年度增速 → forward 前瞻代理（与 RM min(g,60%)/2 一致）
+
+
+def compute_deterministic_peg_inputs(
+    eps_ttm: Optional[float],
+    annual_net_growth: Optional[float],
+    q_net_growth: Optional[float] = None,
+) -> Optional[dict]:
+    """确定性 PEG 输入：钉死「前瞻增速 + 前瞻 EPS + 低基数置信度」，杜绝 LLM 现场选增速/EPS
+    致 PEG 目标价跑跑之间摆动（协创式 320↔180 → OW↔UW 翻转的根）。
+
+    口径（对标 RM 既有半衰公式，只是改成 Python 确定性、不让 LLM 自选）：
+    - **低基数护栏**：用「年度」归母增速做基，**单季尖峰（如 +343%）不进 PEG**。
+    - 前瞻增速 = min(年度增速, 60%) × 0.5（trailing → forward 均值回归代理）。
+    - 前瞻 EPS = EPS_TTM × (1 + 前瞻增速)。
+    - **置信度**：单季 >> 年度（>2× 且 >100%，低基数尖峰，前瞻高度不确定）→ "low"
+      → 下游 RM 降 Conviction / 偏离度近阈值时偏 HOLD（数据本就说不清，不下强方向单）。
+
+    缺确定性年度增速 / EPS_TTM / 年度增速≤0（PEG 不适用衰退）→ 返回 None（RM 走原 LLM 路径，至少不更差）。
+    """
+    if eps_ttm is None or annual_net_growth is None or annual_net_growth <= 0:
+        return None
+    capped = min(annual_net_growth, _PEG_GROWTH_CAP)
+    fwd_growth = capped * _PEG_HALFLIFE
+    fwd_growth_pct = round(fwd_growth * 100)
+    forward_eps = round(eps_ttm * (1 + fwd_growth), 2)
+    low_base = (q_net_growth is not None and annual_net_growth > 0
+                and q_net_growth > max(annual_net_growth * 2.0, 1.0))
+    return {
+        "peg_growth_pct": fwd_growth_pct,
+        "forward_eps": forward_eps,
+        "confidence": "low" if low_base else "normal",
+        "annual_growth_pct": round(annual_net_growth * 100),
+        "quarter_growth_pct": round(q_net_growth * 100) if q_net_growth is not None else None,
+        "capped": capped < annual_net_growth,
+        "low_base_spike": low_base,
+    }
+
+
 def compute_peer_anchored_pe_cap(
     peer_pe_median: Optional[float],
     pe_ttm: Optional[float],

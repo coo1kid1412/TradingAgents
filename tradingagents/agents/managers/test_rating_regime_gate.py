@@ -81,6 +81,22 @@ def test_audit_fields_present():
     assert r["rating_raw"] == "SELL" and r["rating"] == "HOLD"
 
 
+def test_peg_confidence_low_collapses_near_boundary():
+    """opt3：SYS_PEG_CONFIDENCE=low 时，勉强过 HOLD 边界的 OW/UW 收敛 HOLD（前瞻含低基数尖峰，不下方向单）。"""
+    # 协创式：偏离 +31%（dn=27，距边界 4pp≤5）neutral → UNDERWEIGHT；peg=low → 收敛 HOLD
+    r_low = _f(236.46, 180.34, 27, 52.5, "test", "neutral", "low")
+    assert r_low["rating_raw"] == "UNDERWEIGHT" and r_low["rating"] == "HOLD", r_low
+    # 同样偏离但 peg=normal → 不收敛，保留 UNDERWEIGHT
+    r_norm = _f(236.46, 180.34, 27, 52.5, "test", "neutral", "normal")
+    assert r_norm["rating"] == "UNDERWEIGHT", r_norm
+    # 深档（偏离 +122%，远离 dn 边界）peg=low 不误收敛：neutral 先 SELL→UW，UW 距边界 95pp>5 → 保留 UW
+    r_deep = _f(400, 180, 27, 52.5, "test", "neutral", "low")
+    assert r_deep["rating"] == "UNDERWEIGHT", r_deep
+    # OVERWEIGHT 侧对称：偏离 -30%（距 dn 27 仅 3pp）neutral → OW；peg=low → HOLD
+    r_ow = _f(126, 180, 27, 52.5, "test", "neutral", "low")
+    assert r_ow["rating_raw"] == "OVERWEIGHT" and r_ow["rating"] == "HOLD", r_ow
+
+
 if __name__ == "__main__":
     import sys
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]

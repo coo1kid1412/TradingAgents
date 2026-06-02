@@ -51,6 +51,8 @@ from tradingagents.dataflows.profile_calc import (
     parse_sector_rs_30d,
     parse_pe_ttm_from_fundamentals,
     parse_net_profit_growth,
+    parse_sys_net_growth_components,
+    compute_deterministic_peg_inputs,
     compute_peer_anchored_pe_cap,
     compute_valuation_regime,
     parse_growth_deceleration,
@@ -571,15 +573,39 @@ def create_stock_profile_node(llm):
             )
 
         # ---- EPS 口径锁定（所有分支通用；修"TTM 倍数 × 前瞻 EPS"双重计入，澜起派发期被错抬成 OW 的根因）----
+        peg_det = None  # 确定性 PEG 输入（下方注入；强制估值/forbid_pe 分支保持 None）
         if not (forced_valuation["force_valuation"] and forced_valuation["forbid_pe"]):
             eps_ttm_disp = f"{eps_ttm_val:.2f}" if eps_ttm_val is not None else "未抽到"
             prog_lines.append("")
             prog_lines.append("⛔ **EPS 口径锁定（防 TTM 倍数 × 前瞻 EPS 双重计入）**：")
             prog_lines.append(f"- **EPS_TTM = {eps_ttm_disp} 元**（系统给值；下游 RM 直接用，禁止重算/换口径）")
-            if eps_ttm_val is not None and net_profit_growth is not None:
+            # 确定性 PEG 输入（钉死前瞻增速 + 前瞻 EPS，杜绝 LLM 自选致 PEG 目标价摆动）
+            sys_g = parse_sys_net_growth_components(fund_raw + "\n" + fundamentals_report)
+            peg_det = compute_deterministic_peg_inputs(
+                eps_ttm_val, sys_g["annual"], sys_g["quarter"])
+            if peg_det is not None:
+                conf_note = ("⚠️**低基数尖峰，前瞻高度不确定**" if peg_det["confidence"] == "low"
+                             else "正常")
+                prog_lines.append(
+                    f"- **SYS_PEG_GROWTH_PCT = {peg_det['peg_growth_pct']}**（确定性前瞻增速：年度归母"
+                    f"{peg_det['annual_growth_pct']}% 半衰封顶后；**PEG 腿增速直读此值，禁止自选**）"
+                )
+                prog_lines.append(
+                    f"- **SYS_FORWARD_EPS = {peg_det['forward_eps']} 元**（= EPS_TTM×(1+SYS_PEG_GROWTH_PCT)；"
+                    f"**PEG 腿前瞻 EPS 直读此值，禁止用卖方分歧值自选**）"
+                )
+                prog_lines.append(
+                    f"- **SYS_PEG_CONFIDENCE = {peg_det['confidence']}**"
+                    + (f"（单季{peg_det['quarter_growth_pct']}% >> 年度{peg_det['annual_growth_pct']}%，"
+                       f"{conf_note}：RM 须降 Conviction 一档、偏离度近阈值时偏 HOLD）"
+                       if peg_det["confidence"] == "low" else "")
+                )
+            elif eps_ttm_val is not None and net_profit_growth is not None:
+                # SYS 增速缺失/非正 → 回退原"前瞻 EPS 参考"（RM 自选，至少不更差）
                 fwd_eps = eps_ttm_val * (1 + net_profit_growth)
                 prog_lines.append(
-                    f"- 前瞻 EPS 参考 ≈ {fwd_eps:.2f} 元（= EPS_TTM×(1+增速{net_profit_growth*100:.0f}%)，**仅 PEG 腿用**）"
+                    f"- 前瞻 EPS 参考 ≈ {fwd_eps:.2f} 元（= EPS_TTM×(1+增速{net_profit_growth*100:.0f}%)，"
+                    f"**仅 PEG 腿用**；SYS 确定性增速缺失，本值为回退参考）"
                 )
             prog_lines.append(
                 "- **铁律**：`target_pe_range` / 同业中位 / `PE_TTM×0.x` 全是 **TTM 倍数** → 下游 RM 的 "
@@ -918,6 +944,20 @@ TRANSPARENCY:
                 f"SYS_TARGET_PRIMARY_REASON: {growth_method['reason']}\n"
             )
             logger.info("SYS_TARGET_PRIMARY 已注入画像: %s", growth_method["recommend"])
+
+        # 确定性 PEG 输入 —— 机器可读，RM Step4 PEG 腿直读（钉死前瞻增速/EPS，防 LLM 自选致目标价摆动）
+        if peg_det is not None:
+            content = content + (
+                f"\n<!-- ⚠️SYS_PEG｜Python 确定性 PEG 输入(前瞻增速半衰封顶+前瞻EPS+低基数置信)，RM Step4 PEG 腿直读勿改 -->\n"
+                f"SYS_PEG_GROWTH_PCT: {peg_det['peg_growth_pct']}\n"
+                f"SYS_FORWARD_EPS: {peg_det['forward_eps']}\n"
+                f"SYS_PEG_CONFIDENCE: {peg_det['confidence']}\n"
+                f"SYS_PEG_REASON: 年度归母{peg_det['annual_growth_pct']}%半衰封顶→前瞻{peg_det['peg_growth_pct']}%"
+                + (f"；单季{peg_det['quarter_growth_pct']}%>>年度(低基数尖峰)→置信low" if peg_det['low_base_spike'] else "")
+                + "\n"
+            )
+            logger.info("SYS_PEG 已注入画像: growth=%s%% fwd_eps=%s conf=%s",
+                        peg_det['peg_growth_pct'], peg_det['forward_eps'], peg_det['confidence'])
 
         return {"stock_profile": content}
 

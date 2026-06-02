@@ -12,7 +12,33 @@ from tradingagents.dataflows.profile_calc import (
     recommend_growth_primary_method,
     parse_growth_quality,
     gate_premium_by_regime,
+    parse_sys_net_growth_components,
+    compute_deterministic_peg_inputs,
 )
+
+
+def test_deterministic_peg_inputs():
+    """确定性 PEG 输入：钉死前瞻增速/EPS + 低基数护栏（协创式 320↔180 → OW↔UW 摆动根）。"""
+    sysline = ("【SYS_GROWTH_YOY｜tushare】 营收YoY 单季=+192.9% 年度=+65.1% | "
+               "归母净利YoY 单季=+343.45% 年度=+68.51% | 扣非净利YoY 年度=+353%")
+    comp = parse_sys_net_growth_components(sysline)
+    assert abs(comp["annual"] - 0.6851) < 1e-6 and abs(comp["quarter"] - 3.4345) < 1e-6
+
+    # 协创：年度 68.51% 半衰封顶 → 30%（不用单季尖峰 343%）；前瞻 EPS = 4.86×1.30 = 6.32；低基数 → low
+    d = compute_deterministic_peg_inputs(4.86, comp["annual"], comp["quarter"])
+    assert d["peg_growth_pct"] == 30          # min(68.51,60)/2
+    assert d["forward_eps"] == 6.32
+    assert d["confidence"] == "low"           # 单季 343 >> 年度 68（>2× 且 >100%）
+    assert d["low_base_spike"] is True and d["capped"] is True
+
+    # 正常成长股（年度 30%，单季 25%，无尖峰）→ 增速 15%，confidence normal
+    d2 = compute_deterministic_peg_inputs(2.0, 0.30, 0.25)
+    assert d2["peg_growth_pct"] == 15 and d2["confidence"] == "normal" and d2["capped"] is False
+
+    # 缺确定性年度增速 / EPS / 衰退（年度≤0）→ None（RM 走原路径，不更差）
+    assert compute_deterministic_peg_inputs(None, 0.5, 0.5) is None
+    assert compute_deterministic_peg_inputs(4.0, None, 0.5) is None
+    assert compute_deterministic_peg_inputs(4.0, -0.1, None) is None
 
 
 def test_premium_regime_gate_cuts_both_ways():

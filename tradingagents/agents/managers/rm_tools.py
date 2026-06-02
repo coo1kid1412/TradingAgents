@@ -378,6 +378,7 @@ def compute_step6_rating_mapping(
     threshold_up_pct: float,
     target_price_source: str = "",
     valuation_regime: str = "",
+    peg_confidence: str = "",
 ) -> dict:
     """Step 6 评级机械映射工具（估值定倾向 + regime 闸门控极端）。
 
@@ -468,10 +469,21 @@ def compute_step6_rating_mapping(
     elif reg:
         gate_note = f" | regime={reg}，闸门无调整（{rating_raw} 在 regime 允许区内）"
 
+    # PEG 低置信闸（确定性 opt3）：前瞻 EPS 含低基数尖峰（SYS_PEG_CONFIDENCE=low）时，
+    # 仅"勉强过 HOLD 边界"的 OW/UW（偏离度距 ±threshold_dn ≤5pp）收敛回 HOLD——
+    # 数据本就说不清方向，不在 OW↔UW 间横跳；明确的强档(BUY/SELL/深 OW/UW)不动。
+    peg_conf_note = ""
+    _BOUNDARY_PAD = 5.0
+    if (peg_confidence or "").strip().lower() == "low" and rating in ("OVERWEIGHT", "UNDERWEIGHT"):
+        if abs(abs(deviation_pct) - threshold_dn_pct) <= _BOUNDARY_PAD:
+            peg_conf_note = (f" | SYS_PEG_CONFIDENCE=low + 偏离度 {deviation_pct:+.1f}% 近 HOLD 边界"
+                             f"(±{threshold_dn_pct}±{_BOUNDARY_PAD}pp) → 收敛 HOLD（前瞻含低基数尖峰，不下方向单）")
+            rating = "HOLD"
+
     explanation = (
         f"偏离度 = (当前价 {current_price} - 目标价中位 {target_price_mid}) / {target_price_mid} = "
         f"{deviation_pct:+.2f}% | 动态阈值 ±{threshold_dn_pct}%/±{threshold_up_pct}% | "
-        f"估值倾向 → {rating_raw}{gate_note} | 最终 → {rating}"
+        f"估值倾向 → {rating_raw}{gate_note}{peg_conf_note} | 最终 → {rating}"
     )
 
     return {
