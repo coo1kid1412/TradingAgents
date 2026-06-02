@@ -6,6 +6,7 @@ Token 通过环境变量 TUSHARE_TOKEN 配置。
 
 import os
 import re
+import json
 import time
 import logging
 from typing import Annotated, Optional
@@ -34,6 +35,73 @@ _ts_api = None
 # 避免同一运行周期内重复调用已知不可用的接口，直接触发 fallback
 # ---------------------------------------------------------------------------
 _DENIED_APIS: set[str] = set()
+
+# ---------------------------------------------------------------------------
+# fina_indicator 数据缓存：财务指标季度更新、极稳定 → 缓存后命中即用，不调 API（省 1次/小时限流额度）；
+# 限流/不可用时回退旧缓存（旧增速 > 没增速）。这是让下游 SYS_GROWTH_YOY 稳定产出的总开关——
+# earnings 腿确定性 + PEG 确定性输入都依赖它，否则一限流就全降级回 LLM 自选 → 评级摆动复发。
+# ---------------------------------------------------------------------------
+_FINA_CACHE_DIR = os.environ.get(
+    "FINA_INDICATOR_CACHE_DIR",
+    os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
+                 "harness_data", "fina_indicator_cache"),
+)
+_FINA_CACHE_TTL_SEC = 7 * 24 * 3600  # 7 天内必不变（季度数据）；新鲜则直接用、不调 API
+
+
+def _fina_cache_path(ts_code: str) -> str:
+    return os.path.join(_FINA_CACHE_DIR, f"fina_{ts_code}.json")
+
+
+def _read_fina_cache(ts_code: str, require_fresh: bool) -> Optional[pd.DataFrame]:
+    """读 fina_indicator 缓存。require_fresh=True 时仅返回 TTL 内的；损坏/缺失返回 None。"""
+    path = _fina_cache_path(ts_code)
+    if not os.path.exists(path):
+        return None
+    if require_fresh and (time.time() - os.path.getmtime(path)) >= _FINA_CACHE_TTL_SEC:
+        return None
+    try:
+        records = json.load(open(path, encoding="utf-8"))
+        if not records:
+            return None
+        return pd.DataFrame(records)
+    except Exception as e:
+        logger.debug("fina_indicator 缓存读取失败 %s: %s", ts_code, e)
+        return None
+
+
+def _write_fina_cache(ts_code: str, fina: pd.DataFrame) -> None:
+    try:
+        os.makedirs(_FINA_CACHE_DIR, exist_ok=True)
+        json.dump(fina.to_dict(orient="records"),
+                  open(_fina_cache_path(ts_code), "w", encoding="utf-8"),
+                  ensure_ascii=False, default=str)
+    except Exception as e:
+        logger.debug("fina_indicator 缓存写入失败 %s: %s", ts_code, e)
+
+
+def _fetch_fina_indicator_cached(pro, ts_code: str) -> Optional[pd.DataFrame]:
+    """fina_indicator 取数 + 数据缓存（新鲜缓存直接用；限流/失败回退旧缓存）。"""
+    # 1) 新鲜缓存命中 → 直接用，不调 API（省限流额度；fina 季度才变）
+    fresh = _read_fina_cache(ts_code, require_fresh=True)
+    if fresh is not None:
+        logger.info("fina_indicator 命中新鲜缓存(跳过 API)：%s", ts_code)
+        return fresh
+    # 2) 调 API
+    try:
+        fina = _safe_call(pro.fina_indicator, ts_code=ts_code, limit=5, api_name="fina_indicator")
+    except (TushareUnavailableError, TushareRateLimitError):
+        # 3) 限流/不可用 → 回退旧缓存（哪怕过期）；无缓存才把异常抛回原 fallback
+        stale = _read_fina_cache(ts_code, require_fresh=False)
+        if stale is not None:
+            logger.info("fina_indicator 限流/不可用，回退旧缓存：%s", ts_code)
+            return stale
+        raise
+    if fina is not None and not fina.empty:
+        _write_fina_cache(ts_code, fina)
+        return fina
+    # API 返回空 → 试旧缓存兜底
+    return _read_fina_cache(ts_code, require_fresh=False)
 
 
 def _get_tushare_api():
@@ -463,7 +531,7 @@ def get_fundamentals(
 
     # 财务指标（精选关键字段，消除列名歧义）
     try:
-        fina = _safe_call(pro.fina_indicator, ts_code=ts_code, limit=5, api_name="fina_indicator")
+        fina = _fetch_fina_indicator_cached(pro, ts_code)
         if fina is not None and not fina.empty:
             has_data = True
             sections.append("## 财务指标（最近4期）")
