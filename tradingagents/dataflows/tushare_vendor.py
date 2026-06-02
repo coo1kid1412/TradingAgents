@@ -594,6 +594,10 @@ def get_fundamentals(
 
         # 动态 PE(TTM)：收盘价 / TTM_EPS
         ttm_eps = _compute_ttm_eps(fina)
+        # TTM_EPS 单独输出成可解析行——只要 fina 在(缓存即够)就有，不受收盘价/daily_basic 限流影响。
+        # 下游 parse_eps_ttm 直读，确定性 PEG(SYS_FORWARD_EPS = EPS_TTM×(1+增速)) 才能稳定激活。
+        if ttm_eps is not None:
+            sections.append(f"EPS(TTM): {ttm_eps:.4f} 元（系统按 fina_indicator 滚动 4 季计算，下游直读）")
         if close_price and ttm_eps:
             dynamic_pe = round(close_price / ttm_eps, 2)
             sections.append(f"动态PE(系统计算): {dynamic_pe}倍 (公式: 收盘价/TTM_EPS)")
