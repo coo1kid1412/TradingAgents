@@ -225,7 +225,7 @@ def create_market_analyst(llm):
             "- `northbound_data_status`：若为 `数据停滞`（akshare 公开口径 2024-08-16 后停更），"
             "   仅作参考、不进资金面综合判定\n\n"
             "**4.4 龙虎榜与股东户数（筹码迁徙——散户 vs 机构最有体感的信号）**：\n"
-            "- `holder_num_latest` / `holder_num_qoq_pct`（最新户数 + 环比%）：**环比↑=户数增加=机构把筹码派给散户（派发/顶部信号）；环比↓=户数减少=筹码向机构集中（吸筹）**。缺失则注明，不要拿别的指标硬凑\n"
+            "- `holder_num_latest` / `holder_num_qoq_pct` / `holder_num_latest_report_date`（最新户数 + 环比% + 截止日）：**环比↑=户数增加=机构把筹码派给散户（派发/顶部信号）；环比↓=户数减少=筹码向机构集中（吸筹）**。⚠️ **必须标截止日**（季度数据，区别于主力资金日频；如『环比+15%，截至 2026-03-31 季报』）。缺失则注明，不要拿别的指标硬凑\n"
             "- `lhb_count_30d`（30日上榜次数）/ `chip_concentration_signal`（筹码集中信号：集中/分散/平稳）\n\n"
             "**4.5 资金面综合判定**（必输出，**直接引用** `capital_flow_regime` 字段，不要自创判定）：\n"
             "- `capital_flow_regime` ∈ {强势, 分化, 恶化, 中性, 数据不足, 非A股不适用}\n"

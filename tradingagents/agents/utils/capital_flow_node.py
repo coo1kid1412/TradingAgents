@@ -45,6 +45,9 @@ def _format_field_value(field: str, value) -> str:
         return f"{value:.1f}"
     if field == "holder_num_latest":
         return f"{int(value):,} 户"
+    if field == "holder_num_latest_report_date":
+        s = str(value)
+        return f"{s[:4]}-{s[4:6]}-{s[6:8]}" if len(s) == 8 and s.isdigit() else s
     return str(value)
 
 
@@ -114,6 +117,7 @@ _REPORT_FIELD_GROUPS: list[tuple[str, list[str]]] = [
         "lhb_inst_direction",
         "holder_num_latest",
         "holder_num_qoq_pct",
+        "holder_num_latest_report_date",
         "holder_num_4q_trend",
         "chip_concentration_signal",
     ]),

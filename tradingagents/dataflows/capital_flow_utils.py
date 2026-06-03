@@ -778,6 +778,7 @@ FIELD_LABEL_ZH: dict[str, str] = {
     "holder_num_latest":                "最新股东户数",
     "holder_num_qoq_pct":               "户数环比变化(%)",
     "holder_num_4q_trend":              "户数4季度趋势",
+    "holder_num_latest_report_date":    "户数报告期(截止日)",
     "chip_concentration_signal":        "筹码集中度信号",
     "circulating_market_value_yi":      "流通市值(亿)",
     "capital_flow_regime":              "资金面综合状态",
