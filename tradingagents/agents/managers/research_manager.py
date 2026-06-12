@@ -14,43 +14,37 @@ logger = logging.getLogger(__name__)
 _MAX_TOOL_ITERATIONS = 15
 
 
-def _retry_if_empty(llm_with_tools, messages, cot_segments, role: str):
-    """空输出兜底：MiniMax 推理模型偶发整段回复只有 <think> 思考块，被
-    _strip_think_tags 剥成空串（603629 PM / 300394 RM 两次真实事故，各废一次全跑）。
-    累计正文为空时带明确指令重试最多 2 次；仍为空则抛错让上游显式失败，
-    不再让空 thesis 静默流向下游（风控/PM 拿到空输入只能瞎编）。
+def _run_tool_calling_loop(llm_with_tools, initial_messages, *,
+                           tools_by_name=None, role="RM",
+                           completion_token="RM_SUMMARY",
+                           max_iterations=None, max_continuations=2):
+    """执行 LLM 工具调用循环。返回 AIMessage，content 是所有迭代的 LLM 文本累积。
+
+    退出条件不只是『不再调工具』，还要求**正文完整**：必须包含 completion_token
+    （RM_SUMMARY / PM_SUMMARY，两者本就是 prompt 强制的收尾 YAML，天然的完成标记）。
+
+    为什么：MiniMax 推理模型会把部分轮次的正文整段写进 <think> 块，被
+    _strip_think_tags 剥成空串。两类真实事故：
+    - 全空（603629 PM）：decision.md 缺失；
+    - 截断（300394 RM）：首轮有正文、后续轮全空，thesis 停在 Step 4 中途，
+      下游 PM 拿着没有评级的半截报告自己编了个 OVERWEIGHT 推送出去。
+    截断比全空更隐蔽——只查空兜不住，必须查收尾标记。
+
+    恢复策略：正文缺失/截断时带明确指令续写（工具照调，Step 6 的强制工具调用
+    可能还没发生），最多 max_continuations 次；预算用尽仍全空则抛错显式失败，
+    有部分正文则降级返回并 WARNING 留痕。
     """
-    for attempt in range(1, 3):
-        if any(s.strip() for s in cot_segments):
-            return
-        logger.warning("%s 输出正文为空（疑似 think-only 被剥离），第 %d 次重试", role, attempt)
-        messages.append(HumanMessage(
-            content="你上一条回复的正文为空（可能只输出了思考过程）。请**直接输出完整的最终报告正文**，"
-                    "不要输出思考标签，不要再调用任何工具。"
-        ))
-        retry = llm_with_tools.invoke(messages)
-        messages.append(retry)
-        retry_content = (retry.content or "").strip()
-        if retry_content:
-            cot_segments.append(retry_content)
-            return
-    raise RuntimeError(
-        f"{role} 连续 3 次输出空正文（think-only 剥离后无内容），中止本次分析——"
-        "空 thesis 流向下游只会产出无依据的报告"
-    )
+    tools_by_name = tools_by_name if tools_by_name is not None else RM_TOOLS_BY_NAME
+    max_iterations = max_iterations or _MAX_TOOL_ITERATIONS
+    hard_cap = max_iterations + 2 * max_continuations + 2  # 续写也要算轮数，防死循环
 
-
-def _run_tool_calling_loop(llm_with_tools, initial_messages):
-    """执行 LLM 工具调用循环，直到 LLM 不再调工具或达到上限。
-
-    返回 AIMessage，其 content 是**所有迭代的 LLM 文本累积**——保留完整 8 步 COT 链路。
-    历史 bug：之前只返回最后一次 response.content，导致 Step 1-8 + 第六步 COT 全丢，
-    judge_decision 只剩"最终输出 Thesis 报告"段。
-    """
     messages = list(initial_messages)
     cot_segments: list[str] = []
+    continuations = 0
+    iteration = 0
 
-    for iteration in range(_MAX_TOOL_ITERATIONS):
+    while iteration < hard_cap:
+        iteration += 1
         response = llm_with_tools.invoke(messages)
         messages.append(response)
 
@@ -60,50 +54,71 @@ def _run_tool_calling_loop(llm_with_tools, initial_messages):
             cot_segments.append(content)
 
         tool_calls = getattr(response, "tool_calls", None) or []
-        if not tool_calls:
+        if tool_calls:
+            logger.info("%s 第 %d 轮工具调用：%d 个工具", role, iteration, len(tool_calls))
+            for tc in tool_calls:
+                tool_name = tc.get("name")
+                tool_args = tc.get("args", {})
+                tool_id = tc.get("id", "")
+
+                tool = tools_by_name.get(tool_name)
+                if tool is None:
+                    error_msg = f"未知工具：{tool_name}"
+                    logger.warning(error_msg)
+                    messages.append(ToolMessage(content=error_msg, tool_call_id=tool_id))
+                    continue
+
+                try:
+                    result = tool.invoke(tool_args)
+                    result_str = json.dumps(result, ensure_ascii=False) if isinstance(result, dict) else str(result)
+                    logger.debug("%s 工具 %s 结果: %s", role, tool_name, result_str[:200])
+                    messages.append(ToolMessage(content=result_str, tool_call_id=tool_id))
+                except Exception as e:
+                    error_msg = f"工具 {tool_name} 执行失败: {e}"
+                    logger.warning(error_msg)
+                    messages.append(ToolMessage(content=error_msg, tool_call_id=tool_id))
+
+            # 工具轮数到达上限：要求收笔（仍允许它在续写检查中被抓回来）
+            if iteration == max_iterations:
+                logger.warning("%s 达到工具调用上限 (%d 轮)，要求直接收笔", role, max_iterations)
+                messages.append(HumanMessage(
+                    content="你已经调用足够多次工具了。请基于已有的工具结果直接写出最终报告，"
+                            "**不要再调用任何工具**。"
+                ))
+            continue
+
+        # —— 不再调工具：检查正文是否完整 ——
+        joined = "\n\n".join(cot_segments)
+        if joined.strip() and completion_token in joined:
             logger.info(
-                "RM tool calling 循环结束（第 %d 轮，累积 %d 段 COT，总长 %d 字符）",
-                iteration + 1, len(cot_segments), sum(len(s) for s in cot_segments),
+                "%s tool calling 循环结束（第 %d 轮，累积 %d 段，总长 %d 字符）",
+                role, iteration, len(cot_segments), len(joined),
             )
-            _retry_if_empty(llm_with_tools, messages, cot_segments, "RM")
-            return AIMessage(content="\n\n".join(cot_segments))
+            return AIMessage(content=joined)
 
-        logger.info("RM 第 %d 轮工具调用：%d 个工具", iteration + 1, len(tool_calls))
-        for tc in tool_calls:
-            tool_name = tc.get("name")
-            tool_args = tc.get("args", {})
-            tool_id = tc.get("id", "")
+        if continuations >= max_continuations:
+            break
 
-            tool = RM_TOOLS_BY_NAME.get(tool_name)
-            if tool is None:
-                error_msg = f"未知工具：{tool_name}"
-                logger.warning(error_msg)
-                messages.append(ToolMessage(content=error_msg, tool_call_id=tool_id))
-                continue
+        continuations += 1
+        reason = "为空" if not joined.strip() else f"截断（缺 {completion_token} 收尾）"
+        logger.warning("%s 输出正文%s（疑似 think-only 被剥离），第 %d 次续写",
+                       role, reason, continuations)
+        messages.append(HumanMessage(
+            content=f"你的报告正文{reason}——可能你把内容写进了思考过程。请**从中断处继续输出正文**，"
+                    f"不要重复已输出的部分，不要输出思考标签；尚未完成的步骤继续完成"
+                    f"（该调用的工具照常调用），最后必须以完整的 {completion_token} YAML 段收尾。"
+        ))
 
-            try:
-                result = tool.invoke(tool_args)
-                result_str = json.dumps(result, ensure_ascii=False) if isinstance(result, dict) else str(result)
-                logger.debug("RM 工具 %s 结果: %s", tool_name, result_str[:200])
-                messages.append(ToolMessage(content=result_str, tool_call_id=tool_id))
-            except Exception as e:
-                error_msg = f"工具 {tool_name} 执行失败: {e}"
-                logger.warning(error_msg)
-                messages.append(ToolMessage(content=error_msg, tool_call_id=tool_id))
-
-    # 达到上限仍未结束——强制再调一次，要求 LLM 不再用工具直接给最终答案
-    logger.warning("RM 达到工具调用上限 (%d 轮)，强制 LLM 续写最终结论", _MAX_TOOL_ITERATIONS)
-    messages.append(HumanMessage(
-        content="你已经调用足够多次工具了。请基于已有的工具结果直接写出最终的 thesis 报告，"
-                "**不要再调用任何工具**。"
-    ))
-    final = llm_with_tools.invoke(messages)
-    messages.append(final)
-    final_content = (final.content or "").strip()
-    if final_content:
-        cot_segments.append(final_content)
-    _retry_if_empty(llm_with_tools, messages, cot_segments, "RM")
-    return AIMessage(content="\n\n".join(cot_segments))
+    # —— 续写预算用尽 ——
+    joined = "\n\n".join(cot_segments)
+    if not joined.strip():
+        raise RuntimeError(
+            f"{role} 连续 {max_continuations + 1} 次输出空正文（think-only 剥离后无内容），"
+            "中止本次分析——空 thesis 流向下游只会产出无依据的报告"
+        )
+    logger.warning("%s 续写预算用尽仍缺 %s 收尾，按现有 %d 字符正文降级返回（下游解析会标 warning）",
+                   role, completion_token, len(joined))
+    return AIMessage(content=joined)
 
 
 def create_research_manager(llm):

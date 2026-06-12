@@ -1,11 +1,10 @@
-import json
 import logging
 
-from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+from langchain_core.messages import HumanMessage
 
 from tradingagents.agents.utils.agent_utils import build_instrument_context, get_language_instruction, RISK_DEBATE_PHRASING_RULES
 from tradingagents.agents.managers.pm_tools import PM_TOOLS, PM_TOOLS_BY_NAME
-from tradingagents.agents.managers.research_manager import _retry_if_empty
+from tradingagents.agents.managers.research_manager import _run_tool_calling_loop
 
 logger = logging.getLogger(__name__)
 
@@ -13,54 +12,16 @@ _MAX_TOOL_ITERATIONS = 6
 
 
 def _pm_tool_loop(llm_with_tools, initial_messages):
-    """PM 工具调用循环。返回累积了所有迭代 LLM 文本的 AIMessage（保留 9 步决策链路）。
+    """PM 工具调用循环——复用 RM 的共享循环（含空输出/截断续写兜底）。
 
-    空输出兜底复用 RM 的 _retry_if_empty（603629 事故：MiniMax think-only 被剥空
-    → decision.md 缺失，5_portfolio 整段跳过）。
+    完成标记 PM_SUMMARY：prompt 强制的收尾 YAML，缺了说明正文被 think-only
+    剥空或中途截断（603629 事故：decision.md 缺失，5_portfolio 整段跳过）。
     """
-    messages = list(initial_messages)
-    cot_segments: list[str] = []
-
-    for iteration in range(_MAX_TOOL_ITERATIONS):
-        response = llm_with_tools.invoke(messages)
-        messages.append(response)
-
-        content = (response.content or "").strip()
-        if content:
-            cot_segments.append(content)
-
-        tool_calls = getattr(response, "tool_calls", None) or []
-        if not tool_calls:
-            logger.info(
-                "PM tool loop 结束（第 %d 轮，累积 %d 段，总长 %d 字符）",
-                iteration + 1, len(cot_segments), sum(len(s) for s in cot_segments),
-            )
-            _retry_if_empty(llm_with_tools, messages, cot_segments, "PM")
-            return AIMessage(content="\n\n".join(cot_segments))
-
-        logger.info("PM 第 %d 轮工具调用：%d 个", iteration + 1, len(tool_calls))
-        for tc in tool_calls:
-            tool_name = tc.get("name")
-            tool = PM_TOOLS_BY_NAME.get(tool_name)
-            if tool is None:
-                messages.append(ToolMessage(content=f"未知工具：{tool_name}", tool_call_id=tc.get("id", "")))
-                continue
-            try:
-                result = tool.invoke(tc.get("args", {}))
-                payload = json.dumps(result, ensure_ascii=False) if isinstance(result, dict) else str(result)
-                messages.append(ToolMessage(content=payload, tool_call_id=tc.get("id", "")))
-            except Exception as e:
-                messages.append(ToolMessage(content=f"工具 {tool_name} 失败: {e}", tool_call_id=tc.get("id", "")))
-
-    logger.warning("PM 达到工具调用上限 %d 轮", _MAX_TOOL_ITERATIONS)
-    messages.append(HumanMessage(content="请基于已有工具结果直接写出最终决策，不要再调工具。"))
-    final = llm_with_tools.invoke(messages)
-    messages.append(final)
-    final_content = (final.content or "").strip()
-    if final_content:
-        cot_segments.append(final_content)
-    _retry_if_empty(llm_with_tools, messages, cot_segments, "PM")
-    return AIMessage(content="\n\n".join(cot_segments))
+    return _run_tool_calling_loop(
+        llm_with_tools, initial_messages,
+        tools_by_name=PM_TOOLS_BY_NAME, role="PM",
+        completion_token="PM_SUMMARY", max_iterations=_MAX_TOOL_ITERATIONS,
+    )
 
 
 def create_portfolio_manager(llm, memory):
