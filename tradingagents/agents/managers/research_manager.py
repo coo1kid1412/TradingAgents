@@ -514,8 +514,10 @@ bull_target / base_target / bear_target → 你刚设计的三情景目标价
 | theme_stage | THEMATIC_PREMIUM.theme_stage | 仅用于 fading 上沿锁 |
 | valuation_regime | **画像末尾 `SYS_VALUATION_REGIME:` 行** | 照抄 ride/neutral/discipline；严禁臆断或从正文猜；全文搜不到才填 "" |
 | peg_confidence | 画像末尾 `SYS_PEG_CONFIDENCE:` 行 | normal / low；无此行填 "" |
-| consensus_crowded | consensus_snapshot.crowded | true/false |
+| consensus_crowded | consensus_snapshot.crowded | true/false（软标志，工具内须经硬数据确认才生效） |
 | consensus_direction | consensus_snapshot.direction | 偏多 / 偏空 / 中性 |
+| quant_anticrowding | QUANT_SCORE.factor_scores.anticrowding | 0-100；拥挤的硬确认之一（≤30 = 真拥挤），缺失填 None |
+| retail_concentration_signal | 0.6 节 CAPITAL_FLOW.retail_concentration_signal | 散户高接盘 / 中性；拥挤的硬确认之二，缺失填 "" |
 | inflection_stage | 你 Step 3 的『当前周期阶段』 | 加速期 / 底部反转 / 顶部 / 衰退 / 拐点期 |
 | data_completeness | VALUATION_METHOD.data_completeness | L0-L3 |
 | red_flags_count | fundamentals.SUMMARY.red_flags 条数 | 整数 |
@@ -538,7 +540,7 @@ bull_target / base_target / bear_target → 你刚设计的三情景目标价
 工具内部链路（你不执行，只需在 COT 里复述返回的 explanation）：
 1. 动态阈值 = 基础 ±15/±35 × style 系数（blue_chip/cyclical/etf 1.0、illiquid 0.7、high_beta_growth 1.5、theme_speculation 2.0）× (1 + SYS_THEME_PREMIUM_PCT/100)；theme_stage=fading 时上沿锁 30%
 2. 估值五档映射 + regime 闸门（ride 把 UNDERWEIGHT/SELL 托底 HOLD；discipline 把 OVERWEIGHT/BUY 封顶 HOLD、SELL 保留；neutral 收敛三档）+ PEG 低置信边界收敛
-3. 拥挤度（拥挤多头禁 BUY、拥挤空头禁 SELL；**禁令固化为边界，对后续所有步骤持续生效，趋势叠加绕不过**）
+3. 拥挤度（拥挤多头禁 BUY、拥挤空头禁 SELL；**禁令固化为边界，对后续所有步骤持续生效，趋势叠加绕不过**。共识官的 crowded 只是软标志，须经硬数据确认——反拥挤分 ≤30 或 散户高接盘——才触发；无硬确认不动评级，对标投研用持仓/成交数据判拥挤而非舆情观感）
 4. 对称升降档（升档需同时满足：拐点加速/底部反转 + L0/L1 + 红旗≤1 + 低估区 + 非 momentum，且仅 HOLD→OW / OW→BUY；降档 L3 / 红旗≥3 / 拐点顶部衰退 / 空头anchor强+待验证 各 -1，合计最多 -2）
 5. 趋势叠加三路（style 动量 / 报告加权方向票 / 催化硬数据，合成最多 ±1）
 6. 极端背离防御（composite ≤20 压看多 → HOLD；≥80 托看空 → HOLD）

@@ -1243,9 +1243,11 @@ def compute_step6_final_rating(
     valuation_regime: str = "",
     peg_confidence: str = "",
     target_price_source: str = "",
-    # ── 第四步 拥挤度 ──
+    # ── 第四步 拥挤度（软标志 + 硬确认）──
     consensus_crowded: bool = False,
     consensus_direction: str = "",
+    quant_anticrowding: Optional[float] = None,
+    retail_concentration_signal: str = "",
     # ── 第五步 对称升降档 ──
     inflection_stage: str = "",
     data_completeness: str = "",
@@ -1294,7 +1296,13 @@ def compute_step6_final_rating(
       1) 动态阈值 = 基础 15/35 × style 系数 × (1 + theme_premium_pct/100)；
          theme_stage 含 fading 时上沿锁 30%（主题反噬保护）
       2) compute_step6_rating_mapping（含 regime 闸门 + PEG 低置信收敛）
-      3) 拥挤度调整（crowded+偏多：BUY→OVERWEIGHT 且设天花板；偏空对称）
+      3) 拥挤度调整（crowded+偏多：BUY→OVERWEIGHT 且设天花板；偏空对称）。
+         ⚠️ 软标志须经硬数据确认才触发：consensus_crowded 是共识官(LLM)读舆情拍的，
+         实测同跑内会对拥挤方向自相矛盾（300394：工具入参填"拥挤空头"、风险清单写
+         "拥挤多头"）。对标投研：判拥挤用持仓/成交数据（换手率分位、融资余额分位），
+         不用舆情观感。硬确认 = 反拥挤因子分 ≤30（60日收益+换手率加速度，Python 算）
+         或 散户高接盘（资金流官确定性信号）。无硬确认 → 拥挤闸不触发。
+         （A 股无个股做空，"拥挤空头"硬确认后实际几乎不触发——本就该如此）
       4) 对称升降档（升档需 拐点加速/底部反转 + L0/L1 + 红旗≤1 + 偏离<0 +
          非 momentum 风格，且仅 HOLD→OW / OW→BUY；降档 L3/红旗≥3/拐点顶部衰退/
          空头anchor强+可持续性待验证 各 -1，合计最多 -2）
@@ -1312,6 +1320,8 @@ def compute_step6_final_rating(
         valuation_regime: 画像末尾 SYS_VALUATION_REGIME（ride/neutral/discipline）
         peg_confidence: 画像末尾 SYS_PEG_CONFIDENCE（normal/low；无则 ""）
         consensus_crowded / consensus_direction: 共识快照 crowded 与方向（偏多/偏空）
+        quant_anticrowding: QUANT_SCORE.factor_scores.anticrowding（0-100，硬确认用）
+        retail_concentration_signal: 资金流官散户接盘信号（散户高接盘/中性，硬确认用）
         inflection_stage: RM Step 3 业绩拐点阶段（加速期/底部反转/顶部/衰退/拐点期…）
         data_completeness: VALUATION_METHOD.data_completeness（L0-L3）
         red_flags_count: fundamentals.SUMMARY.red_flags 条数
@@ -1389,24 +1399,39 @@ def compute_step6_final_rating(
     stages: dict = {"mapping": mapping}
 
     # ── 3) 第四步 拥挤度（原 LLM 对照表 → Python；并把禁令固化为持续边界）──
+    # 软标志(共识官 LLM 判的 crowded)须经硬数据确认才触发——舆情观感判拥挤不可靠，
+    # 对标投研用持仓/成交数据。硬确认任一即可：反拥挤因子分≤30 或 散户高接盘。
     crowd_note = "consensus 不拥挤，无调整"
     direction = (consensus_direction or "").strip()
+    hard_confirms = []
+    if quant_anticrowding is not None and quant_anticrowding <= 30:
+        hard_confirms.append(f"反拥挤分 {quant_anticrowding:.0f}≤30")
+    if (retail_concentration_signal or "").strip() == "散户高接盘":
+        hard_confirms.append("散户高接盘")
+
+    if consensus_crowded and not hard_confirms:
+        crowd_note = ("共识官标拥挤，但无硬数据确认（反拥挤分>30 且非散户高接盘）→ "
+                      "拥挤闸不触发（软标志单独不可靠，不据此动评级）")
+        consensus_crowded = False
+
     if consensus_crowded and ("多" in direction):
+        confirm = "、".join(hard_confirms)
         ceiling_idx = min(ceiling_idx, _RATINGS_ORDER.index("OVERWEIGHT"))
-        bound_sources.append("拥挤多头：天花板 OVERWEIGHT（禁 BUY，对后续步骤持续生效）")
+        bound_sources.append(f"拥挤多头（硬确认：{confirm}）：天花板 OVERWEIGHT（禁 BUY，对后续步骤持续生效）")
         if rating == "BUY":
             rating = "OVERWEIGHT"
-            crowd_note = "拥挤多头：BUY → OVERWEIGHT（不在拥挤多头继续极端追高）"
+            crowd_note = f"拥挤多头（硬确认：{confirm}）：BUY → OVERWEIGHT（不在拥挤多头继续极端追高）"
         else:
-            crowd_note = f"拥挤多头：{rating} 在保留区，无即时调整（但天花板 OVERWEIGHT 已生效）"
+            crowd_note = f"拥挤多头（硬确认：{confirm}）：{rating} 在保留区，无即时调整（但天花板 OVERWEIGHT 已生效）"
     elif consensus_crowded and ("空" in direction):
+        confirm = "、".join(hard_confirms)
         floor_idx = max(floor_idx, _RATINGS_ORDER.index("UNDERWEIGHT"))
-        bound_sources.append("拥挤空头：地板 UNDERWEIGHT（禁 SELL，对后续步骤持续生效）")
+        bound_sources.append(f"拥挤空头（硬确认：{confirm}）：地板 UNDERWEIGHT（禁 SELL，对后续步骤持续生效）")
         if rating == "SELL":
             rating = "UNDERWEIGHT"
-            crowd_note = "拥挤空头：SELL → UNDERWEIGHT（不在拥挤空头继续极端追空）"
+            crowd_note = f"拥挤空头（硬确认：{confirm}）：SELL → UNDERWEIGHT（不在拥挤空头继续极端追空）"
         else:
-            crowd_note = f"拥挤空头：{rating} 在保留区，无即时调整（但地板 UNDERWEIGHT 已生效）"
+            crowd_note = f"拥挤空头（硬确认：{confirm}）：{rating} 在保留区，无即时调整（但地板 UNDERWEIGHT 已生效）"
     rating, _clamped = _clamp_to_bounds(rating)
     stages["crowding"] = {"rating_after": rating, "note": crowd_note}
 

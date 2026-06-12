@@ -92,13 +92,14 @@ def test_e_sign_invariant_blocks_bearish_positive_e():
 
 
 def test_crowded_long_ceiling_survives_overlay():
-    """拥挤绕道封堵：拥挤多头天花板 OVERWEIGHT 对趋势叠加持续生效。"""
+    """拥挤绕道封堵：拥挤多头（含硬确认）天花板 OVERWEIGHT 对趋势叠加持续生效。"""
     # 深度低估（题材股阈值 ±30/70，偏离 -75% 落 BUY 区）+ 拥挤多头 → 降为 OW；
     # 强动量题材股叠加 +1 想回 BUY → 被天花板钳住
     r = F.invoke(_base(
         current_price=25.0, target_price_mid=100.0,
         style="theme_speculation", theme_premium_pct=0.0,
         consensus_crowded=True, consensus_direction="偏多",
+        quant_anticrowding=25.0,   # 硬确认：反拥挤分≤30
         composite_score=60.0, momentum_score=70.0,
     ))
     assert r["rating_raw"] == "BUY"
@@ -108,11 +109,42 @@ def test_crowded_long_ceiling_survives_overlay():
     print("✓ 拥挤多头禁 BUY：趋势叠加无法绕回 BUY")
 
 
+def test_crowded_without_hard_confirm_not_triggered():
+    """共识官标拥挤但无硬数据确认 → 拥挤闸不触发（软标志单独不可靠）。"""
+    r = F.invoke(_base(
+        current_price=25.0, target_price_mid=100.0,
+        style="theme_speculation", theme_premium_pct=0.0,
+        consensus_crowded=True, consensus_direction="偏多",
+        quant_anticrowding=55.0,                 # 反拥挤分健康
+        retail_concentration_signal="中性",       # 无散户高接盘
+    ))
+    assert r["rating_raw"] == "BUY"
+    assert r["final_rating"] == "BUY", r["explanation"]   # 闸不触发，BUY 保留
+    assert "不触发" in r["stages"]["crowding"]["note"]
+    assert not any("拥挤" in s for s in r["bounds"]["sources"])
+    print("✓ 软拥挤标志无硬确认 → 不动评级")
+
+
+def test_crowded_confirmed_by_retail_signal():
+    """硬确认第二路：散户高接盘单独也能确认拥挤多头。"""
+    r = F.invoke(_base(
+        current_price=25.0, target_price_mid=100.0,
+        style="theme_speculation", theme_premium_pct=0.0,
+        consensus_crowded=True, consensus_direction="偏多",
+        quant_anticrowding=55.0,
+        retail_concentration_signal="散户高接盘",
+    ))
+    assert r["final_rating"] != "BUY"
+    assert any("散户高接盘" in s for s in r["bounds"]["sources"])
+    print("✓ 散户高接盘单独确认拥挤")
+
+
 def test_crowded_short_floor_survives():
-    """拥挤空头地板 UNDERWEIGHT：SELL 收敛且下游不得再压回。"""
+    """拥挤空头（含硬确认）地板 UNDERWEIGHT：SELL 收敛且下游不得再压回。"""
     r = F.invoke(_base(
         current_price=200.0, target_price_mid=100.0,
         consensus_crowded=True, consensus_direction="偏空",
+        quant_anticrowding=20.0,
     ))
     assert r["rating_raw"] == "SELL"
     assert r["final_rating"] == "UNDERWEIGHT", r["explanation"]
@@ -242,6 +274,8 @@ if __name__ == "__main__":
     test_e_sign_invariant_blocks_bullish_negative_e()
     test_e_sign_invariant_blocks_bearish_positive_e()
     test_crowded_long_ceiling_survives_overlay()
+    test_crowded_without_hard_confirm_not_triggered()
+    test_crowded_confirmed_by_retail_signal()
     test_crowded_short_floor_survives()
     test_discipline_ceiling_not_reupgraded()
     test_symmetric_upgrade_path()
@@ -251,4 +285,4 @@ if __name__ == "__main__":
     test_extreme_defense_and_exception()
     test_neutral_passthrough_equals_legacy_chain()
     test_mapping_error_propagates()
-    print("\n全部 13 项通过 ✅")
+    print("\n全部 15 项通过 ✅")
