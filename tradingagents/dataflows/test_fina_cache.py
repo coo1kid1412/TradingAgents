@@ -39,7 +39,7 @@ def test_fresh_vs_stale_ttl():
     tv._write_fina_cache("TEST002.SZ", _DF)
     assert tv._read_fina_cache("TEST002.SZ", require_fresh=True) is not None   # 刚写，新鲜
     # 人为把文件 mtime 改老到超 TTL
-    path = tv._fina_cache_path("TEST002.SZ")
+    path = tv._api_cache_path("fina", "TEST002.SZ")
     old = time.time() - tv._FINA_CACHE_TTL_SEC - 100
     os.utime(path, (old, old))
     assert tv._read_fina_cache("TEST002.SZ", require_fresh=True) is None       # 过期 → 新鲜读取为 None
@@ -56,7 +56,7 @@ def test_rate_limit_falls_back_to_stale(monkeypatch=None):
     from tradingagents.dataflows.vendor_errors import TushareRateLimitError
     tv._write_fina_cache("TEST003.SZ", _DF)
     # 让缓存过期（强制走 API 路径），再模拟 API 限流 → 应回退旧缓存
-    path = tv._fina_cache_path("TEST003.SZ")
+    path = tv._api_cache_path("fina", "TEST003.SZ")
     old = time.time() - tv._FINA_CACHE_TTL_SEC - 100
     os.utime(path, (old, old))
 

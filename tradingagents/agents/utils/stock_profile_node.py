@@ -588,7 +588,7 @@ def create_stock_profile_node(llm):
                              else "正常")
                 prog_lines.append(
                     f"- **SYS_PEG_GROWTH_PCT = {peg_det['peg_growth_pct']}**（确定性前瞻增速：年度归母"
-                    f"{peg_det['annual_growth_pct']}% 半衰封顶后；**PEG 腿增速直读此值，禁止自选**）"
+                    f"{peg_det['annual_growth_pct']}% 分段衰减后(≤40%全采信/超出五折/封顶60%)；**PEG 腿增速直读此值，禁止自选**）"
                 )
                 prog_lines.append(
                     f"- **SYS_FORWARD_EPS = {peg_det['forward_eps']} 元**（= EPS_TTM×(1+SYS_PEG_GROWTH_PCT)；"
@@ -948,11 +948,11 @@ TRANSPARENCY:
         # 确定性 PEG 输入 —— 机器可读，RM Step4 PEG 腿直读（钉死前瞻增速/EPS，防 LLM 自选致目标价摆动）
         if peg_det is not None:
             content = content + (
-                f"\n<!-- ⚠️SYS_PEG｜Python 确定性 PEG 输入(前瞻增速半衰封顶+前瞻EPS+低基数置信)，RM Step4 PEG 腿直读勿改 -->\n"
+                f"\n<!-- ⚠️SYS_PEG｜Python 确定性 PEG 输入(前瞻增速分段衰减+前瞻EPS+低基数置信)，RM Step4 PEG 腿直读勿改 -->\n"
                 f"SYS_PEG_GROWTH_PCT: {peg_det['peg_growth_pct']}\n"
                 f"SYS_FORWARD_EPS: {peg_det['forward_eps']}\n"
                 f"SYS_PEG_CONFIDENCE: {peg_det['confidence']}\n"
-                f"SYS_PEG_REASON: 年度归母{peg_det['annual_growth_pct']}%半衰封顶→前瞻{peg_det['peg_growth_pct']}%"
+                f"SYS_PEG_REASON: 年度归母{peg_det['annual_growth_pct']}%分段衰减→前瞻{peg_det['peg_growth_pct']}%"
                 + (f"；单季{peg_det['quarter_growth_pct']}%>>年度(低基数尖峰)→置信low" if peg_det['low_base_spike'] else "")
                 + "\n"
             )

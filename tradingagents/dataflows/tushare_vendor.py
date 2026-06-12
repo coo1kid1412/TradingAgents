@@ -41,24 +41,34 @@ _DENIED_APIS: set[str] = set()
 # 限流/不可用时回退旧缓存（旧增速 > 没增速）。这是让下游 SYS_GROWTH_YOY 稳定产出的总开关——
 # earnings 腿确定性 + PEG 确定性输入都依赖它，否则一限流就全降级回 LLM 自选 → 评级摆动复发。
 # ---------------------------------------------------------------------------
+# 通用 tushare 接口缓存（目录沿用历史名 fina_indicator_cache，现存 fina_/income_/daily_basic_ 三类文件）
+# tushare 免费档限流狠（fina 1次/小时、income 5次/天、daily_basic 1次/分），
+# 没缓存则多股连跑必击穿 → 下游确定性链断 → 评级摆动复发。模式统一为：
+# 新鲜缓存直接用（省额度）→ 调 API 成功落盘 → 限流/失败回退旧缓存（哪怕过期）。
 _FINA_CACHE_DIR = os.environ.get(
     "FINA_INDICATOR_CACHE_DIR",
     os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
                  "harness_data", "fina_indicator_cache"),
 )
-_FINA_CACHE_TTL_SEC = 7 * 24 * 3600  # 7 天内必不变（季度数据）；新鲜则直接用、不调 API
+_FINA_CACHE_TTL_SEC = 7 * 24 * 3600  # 季度数据 7 天内必不变
+_API_CACHE_TTL_SEC = {
+    "fina": _FINA_CACHE_TTL_SEC,      # fina_indicator：季度
+    "income": _FINA_CACHE_TTL_SEC,    # 利润表：季度
+    "daily_basic": 12 * 3600,         # EOD 估值快照：同一天内复用（盘中取到的也是前收）
+}
 
 
-def _fina_cache_path(ts_code: str) -> str:
-    return os.path.join(_FINA_CACHE_DIR, f"fina_{ts_code}.json")
+def _api_cache_path(prefix: str, ts_code: str) -> str:
+    return os.path.join(_FINA_CACHE_DIR, f"{prefix}_{ts_code}.json")
 
 
-def _read_fina_cache(ts_code: str, require_fresh: bool) -> Optional[pd.DataFrame]:
-    """读 fina_indicator 缓存。require_fresh=True 时仅返回 TTL 内的；损坏/缺失返回 None。"""
-    path = _fina_cache_path(ts_code)
+def _read_api_cache(prefix: str, ts_code: str, require_fresh: bool) -> Optional[pd.DataFrame]:
+    """读接口缓存。require_fresh=True 时仅返回 TTL 内的；损坏/缺失返回 None。"""
+    path = _api_cache_path(prefix, ts_code)
     if not os.path.exists(path):
         return None
-    if require_fresh and (time.time() - os.path.getmtime(path)) >= _FINA_CACHE_TTL_SEC:
+    ttl = _API_CACHE_TTL_SEC[prefix]
+    if require_fresh and (time.time() - os.path.getmtime(path)) >= ttl:
         return None
     try:
         records = json.load(open(path, encoding="utf-8"))
@@ -66,42 +76,60 @@ def _read_fina_cache(ts_code: str, require_fresh: bool) -> Optional[pd.DataFrame
             return None
         return pd.DataFrame(records)
     except Exception as e:
-        logger.debug("fina_indicator 缓存读取失败 %s: %s", ts_code, e)
+        logger.debug("%s 缓存读取失败 %s: %s", prefix, ts_code, e)
         return None
 
 
-def _write_fina_cache(ts_code: str, fina: pd.DataFrame) -> None:
+def _write_api_cache(prefix: str, ts_code: str, df: pd.DataFrame) -> None:
     try:
         os.makedirs(_FINA_CACHE_DIR, exist_ok=True)
-        json.dump(fina.to_dict(orient="records"),
-                  open(_fina_cache_path(ts_code), "w", encoding="utf-8"),
+        json.dump(df.to_dict(orient="records"),
+                  open(_api_cache_path(prefix, ts_code), "w", encoding="utf-8"),
                   ensure_ascii=False, default=str)
     except Exception as e:
-        logger.debug("fina_indicator 缓存写入失败 %s: %s", ts_code, e)
+        logger.debug("%s 缓存写入失败 %s: %s", prefix, ts_code, e)
+
+
+# fina 的旧接口名保留（test_fina_cache.py 及历史调用依赖）
+def _read_fina_cache(ts_code: str, require_fresh: bool) -> Optional[pd.DataFrame]:
+    return _read_api_cache("fina", ts_code, require_fresh)
+
+
+def _write_fina_cache(ts_code: str, fina: pd.DataFrame) -> None:
+    _write_api_cache("fina", ts_code, fina)
+
+
+def _fetch_cached(prefix: str, ts_code: str, fetch_fn) -> Optional[pd.DataFrame]:
+    """通用『缓存优先 + 限流回退陈旧值』取数。
+
+    fetch_fn: 无参可调用，内部执行真实 API 调用（_safe_call 包好），
+              限流/不可用时抛 TushareUnavailableError/TushareRateLimitError。
+    """
+    fresh = _read_api_cache(prefix, ts_code, require_fresh=True)
+    if fresh is not None:
+        logger.info("%s 命中新鲜缓存(跳过 API)：%s", prefix, ts_code)
+        return fresh
+    try:
+        df = fetch_fn()
+    except (TushareUnavailableError, TushareRateLimitError):
+        stale = _read_api_cache(prefix, ts_code, require_fresh=False)
+        if stale is not None:
+            logger.info("%s 限流/不可用，回退旧缓存：%s", prefix, ts_code)
+            return stale
+        raise
+    if df is not None and not df.empty:
+        _write_api_cache(prefix, ts_code, df)
+        return df
+    # API 返回空 → 试旧缓存兜底
+    return _read_api_cache(prefix, ts_code, require_fresh=False)
 
 
 def _fetch_fina_indicator_cached(pro, ts_code: str) -> Optional[pd.DataFrame]:
     """fina_indicator 取数 + 数据缓存（新鲜缓存直接用；限流/失败回退旧缓存）。"""
-    # 1) 新鲜缓存命中 → 直接用，不调 API（省限流额度；fina 季度才变）
-    fresh = _read_fina_cache(ts_code, require_fresh=True)
-    if fresh is not None:
-        logger.info("fina_indicator 命中新鲜缓存(跳过 API)：%s", ts_code)
-        return fresh
-    # 2) 调 API
-    try:
-        fina = _safe_call(pro.fina_indicator, ts_code=ts_code, limit=5, api_name="fina_indicator")
-    except (TushareUnavailableError, TushareRateLimitError):
-        # 3) 限流/不可用 → 回退旧缓存（哪怕过期）；无缓存才把异常抛回原 fallback
-        stale = _read_fina_cache(ts_code, require_fresh=False)
-        if stale is not None:
-            logger.info("fina_indicator 限流/不可用，回退旧缓存：%s", ts_code)
-            return stale
-        raise
-    if fina is not None and not fina.empty:
-        _write_fina_cache(ts_code, fina)
-        return fina
-    # API 返回空 → 试旧缓存兜底
-    return _read_fina_cache(ts_code, require_fresh=False)
+    return _fetch_cached(
+        "fina", ts_code,
+        lambda: _safe_call(pro.fina_indicator, ts_code=ts_code, limit=5, api_name="fina_indicator"),
+    )
 
 
 def _get_tushare_api():
@@ -414,6 +442,57 @@ def _compute_ttm_revenue_per_share_fina(
     )
 
 
+def _format_landmine_line(stock_name, fina) -> str:
+    """地雷排查可确定性判定项 → 固定格式行，RM 第负一步直读（不再让 LLM 从 prose 猜）。
+
+    只用已取到的数据，不新增 API 依赖：
+    - ST/*ST：股票名称字符串匹配（L1）
+    - 连续两年亏损：最近两个年度期（end_date=1231）EPS 符号（L2 的可判部分）
+    - 资产负债率 / 流动比率：fina 最新期（L6 的输入）
+    免费档拿不到的（质押率/商誉占比/审计意见）显式标"不可得"，留给 LLM 从
+    news/fundamentals prose 判断——宁可标注空白，不让确定性行假装全知。
+    防御式：任何解析失败返回空串（RM 退回原 prose 判断路径，不更差）。
+    """
+    try:
+        parts = []
+        if stock_name:
+            parts.append(f"ST={'是' if 'ST' in str(stock_name).upper() else '否'}")
+        else:
+            parts.append("ST=不可得")
+
+        loss_str = "数据不足"
+        debt_str, curr_str = "不可得", "不可得"
+        if fina is not None and not fina.empty:
+            df = fina.sort_values("end_date")
+            annual = df[df["end_date"].astype(str).str.endswith("1231")]
+            # fina 缓存常只含最近 5 期（≈1 个年度期）：最近年度盈利即足以判"否"
+            #（连续两年亏损要求最近一年也亏）；最近年度亏损才需要上一年数据
+            if len(annual) >= 1:
+                eps_vals = [float(v) for v in annual["eps"].tolist() if v is not None]
+                if eps_vals:
+                    if eps_vals[-1] >= 0:
+                        loss_str = "否"
+                    elif len(eps_vals) >= 2:
+                        loss_str = "是" if eps_vals[-2] < 0 else "否"
+                    else:
+                        loss_str = "最近年度亏损,上年数据不足"
+            latest = df.iloc[-1]
+            d = latest.get("debt_to_assets")
+            c = latest.get("current_ratio")
+            if d is not None:
+                debt_str = f"{float(d):.1f}%"
+            if c is not None:
+                curr_str = f"{float(c):.2f}"
+        parts.append(f"连续两年亏损={loss_str}")
+        parts.append(f"资产负债率={debt_str}")
+        parts.append(f"流动比率={curr_str}")
+        parts.append("不可得:质押率,商誉占比,审计意见")
+        return "【SYS_LANDMINE｜tushare】 " + " | ".join(parts)
+    except Exception as e:
+        logger.debug("_format_landmine_line 失败: %s", e)
+        return ""
+
+
 def _format_growth_indicators(fina) -> str:
     """从 fina_indicator df 抽确定性增速指标，输出固定格式行供 stock_profile parser 直读。
 
@@ -506,6 +585,7 @@ def get_fundamentals(
     fina = None  # 提升到函数级别，供后续 PE 计算使用
 
     # 公司基本信息
+    stock_name = None
     try:
         basic = _safe_call(
             pro.stock_basic,
@@ -516,6 +596,7 @@ def get_fundamentals(
         if basic is not None and not basic.empty:
             has_data = True
             row = basic.iloc[0]
+            stock_name = row.get("name")
             sections.append("## 公司基本信息")
             sections.append(f"代码: {row.get('ts_code', 'N/A')}")
             sections.append(f"名称: {row.get('name', 'N/A')}")
@@ -541,6 +622,10 @@ def get_fundamentals(
             growth_line = _format_growth_indicators(fina)
             if growth_line:
                 sections.append(growth_line)
+            # 地雷排查确定性行（ST/连续亏损/负债率/流动比率）——RM 第负一步直读
+            landmine_line = _format_landmine_line(stock_name, fina)
+            if landmine_line:
+                sections.append(landmine_line)
     except (TushareUnavailableError, TushareRateLimitError) as e:
         logger.warning("获取财务指标失败（接口限流或不可用），跳过: %s", e)
     except Exception as e:
@@ -551,7 +636,10 @@ def get_fundamentals(
     try:
         if fina is None or fina.empty or "tob_operate_income" not in fina.columns:
             logger.debug("fina_indicator 无 tob_operate_income 字段，尝试从 income 接口获取营业收入")
-            income_for_ps = _safe_call(pro.income, ts_code=ts_code, limit=5, api_name="income")
+            income_for_ps = _fetch_cached(
+                "income", ts_code,
+                lambda: _safe_call(pro.income, ts_code=ts_code, limit=5, api_name="income"),
+            )
             if income_for_ps is not None and not income_for_ps.empty:
                 logger.debug("成功从 income 接口获取营业收入数据，可用于 PS(TTM) 计算")
     except (TushareUnavailableError, TushareRateLimitError) as e:
@@ -564,19 +652,23 @@ def get_fundamentals(
     api_pe_ttm = None
     daily_basic = None
     try:
-        if curr_date:
-            daily_basic = _safe_call(
-                pro.daily_basic,
-                ts_code=ts_code,
-                trade_date=to_akshare_date(curr_date),
-                api_name="daily_basic",
-            )
-        else:
-            daily_basic = _safe_call(pro.daily_basic, ts_code=ts_code, limit=1, api_name="daily_basic")
-        # 非交易日时 trade_date 查询返回空，自动回退到 limit=1 获取最近交易日
-        if (daily_basic is None or daily_basic.empty) and curr_date:
-            logger.info("daily_basic 指定日期无数据（可能是非交易日），回退到 limit=1: %s", ts_code)
-            daily_basic = _safe_call(pro.daily_basic, ts_code=ts_code, limit=1, api_name="daily_basic")
+        def _fetch_daily_basic():
+            if curr_date:
+                db = _safe_call(
+                    pro.daily_basic,
+                    ts_code=ts_code,
+                    trade_date=to_akshare_date(curr_date),
+                    api_name="daily_basic",
+                )
+                # 非交易日时 trade_date 查询返回空，自动回退到 limit=1 获取最近交易日
+                if db is None or db.empty:
+                    logger.info("daily_basic 指定日期无数据（可能是非交易日），回退到 limit=1: %s", ts_code)
+                    db = _safe_call(pro.daily_basic, ts_code=ts_code, limit=1, api_name="daily_basic")
+                return db
+            return _safe_call(pro.daily_basic, ts_code=ts_code, limit=1, api_name="daily_basic")
+
+        # 缓存 12h：同一天重跑直接复用（EOD 数据盘中取到的也是前收）；限流回退最近快照
+        daily_basic = _fetch_cached("daily_basic", ts_code, _fetch_daily_basic)
         if daily_basic is not None and not daily_basic.empty:
             has_data = True
             r = daily_basic.iloc[0]

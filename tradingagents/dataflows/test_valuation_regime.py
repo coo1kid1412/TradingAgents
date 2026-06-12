@@ -24,16 +24,22 @@ def test_deterministic_peg_inputs():
     comp = parse_sys_net_growth_components(sysline)
     assert abs(comp["annual"] - 0.6851) < 1e-6 and abs(comp["quarter"] - 3.4345) < 1e-6
 
-    # 协创：年度 68.51% 半衰封顶 → 30%（不用单季尖峰 343%）；前瞻 EPS = 4.86×1.30 = 6.32；低基数 → low
+    # 协创：年度 68.51% 分段衰减 → 40 + (68.51-40)/2 ≈ 54%（不用单季尖峰 343%）；
+    # 前瞻 EPS = 4.86×1.54255 ≈ 7.50；低基数 → low
     d = compute_deterministic_peg_inputs(4.86, comp["annual"], comp["quarter"])
-    assert d["peg_growth_pct"] == 30          # min(68.51,60)/2
-    assert d["forward_eps"] == 6.32
+    assert d["peg_growth_pct"] == 54          # 40 + (68.51-40)×0.5
+    assert d["forward_eps"] == 7.5
     assert d["confidence"] == "low"           # 单季 343 >> 年度 68（>2× 且 >100%）
     assert d["low_base_spike"] is True and d["capped"] is True
 
-    # 正常成长股（年度 30%，单季 25%，无尖峰）→ 增速 15%，confidence normal
+    # 可持续区间（年度 30% ≤ 40%）→ 全采信不打折，confidence normal
     d2 = compute_deterministic_peg_inputs(2.0, 0.30, 0.25)
-    assert d2["peg_growth_pct"] == 15 and d2["confidence"] == "normal" and d2["capped"] is False
+    assert d2["peg_growth_pct"] == 30 and d2["confidence"] == "normal" and d2["capped"] is False
+
+    # 分段边界：40% 恰好不打折；80% 触顶 60%；120% 仍封顶 60%
+    assert compute_deterministic_peg_inputs(1.0, 0.40)["peg_growth_pct"] == 40
+    assert compute_deterministic_peg_inputs(1.0, 0.80)["peg_growth_pct"] == 60
+    assert compute_deterministic_peg_inputs(1.0, 1.20)["peg_growth_pct"] == 60
 
     # 缺确定性年度增速 / EPS / 衰退（年度≤0）→ None（RM 走原路径，不更差）
     assert compute_deterministic_peg_inputs(None, 0.5, 0.5) is None

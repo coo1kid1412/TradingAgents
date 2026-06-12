@@ -928,8 +928,28 @@ def parse_sys_net_growth_components(fund_str: str) -> dict:
     return res
 
 
-_PEG_GROWTH_CAP = 0.60   # 可持续性封顶：>60% 增速极少长期持续（对标 RM 既有半衰公式封顶）
-_PEG_HALFLIFE = 0.5      # 半衰：trailing 年度增速 → forward 前瞻代理（与 RM min(g,60%)/2 一致）
+_PEG_GROWTH_CAP = 0.60        # 可持续性封顶：>60% 前瞻增速极少长期持续
+_PEG_TRUST_BAND = 0.40        # 全采信区间：≤40% 增速视为可持续（约等于优质成长行业长期复合上限）
+_PEG_HALFLIFE = 0.5           # 超出可持续区间的部分打五折（高增的均值回归）
+
+
+def _peg_forward_growth(annual_growth: float) -> float:
+    """trailing 年度增速 → forward 前瞻代理（分段衰减）。
+
+    旧公式 min(g, 60%)×0.5 一刀切半衰，前瞻增速被压到最高 30%：
+    - 50% 增速的票（天孚）前瞻只剩 25%，隐含 PE = PEG区间×25 ≈ 25-37 倍，
+      公式目标价系统性偏低 → LLM 曾因"觉得太低"手算造反（82↔410 摆动的诱因）；
+    - 100%+ 增速的一线光模块龙头（中际旭创/新易盛式）被压得更狠。
+    对标卖方：12 个月目标价用 NTM 一致预期 EPS；我们无一致预期数据源，
+    用分段衰减做代理——可持续区间全采信、超出部分均值回归打折、超高增封顶：
+      g ≤ 40%          → 前瞻 = g（可持续高增全采信）
+      40% < g          → 前瞻 = 40% + (g − 40%) × 0.5（超出部分五折）
+      封顶 60%          →（g ≥ 80% 时触顶；超高增几乎必回落）
+    """
+    if annual_growth <= _PEG_TRUST_BAND:
+        return annual_growth
+    return min(_PEG_TRUST_BAND + (annual_growth - _PEG_TRUST_BAND) * _PEG_HALFLIFE,
+               _PEG_GROWTH_CAP)
 
 
 def compute_deterministic_peg_inputs(
@@ -940,9 +960,9 @@ def compute_deterministic_peg_inputs(
     """确定性 PEG 输入：钉死「前瞻增速 + 前瞻 EPS + 低基数置信度」，杜绝 LLM 现场选增速/EPS
     致 PEG 目标价跑跑之间摆动（协创式 320↔180 → OW↔UW 翻转的根）。
 
-    口径（对标 RM 既有半衰公式，只是改成 Python 确定性、不让 LLM 自选）：
+    口径（Python 确定性、不让 LLM 自选）：
     - **低基数护栏**：用「年度」归母增速做基，**单季尖峰（如 +343%）不进 PEG**。
-    - 前瞻增速 = min(年度增速, 60%) × 0.5（trailing → forward 均值回归代理）。
+    - 前瞻增速 = 分段衰减（见 _peg_forward_growth：≤40% 全采信 / 超出部分五折 / 封顶 60%）。
     - 前瞻 EPS = EPS_TTM × (1 + 前瞻增速)。
     - **置信度**：单季 >> 年度（>2× 且 >100%，低基数尖峰，前瞻高度不确定）→ "low"
       → 下游 RM 降 Conviction / 偏离度近阈值时偏 HOLD（数据本就说不清，不下强方向单）。
@@ -951,8 +971,7 @@ def compute_deterministic_peg_inputs(
     """
     if eps_ttm is None or annual_net_growth is None or annual_net_growth <= 0:
         return None
-    capped = min(annual_net_growth, _PEG_GROWTH_CAP)
-    fwd_growth = capped * _PEG_HALFLIFE
+    fwd_growth = _peg_forward_growth(annual_net_growth)
     fwd_growth_pct = round(fwd_growth * 100)
     forward_eps = round(eps_ttm * (1 + fwd_growth), 2)
     low_base = (q_net_growth is not None and annual_net_growth > 0
@@ -963,7 +982,7 @@ def compute_deterministic_peg_inputs(
         "confidence": "low" if low_base else "normal",
         "annual_growth_pct": round(annual_net_growth * 100),
         "quarter_growth_pct": round(q_net_growth * 100) if q_net_growth is not None else None,
-        "capped": capped < annual_net_growth,
+        "capped": fwd_growth < annual_net_growth,   # 是否被分段衰减打了折
         "low_base_spike": low_base,
     }
 

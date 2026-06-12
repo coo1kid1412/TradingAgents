@@ -62,47 +62,79 @@ def compute_r_multiple_levels(entry_price: float, sl_hard_price: float) -> dict:
 # Conviction → 仓位映射
 # ============================================================================
 
-@tool
-def compute_conviction_position_map(abs_d: float, odds_r: float = 1.0,
-                                       anchor_sensitive: bool = False) -> dict:
-    """Conviction 五星制 + 仓位上限映射。
+_STAR_POSITION = {
+    5: ("Very High", 15, 20),
+    4: ("High", 8, 12),
+    3: ("Medium", 4, 6),
+    2: ("Low", 2, 3),
+    1: ("Very Low", 0, 1),
+}
 
-    严格规则（不允许自由发挥）：
-    | Conviction | 触发条件 | 仓位上限 |
-    |------------|---------|---------|
-    | 5★ Very High | \|d\| > 2.0 且 R > 2.0 且 anchor 不敏感 | 15-20% |
-    | 4★ High | \|d\| > 1.5 且 R > 1.5 | 8-12% |
-    | 3★ Medium | \|d\| > 1.0 且 R ≥ 1.0 | 4-6% |
-    | 2★ Low | \|d\| > 0.5 | 2-3% |
-    | 1★ Very Low | \|d\| ≤ 0.5 | ≤1% |
+
+@tool
+def compute_conviction_position_map(rm_conviction: str, odds_r: float = 1.0,
+                                    abs_d: float = 0.0,
+                                    anchor_sensitive: bool = False) -> dict:
+    """Conviction 五星制 + 仓位上限映射（主输入 = RM Conviction + 赔率 R）。
+
+    为什么不再以 \|d\|（多空辩论比分差）为主：仓位是执行端最重要的参数，而辩论
+    比分是全链最软的信号（LLM 给 LLM 打分的 prose 产物），且系统设计本就规定
+    "辩论不影响方向只影响置信"——让它主导仓位自相矛盾。对标真实台子：仓位由
+    信念强度（证据质量：数据完整度/估值方法收敛度/拐点确认度——RM Conviction
+    正是按这些硬条件校准的）+ 赔率 + 风险预算决定，辩论比分顶多是微调。
+
+    映射规则（确定性）：
+      基础星 = RM Conviction：高 → 4★ / 中 → 3★ / 低 → 2★
+      赔率调整：R ≥ 2.0 → +1★；R < 1.0 → −1★
+      辩论微调（降级为仅减分）：\|d\| < 0.5（多空胶着、thesis 有real争议）→ −1★
+      anchor 敏感（单一 anchor 失效即跨档）→ 封顶 4★
+      5★ 门槛：必须同时 RM Conviction=高 且 R ≥ 2.0 且 anchor 不敏感
+      结果钳制在 1-5★
+
+    仓位上限（不变）：5★ 15-20% / 4★ 8-12% / 3★ 4-6% / 2★ 2-3% / 1★ ≤1%
 
     Args:
-        abs_d: |d| 绝对值
+        rm_conviction: RM 评级置信度（高 / 中 / 低，照抄 RM thesis）
         odds_r: 赔率 R（U/D）
+        abs_d: \|d\| 多空辩论比分差绝对值（仅作减分微调；缺省 0 会按"胶着"
+               保守扣一档，应如实填 RM 辅助分析的 d 值）
         anchor_sensitive: anchor 是否敏感（True 表示 anchor 失效会跨档）
 
     Returns:
-        dict: {"conviction_stars": __, "conviction_label": __, "position_low_pct": __, "position_high_pct": __}
+        dict: {"conviction_stars", "conviction_label", "position_low_pct",
+               "position_high_pct", "reason"}
     """
-    if abs_d > 2.0 and odds_r > 2.0 and not anchor_sensitive:
-        return {"conviction_stars": 5, "conviction_label": "Very High",
-                "position_low_pct": 15, "position_high_pct": 20,
-                "reason": "|d|>2.0 且 R>2.0 且 anchor 不敏感"}
-    if abs_d > 1.5 and odds_r > 1.5:
-        return {"conviction_stars": 4, "conviction_label": "High",
-                "position_low_pct": 8, "position_high_pct": 12,
-                "reason": "|d|>1.5 且 R>1.5"}
-    if abs_d > 1.0 and odds_r >= 1.0:
-        return {"conviction_stars": 3, "conviction_label": "Medium",
-                "position_low_pct": 4, "position_high_pct": 6,
-                "reason": "|d|>1.0 且 R≥1.0"}
-    if abs_d > 0.5:
-        return {"conviction_stars": 2, "conviction_label": "Low",
-                "position_low_pct": 2, "position_high_pct": 3,
-                "reason": "|d|>0.5"}
-    return {"conviction_stars": 1, "conviction_label": "Very Low",
-            "position_low_pct": 0, "position_high_pct": 1,
-            "reason": "|d|≤0.5（试探仓或观望）"}
+    conv = (rm_conviction or "").strip()
+    base = {"高": 4, "中": 3, "低": 2}.get(conv)
+    if base is None:
+        return {"error": f"rm_conviction 必须是 高/中/低，当前={rm_conviction!r}"}
+
+    stars = base
+    notes = [f"RM Conviction={conv} → 基础 {base}★"]
+
+    if odds_r >= 2.0:
+        stars += 1
+        notes.append(f"R={odds_r:.2f}≥2.0 赔率优 → +1★")
+    elif odds_r < 1.0:
+        stars -= 1
+        notes.append(f"R={odds_r:.2f}<1.0 赔率劣 → -1★")
+
+    if abs_d < 0.5:
+        stars -= 1
+        notes.append(f"|d|={abs_d:.2f}<0.5 多空胶着 → -1★（辩论仅作减分微调）")
+
+    if stars >= 5 and not (conv == "高" and odds_r >= 2.0 and not anchor_sensitive):
+        stars = 4
+        notes.append("5★ 门槛未全满足（需 RM=高 且 R≥2.0 且 anchor 不敏感）→ 封 4★")
+    if anchor_sensitive and stars > 4:
+        stars = 4
+        notes.append("anchor 敏感 → 封顶 4★")
+
+    stars = max(1, min(5, stars))
+    label, lo, hi = _STAR_POSITION[stars]
+    return {"conviction_stars": stars, "conviction_label": label,
+            "position_low_pct": lo, "position_high_pct": hi,
+            "reason": "；".join(notes)}
 
 
 # ============================================================================
