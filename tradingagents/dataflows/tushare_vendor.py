@@ -522,8 +522,10 @@ def _format_cyclical_line(industry, stock_name, fina, close_price) -> str:
         if bps is not None and roe_med > 0:
             neps = round(roe_med / 100 * float(bps), 2)
             parts.append(f"normalized_eps={neps}")
+            # pe_on_normalized = 当前价 ÷ 正常化 EPS——是"按穿越周期口径现在贵不贵"的
+            # 读数，不是目标倍数（000725 实跑：RM 曾把它当目标 PE，算出目标价=现价的套套逻辑）
             if close_price and neps > 0:
-                parts.append(f"normalized_pe={close_price / neps:.1f}")
+                parts.append(f"pe_on_normalized={close_price / neps:.1f}")
         parts.append(f"年度样本={len(roe_vals)}")
         return " | ".join(parts)
     except Exception as e:

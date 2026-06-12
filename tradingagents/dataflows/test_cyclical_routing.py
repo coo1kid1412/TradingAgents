@@ -44,7 +44,7 @@ def test_cyclical_line_top_and_trough():
     assert abs(d["roe_10y_median"] - 9.5) < 0.1
     # normalized EPS = 9.5% × 15.0 = 1.43（一分钱不差）
     assert abs(d["normalized_eps"] - 1.43) < 0.01, d
-    assert d["normalized_pe"] is not None
+    assert d["pe_on_normalized"] is not None
     # Q1 累计 0.5% → 年化 2% → trough
     d2 = parse_sys_cyclical(_format_cyclical_line("元器件", "京东方A", _fina(0.5), 4.5))
     assert d2["position"] == "trough"

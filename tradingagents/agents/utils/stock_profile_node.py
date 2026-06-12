@@ -597,9 +597,15 @@ def create_stock_profile_node(llm):
             prog_lines.append("⛔ **EPS 口径锁定（防 TTM 倍数 × 前瞻 EPS 双重计入）**：")
             prog_lines.append(f"- **EPS_TTM = {eps_ttm_disp} 元**（系统给值；下游 RM 直接用，禁止重算/换口径）")
             # 确定性 PEG 输入（钉死前瞻增速 + 前瞻 EPS，杜绝 LLM 自选致 PEG 目标价摆动）
+            # ⛔ 强周期股禁发（同 SYS_TARGET_PRIMARY）：周期增速无前瞻意义，且 RM 见到
+            # 现成 SYS_PEG 行就会拿去当腿（000725 实跑：禁 PEG 规则下仍用了 25% PEG 腿）
             sys_g = parse_sys_net_growth_components(fund_raw + "\n" + fundamentals_report)
-            peg_det = compute_deterministic_peg_inputs(
-                eps_ttm_val, sys_g["annual"], sys_g["quarter"])
+            if cyc_info and cyc_info["class"] == "strong":
+                peg_det = None
+                logger.info("强周期股：SYS_PEG 禁发（PEG 对周期股无效，防 RM 拿现成行当腿）")
+            else:
+                peg_det = compute_deterministic_peg_inputs(
+                    eps_ttm_val, sys_g["annual"], sys_g["quarter"])
             if peg_det is not None:
                 conf_note = ("⚠️**低基数尖峰，前瞻高度不确定**" if peg_det["confidence"] == "low"
                              else "正常")
@@ -966,7 +972,7 @@ TRANSPARENCY:
                 f"SYS_CYCLICAL_CLASS: {cyc_info['class']}\n"
                 f"SYS_CYCLICAL_POSITION: {cyc_info['position'] or '数据不足'}\n"
                 f"SYS_CYCLICAL_NORMALIZED_EPS: {cyc_info['normalized_eps'] if cyc_info['normalized_eps'] is not None else 'N/A'}\n"
-                f"SYS_CYCLICAL_NORMALIZED_PE: {cyc_info['normalized_pe'] if cyc_info['normalized_pe'] is not None else 'N/A'}\n"
+                f"SYS_CYCLICAL_PE_ON_NORMALIZED: {cyc_info['pe_on_normalized'] if cyc_info['pe_on_normalized'] is not None else 'N/A'}（当前价÷正常化EPS的『贵不贵』读数，⛔不是目标倍数）\n"
                 f"SYS_CYCLICAL_ROE_RANK: {cyc_info['roe_pct_rank'] if cyc_info['roe_pct_rank'] is not None else 'N/A'}\n"
             )
             logger.info("SYS_CYCLICAL 已回显画像: class=%s position=%s",

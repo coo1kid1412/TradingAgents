@@ -427,7 +427,7 @@ _SYS_CYCLICAL_RE = re.compile(
     r"(?:\s*\|\s*roe_10y_median=(?P<roe_med>[-\d.]+)%)?"
     r"(?:\s*\|\s*roe_latest=(?P<roe_now>[-\d.]+)%)?"
     r"(?:\s*\|\s*normalized_eps=(?P<neps>[-\d.]+))?"
-    r"(?:\s*\|\s*normalized_pe=(?P<npe>[-\d.]+|N/A))?"
+    r"(?:\s*\|\s*pe_on_normalized=(?P<npe>[-\d.]+|N/A))?"
 )
 
 
@@ -435,7 +435,8 @@ def parse_sys_cyclical(fund_str: str) -> Optional[dict]:
     """从 fundamentals 报告解析 SYS_CYCLICAL 机读行（Python 转录保证在场）。
 
     Returns: {class, position, roe_pct_rank, roe_10y_median, roe_latest,
-              normalized_eps, normalized_pe} 或 None（非周期股/行缺失）。
+              normalized_eps, pe_on_normalized} 或 None（非周期股/行缺失）。
+    pe_on_normalized = 当前价÷正常化EPS（"贵不贵"读数，不是目标倍数）。
     """
     if not fund_str:
         return None
@@ -459,7 +460,7 @@ def parse_sys_cyclical(fund_str: str) -> Optional[dict]:
         "roe_10y_median": _f("roe_med"),
         "roe_latest": _f("roe_now"),
         "normalized_eps": _f("neps"),
-        "normalized_pe": _f("npe"),
+        "pe_on_normalized": _f("npe"),
     }
 
 
