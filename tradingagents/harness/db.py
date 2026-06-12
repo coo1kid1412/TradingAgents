@@ -54,6 +54,21 @@ def _migrate_schema(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE outcomes ADD COLUMN relative_return_pct REAL")
         logger.info("Migrated: outcomes.relative_return_pct added")
 
+    # predictions 表加评级链审计列（2026-06 P0：回测分腿归因）
+    pred_cols = {r[1] for r in conn.execute("PRAGMA table_info(predictions)").fetchall()}
+    for col, typ in [
+        ("valuation_regime", "TEXT"),
+        ("regime_legs", "TEXT"),
+        ("rating_raw", "TEXT"),
+        ("peg_confidence", "TEXT"),
+        ("overlay_style_adj", "INTEGER"),
+        ("overlay_vote_adj", "INTEGER"),
+        ("overlay_catalyst_adj", "INTEGER"),
+    ]:
+        if col not in pred_cols:
+            conn.execute(f"ALTER TABLE predictions ADD COLUMN {col} {typ}")
+            logger.info("Migrated: predictions.%s added", col)
+
 
 @contextmanager
 def connect(db_path: Path | str | None = None) -> Iterator[sqlite3.Connection]:

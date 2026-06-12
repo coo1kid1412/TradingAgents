@@ -1219,12 +1219,331 @@ def compute_step6_trend_overlay(
     }
 
 
+# Step 6 动态阈值的 style 系数（与 RM 提示词第一步公式一致，搬进 Python 消手算漂移）
+_THRESHOLD_STYLE_COEF = {
+    "blue_chip": 1.0,
+    "cyclical": 1.0,
+    "illiquid": 0.7,
+    "etf": 1.0,
+    "high_beta_growth": 1.5,
+    "theme_speculation": 2.0,
+}
+_THRESHOLD_BASE_DN = 15.0
+_THRESHOLD_BASE_UP = 35.0
+_FADING_UP_LOCK = 30.0   # 主题退潮期上沿锁定（主题反噬保护，不再放宽）
+
+
+@tool
+def compute_step6_final_rating(
+    current_price: float,
+    target_price_mid: float,
+    style: str,
+    theme_premium_pct: float = 0.0,
+    theme_stage: str = "",
+    valuation_regime: str = "",
+    peg_confidence: str = "",
+    target_price_source: str = "",
+    # ── 第四步 拥挤度 ──
+    consensus_crowded: bool = False,
+    consensus_direction: str = "",
+    # ── 第五步 对称升降档 ──
+    inflection_stage: str = "",
+    data_completeness: str = "",
+    red_flags_count: int = 0,
+    earnings_sustainability: str = "",
+    bear_anchor_strong: bool = False,
+    decision_style: str = "",
+    # ── 第六步 趋势叠加三路 ──
+    composite_score: Optional[float] = None,
+    momentum_score: Optional[float] = None,
+    market_weight: float = 0.0,
+    news_weight: float = 0.0,
+    sentiment_weight: float = 0.0,
+    market_direction_vote: float = 0.0,
+    news_direction_vote: float = 0.0,
+    sentiment_direction_vote: float = 0.0,
+    sell_side_target_change_pct: Optional[float] = None,
+    institutional_holding_change_pct: Optional[float] = None,
+    northbound_flow_5d_direction: Optional[int] = None,
+    kol_bullish_ratio_trend_pct: Optional[float] = None,
+    # ── 第七步 极端背离防御例外 ──
+    inflection_confirmed_recent: bool = False,
+) -> dict:
+    """Step 6 评级终段一次合议：阈值→映射→拥挤→升降档→趋势叠加→极端防御 全链 Python。
+
+    背景：评级出厂前原本要过 8 道互相不知情的关卡，其中拥挤度/对称升降档/极端防御
+    三道还是 LLM 徒手照表执行——产生过两类真实事故：
+      ① regime 闸门把 SELL 托底成 HOLD（语义=贵+强趋势，不看空也不看多），下游趋势
+         叠加不知情又 +1 → OVERWEIGHT（天孚：偏离 +133% 的票评级看多）；
+      ② 第四步"拥挤多头禁 BUY"把 BUY 降为 OVERWEIGHT 后，第六步叠加 +1 又回 BUY，
+         禁令被绕过。
+    本工具把第四~七步合并为一次确定性执行（对标投研：评级是一次合议，不是流水线
+    各调一档），并加两条全链不变量：
+
+    【不变量 A · 评级方向与隐含收益同号】最终评级看多（BUY/OVERWEIGHT）要求目标价
+    中位在现价上方（偏离<0）；看空（UNDERWEIGHT/SELL）要求在现价下方（偏离>0）。
+    违反者收敛 HOLD。真台子不存在"看多但目标价低于现价"的票，反之亦然。
+
+    【不变量 B · 闸门边界不可被下游反转】ride 托底产生的 HOLD 设地板（后续不得降到
+    HOLD 之下）；discipline 封顶产生的 HOLD 设天花板（后续不得升到 HOLD 之上）；
+    拥挤多头设天花板 OVERWEIGHT、拥挤空头设地板 UNDERWEIGHT——边界对其后所有
+    步骤持续生效，趋势叠加无法绕过。
+
+    内部顺序（与原提示词第一/三/四/五/六/七步严格一致，机械映射与趋势叠加直接
+    复用既有工具，行为逐位不变）：
+      1) 动态阈值 = 基础 15/35 × style 系数 × (1 + theme_premium_pct/100)；
+         theme_stage 含 fading 时上沿锁 30%（主题反噬保护）
+      2) compute_step6_rating_mapping（含 regime 闸门 + PEG 低置信收敛）
+      3) 拥挤度调整（crowded+偏多：BUY→OVERWEIGHT 且设天花板；偏空对称）
+      4) 对称升降档（升档需 拐点加速/底部反转 + L0/L1 + 红旗≤1 + 偏离<0 +
+         非 momentum 风格，且仅 HOLD→OW / OW→BUY；降档 L3/红旗≥3/拐点顶部衰退/
+         空头anchor强+可持续性待验证 各 -1，合计最多 -2）
+      5) compute_step6_trend_overlay（style/方向票/催化三路合成 ±1）
+      6) 极端背离防御（composite≤20 压看多 / ≥80 托看空 → HOLD；
+         inflection_confirmed_recent=True 时跳过——量化锚滞后于刚出的新数据）
+      7) 两条不变量终检
+
+    Args:
+        current_price: 当前价 P_0
+        target_price_mid: Step 4 综合目标价中位（必须来自 weighted/overlap 工具输出）
+        style: stock_profile.style
+        theme_premium_pct: 画像末尾 SYS_THEME_PREMIUM_PCT（已按 regime 闸门）
+        theme_stage: THEMATIC_PREMIUM.theme_stage（仅用于 fading 上沿锁）
+        valuation_regime: 画像末尾 SYS_VALUATION_REGIME（ride/neutral/discipline）
+        peg_confidence: 画像末尾 SYS_PEG_CONFIDENCE（normal/low；无则 ""）
+        consensus_crowded / consensus_direction: 共识快照 crowded 与方向（偏多/偏空）
+        inflection_stage: RM Step 3 业绩拐点阶段（加速期/底部反转/顶部/衰退/拐点期…）
+        data_completeness: VALUATION_METHOD.data_completeness（L0-L3）
+        red_flags_count: fundamentals.SUMMARY.red_flags 条数
+        earnings_sustainability: Step 3 业绩可持续性（持续/一次性/待验证）
+        bear_anchor_strong: 空头 anchor 论据是否强（hard data 支撑）
+        decision_style: stock_profile.DECISION_STYLE（momentum 不靠低估升档）
+        composite_score / momentum_score: QUANT_SCORE
+        market/news/sentiment_weight + *_direction_vote: 三报告方向票（同 trend_overlay）
+        sell_side_target_change_pct 等四项: 催化动量硬数据（缺失 None，禁止编造）
+        inflection_confirmed_recent: 业绩拐点刚被新数据确认（极端防御例外）
+
+    Returns:
+        dict: {final_rating, rating_raw, rating_after_gate, deviation_pct,
+               threshold_dn_pct, threshold_up_pct, valuation_regime, peg_confidence,
+               overlay_components, bounds, stages{...各步留痕}, explanation}
+    """
+    # ── 1) 动态阈值（Python 消手算）──
+    style_key = (style or "").strip().lower()
+    coef = _THRESHOLD_STYLE_COEF.get(style_key, 1.0)
+    theme_factor = 1.0 + (theme_premium_pct or 0.0) / 100.0
+    if theme_factor < 0:
+        theme_factor = 0.0  # premium < -100% 无意义，钳到 0（阈值塌缩交给下面的下限保护）
+    threshold_dn = _THRESHOLD_BASE_DN * coef * theme_factor
+    threshold_up = _THRESHOLD_BASE_UP * coef * theme_factor
+    threshold_notes = [
+        f"基础 ±{_THRESHOLD_BASE_DN:.0f}/{_THRESHOLD_BASE_UP:.0f} × style({style_key or '未知→1.0'})"
+        f" {coef} × theme(1+{theme_premium_pct or 0:.0f}%/100)={theme_factor:.2f}"
+        f" → ±{threshold_dn:.1f}%/±{threshold_up:.1f}%"
+    ]
+    if "fading" in (theme_stage or "").lower() and threshold_up > _FADING_UP_LOCK:
+        threshold_up = _FADING_UP_LOCK
+        threshold_notes.append(f"主题退潮 fading → 上沿锁定 {_FADING_UP_LOCK:.0f}%")
+    # 阈值下限保护：负 premium 可能把阈值压到接近 0，导致任何偏离都触发极端档
+    threshold_dn = max(threshold_dn, 5.0)
+    threshold_up = max(threshold_up, threshold_dn + 5.0)
+
+    # ── 2) 机械映射（复用既有工具：regime 闸门 + PEG 低置信收敛，行为不变）──
+    mapping = compute_step6_rating_mapping.invoke({
+        "current_price": current_price,
+        "target_price_mid": target_price_mid,
+        "threshold_dn_pct": round(threshold_dn, 2),
+        "threshold_up_pct": round(threshold_up, 2),
+        "target_price_source": target_price_source,
+        "valuation_regime": valuation_regime,
+        "peg_confidence": peg_confidence,
+    })
+    if "error" in mapping:
+        return mapping
+
+    rating = mapping["rating"]
+    rating_raw = mapping["rating_raw"]
+    deviation_pct = mapping["deviation_pct"]
+    reg = (valuation_regime or "").strip().lower()
+
+    hold_idx = _RATINGS_ORDER.index("HOLD")
+    floor_idx, ceiling_idx = 0, len(_RATINGS_ORDER) - 1
+    bound_sources: list[str] = []
+
+    # ── 不变量 B 起点：regime 闸门产生的边界 ──
+    if reg == "ride" and rating_raw in ("SELL", "UNDERWEIGHT"):
+        floor_idx = max(floor_idx, hold_idx)
+        bound_sources.append("ride 托底：地板 HOLD（强基本面不看空，下游不得再降）")
+    if reg == "discipline" and rating_raw in ("BUY", "OVERWEIGHT"):
+        ceiling_idx = min(ceiling_idx, hold_idx)
+        bound_sources.append("discipline 封顶：天花板 HOLD（弱基本面不追多，下游不得再升）")
+
+    def _clamp_to_bounds(r: str) -> tuple[str, str]:
+        idx = _RATINGS_ORDER.index(r)
+        if idx < floor_idx:
+            return _RATINGS_ORDER[floor_idx], f"触地板 {_RATINGS_ORDER[floor_idx]}"
+        if idx > ceiling_idx:
+            return _RATINGS_ORDER[ceiling_idx], f"触天花板 {_RATINGS_ORDER[ceiling_idx]}"
+        return r, ""
+
+    stages: dict = {"mapping": mapping}
+
+    # ── 3) 第四步 拥挤度（原 LLM 对照表 → Python；并把禁令固化为持续边界）──
+    crowd_note = "consensus 不拥挤，无调整"
+    direction = (consensus_direction or "").strip()
+    if consensus_crowded and ("多" in direction):
+        ceiling_idx = min(ceiling_idx, _RATINGS_ORDER.index("OVERWEIGHT"))
+        bound_sources.append("拥挤多头：天花板 OVERWEIGHT（禁 BUY，对后续步骤持续生效）")
+        if rating == "BUY":
+            rating = "OVERWEIGHT"
+            crowd_note = "拥挤多头：BUY → OVERWEIGHT（不在拥挤多头继续极端追高）"
+        else:
+            crowd_note = f"拥挤多头：{rating} 在保留区，无即时调整（但天花板 OVERWEIGHT 已生效）"
+    elif consensus_crowded and ("空" in direction):
+        floor_idx = max(floor_idx, _RATINGS_ORDER.index("UNDERWEIGHT"))
+        bound_sources.append("拥挤空头：地板 UNDERWEIGHT（禁 SELL，对后续步骤持续生效）")
+        if rating == "SELL":
+            rating = "UNDERWEIGHT"
+            crowd_note = "拥挤空头：SELL → UNDERWEIGHT（不在拥挤空头继续极端追空）"
+        else:
+            crowd_note = f"拥挤空头：{rating} 在保留区，无即时调整（但地板 UNDERWEIGHT 已生效）"
+    rating, _clamped = _clamp_to_bounds(rating)
+    stages["crowding"] = {"rating_after": rating, "note": crowd_note}
+
+    # ── 4) 第五步 对称升降档（原 LLM 徒手 → Python）──
+    sym_notes: list[str] = []
+    infl = (inflection_stage or "").strip()
+    dcl = (data_completeness or "").strip().upper()
+
+    upgrade = 0
+    up_ok = (
+        ("加速" in infl or "底部反转" in infl)
+        and dcl in ("L0", "L1")
+        and red_flags_count <= 1
+        and deviation_pct < 0
+        and "momentum" not in (decision_style or "").lower()
+        and rating in ("HOLD", "OVERWEIGHT")  # 升档只对偏多档
+    )
+    if up_ok:
+        upgrade = 1
+        sym_notes.append("升档 +1：拐点加速/底部反转 + L0/L1 + 红旗≤1 + 低估区 + 非momentum")
+    else:
+        sym_notes.append("升档不通过")
+
+    downgrade = 0
+    if dcl == "L3":
+        downgrade -= 1
+        sym_notes.append("降档 -1：数据完整度 L3")
+    if red_flags_count >= 3:
+        downgrade -= 1
+        sym_notes.append(f"降档 -1：红旗 {red_flags_count} 条")
+    if "顶部" in infl or "衰退" in infl:
+        downgrade -= 1
+        sym_notes.append(f"降档 -1：拐点={infl}")
+    if bear_anchor_strong and "待验证" in (earnings_sustainability or ""):
+        downgrade -= 1
+        sym_notes.append("降档 -1：空头 anchor 强 + 业绩可持续性待验证")
+    downgrade = max(downgrade, -2)  # 最多降 2 档
+
+    net = upgrade + downgrade
+    if net != 0:
+        new_idx = max(0, min(len(_RATINGS_ORDER) - 1, _RATINGS_ORDER.index(rating) + net))
+        rating = _RATINGS_ORDER[new_idx]
+    rating, clamp_note = _clamp_to_bounds(rating)
+    if clamp_note:
+        sym_notes.append(f"边界钳制：{clamp_note}")
+    stages["symmetric"] = {"upgrade": upgrade, "downgrade": downgrade,
+                           "rating_after": rating, "notes": sym_notes}
+
+    # ── 5) 第六步 趋势叠加（复用既有工具，行为不变；结果受边界钳制——堵绕道）──
+    overlay = compute_step6_trend_overlay.invoke({
+        "rating_after_symmetric": rating,
+        "style": style,
+        "composite_score": composite_score,
+        "momentum_score": momentum_score,
+        "market_weight": market_weight,
+        "news_weight": news_weight,
+        "sentiment_weight": sentiment_weight,
+        "market_direction_vote": market_direction_vote,
+        "news_direction_vote": news_direction_vote,
+        "sentiment_direction_vote": sentiment_direction_vote,
+        "sell_side_target_change_pct": sell_side_target_change_pct,
+        "institutional_holding_change_pct": institutional_holding_change_pct,
+        "northbound_flow_5d_direction": northbound_flow_5d_direction,
+        "kol_bullish_ratio_trend_pct": kol_bullish_ratio_trend_pct,
+    })
+    overlay_components = overlay.get("components", {})
+    rating_overlay = overlay.get("final_rating", rating)
+    rating, clamp_note = _clamp_to_bounds(rating_overlay)
+    overlay_clamp = ""
+    if rating != rating_overlay:
+        overlay_clamp = f"叠加结果 {rating_overlay} 越过闸门边界 → 钳回 {rating}（{clamp_note}）"
+    stages["overlay"] = {"components": overlay_components,
+                         "rating_overlay_raw": rating_overlay,
+                         "rating_after": rating,
+                         "clamp": overlay_clamp or "未触边界",
+                         "detail": overlay.get("explanation", "")}
+
+    # ── 6) 第七步 极端背离防御（原 LLM 徒手 → Python）──
+    extreme_note = "未触发"
+    if inflection_confirmed_recent:
+        extreme_note = "拐点刚被新数据确认 → 量化锚滞后，跳过极端防御"
+    elif composite_score is not None:
+        if composite_score <= 20 and rating in ("BUY", "OVERWEIGHT"):
+            rating = "HOLD"
+            extreme_note = f"composite={composite_score:.0f} ≤20 且评级看多 → 强制 HOLD"
+        elif composite_score >= 80 and rating in ("UNDERWEIGHT", "SELL"):
+            rating = "HOLD"
+            extreme_note = f"composite={composite_score:.0f} ≥80 且评级看空 → 强制 HOLD"
+    stages["extreme_defense"] = {"rating_after": rating, "note": extreme_note}
+
+    # ── 7) 不变量 A 终检：评级方向必须与隐含收益同号 ──
+    invariant_note = "通过（评级方向与目标价隐含收益同号）"
+    if rating in ("BUY", "OVERWEIGHT") and deviation_pct >= 0:
+        invariant_note = (f"违反：评级 {rating} 看多，但目标价中位 {target_price_mid} 不高于现价"
+                          f"（偏离 {deviation_pct:+.1f}%，隐含收益≤0）→ 收敛 HOLD。"
+                          "投研不存在'看多但目标价在现价下方'的票")
+        rating = "HOLD"
+    elif rating in ("UNDERWEIGHT", "SELL") and deviation_pct <= 0:
+        invariant_note = (f"违反：评级 {rating} 看空，但目标价中位 {target_price_mid} 不低于现价"
+                          f"（偏离 {deviation_pct:+.1f}%，隐含收益≥0）→ 收敛 HOLD")
+        rating = "HOLD"
+    stages["e_sign_invariant"] = {"rating_after": rating, "note": invariant_note}
+
+    chain = (
+        f"阈值 ±{threshold_dn:.1f}/±{threshold_up:.1f} → 映射 {rating_raw}"
+        f"（regime 闸门后 {mapping['rating']}）→ 拥挤 {stages['crowding']['rating_after']}"
+        f" → 升降档 {stages['symmetric']['rating_after']}"
+        f" → 趋势叠加 {stages['overlay']['rating_after']}"
+        f" → 极端防御 {stages['extreme_defense']['rating_after']}"
+        f" → 不变量终检 {rating}"
+    )
+
+    return {
+        "final_rating": rating,
+        "rating_raw": rating_raw,
+        "rating_after_gate": mapping["rating"],
+        "deviation_pct": deviation_pct,
+        "threshold_dn_pct": round(threshold_dn, 2),
+        "threshold_up_pct": round(threshold_up, 2),
+        "threshold_notes": threshold_notes,
+        "valuation_regime": mapping["valuation_regime"],
+        "peg_confidence": (peg_confidence or "").strip().lower() or "（未提供）",
+        "overlay_components": overlay_components,
+        "bounds": {"floor": _RATINGS_ORDER[floor_idx], "ceiling": _RATINGS_ORDER[ceiling_idx],
+                   "sources": bound_sources or ["无闸门边界"]},
+        "stages": stages,
+        "explanation": chain,
+    }
+
+
 # ============================================================================
 # 工具集合（供 research_manager.py 一次性绑定）
 # ============================================================================
-# 注：Step 6 第六步的 4 个子工具（style/vote/catalyst/synthesis）仍保留定义供合并
-# 工具内部复用，但**不再单独绑定给 RM**——RM 只调 compute_step6_trend_overlay 一次
-# （4 轮 → 1 轮）。这样工具调用轮数从 ~11-15 压到 ~8-11，远离 15 轮上限。
+# 注：Step 6 的子工具（rating_mapping / trend_overlay / style/vote/catalyst/synthesis）
+# 仍保留定义供合并工具内部复用，但**不再单独绑定给 RM**——RM 的 Step 6 评级终段只调
+# compute_step6_final_rating 一次（阈值+映射+拥挤+升降档+叠加+极端防御一次合议）。
+# 评级链中段不再有 LLM 徒手执行的对照表，同股不同跑的残余漂移源就此消除。
 
 RM_TOOLS = [
     compute_bull_bear_score,
@@ -1236,9 +1555,8 @@ RM_TOOLS = [
     compute_scenario_weighted_e,
     compute_odds_and_expected_return,
     compute_conviction_calibration,
-    compute_step6_rating_mapping,
     compute_scenario_consistency_check,
-    compute_step6_trend_overlay,
+    compute_step6_final_rating,
 ]
 
 

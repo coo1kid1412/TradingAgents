@@ -30,6 +30,9 @@ _PRED_FIELDS = [
     "bear_target", "bear_prob",
     "base_case_expected_return_pct",
     "deviation_pct", "threshold_dn_pct", "threshold_up_pct",
+    # RM 评级链审计（2026-06 P0：回测分腿归因）
+    "valuation_regime", "regime_legs", "rating_raw", "peg_confidence",
+    "overlay_style_adj", "overlay_vote_adj", "overlay_catalyst_adj",
     # PM
     "pm_rating", "pm_conviction_stars",
     "pm_invest_judgment", "pm_entry_judgment", "pm_action_keyword",
@@ -78,8 +81,14 @@ def _merge_pred_fields(extract: ExtractResult) -> dict:
               "target_price_low", "target_price_mid", "target_price_high",
               "bull_target", "bull_prob", "base_target", "base_prob",
               "bear_target", "bear_prob", "base_case_expected_return_pct",
-              "deviation_pct", "threshold_dn_pct", "threshold_up_pct"):
+              "deviation_pct", "threshold_dn_pct", "threshold_up_pct",
+              "valuation_regime", "rating_raw", "peg_confidence",
+              "overlay_style_adj", "overlay_vote_adj", "overlay_catalyst_adj"):
         out[k] = rm.get(k)
+
+    # regime_legs：LLM 可能照抄成 YAML flow mapping（dict）或带引号字符串，统一存 TEXT
+    legs = rm.get("regime_legs")
+    out["regime_legs"] = str(legs) if legs is not None else None
 
     # PM 字段
     for k in ("pm_rating", "pm_conviction_stars",

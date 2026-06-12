@@ -52,6 +52,14 @@ CREATE TABLE IF NOT EXISTS predictions (
     deviation_pct REAL,
     threshold_dn_pct REAL,
     threshold_up_pct REAL,
+    -- 评级链审计字段（2026-06 P0：回测分腿归因——regime 闸门/六腿/趋势叠加三路是否有效，数据说话）
+    valuation_regime TEXT,
+    regime_legs TEXT,
+    rating_raw TEXT,
+    peg_confidence TEXT,
+    overlay_style_adj INTEGER,
+    overlay_vote_adj INTEGER,
+    overlay_catalyst_adj INTEGER,
 
     -- PM 字段
     pm_rating TEXT,
