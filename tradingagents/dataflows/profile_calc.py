@@ -22,6 +22,7 @@
 
 from __future__ import annotations
 
+import re
 from typing import Optional
 
 
@@ -373,6 +374,95 @@ def is_loss_making(eps_ttm: Optional[float]) -> bool:
 
 
 # 行业 → 强制估值范式（仅 PE 失真行业，其他行业 LLM 自由发挥）
+# ============================================================================
+# 周期股识别与正常化估值（对标投研：周期股 TTM EPS 不能代表正常盈利——
+# 林奇铁律：周期股顶部 PE 最低（该卖）、谷底 PE 最高（该买），TTM 口径整个反着）
+# ============================================================================
+
+# 传统强周期：tushare stock_basic.industry 关键词匹配（行业粒度够细，安全）
+_CYCLICAL_STRONG_INDUSTRY_KW = (
+    "钢", "煤", "焦炭", "有色", "铝", "铜", "锌", "铅", "镍", "锂矿",
+    "化工原料", "化纤", "石油开采", "炼油", "航运", "船舶",
+    "水泥", "玻璃", "造纸", "养殖", "畜禽", "猪",
+)
+# 科技周期：tushare industry 太粗（"半导体"既有周期的存储也有 secular 的澜起/海光），
+# 用公司名单确定性判（维护成本低、零误伤）。LLM 仍可对漏网者加注 cyclical（只能加注不能摘帽）。
+_CYCLICAL_STRONG_NAMES = (
+    "京东方", "TCL科技", "彩虹股份", "深天马",                 # 面板
+    "兆易创新", "佰维存储", "江波龙", "德明利", "普冉股份",      # 存储
+    "中远海控", "招商轮船",                                   # 海运（industry 关键词外的补充）
+)
+_CYCLICAL_SEMI_NAMES = (
+    "长电科技", "通富微电", "华天科技", "晶方科技",              # 封测（有成长β但跟半导体周期）
+    "中芯国际", "华虹",                                       # 代工
+    "三安光电",                                               # LED
+)
+
+
+def detect_cyclical(industry: Optional[str], company_name: Optional[str]) -> Optional[str]:
+    """周期股确定性识别 → "strong" / "semi" / None。
+
+    Python 优先判（防 LLM 跑间漂移）；LLM 只能对漏网者加注 cyclical，不能摘帽。
+    """
+    name = (company_name or "").strip()
+    if name:
+        for kw in _CYCLICAL_STRONG_NAMES:
+            if kw in name:
+                return "strong"
+        for kw in _CYCLICAL_SEMI_NAMES:
+            if kw in name:
+                return "semi"
+    ind = (industry or "").strip()
+    if ind:
+        for kw in _CYCLICAL_STRONG_INDUSTRY_KW:
+            if kw in ind:
+                return "strong"
+    return None
+
+
+_SYS_CYCLICAL_RE = re.compile(
+    r"【SYS_CYCLICAL[^】]*】\s*class=(?P<cls>strong|semi)"
+    r"(?:\s*\|\s*position=(?P<pos>top|mid|trough|数据不足))?"
+    r"(?:\s*\|\s*roe_pct_rank=(?P<rank>[\d.]+))?"
+    r"(?:\s*\|\s*roe_10y_median=(?P<roe_med>[-\d.]+)%)?"
+    r"(?:\s*\|\s*roe_latest=(?P<roe_now>[-\d.]+)%)?"
+    r"(?:\s*\|\s*normalized_eps=(?P<neps>[-\d.]+))?"
+    r"(?:\s*\|\s*normalized_pe=(?P<npe>[-\d.]+|N/A))?"
+)
+
+
+def parse_sys_cyclical(fund_str: str) -> Optional[dict]:
+    """从 fundamentals 报告解析 SYS_CYCLICAL 机读行（Python 转录保证在场）。
+
+    Returns: {class, position, roe_pct_rank, roe_10y_median, roe_latest,
+              normalized_eps, normalized_pe} 或 None（非周期股/行缺失）。
+    """
+    if not fund_str:
+        return None
+    m = _SYS_CYCLICAL_RE.search(fund_str)
+    if not m:
+        return None
+
+    def _f(key):
+        v = m.group(key)
+        if v in (None, "N/A"):
+            return None
+        try:
+            return float(v)
+        except ValueError:
+            return None
+
+    return {
+        "class": m.group("cls"),
+        "position": m.group("pos"),
+        "roe_pct_rank": _f("rank"),
+        "roe_10y_median": _f("roe_med"),
+        "roe_latest": _f("roe_now"),
+        "normalized_eps": _f("neps"),
+        "normalized_pe": _f("npe"),
+    }
+
+
 INDUSTRY_FORCED_VALUATION: dict[str, str] = {
     "银行": "pb",
     "保险": "pb",
@@ -1193,6 +1283,8 @@ def compute_valuation_regime(
     distribution_detected: bool = False,
     capital_flow_score: Optional[float] = None,
     recurring_loss: Optional[bool] = None,
+    cyclical_class: Optional[str] = None,
+    roe_pct_rank_10y: Optional[float] = None,
 ) -> dict:
     """客观估值 regime（骑趋势 / 中性 / 收纪律）——六路分析师信号合成，纯 Python 确定性。
 
@@ -1263,6 +1355,20 @@ def compute_valuation_regime(
         else:
             legs["earnings"] = 0
 
+    # 3b 强周期股的盈利动能语义反转（林奇铁律，只对 strong；半周期保留成长β语义）：
+    #   - 周期顶部（ROE 10年分位 ≥0.8）：高增速是"周期顶部现象"而非动能证据，
+    #     +1 压到 0——否则系统在最该下车的位置判 ride、把 SELL 托底成 HOLD
+    #   - 周期谷底（≤0.2）：负增长/低增速是周期常态而非基本面恶化，
+    #     -1 抬到 0——否则在最该布局的位置判 discipline、封死 BUY
+    cyc_note = ""
+    if cyclical_class == "strong" and roe_pct_rank_10y is not None and "earnings" in legs:
+        if roe_pct_rank_10y >= 0.8 and legs["earnings"] > 0:
+            legs["earnings"] = 0
+            cyc_note = f"；强周期顶部(ROE分位{roe_pct_rank_10y:.2f})高增速不算动能，earnings腿压0"
+        elif roe_pct_rank_10y <= 0.2 and legs["earnings"] < 0:
+            legs["earnings"] = 0
+            cyc_note = f"；强周期谷底(ROE分位{roe_pct_rank_10y:.2f})盈利差是周期常态，earnings腿抬0"
+
     # 4 舆情拥挤
     crowd_vote = 0
     if retail_concentration_signal == "散户高接盘" or (
@@ -1303,7 +1409,8 @@ def compute_valuation_regime(
     if has_peak_signal and regime == "ride":
         regime = "neutral"
 
-    reasoning = f"六路净分={score}（{legs}）→ {regime}" + ("；peak信号压制不骑" if has_peak_signal else "")
+    reasoning = (f"六路净分={score}（{legs}）→ {regime}"
+                 + ("；peak信号压制不骑" if has_peak_signal else "") + cyc_note)
     return {"valuation_regime": regime, "score": score, "legs": legs, "reasoning": reasoning}
 
 

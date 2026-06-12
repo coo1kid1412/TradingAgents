@@ -57,6 +57,7 @@ from tradingagents.dataflows.profile_calc import (
     compute_valuation_regime,
     parse_growth_deceleration,
     parse_distribution_signals,
+    parse_sys_cyclical,
 )
 
 logger = logging.getLogger(__name__)
@@ -373,6 +374,12 @@ def create_stock_profile_node(llm):
         net_growth_strict = parse_net_profit_growth(fundamentals_report + "\n" + fund_raw, strict=True)
         dist_sig = parse_distribution_signals(news_report, fundamentals_report, sentiment_report)
         gq = parse_growth_quality(fund_raw + "\n" + fundamentals_report)  # 扣非口径成长质量
+        # 周期股机读行（vendor Python 发射 + fundamentals 转录兜底保证在场）
+        cyc_info = parse_sys_cyclical(fundamentals_report + "\n" + fund_raw)
+        if cyc_info:
+            logger.info("SYS_CYCLICAL: class=%s position=%s roe_rank=%s normalized_eps=%s",
+                        cyc_info["class"], cyc_info["position"],
+                        cyc_info["roe_pct_rank"], cyc_info["normalized_eps"])
         regime_info = compute_valuation_regime(
             momentum_score=momentum_score,
             rsi_percentile_1y=price_signals.get("rsi_percentile_1y"),
@@ -388,6 +395,8 @@ def create_stock_profile_node(llm):
             distribution_detected=dist_sig["detected"],
             capital_flow_score=cf_sig["score"],
             recurring_loss=gq["recurring_loss"],
+            cyclical_class=cyc_info["class"] if cyc_info else None,
+            roe_pct_rank_10y=cyc_info["roe_pct_rank"] if cyc_info else None,
         )
         valuation_regime = regime_info["valuation_regime"]
         if dist_sig["detected"]:
@@ -908,7 +917,13 @@ TRANSPARENCY:
                 discipline_cap = pe_ttm_fallback * 0.6
 
             eff_cap = pe_ttm_actual if valuation_regime == "ride" else discipline_cap
-            if eff_cap is not None:
+            # 强周期谷底：TTM EPS 趴地板 → TTM PE 本就虚高（林奇铁律），任何
+            # 以 PE_TTM/同业 TTM 为基的 cap 都失真 → 整体跳过（目标价由
+            # normalized EPS 路由约束，不靠 TTM cap）
+            if (cyc_info and cyc_info["class"] == "strong"
+                    and cyc_info["position"] == "trough"):
+                logger.info("强周期谷底：跳过 target_pe 出口 cap（TTM PE 虚高失真）")
+            elif eff_cap is not None:
                 content = _enforce_target_pe_cap(content, eff_cap)
                 logger.info(
                     "target_pe 出口 cap: regime=%s → eff_cap=%.1f", valuation_regime, eff_cap,
@@ -934,6 +949,20 @@ TRANSPARENCY:
             f"SYS_THEME_PREMIUM_REASON: {premium_gate_note}\n"
         )
         logger.info("SYS_THEME_PREMIUM_PCT 已注入画像: %s", premium_gated)
+
+        # 周期股机读行回显（来源是 fundamentals 的 SYS_CYCLICAL，这里转抄到画像尾部，
+        # RM Step4 路由 / Step6 工具入参直读画像即可，不必回 fundamentals 翻找）
+        if cyc_info:
+            content = content + (
+                f"\n<!-- ⚠️SYS_CYCLICAL｜Python 确定性周期识别+正常化估值，RM Step4 路由/Step6 入参直读勿改 -->\n"
+                f"SYS_CYCLICAL_CLASS: {cyc_info['class']}\n"
+                f"SYS_CYCLICAL_POSITION: {cyc_info['position'] or '数据不足'}\n"
+                f"SYS_CYCLICAL_NORMALIZED_EPS: {cyc_info['normalized_eps'] if cyc_info['normalized_eps'] is not None else 'N/A'}\n"
+                f"SYS_CYCLICAL_NORMALIZED_PE: {cyc_info['normalized_pe'] if cyc_info['normalized_pe'] is not None else 'N/A'}\n"
+                f"SYS_CYCLICAL_ROE_RANK: {cyc_info['roe_pct_rank'] if cyc_info['roe_pct_rank'] is not None else 'N/A'}\n"
+            )
+            logger.info("SYS_CYCLICAL 已回显画像: class=%s position=%s",
+                        cyc_info["class"], cyc_info["position"])
 
         # 成长股前瞻路由 —— 机器可读，RM Step4 直读决定主方法/权重（防画像 LLM 漂移）
         if growth_method["recommend"]:

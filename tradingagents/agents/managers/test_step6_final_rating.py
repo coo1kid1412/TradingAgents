@@ -262,6 +262,56 @@ def test_neutral_passthrough_equals_legacy_chain():
     print("✓ 中性输入下与旧链逐位等价（3 组）")
 
 
+def test_cyclical_top_blocks_upgrade_and_overlay():
+    """强周期顶部：对称升档禁用 + 趋势叠加正向钳零（顶部要下车不是骑）。"""
+    # 低估区 + 拐点加速 + 数据可信（非周期股会升 OW 再被叠加抬 BUY 的组合）
+    p = _base(
+        current_price=90.0, target_price_mid=100.0,
+        style="high_beta_growth",
+        inflection_stage="加速期", data_completeness="L0", red_flags_count=0,
+        composite_score=70.0, momentum_score=80.0,   # 成长股叠加 +1 阈值满足
+    )
+    no_cyc = F.invoke(p)
+    assert no_cyc["final_rating"] in ("OVERWEIGHT", "BUY")   # 非周期：升档/叠加生效
+
+    top = F.invoke({**p, "cyclical_class": "strong", "cycle_position": "top"})
+    assert top["stages"]["symmetric"]["upgrade"] == 0, top["stages"]["symmetric"]
+    assert top["final_rating"] == "HOLD", top["explanation"]
+    assert "顶部" in str(top["stages"]["symmetric"]["notes"])
+    print("✓ 强周期顶部：升档禁用 + 叠加正向钳零 → HOLD")
+
+
+def test_cyclical_trough_mutes_inflection_downgrade():
+    """强周期谷底：『拐点衰退』降档静音（谷底盈利差是常态，不在底部追杀）。"""
+    p = _base(
+        current_price=110.0, target_price_mid=100.0,   # UW 区边内(HOLD 区上沿内)
+        inflection_stage="衰退", data_completeness="L1", red_flags_count=0,
+    )
+    no_cyc = F.invoke(p)
+    assert no_cyc["stages"]["symmetric"]["downgrade"] == -1   # 非周期：衰退降档
+
+    trough = F.invoke({**p, "cyclical_class": "strong", "cycle_position": "trough"})
+    assert trough["stages"]["symmetric"]["downgrade"] == 0, trough["stages"]["symmetric"]
+    assert "静音" in str(trough["stages"]["symmetric"]["notes"])
+    # 数据质量降档不受周期豁免
+    bad_data = F.invoke({**p, "cyclical_class": "strong", "cycle_position": "trough",
+                         "data_completeness": "L3"})
+    assert bad_data["stages"]["symmetric"]["downgrade"] == -1
+    print("✓ 强周期谷底：拐点衰退静音，数据质量降档保留")
+
+
+def test_semi_cyclical_not_affected():
+    """半周期不触发顶部/谷底修正（保留成长β语义）。"""
+    p = _base(
+        current_price=90.0, target_price_mid=100.0,
+        inflection_stage="加速期", data_completeness="L0", red_flags_count=0,
+        cyclical_class="semi", cycle_position="top",
+    )
+    r = F.invoke(p)
+    assert r["stages"]["symmetric"]["upgrade"] == 1, r["stages"]["symmetric"]
+    print("✓ 半周期不触发周期修正")
+
+
 def test_mapping_error_propagates():
     """target_price_mid ≤ 0 时返回错误而非崩溃。"""
     r = F.invoke(_base(target_price_mid=0.0))
@@ -284,5 +334,8 @@ if __name__ == "__main__":
     test_threshold_formula_and_fading_lock()
     test_extreme_defense_and_exception()
     test_neutral_passthrough_equals_legacy_chain()
+    test_cyclical_top_blocks_upgrade_and_overlay()
+    test_cyclical_trough_mutes_inflection_downgrade()
+    test_semi_cyclical_not_affected()
     test_mapping_error_propagates()
-    print("\n全部 15 项通过 ✅")
+    print("\n全部 18 项通过 ✅")

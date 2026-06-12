@@ -101,7 +101,7 @@ def _format_structured_data(raw_data: dict, ticker: str, current_date: str) -> s
 # 300308_20260612 实跑：SYS_GROWTH_YOY 被丢 → 画像 peg_det=None → 无 SYS_PEG 注入
 # → RM 退回自估 PEG 还伪造了"SYS_PEG_CONFIDENCE=low"的来源标注。
 # 修法与 stock_profile_node 同款：Python 原样转录追加在报告末尾，不靠 LLM 自觉。
-_SYS_LINE_PREFIXES = ("【SYS_GROWTH_YOY", "【SYS_LANDMINE", "EPS(TTM):")
+_SYS_LINE_PREFIXES = ("【SYS_GROWTH_YOY", "【SYS_LANDMINE", "【SYS_CYCLICAL", "EPS(TTM):")
 
 
 def _extract_sys_lines(vendor_text: str) -> list[str]:

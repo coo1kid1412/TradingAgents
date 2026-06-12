@@ -1270,6 +1270,9 @@ def compute_step6_final_rating(
     kol_bullish_ratio_trend_pct: Optional[float] = None,
     # ── 第七步 极端背离防御例外 ──
     inflection_confirmed_recent: bool = False,
+    # ── 周期股修正（画像 SYS_CYCLICAL_CLASS / SYS_CYCLICAL_POSITION 直读）──
+    cyclical_class: str = "",
+    cycle_position: str = "",
 ) -> dict:
     """Step 6 评级终段一次合议：阈值→映射→拥挤→升降档→趋势叠加→极端防御 全链 Python。
 
@@ -1332,6 +1335,12 @@ def compute_step6_final_rating(
         market/news/sentiment_weight + *_direction_vote: 三报告方向票（同 trend_overlay）
         sell_side_target_change_pct 等四项: 催化动量硬数据（缺失 None，禁止编造）
         inflection_confirmed_recent: 业绩拐点刚被新数据确认（极端防御例外）
+        cyclical_class / cycle_position: 周期股标记（strong/semi + top/mid/trough），
+            来自画像 SYS_CYCLICAL 行。林奇铁律在评级链的落地（只对 strong）：
+            - top（周期顶部）：禁对称升档、趋势叠加正向钳零——"拐点加速/强动量"
+              在顶部是周期顶部现象，不是加仓证据（顶部要下车，不是骑）
+            - trough（谷底）："拐点顶部/衰退"降档静音——谷底盈利差是周期常态，
+              在最该布局的位置追杀 = 林奇说的"在谷底卖出周期股"经典错误
 
     Returns:
         dict: {final_rating, rating_raw, rating_after_gate, deviation_pct,
@@ -1435,10 +1444,14 @@ def compute_step6_final_rating(
     rating, _clamped = _clamp_to_bounds(rating)
     stages["crowding"] = {"rating_after": rating, "note": crowd_note}
 
-    # ── 4) 第五步 对称升降档（原 LLM 徒手 → Python）──
+    # ── 4) 第五步 对称升降档（原 LLM 徒手 → Python；含周期修正）──
     sym_notes: list[str] = []
     infl = (inflection_stage or "").strip()
     dcl = (data_completeness or "").strip().upper()
+    cyc = (cyclical_class or "").strip().lower()
+    cyc_pos = (cycle_position or "").strip().lower()
+    cyc_top = (cyc == "strong" and cyc_pos == "top")
+    cyc_trough = (cyc == "strong" and cyc_pos == "trough")
 
     upgrade = 0
     up_ok = (
@@ -1449,7 +1462,9 @@ def compute_step6_final_rating(
         and "momentum" not in (decision_style or "").lower()
         and rating in ("HOLD", "OVERWEIGHT")  # 升档只对偏多档
     )
-    if up_ok:
+    if up_ok and cyc_top:
+        sym_notes.append("升档禁用：强周期顶部，『拐点加速』是周期顶部现象非加仓证据")
+    elif up_ok:
         upgrade = 1
         sym_notes.append("升档 +1：拐点加速/底部反转 + L0/L1 + 红旗≤1 + 低估区 + 非momentum")
     else:
@@ -1463,8 +1478,11 @@ def compute_step6_final_rating(
         downgrade -= 1
         sym_notes.append(f"降档 -1：红旗 {red_flags_count} 条")
     if "顶部" in infl or "衰退" in infl:
-        downgrade -= 1
-        sym_notes.append(f"降档 -1：拐点={infl}")
+        if cyc_trough:
+            sym_notes.append("『拐点顶部/衰退』降档静音：强周期谷底，盈利差是周期常态非恶化证据")
+        else:
+            downgrade -= 1
+            sym_notes.append(f"降档 -1：拐点={infl}")
     if bear_anchor_strong and "待验证" in (earnings_sustainability or ""):
         downgrade -= 1
         sym_notes.append("降档 -1：空头 anchor 强 + 业绩可持续性待验证")
@@ -1499,12 +1517,16 @@ def compute_step6_final_rating(
     })
     overlay_components = overlay.get("components", {})
     rating_overlay = overlay.get("final_rating", rating)
-    rating, clamp_note = _clamp_to_bounds(rating_overlay)
     overlay_clamp = ""
-    if rating != rating_overlay:
+    # 周期顶部：趋势叠加正向钳零——强动量在顶部是"最后一棒"风险不是骑的理由
+    if cyc_top and _RATINGS_ORDER.index(rating_overlay) > _RATINGS_ORDER.index(rating):
+        overlay_clamp = f"强周期顶部：叠加 +1（{rating} → {rating_overlay}）钳零，顶部不追涨"
+        rating_overlay = rating
+    rating, clamp_note = _clamp_to_bounds(rating_overlay)
+    if not overlay_clamp and rating != rating_overlay:
         overlay_clamp = f"叠加结果 {rating_overlay} 越过闸门边界 → 钳回 {rating}（{clamp_note}）"
     stages["overlay"] = {"components": overlay_components,
-                         "rating_overlay_raw": rating_overlay,
+                         "rating_overlay_raw": overlay.get("final_rating", rating),
                          "rating_after": rating,
                          "clamp": overlay_clamp or "未触边界",
                          "detail": overlay.get("explanation", "")}
@@ -1555,6 +1577,7 @@ def compute_step6_final_rating(
         "valuation_regime": mapping["valuation_regime"],
         "peg_confidence": (peg_confidence or "").strip().lower() or "（未提供）",
         "overlay_components": overlay_components,
+        "cyclical": {"class": cyc or "（非周期）", "position": cyc_pos or ""},
         "bounds": {"floor": _RATINGS_ORDER[floor_idx], "ceiling": _RATINGS_ORDER[ceiling_idx],
                    "sources": bound_sources or ["无闸门边界"]},
         "stages": stages,

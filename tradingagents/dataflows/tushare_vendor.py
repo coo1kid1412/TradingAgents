@@ -124,12 +124,37 @@ def _fetch_cached(prefix: str, ts_code: str, fetch_fn) -> Optional[pd.DataFrame]
     return _read_api_cache(prefix, ts_code, require_fresh=False)
 
 
+# fina 拉 40 期（≈10 年季度）：一次 API 成本与 5 期相同，但解锁周期股正常化估值
+# （ROE 十年中位 × BPS = normalized EPS、ROE 分位 = 周期位置）
+_FINA_FETCH_LIMIT = 40
+# 旧缓存只有 5 期：行数不足以算穿越周期指标时视同过期重取（限流仍回退旧值，不更差）
+_FINA_MIN_ROWS_FOR_FRESH = 20
+
+
 def _fetch_fina_indicator_cached(pro, ts_code: str) -> Optional[pd.DataFrame]:
-    """fina_indicator 取数 + 数据缓存（新鲜缓存直接用；限流/失败回退旧缓存）。"""
-    return _fetch_cached(
-        "fina", ts_code,
-        lambda: _safe_call(pro.fina_indicator, ts_code=ts_code, limit=5, api_name="fina_indicator"),
-    )
+    """fina_indicator 取数 + 数据缓存（新鲜缓存直接用；限流/失败回退旧缓存）。
+
+    行数闸：limit 5→40 升级后，存量缓存只有 5 期，对"新鲜"缓存额外要求 ≥20 行
+    才直接采用；行数不足则尝试重取（新上市股本就不足 20 行会反复尝试——可接受，
+    每跑最多 1 次调用，且限流时回退短缓存）。
+    """
+    fresh = _read_api_cache("fina", ts_code, require_fresh=True)
+    if fresh is not None and len(fresh) >= _FINA_MIN_ROWS_FOR_FRESH:
+        logger.info("fina_indicator 命中新鲜缓存(跳过 API)：%s", ts_code)
+        return fresh
+    try:
+        df = _safe_call(pro.fina_indicator, ts_code=ts_code,
+                        limit=_FINA_FETCH_LIMIT, api_name="fina_indicator")
+    except (TushareUnavailableError, TushareRateLimitError):
+        stale = _read_api_cache("fina", ts_code, require_fresh=False)
+        if stale is not None:
+            logger.info("fina_indicator 限流/不可用，回退旧缓存：%s", ts_code)
+            return stale
+        raise
+    if df is not None and not df.empty:
+        _write_api_cache("fina", ts_code, df)
+        return df
+    return _read_api_cache("fina", ts_code, require_fresh=False)
 
 
 def _get_tushare_api():
@@ -442,6 +467,70 @@ def _compute_ttm_revenue_per_share_fina(
     )
 
 
+def _format_cyclical_line(industry, stock_name, fina, close_price) -> str:
+    """周期股正常化估值机读行（对标投研：周期股不能用 TTM EPS 套 PE）。
+
+    - 识别：profile_calc.detect_cyclical（传统周期行业关键词 + 科技周期名单，确定性）
+    - normalized EPS = 年度 ROE 十年中位 ÷100 × 最新 BPS（卖方标准 mid-cycle 做法：
+      净资产稳定累积、ROE 围绕中枢摆；比"多年净利均值"抗增发/回购污染）
+    - 周期位置 = 当前年化 ROE 在最近 ≤10 个年度 ROE 中的分位：≥0.8 top / ≤0.2 trough
+      （当前年化 = 最新累计期 ROE ÷ 季数 ×4，比"最新年度"少滞后一年）
+    - 年度样本 <5 → position=数据不足，只发识别行（新上市股不硬算穿越周期）
+    防御式：任何失败返回空串。
+    """
+    from tradingagents.dataflows.profile_calc import detect_cyclical
+
+    try:
+        cyc = detect_cyclical(industry, stock_name)
+        if cyc is None:
+            return ""
+        head = f"【SYS_CYCLICAL｜tushare】 class={cyc}"
+        if fina is None or fina.empty or "roe" not in fina.columns:
+            return head + " | position=数据不足"
+
+        df = fina.sort_values("end_date")
+        annual = df[df["end_date"].astype(str).str.endswith("1231")].tail(10)
+        roe_vals = [float(v) for v in annual["roe"].tolist() if v is not None]
+        if len(roe_vals) < 5:
+            return head + " | position=数据不足"
+
+        roe_med = sorted(roe_vals)[len(roe_vals) // 2] if len(roe_vals) % 2 == 1 else \
+            sum(sorted(roe_vals)[len(roe_vals) // 2 - 1:len(roe_vals) // 2 + 1]) / 2
+
+        # 当前年化 ROE：最新累计期 ÷ 季数 ×4
+        latest = df.iloc[-1]
+        roe_now = None
+        if latest.get("roe") is not None:
+            end = str(latest.get("end_date"))
+            q_num = {"0331": 1, "0630": 2, "0930": 3, "1231": 4}.get(end[-4:])
+            if q_num:
+                roe_now = float(latest["roe"]) / q_num * 4
+
+        parts = [head]
+        if roe_now is not None:
+            rank = sum(1 for v in roe_vals if v < roe_now) / len(roe_vals)
+            position = "top" if rank >= 0.8 else ("trough" if rank <= 0.2 else "mid")
+            parts.append(f"position={position}")
+            parts.append(f"roe_pct_rank={rank:.2f}")
+        else:
+            parts.append("position=数据不足")
+        parts.append(f"roe_10y_median={roe_med:.1f}%")
+        if roe_now is not None:
+            parts.append(f"roe_latest={roe_now:.1f}%")
+
+        bps = latest.get("bps")
+        if bps is not None and roe_med > 0:
+            neps = round(roe_med / 100 * float(bps), 2)
+            parts.append(f"normalized_eps={neps}")
+            if close_price and neps > 0:
+                parts.append(f"normalized_pe={close_price / neps:.1f}")
+        parts.append(f"年度样本={len(roe_vals)}")
+        return " | ".join(parts)
+    except Exception as e:
+        logger.debug("_format_cyclical_line 失败: %s", e)
+        return ""
+
+
 def _format_landmine_line(stock_name, fina) -> str:
     """地雷排查可确定性判定项 → 固定格式行，RM 第负一步直读（不再让 LLM 从 prose 猜）。
 
@@ -586,6 +675,7 @@ def get_fundamentals(
 
     # 公司基本信息
     stock_name = None
+    stock_industry = None
     try:
         basic = _safe_call(
             pro.stock_basic,
@@ -597,6 +687,7 @@ def get_fundamentals(
             has_data = True
             row = basic.iloc[0]
             stock_name = row.get("name")
+            stock_industry = row.get("industry")
             sections.append("## 公司基本信息")
             sections.append(f"代码: {row.get('ts_code', 'N/A')}")
             sections.append(f"名称: {row.get('name', 'N/A')}")
@@ -695,6 +786,11 @@ def get_fundamentals(
             sections.append(f"动态PE(系统计算): {dynamic_pe}倍 (公式: 收盘价/TTM_EPS)")
         else:
             sections.append("动态PE(系统计算): N/A (缺少收盘价或TTM_EPS)")
+
+        # 周期股正常化估值机读行（非周期股返回空串不发射）——下游画像路由 + RM Step4 直读
+        cyclical_line = _format_cyclical_line(stock_industry, stock_name, fina, close_price)
+        if cyclical_line:
+            sections.append(cyclical_line)
 
         # 静态 PE：收盘价 / 年度 EPS
         if fina is not None and not fina.empty and close_price:
