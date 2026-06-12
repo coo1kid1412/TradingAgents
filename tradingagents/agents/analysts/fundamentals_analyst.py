@@ -97,6 +97,29 @@ def _format_structured_data(raw_data: dict, ticker: str, current_date: str) -> s
     return header + "\n\n---\n\n".join(sections)
 
 
+# 必须确定性传递的机读行前缀：源数据(tushare_vendor)里有，但 LLM 写报告时经常丢——
+# 300308_20260612 实跑：SYS_GROWTH_YOY 被丢 → 画像 peg_det=None → 无 SYS_PEG 注入
+# → RM 退回自估 PEG 还伪造了"SYS_PEG_CONFIDENCE=low"的来源标注。
+# 修法与 stock_profile_node 同款：Python 原样转录追加在报告末尾，不靠 LLM 自觉。
+_SYS_LINE_PREFIXES = ("【SYS_GROWTH_YOY", "【SYS_LANDMINE", "EPS(TTM):")
+
+
+def _extract_sys_lines(vendor_text: str) -> list[str]:
+    """从源数据文本里抽出机读行（防御式：空文本返回空列表）。"""
+    return [ln.strip() for ln in (vendor_text or "").splitlines()
+            if ln.strip().startswith(_SYS_LINE_PREFIXES)]
+
+
+def _append_sys_lines(report: str, vendor_text: str) -> str:
+    """把源数据机读行追加到 LLM 报告末尾（已被 LLM 原样转抄的不重复追加）。"""
+    missing = [ln for ln in _extract_sys_lines(vendor_text) if ln not in report]
+    if not missing:
+        return report
+    return (report
+            + "\n\n<!-- ⚠️SYS 机读行｜Python 从源数据原样转录(LLM 报告丢行不再断确定性链)，下游解析直读 -->\n"
+            + "\n".join(missing) + "\n")
+
+
 def create_fundamentals_analyst(llm):
     def fundamentals_analyst_node(state):
         ticker = state["company_of_interest"]
@@ -373,6 +396,8 @@ SUMMARY:
             result = llm_with_tools.invoke(messages)
 
         report = result.content if hasattr(result, "content") else str(result)
+        # 机读行确定性传递（Python 兜底，不靠 LLM 转抄）
+        report = _append_sys_lines(report, raw_data.get("fundamentals", ""))
 
         return {
             "messages": [
