@@ -72,10 +72,15 @@ def _migrate_schema(conn: sqlite3.Connection) -> None:
 
 @contextmanager
 def connect(db_path: Path | str | None = None) -> Iterator[sqlite3.Connection]:
-    """获取 DB 连接，自动 commit + close。"""
+    """获取 DB 连接，自动 commit + close。
+
+    每次连接前都跑 init_db（建表 IF NOT EXISTS + 幂等 migration）：
+    原来只在文件不存在时初始化，导致已有库永远吃不到新列 migration
+    （实测：predictions 扩列后归档报 no column named valuation_regime）。
+    本地 SQLite，executescript 开销可忽略。
+    """
     path = get_db_path(db_path)
-    if not path.exists():
-        init_db(path)
+    init_db(path)
     conn = sqlite3.connect(path)
     conn.row_factory = sqlite3.Row
     # 启用外键约束

@@ -14,6 +14,32 @@ logger = logging.getLogger(__name__)
 _MAX_TOOL_ITERATIONS = 15
 
 
+def _retry_if_empty(llm_with_tools, messages, cot_segments, role: str):
+    """空输出兜底：MiniMax 推理模型偶发整段回复只有 <think> 思考块，被
+    _strip_think_tags 剥成空串（603629 PM / 300394 RM 两次真实事故，各废一次全跑）。
+    累计正文为空时带明确指令重试最多 2 次；仍为空则抛错让上游显式失败，
+    不再让空 thesis 静默流向下游（风控/PM 拿到空输入只能瞎编）。
+    """
+    for attempt in range(1, 3):
+        if any(s.strip() for s in cot_segments):
+            return
+        logger.warning("%s 输出正文为空（疑似 think-only 被剥离），第 %d 次重试", role, attempt)
+        messages.append(HumanMessage(
+            content="你上一条回复的正文为空（可能只输出了思考过程）。请**直接输出完整的最终报告正文**，"
+                    "不要输出思考标签，不要再调用任何工具。"
+        ))
+        retry = llm_with_tools.invoke(messages)
+        messages.append(retry)
+        retry_content = (retry.content or "").strip()
+        if retry_content:
+            cot_segments.append(retry_content)
+            return
+    raise RuntimeError(
+        f"{role} 连续 3 次输出空正文（think-only 剥离后无内容），中止本次分析——"
+        "空 thesis 流向下游只会产出无依据的报告"
+    )
+
+
 def _run_tool_calling_loop(llm_with_tools, initial_messages):
     """执行 LLM 工具调用循环，直到 LLM 不再调工具或达到上限。
 
@@ -39,6 +65,7 @@ def _run_tool_calling_loop(llm_with_tools, initial_messages):
                 "RM tool calling 循环结束（第 %d 轮，累积 %d 段 COT，总长 %d 字符）",
                 iteration + 1, len(cot_segments), sum(len(s) for s in cot_segments),
             )
+            _retry_if_empty(llm_with_tools, messages, cot_segments, "RM")
             return AIMessage(content="\n\n".join(cot_segments))
 
         logger.info("RM 第 %d 轮工具调用：%d 个工具", iteration + 1, len(tool_calls))
@@ -71,9 +98,11 @@ def _run_tool_calling_loop(llm_with_tools, initial_messages):
                 "**不要再调用任何工具**。"
     ))
     final = llm_with_tools.invoke(messages)
+    messages.append(final)
     final_content = (final.content or "").strip()
     if final_content:
         cot_segments.append(final_content)
+    _retry_if_empty(llm_with_tools, messages, cot_segments, "RM")
     return AIMessage(content="\n\n".join(cot_segments))
 
 

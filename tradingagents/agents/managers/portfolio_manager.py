@@ -5,6 +5,7 @@ from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
 from tradingagents.agents.utils.agent_utils import build_instrument_context, get_language_instruction, RISK_DEBATE_PHRASING_RULES
 from tradingagents.agents.managers.pm_tools import PM_TOOLS, PM_TOOLS_BY_NAME
+from tradingagents.agents.managers.research_manager import _retry_if_empty
 
 logger = logging.getLogger(__name__)
 
@@ -12,7 +13,11 @@ _MAX_TOOL_ITERATIONS = 6
 
 
 def _pm_tool_loop(llm_with_tools, initial_messages):
-    """PM 工具调用循环。返回累积了所有迭代 LLM 文本的 AIMessage（保留 9 步决策链路）。"""
+    """PM 工具调用循环。返回累积了所有迭代 LLM 文本的 AIMessage（保留 9 步决策链路）。
+
+    空输出兜底复用 RM 的 _retry_if_empty（603629 事故：MiniMax think-only 被剥空
+    → decision.md 缺失，5_portfolio 整段跳过）。
+    """
     messages = list(initial_messages)
     cot_segments: list[str] = []
 
@@ -30,6 +35,7 @@ def _pm_tool_loop(llm_with_tools, initial_messages):
                 "PM tool loop 结束（第 %d 轮，累积 %d 段，总长 %d 字符）",
                 iteration + 1, len(cot_segments), sum(len(s) for s in cot_segments),
             )
+            _retry_if_empty(llm_with_tools, messages, cot_segments, "PM")
             return AIMessage(content="\n\n".join(cot_segments))
 
         logger.info("PM 第 %d 轮工具调用：%d 个", iteration + 1, len(tool_calls))
@@ -49,9 +55,11 @@ def _pm_tool_loop(llm_with_tools, initial_messages):
     logger.warning("PM 达到工具调用上限 %d 轮", _MAX_TOOL_ITERATIONS)
     messages.append(HumanMessage(content="请基于已有工具结果直接写出最终决策，不要再调工具。"))
     final = llm_with_tools.invoke(messages)
+    messages.append(final)
     final_content = (final.content or "").strip()
     if final_content:
         cot_segments.append(final_content)
+    _retry_if_empty(llm_with_tools, messages, cot_segments, "PM")
     return AIMessage(content="\n\n".join(cot_segments))
 
 
