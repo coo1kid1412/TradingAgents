@@ -409,12 +409,20 @@ def create_stock_profile_node(llm):
 
         # 成长股目标价口径路由：high_beta_growth → 前瞻 PEG 主导（只改权重，不改各腿 EPS 口径）
         # 先过"成长质量闸"：扣非亏损/基数效应增速 → 不走前瞻 PEG（防淳中式价值陷阱）
-        growth_method = recommend_growth_primary_method(
-            style=style, net_profit_growth=net_profit_growth,
-            forced_valuation=forced_valuation, valuation_regime=valuation_regime,
-            recurring_loss=gq["recurring_loss"], deducted_yoy=gq["deducted_yoy"])
-        logger.info("成长股前瞻路由: recommend=%s | 扣非亏损=%s | %s",
-                    growth_method["recommend"], gq["recurring_loss"], growth_method["reason"])
+        # ⛔ 强周期闸（最高优先）：strong 周期股禁发成长路由——周期增速无前瞻意义，
+        # 两条机读指令并存会让 RM 钻缝"混合路由"（000725 实跑：自行把 PEG 拉回当 40% 主腿）。
+        # 冲突信号不该存在：源头只发周期路由（SYS_CYCLICAL），不发 SYS_TARGET_PRIMARY。
+        if cyc_info and cyc_info["class"] == "strong":
+            growth_method = {"recommend": None,
+                             "reason": "强周期股走 SYS_CYCLICAL 路由，成长前瞻路由禁发"}
+            logger.info("强周期股：SYS_TARGET_PRIMARY 禁发（周期路由独占）")
+        else:
+            growth_method = recommend_growth_primary_method(
+                style=style, net_profit_growth=net_profit_growth,
+                forced_valuation=forced_valuation, valuation_regime=valuation_regime,
+                recurring_loss=gq["recurring_loss"], deducted_yoy=gq["deducted_yoy"])
+            logger.info("成长股前瞻路由: recommend=%s | 扣非亏损=%s | %s",
+                        growth_method["recommend"], gq["recurring_loss"], growth_method["reason"])
 
         # === 程序化判定结束 ===
 
