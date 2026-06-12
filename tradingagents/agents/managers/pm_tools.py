@@ -6,6 +6,8 @@ PM 需要的数值计算工具：
 - 4 情景概率加权 E（PM 比 RM 多一档"黑天鹅"）
 """
 
+from typing import Optional
+
 from langchain_core.tools import tool
 
 
@@ -72,9 +74,9 @@ _STAR_POSITION = {
 
 
 @tool
-def compute_conviction_position_map(rm_conviction: str, odds_r: float = 1.0,
-                                    abs_d: float = 0.0,
-                                    anchor_sensitive: bool = False) -> dict:
+def compute_conviction_position_map(rm_conviction: str, odds_r: Optional[float] = 1.0,
+                                    abs_d: Optional[float] = 0.0,
+                                    anchor_sensitive: Optional[bool] = False) -> dict:
     """Conviction 五星制 + 仓位上限映射（主输入 = RM Conviction + 赔率 R）。
 
     为什么不再以 \|d\|（多空辩论比分差）为主：仓位是执行端最重要的参数，而辩论
@@ -104,6 +106,11 @@ def compute_conviction_position_map(rm_conviction: str, odds_r: float = 1.0,
         dict: {"conviction_stars", "conviction_label", "position_low_pct",
                "position_high_pct", "reason"}
     """
+    # LLM 工具调用可能把缺省字段传 null（pydantic 校验失败会废掉整轮调用）
+    odds_r = float(odds_r if odds_r is not None else 1.0)
+    abs_d = float(abs_d or 0.0)
+    anchor_sensitive = bool(anchor_sensitive)
+
     conv = (rm_conviction or "").strip()
     base = {"高": 4, "中": 3, "低": 2}.get(conv)
     if base is None:

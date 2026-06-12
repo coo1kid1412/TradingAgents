@@ -701,6 +701,21 @@ def get_fundamentals(
     except Exception as e:
         sections.append(f"# 获取公司信息出错：{e}\n")
 
+    # stock_basic 限流时回退 peer_comps 的全市场名字/行业缓存（7 天 TTL，几乎必在）——
+    # 名字/行业是周期识别(SYS_CYCLICAL)和 ST 判定(SYS_LANDMINE)的输入，单点依赖 API 不可靠
+    # （000725_20260612 实跑：stock_basic 限流 → ST=不可得 + 周期识别整段没跑）
+    if stock_name is None:
+        try:
+            from tradingagents.dataflows.peer_comps import get_stock_basic  # 函数内导入防循环依赖
+            info = get_stock_basic().get(ts_code.split(".")[0])
+            if info:
+                stock_name = info.get("name")
+                stock_industry = info.get("industry")
+                logger.info("stock_basic 回退 peer_comps 缓存：%s → %s/%s",
+                            ts_code, stock_name, stock_industry)
+        except Exception as e:
+            logger.debug("peer_comps stock_basic 回退失败: %s", e)
+
     # 财务指标（精选关键字段，消除列名歧义）
     try:
         fina = _fetch_fina_indicator_cached(pro, ts_code)
