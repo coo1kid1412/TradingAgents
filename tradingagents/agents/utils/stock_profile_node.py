@@ -48,7 +48,6 @@ from tradingagents.dataflows.profile_calc import (
     detect_leadership_bonus,
     compute_default_premium,
     infer_theme_stage_from_data,
-    parse_sector_rs_30d,
     parse_pe_ttm_from_fundamentals,
     parse_net_profit_growth,
     parse_sys_net_growth_components,
@@ -157,6 +156,37 @@ def _fetch_price_df_for_profile(ticker: str, trade_date: str):
         return None
 
 
+def _return_30d_from_df(price_df) -> float | None:
+    """从 OHLCV DataFrame 算近 30 交易日累计收益率（%）。"""
+    if price_df is None or "Close" not in price_df.columns:
+        return None
+    import pandas as pd
+    closes = pd.to_numeric(price_df["Close"], errors="coerce").dropna().reset_index(drop=True)
+    if len(closes) <= 30:
+        return None
+    past = float(closes.iloc[-31])
+    if past <= 0:
+        return None
+    return round((float(closes.iloc[-1]) / past - 1) * 100, 2)
+
+
+def _compute_sector_rs_30d(price_df, trade_date: str) -> float | None:
+    """本股 vs 沪深300 的 30d 相对强弱（自算，打破 profile↔sector 节点环依赖）。
+
+    历史 bug：profile 跑在 sector 之前，从 state['sector_comparison'] 解析 RS 恒得空
+    （字段一直 null，且 parser 还抓成本股自身收益而非 RS）。这里直接用本股 price_df
+    + 沪深300(510300) 自算，喂 infer_theme_stage（acceleration/fading 判定的输入）。
+    """
+    self_ret = _return_30d_from_df(price_df)
+    if self_ret is None:
+        return None
+    bench_df = _fetch_price_df_for_profile("510300", trade_date)
+    bench_ret = _return_30d_from_df(bench_df)
+    if bench_ret is None:
+        return None
+    return round(self_ret - bench_ret, 2)
+
+
 def _fetch_fundamentals_raw(ticker: str, trade_date: str) -> str:
     try:
         return route_to_vendor("get_fundamentals", ticker, trade_date)
@@ -244,7 +274,8 @@ def create_stock_profile_node(llm):
         fundamentals_report = state.get("fundamentals_report", "")
         macro_context = state.get("macro_context", "")
         quant_score_md = state.get("quant_score", "")
-        sector_comparison_md = state.get("sector_comparison", "")
+        # 注：sector_comparison 由下游 sector 节点产出（profile 跑在它前面），故不在此消费——
+        # 板块 RS 改为 profile 自算（_compute_sector_rs_30d），见下方
         capital_flow_yaml = state.get("capital_flow_yaml", "")
 
         # === 程序化判定开始 ===
@@ -350,7 +381,8 @@ def create_stock_profile_node(llm):
                 net_profit_growth=net_profit_growth,
                 leadership_bonus_pct=leadership_bonus_pct,
             )
-        sector_rs_30d = parse_sector_rs_30d(sector_comparison_md)
+        # 自算 sector RS（不再依赖下游 sector 节点——profile 跑在它前面，那条路恒空）
+        sector_rs_30d = _compute_sector_rs_30d(price_df, trade_date)
         theme_inferred, theme_reason = infer_theme_stage_from_data(
             momentum_score=momentum_score,
             sector_rs_30d=sector_rs_30d,
@@ -667,7 +699,7 @@ def create_stock_profile_node(llm):
         if leadership_bonus_pct > 0:
             prog_lines.append(f"- 龙头溢价识别: +{leadership_bonus_pct}% （{leadership_reason}）")
         if sector_rs_30d is not None:
-            prog_lines.append(f"- 板块 RS 30d: {sector_rs_30d:+.1f}%（来自 sector_comparison）")
+            prog_lines.append(f"- 板块 RS 30d: {sector_rs_30d:+.1f}%（本股 vs 沪深300，自算）")
 
         # === Layer 3: 透明化标注要求 ===
         prog_lines.append("")

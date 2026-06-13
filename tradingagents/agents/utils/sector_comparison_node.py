@@ -70,10 +70,14 @@ def _parse_industry_from_profile(stock_profile_md: str) -> str | None:
 # Price fetching（用 harness.price_cache 增量缓存）
 # ---------------------------------------------------------------------------
 def _fetch_ohlcv(ticker: str, base_date: _dt.date) -> pd.DataFrame | None:
-    """拉本股或基准近 70 天 OHLCV。优先用 harness.price_cache 命中缓存。"""
+    """拉本股或基准 OHLCV（覆盖最长 RS 窗口 60 交易日）。优先用 harness.price_cache 命中缓存。
+
+    窗口须覆盖 max(_RS_HORIZONS)=60 交易日 → 需 >61 根 K 线。原取 80 日历日 ≈56 交易日，
+    60d 收益恒返 None（所有票 60d 全 N/A 的根）。120 日历日 ≈84 交易日，含春节长假缺口仍稳过 61 根。
+    """
     try:
         from tradingagents.harness import price_cache as _pcache
-        start = base_date - _dt.timedelta(days=80)
+        start = base_date - _dt.timedelta(days=120)
         end = base_date
         df = _pcache.fetch_with_cache(ticker, start, end)
         return df
