@@ -53,6 +53,9 @@ def _migrate_schema(conn: sqlite3.Connection) -> None:
     if "relative_return_pct" not in cols:
         conn.execute("ALTER TABLE outcomes ADD COLUMN relative_return_pct REAL")
         logger.info("Migrated: outcomes.relative_return_pct added")
+    if "signed_pnl_pct" not in cols:
+        conn.execute("ALTER TABLE outcomes ADD COLUMN signed_pnl_pct REAL")
+        logger.info("Migrated: outcomes.signed_pnl_pct added")
 
     # predictions 表加评级链审计列（2026-06 P0：回测分腿归因）
     pred_cols = {r[1] for r in conn.execute("PRAGMA table_info(predictions)").fetchall()}

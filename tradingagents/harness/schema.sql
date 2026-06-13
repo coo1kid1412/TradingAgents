@@ -101,6 +101,7 @@ CREATE TABLE IF NOT EXISTS outcomes (
     actual_high_during_horizon REAL,
     actual_low_during_horizon REAL,
     realized_return_pct REAL,                 -- (actual_close - ref) / ref * 100
+    signed_pnl_pct REAL,                       -- 按方向取符号的策略盈亏：long/neutral=+r, short=-r
 
     -- 命中判定
     direction_predicted TEXT,                 -- long / short / neutral

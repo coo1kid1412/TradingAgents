@@ -38,7 +38,7 @@ def _query_fetched_outcomes(horizon: str, db_path=None) -> list[dict]:
     with _db.connect(db_path) as conn:
         rows = conn.execute(
             """SELECT
-                o.run_id, o.horizon, o.realized_return_pct, o.direction_hit,
+                o.run_id, o.horizon, o.realized_return_pct, o.signed_pnl_pct, o.direction_hit,
                 o.tp1_hit, o.sl_hard_hit,
                 p.rm_rating, p.pm_rating, p.style, p.theme_stage,
                 p.pm_conviction_stars, p.composite_score, p.momentum_score,
@@ -70,19 +70,23 @@ def _compute_group_metric(group_rows: list[dict]) -> dict:
     hits = sum(1 for r in valid_dir if r["direction_hit"] == 1)
     hit_rate = hits / valid_n if valid_n > 0 else 0.0
 
-    correct_returns = [r["realized_return_pct"] for r in valid_dir if r["direction_hit"] == 1]
-    wrong_returns = [r["realized_return_pct"] for r in valid_dir if r["direction_hit"] == 0]
+    # 收益统计一律用 signed_pnl_pct（按方向取符号）：原来用 realized_return_pct 直接池化，
+    # 把"成功看空、避开 -10% 下跌"记成 -10% 亏损，导致 HOLD/SELL 全线"赔钱"假象。
+    # signed PnL 下：long/HOLD=+r、short=-r，correct short 现在正确贡献正收益。
+    # 缺 signed_pnl 的旧行（未回填）回退 realized_return，避免 None 污染。
+    def _pnl(r):
+        v = r.get("signed_pnl_pct")
+        return v if v is not None else r.get("realized_return_pct")
+
+    pnl_all = [_pnl(r) for r in valid_dir if _pnl(r) is not None]
+    correct_returns = [_pnl(r) for r in valid_dir if r["direction_hit"] == 1 and _pnl(r) is not None]
+    wrong_returns = [_pnl(r) for r in valid_dir if r["direction_hit"] == 0 and _pnl(r) is not None]
     avg_correct = _stats.mean(correct_returns) if correct_returns else None
     avg_wrong = _stats.mean(wrong_returns) if wrong_returns else None
 
-    if avg_correct is not None and avg_wrong is not None:
-        expectation = hit_rate * avg_correct + (1 - hit_rate) * avg_wrong
-    elif avg_correct is not None:
-        expectation = avg_correct  # 全对的特殊情况
-    elif avg_wrong is not None:
-        expectation = avg_wrong
-    else:
-        expectation = None
+    # 期望 = signed PnL 的直接均值（不再用 hit_rate×avg_correct 的池化公式——
+    # 那个公式建立在未取符号的收益上，是 bug 的来源）
+    expectation = _stats.mean(pnl_all) if pnl_all else None
 
     return {
         "total_runs": valid_n,

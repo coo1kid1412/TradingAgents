@@ -42,16 +42,46 @@ BENCHMARKS = [
 DEFAULT_BENCHMARK = "510300"
 
 
-def _direction_hit(direction_predicted: str | None, realized_return_pct: float) -> int | None:
-    """判定方向是否命中。阈值 ±_HIT_THRESHOLD_PCT。"""
+# 命中带按 horizon 缩放：±2% 对 T 合理，但对 T+5/T+30 太窄——高波动 regime 下
+# 5 日内几乎没票停在 ±2%，HOLD 全被判"踩空"（2026-06 周报 HOLD 命中率虚低的根）。
+# 波动随时间约按 √t 放大，这里取保守整数带。
+_HIT_BAND_BY_HORIZON = {"T": 2.0, "T+1": 3.0, "T+5": 5.0, "T+30": 10.0}
+
+
+def _hit_band(horizon: str | None) -> float:
+    return _HIT_BAND_BY_HORIZON.get(horizon or "", _HIT_THRESHOLD_PCT)
+
+
+def _direction_hit(direction_predicted: str | None, realized_return_pct: float,
+                   horizon: str | None = None) -> int | None:
+    """判定方向是否命中。阈值按 horizon 缩放（band(horizon)）。"""
     if direction_predicted is None:
         return None
+    band = _hit_band(horizon)
     if direction_predicted == "long":
-        return 1 if realized_return_pct > _HIT_THRESHOLD_PCT else 0
+        return 1 if realized_return_pct > band else 0
     if direction_predicted == "short":
-        return 1 if realized_return_pct < -_HIT_THRESHOLD_PCT else 0
+        return 1 if realized_return_pct < -band else 0
     if direction_predicted == "neutral":
-        return 1 if abs(realized_return_pct) < _HIT_THRESHOLD_PCT else 0
+        return 1 if abs(realized_return_pct) < band else 0
+    return None
+
+
+def _signed_pnl(direction_predicted: str | None, realized_return_pct: float) -> float | None:
+    """按预测方向取符号的策略盈亏（修原报告"看空判对被记成巨亏"的记账 bug）。
+
+    长/平 A 股账本语义：
+    - long（BUY/OVERWEIGHT）：持仓 → 拿到个股涨跌幅
+    - neutral（HOLD）：继续持有 → 同样拿到涨跌幅（HOLD 与 BUY 的差异在仓位不在方向）
+    - short（SELL/UNDERWEIGHT）：离场/反向 → 拿到反向收益（成功看空=避开的下跌记为正）
+    direction_hit（方向对不对）与本指标（按方向行动赚没赚）是两个独立问题，分开记。
+    """
+    if direction_predicted is None or realized_return_pct is None:
+        return None
+    if direction_predicted in ("long", "neutral"):
+        return round(realized_return_pct, 4)
+    if direction_predicted == "short":
+        return round(-realized_return_pct, 4)
     return None
 
 
@@ -225,7 +255,8 @@ def fetch_one_run_outcomes(run_id: int, db_path=None) -> dict:
         low_during = float(period["Low"].min()) if "Low" in period.columns else None
 
         realized_return = (actual_close - ref_price) / ref_price * 100.0
-        dir_hit = _direction_hit(o["direction_predicted"], realized_return)
+        dir_hit = _direction_hit(o["direction_predicted"], realized_return, horizon)
+        signed_pnl = _signed_pnl(o["direction_predicted"], realized_return)
 
         tp1_hit = None
         sl_hard_hit = None
@@ -247,13 +278,14 @@ def fetch_one_run_outcomes(run_id: int, db_path=None) -> dict:
                 """UPDATE outcomes SET
                     target_date = ?, actual_close_at_horizon = ?,
                     actual_high_during_horizon = ?, actual_low_during_horizon = ?,
-                    realized_return_pct = ?, direction_hit = ?, tp1_hit = ?, sl_hard_hit = ?,
+                    realized_return_pct = ?, signed_pnl_pct = ?, direction_hit = ?,
+                    tp1_hit = ?, sl_hard_hit = ?,
                     benchmark_ticker = ?, benchmark_return_pct = ?, relative_return_pct = ?,
                     fetch_status = 'fetched', fetched_at = CURRENT_TIMESTAMP, error_message = NULL
                    WHERE run_id = ? AND horizon = ?""",
                 (
                     target_date.isoformat(), actual_close, high_during, low_during,
-                    round(realized_return, 4), dir_hit, tp1_hit, sl_hard_hit,
+                    round(realized_return, 4), signed_pnl, dir_hit, tp1_hit, sl_hard_hit,
                     benchmark_ticker, benchmark_return, relative_return,
                     run_id, horizon,
                 ),

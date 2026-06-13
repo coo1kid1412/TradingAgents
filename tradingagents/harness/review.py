@@ -157,6 +157,10 @@ def render_markdown(insights: dict, db_path=None) -> str:
     lines.append(f"- 显著样本量（n ≥ {_MIN_SAMPLE_SIZE}）：{insights['significant_rows']}")
     lines.append(f"- 识别问题：{len(insights['issues'])} 条")
     lines.append("")
+    lines.append("> **口径说明**：收益统计用 `signed_pnl_pct`（按预测方向取符号：long/HOLD=+涨跌幅，"
+                 "short=−涨跌幅）——成功看空避开的下跌记为正收益。期望收益 = signed PnL 的样本均值。"
+                 "命中带按 horizon 缩放（T±2% / T+1±3% / T+5±5% / T+30±10%）。")
+    lines.append("")
 
     # 全局命中率
     lines.append("## 全局命中率（所有样本）")
@@ -164,7 +168,7 @@ def render_markdown(insights: dict, db_path=None) -> str:
     if not insights["overall_by_horizon"]:
         lines.append("（暂无已采集样本，请先跑真值采集）")
     else:
-        lines.append("| Horizon | 样本数 | 命中率 | 对的平均收益 | 错的平均收益 | 期望收益 |")
+        lines.append("| Horizon | 样本数 | 命中率 | 判对均PnL | 判错均PnL | 期望PnL |")
         lines.append("|---------|--------|--------|------------|------------|---------|")
         for horizon in ("T", "T+1", "T+5", "T+30"):
             r = insights["overall_by_horizon"].get(horizon)
@@ -200,9 +204,9 @@ def render_markdown(insights: dict, db_path=None) -> str:
                 lines.append("")
                 lines.append(f"- 样本量: {m['total_runs']} | 命中: {m['direction_hits']} | 命中率: {m['direction_hit_rate']:.0%}")
                 if m["avg_return_correct"] is not None:
-                    lines.append(f"- 对的平均收益: {m['avg_return_correct']:+.2f}%")
+                    lines.append(f"- 判对均PnL: {m['avg_return_correct']:+.2f}%")
                 if m["avg_return_wrong"] is not None:
-                    lines.append(f"- 错的平均收益: {m['avg_return_wrong']:+.2f}%")
+                    lines.append(f"- 判错均PnL: {m['avg_return_wrong']:+.2f}%")
                 if m["expectation"] is not None:
                     lines.append(f"- 期望收益: {m['expectation']:+.2f}%")
             lines.append("")
