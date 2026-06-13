@@ -1205,6 +1205,56 @@ def get_capital_flow(
     except (TushareUnavailableError, TushareRateLimitError) as e:
         logger.warning("get_capital_flow: moneyflow_dc 不可用: %s", e)
 
+    # 子调用 1-fallback: 经典 moneyflow（2000 档可用；moneyflow_dc 需 5000 档）
+    # moneyflow_dc 无权限时主力资金维度会整段 null（兆易创新 603986 实跑暴露）。经典
+    # moneyflow 有 大/特大/中/小单 买卖明细，主力净额=（大单+特大单）净额，口径等价。
+    if out["moneyflow_df"] is None:
+        try:
+            mf2 = _safe_call(
+                pro.moneyflow,
+                ts_code=ts_code,
+                start_date=start_compact,
+                end_date=end_compact,
+                api_name="moneyflow",
+            )
+            if mf2 is not None and not mf2.empty:
+                mf2 = mf2.sort_values("trade_date").reset_index(drop=True)
+                f = lambda c: mf2[c].astype(float) if c in mf2.columns else 0.0
+                # 单位：经典 moneyflow 的 *_amount 均为「万元」→ ×1e-4 = 亿元
+                elg_net = (f("buy_elg_amount") - f("sell_elg_amount")) * 1e-4
+                lg_net = (f("buy_lg_amount") - f("sell_lg_amount")) * 1e-4
+                main_net = (elg_net + lg_net).round(4)   # 主力 = 大单 + 特大单 净额
+                normalized = pd.DataFrame({
+                    "trade_date":                mf2["trade_date"].astype(str),
+                    "main_force_net_amount_yi":  main_net,
+                    "extra_large_net_amount_yi": elg_net.round(4),
+                    "large_net_amount_yi":       lg_net.round(4),
+                    # 经典口径无现成 buy_rate 字段；散户净占比口径不可靠（项目已排雷），留空
+                    "medium_buy_amount_rate_pct": None,
+                    "small_buy_amount_rate_pct":  None,
+                })
+                out["latest_trade_date"] = str(normalized["trade_date"].iloc[-1])
+                try:
+                    daily = _safe_call(
+                        pro.daily, ts_code=ts_code, start_date=start_compact,
+                        end_date=end_compact, fields="trade_date,close,amount",
+                        api_name="daily",
+                    )
+                    if daily is not None and not daily.empty:
+                        daily = daily.sort_values("trade_date").reset_index(drop=True)
+                        daily["daily_amount_yi"] = (daily["amount"].astype(float) * 1e-5).round(4)
+                        normalized = normalized.merge(
+                            daily[["trade_date", "close", "daily_amount_yi"]],
+                            on="trade_date", how="left",
+                        )
+                except (TushareUnavailableError, TushareRateLimitError) as e:
+                    logger.info("get_capital_flow: 经典 moneyflow 路径 daily 补价失败: %s", e)
+                out["moneyflow_df"] = normalized
+                out["data_source_breakdown"]["moneyflow"] = "tushare_classic"
+                logger.info("get_capital_flow: moneyflow_dc 无权限，已用经典 moneyflow 兜底 (%s)", symbol)
+        except (TushareUnavailableError, TushareRateLimitError) as e:
+            logger.warning("get_capital_flow: 经典 moneyflow 也不可用: %s", e)
+
     # 子调用 2: bak_daily 拿流通市值（亿元，单位已是亿元，不限流）
     try:
         # 取最近 5 个交易日，避免节假日空数据
