@@ -57,6 +57,7 @@ _API_CACHE_TTL_SEC = {
     "daily_basic": 12 * 3600,         # EOD 估值快照：同一天内复用（盘中取到的也是前收）
     "cyq": 12 * 3600,                 # 筹码分布：EOD 日频，1次/小时限流，同日复用
     "bak_daily": 12 * 3600,           # 流通市值：EOD 日频，5次/天限流，同日复用
+    "thshot": 12 * 3600,              # 同花顺热榜：全市场单次返回，按日期缓存，同日复用
 }
 
 
@@ -1099,6 +1100,37 @@ def get_insider_transactions(
         f"# Data retrieved on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
     )
     return header + csv_string
+
+
+def get_ths_hot_rank(symbol: str, trade_date: str) -> Optional[int]:
+    """同花顺热榜排名（tushare ths_hot，2000 档可用）。
+
+    热榜=散户关注度的确定性代理（rank 越小越热）。返回本股在『热股』榜的 rank，
+    未上榜→None。第三路拥挤硬确认（补反拥挤分/散户高接盘）。
+    全市场单次返回，按日期缓存整表（缓存键用日期不用 ts_code）。
+    """
+    ts_code = to_tushare_format(symbol)
+    td = trade_date.replace("-", "")
+    pro = _get_tushare_api()
+    try:
+        df = _fetch_cached("thshot", td, lambda: _safe_call(
+            pro.ths_hot, trade_date=td, api_name="ths_hot"))
+    except (TushareUnavailableError, TushareRateLimitError) as e:
+        logger.info("get_ths_hot_rank: ths_hot 不可用: %s", e)
+        return None
+    if df is None or df.empty or "ts_code" not in df.columns:
+        return None
+    hot = df[df["ts_code"] == ts_code]
+    if "data_type" in hot.columns:
+        stock_hot = hot[hot["data_type"] == "热股"]
+        if not stock_hot.empty:
+            hot = stock_hot
+    if hot.empty:
+        return None
+    try:
+        return int(hot["rank"].astype(float).min())   # 多榜取最热(最小 rank)
+    except (ValueError, TypeError):
+        return None
 
 
 def get_chip_distribution(symbol: str, end_date: str) -> Optional[dict]:

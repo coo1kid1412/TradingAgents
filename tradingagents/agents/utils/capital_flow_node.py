@@ -104,6 +104,7 @@ _REPORT_FIELD_GROUPS: list[tuple[str, list[str]]] = [
         "winner_rate_pct",
         "winner_rate_chg_5d",
         "chip_weight_avg_cost",
+        "ths_hot_rank",
         "retail_buy_amount_rate_5d_pct",
         "retail_net_inflow_rate_5d_pct",
         "retail_concentration_signal",
@@ -275,6 +276,14 @@ def create_capital_flow_node():
         except Exception as e:
             logger.info("capital_flow_node: get_chip_distribution 失败（不影响主流程）: %s", e)
 
+        # 5. 同花顺热榜排名（拥挤度第三路硬确认；未上榜=None）
+        ths_hot_rank = None
+        try:
+            from tradingagents.dataflows.tushare_vendor import get_ths_hot_rank
+            ths_hot_rank = get_ths_hot_rank(symbol, trade_date)
+        except Exception as e:
+            logger.info("capital_flow_node: get_ths_hot_rank 失败（不影响主流程）: %s", e)
+
         # 装配
         if cap_data is None:
             cap_data = {
@@ -294,6 +303,7 @@ def create_capital_flow_node():
             lhb_inst_net_buy_30d_yi=cap_data.get("lhb_inst_net_buy_30d_yi"),
             latest_trade_date=cap_data.get("latest_trade_date"),
             chip_metrics=chip_metrics,
+            ths_hot_rank=ths_hot_rank,
         )
 
         # 序列化

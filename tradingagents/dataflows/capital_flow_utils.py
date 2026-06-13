@@ -733,6 +733,7 @@ def assemble_capital_flow_metrics(
     lhb_inst_net_buy_30d_yi: Optional[float] = None,
     latest_trade_date: Optional[str] = None,
     chip_metrics: Optional[dict] = None,
+    ths_hot_rank: Optional[int] = None,
 ) -> dict:
     """一次性组装所有资金流字段（含 regime 与 cf_score）。
 
@@ -758,6 +759,7 @@ def assemble_capital_flow_metrics(
     metrics["winner_rate_pct"] = chip.get("winner_rate_pct")
     metrics["winner_rate_chg_5d"] = chip.get("winner_rate_chg_5d")
     metrics["chip_weight_avg_cost"] = chip.get("weight_avg_cost")
+    metrics["ths_hot_rank"] = ths_hot_rank   # 同花顺热榜排名（拥挤硬确认；未上榜=None）
 
     # 散户接盘信号（散户高位承接 + 主力派发）——优先筹码口径(winner_rate)，毛买/净流入占比兜底
     metrics["retail_concentration_signal"] = compute_retail_concentration_signal(
@@ -801,6 +803,7 @@ FIELD_LABEL_ZH: dict[str, str] = {
     "winner_rate_pct":                  "获利盘比例(%,cyq日频)",
     "winner_rate_chg_5d":               "获利盘5日变化(pp)",
     "chip_weight_avg_cost":             "筹码加权平均成本",
+    "ths_hot_rank":                     "同花顺热榜排名(越小越热,未上榜=null)",
     "holder_num_latest":                "最新股东户数",
     "holder_num_qoq_pct":               "户数环比变化(%)",
     "holder_num_4q_trend":              "户数4季度趋势",

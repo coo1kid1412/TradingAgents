@@ -66,8 +66,28 @@ def test_assemble_wires_chip():
     print("✓ assemble 接入筹码字段 + 缺失防御")
 
 
+def test_ths_hot_rank_parse():
+    df = pd.DataFrame([
+        {"ts_code": "603986.SH", "ts_name": "兆易创新", "rank": 58, "data_type": "热股"},
+        {"ts_code": "603986.SH", "ts_name": "兆易创新", "rank": 12, "data_type": "概念板块"},
+        {"ts_code": "000001.SZ", "ts_name": "平安", "rank": 3, "data_type": "热股"},
+    ])
+    with patch.object(tv, "_fetch_cached", return_value=df), patch.object(tv, "_get_tushare_api"):
+        assert tv.get_ths_hot_rank("603986", "2026-06-12") == 58   # 只认热股榜（非概念）
+        assert tv.get_ths_hot_rank("000001", "2026-06-12") == 3
+        assert tv.get_ths_hot_rank("999999", "2026-06-12") is None  # 未上榜
+    # 空表防御
+    with patch.object(tv, "_fetch_cached", return_value=pd.DataFrame()), patch.object(tv, "_get_tushare_api"):
+        assert tv.get_ths_hot_rank("603986", "2026-06-12") is None
+    # assemble 接入
+    m = assemble_capital_flow_metrics(ths_hot_rank=58)
+    assert m["ths_hot_rank"] == 58
+    print("✓ ths_hot 热榜 rank 解析 + assemble 接入")
+
+
 if __name__ == "__main__":
     test_chip_parse()
     test_retail_signal_chip_first()
     test_assemble_wires_chip()
-    print("\n全部 3 组通过 ✅")
+    test_ths_hot_rank_parse()
+    print("\n全部 4 组通过 ✅")

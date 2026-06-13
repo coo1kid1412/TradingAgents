@@ -1248,6 +1248,7 @@ def compute_step6_final_rating(
     consensus_direction: Optional[str] = "",
     quant_anticrowding: Optional[float] = None,
     retail_concentration_signal: Optional[str] = "",
+    ths_hot_rank: Optional[int] = None,
     # ── 第五步 对称升降档 ──
     inflection_stage: Optional[str] = "",
     data_completeness: Optional[str] = "",
@@ -1325,6 +1326,7 @@ def compute_step6_final_rating(
         consensus_crowded / consensus_direction: 共识快照 crowded 与方向（偏多/偏空）
         quant_anticrowding: QUANT_SCORE.factor_scores.anticrowding（0-100，硬确认用）
         retail_concentration_signal: 资金流官散户接盘信号（散户高接盘/中性，硬确认用）
+        ths_hot_rank: 同花顺热榜排名（CAPITAL_FLOW.ths_hot_rank；≤30=散户关注高度集中，第三路硬确认）
         inflection_stage: RM Step 3 业绩拐点阶段（加速期/底部反转/顶部/衰退/拐点期…）
         data_completeness: VALUATION_METHOD.data_completeness（L0-L3）
         red_flags_count: fundamentals.SUMMARY.red_flags 条数
@@ -1445,6 +1447,8 @@ def compute_step6_final_rating(
         hard_confirms.append(f"反拥挤分 {quant_anticrowding:.0f}≤30")
     if (retail_concentration_signal or "").strip() == "散户高接盘":
         hard_confirms.append("散户高接盘")
+    if ths_hot_rank is not None and ths_hot_rank <= 30:
+        hard_confirms.append(f"同花顺热榜 rank {ths_hot_rank}≤30（散户关注高度集中）")
 
     if consensus_crowded and not hard_confirms:
         crowd_note = ("共识官标拥挤，但无硬数据确认（反拥挤分>30 且非散户高接盘）→ "

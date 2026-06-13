@@ -535,6 +535,7 @@ bull_target / base_target / bear_target → 你刚设计的三情景目标价
 | consensus_direction | consensus_snapshot.direction | 偏多 / 偏空 / 中性 |
 | quant_anticrowding | QUANT_SCORE.factor_scores.anticrowding | 0-100；拥挤的硬确认之一（≤30 = 真拥挤），缺失填 None |
 | retail_concentration_signal | 0.6 节 CAPITAL_FLOW.retail_concentration_signal | 散户高接盘 / 中性；拥挤的硬确认之二，缺失填 "" |
+| ths_hot_rank | 0.6 节 CAPITAL_FLOW.ths_hot_rank | 同花顺热榜排名（越小越热）；拥挤的硬确认之三（≤30=散户关注集中），未上榜/缺失填 None |
 | inflection_stage | 你 Step 3 的『当前周期阶段』 | 加速期 / 底部反转 / 顶部 / 衰退 / 拐点期 |
 | data_completeness | VALUATION_METHOD.data_completeness | L0-L3 |
 | red_flags_count | fundamentals.SUMMARY.red_flags 条数 | 整数 |
