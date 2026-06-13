@@ -55,6 +55,8 @@ _API_CACHE_TTL_SEC = {
     "fina": _FINA_CACHE_TTL_SEC,      # fina_indicator：季度
     "income": _FINA_CACHE_TTL_SEC,    # 利润表：季度
     "daily_basic": 12 * 3600,         # EOD 估值快照：同一天内复用（盘中取到的也是前收）
+    "cyq": 12 * 3600,                 # 筹码分布：EOD 日频，1次/小时限流，同日复用
+    "bak_daily": 12 * 3600,           # 流通市值：EOD 日频，5次/天限流，同日复用
 }
 
 
@@ -1099,6 +1101,39 @@ def get_insider_transactions(
     return header + csv_string
 
 
+def get_chip_distribution(symbol: str, end_date: str) -> Optional[dict]:
+    """筹码分布（tushare cyq_perf，2000 档可用，1次/小时限流→套缓存）。
+
+    winner_rate（获利盘%）是日频、可靠的散户套牢/筹码信号——替代项目里口径不可靠的
+    retail_buy_amount_rate（实测 6-10% 远低于应有值）和季度滞后的股东户数。
+    Returns: {winner_rate_pct, weight_avg_cost, cost_50pct, winner_rate_chg_5d} 或 None。
+    """
+    ts_code = to_tushare_format(symbol)
+    pro = _get_tushare_api()
+    start = (datetime.strptime(end_date.replace("-", ""), "%Y%m%d") - timedelta(days=15)).strftime("%Y%m%d")
+    try:
+        df = _fetch_cached("cyq", ts_code, lambda: _safe_call(
+            pro.cyq_perf, ts_code=ts_code,
+            start_date=start, end_date=end_date.replace("-", ""), api_name="cyq_perf"))
+    except (TushareUnavailableError, TushareRateLimitError) as e:
+        logger.info("get_chip_distribution: cyq_perf 不可用: %s", e)
+        return None
+    if df is None or df.empty or "winner_rate" not in df.columns:
+        return None
+    df = df.sort_values("trade_date").reset_index(drop=True)
+    latest = df.iloc[-1]
+    wr = float(latest["winner_rate"]) if pd.notna(latest.get("winner_rate")) else None
+    chg5 = None
+    if wr is not None and len(df) >= 6 and pd.notna(df.iloc[-6].get("winner_rate")):
+        chg5 = round(wr - float(df.iloc[-6]["winner_rate"]), 2)
+    return {
+        "winner_rate_pct": round(wr, 2) if wr is not None else None,
+        "weight_avg_cost": round(float(latest["weight_avg"]), 2) if pd.notna(latest.get("weight_avg")) else None,
+        "cost_50pct": round(float(latest["cost_50pct"]), 2) if pd.notna(latest.get("cost_50pct")) else None,
+        "winner_rate_chg_5d": chg5,
+    }
+
+
 # ---------------------------------------------------------------------------
 # 10. get_capital_flow —— 资金流主力/超大/大/中/小单 + 流通市值 + 龙虎榜 30 日计数
 # ---------------------------------------------------------------------------
@@ -1255,18 +1290,18 @@ def get_capital_flow(
         except (TushareUnavailableError, TushareRateLimitError) as e:
             logger.warning("get_capital_flow: 经典 moneyflow 也不可用: %s", e)
 
-    # 子调用 2: bak_daily 拿流通市值（亿元，单位已是亿元，不限流）
+    # 子调用 2: bak_daily 拿流通市值（亿元；2000 档限 5次/天 → 套缓存,同日复用回退陈旧值）
     try:
         # 取最近 5 个交易日，避免节假日空数据
         bak_start = (end_dt - timedelta(days=10)).strftime("%Y%m%d")
-        bak = _safe_call(
+        bak = _fetch_cached("bak_daily", ts_code, lambda: _safe_call(
             pro.bak_daily,
             ts_code=ts_code,
             start_date=bak_start,
             end_date=end_compact,
             fields="trade_date,close,float_mv",
             api_name="bak_daily",
-        )
+        ))
         if bak is not None and not bak.empty:
             bak = bak.sort_values("trade_date")
             mv = bak.iloc[-1].get("float_mv")

@@ -164,24 +164,39 @@ def compute_dde_like_metrics(
     return out
 
 
+# 筹码口径（cyq_perf winner_rate，2000 档解锁，日频可靠）：
+# 主力派发 + 获利盘低位（多数持仓套牢=散户在高位接的盘被埋）= 散户高接盘
+_WINNER_RATE_TRAPPED_PCT = 50.0   # 获利盘 ≤50% = 多数套牢
+
+
 def compute_retail_concentration_signal(
     retail_buy_amount_rate_5d_pct: Optional[float],
     net_inflow_streak_days: Optional[int],
     retail_net_inflow_rate_5d_pct: Optional[float] = None,
+    winner_rate_pct: Optional[float] = None,
 ) -> Optional[str]:
     """散户接盘信号（替代恒等 1.0 的旧 retail_takeover_ratio）。
 
-    真接盘 = 主力持续派发（streak ≤ -3）+ 散户大举承接。两种数据口径分别判：
-    - 毛买占比口径（tushare）：散户买占比 ≥ 65%；
-    - 净流入占比口径（akshare）：散户(中+小单)净流入占比 ≥ +8%（散户在净买入接盘）。
-    与"主力流出 + 散户也跑（踩踏，净流入为负）"区分开。
+    真接盘 = 主力持续派发（streak ≤ -3）+ 散户在高位承接被套。优先用筹码口径：
+    - **筹码口径（cyq_perf winner_rate，最可靠，优先）**：主力派发 + 获利盘 ≤50%
+      （多数持仓套牢=散户在高位接的盘被埋），日频可靠，无坏口径问题；
+    - 毛买占比口径（tushare）：散户买占比 ≥ 65%（口径不可靠，仅前者缺失时退用）；
+    - 净流入占比口径（akshare）：散户(中+小单)净流入占比 ≥ +8%。
 
     Returns: "散户高接盘" / "中性" / None（数据缺失）
     """
+    if net_inflow_streak_days is None and winner_rate_pct is None:
+        return None
+    distributing = (net_inflow_streak_days is not None
+                    and net_inflow_streak_days <= _STREAK_DISTRIBUTION)
+    # 筹码口径优先（日频可靠）
+    if winner_rate_pct is not None:
+        if distributing and winner_rate_pct <= _WINNER_RATE_TRAPPED_PCT:
+            return "散户高接盘"
+        return "中性"
     if net_inflow_streak_days is None:
         return None
-    distributing = net_inflow_streak_days <= _STREAK_DISTRIBUTION
-    # 毛买占比口径优先
+    # 毛买占比口径（不可靠，退用）
     if retail_buy_amount_rate_5d_pct is not None:
         if distributing and retail_buy_amount_rate_5d_pct >= _RETAIL_HIGH_RATE_PCT:
             return "散户高接盘"
@@ -717,6 +732,7 @@ def assemble_capital_flow_metrics(
     lhb_count_30d: Optional[int] = None,
     lhb_inst_net_buy_30d_yi: Optional[float] = None,
     latest_trade_date: Optional[str] = None,
+    chip_metrics: Optional[dict] = None,
 ) -> dict:
     """一次性组装所有资金流字段（含 regime 与 cf_score）。
 
@@ -737,11 +753,18 @@ def assemble_capital_flow_metrics(
     metrics.update(compute_lhb_metrics(lhb_count_30d, lhb_inst_net_buy_30d_yi))
     metrics.update(compute_retail_amount_rate(moneyflow_df))
 
-    # 散户接盘信号（散户承接 + 主力派发，替代恒等 1.0 的旧 ratio）——毛买占比/净流入占比两口径
+    # 筹码分布（cyq_perf）——winner_rate 获利盘%，日频可靠的套牢/接盘信号
+    chip = chip_metrics or {}
+    metrics["winner_rate_pct"] = chip.get("winner_rate_pct")
+    metrics["winner_rate_chg_5d"] = chip.get("winner_rate_chg_5d")
+    metrics["chip_weight_avg_cost"] = chip.get("weight_avg_cost")
+
+    # 散户接盘信号（散户高位承接 + 主力派发）——优先筹码口径(winner_rate)，毛买/净流入占比兜底
     metrics["retail_concentration_signal"] = compute_retail_concentration_signal(
         metrics.get("retail_buy_amount_rate_5d_pct"),
         metrics.get("net_inflow_streak_days"),
         retail_net_inflow_rate_5d_pct=metrics.get("retail_net_inflow_rate_5d_pct"),
+        winner_rate_pct=metrics.get("winner_rate_pct"),
     )
 
     regime_info = compute_capital_flow_regime(metrics)
@@ -775,6 +798,9 @@ FIELD_LABEL_ZH: dict[str, str] = {
     "lhb_count_30d":                    "龙虎榜30日上榜次数(关注度)",
     "lhb_inst_net_buy_30d_yi":          "龙虎榜机构30日净买(亿)",
     "lhb_inst_direction":               "龙虎榜机构净买方向",
+    "winner_rate_pct":                  "获利盘比例(%,cyq日频)",
+    "winner_rate_chg_5d":               "获利盘5日变化(pp)",
+    "chip_weight_avg_cost":             "筹码加权平均成本",
     "holder_num_latest":                "最新股东户数",
     "holder_num_qoq_pct":               "户数环比变化(%)",
     "holder_num_4q_trend":              "户数4季度趋势",
