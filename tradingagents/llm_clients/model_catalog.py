@@ -79,13 +79,14 @@ MODEL_OPTIONS: ProviderModeOptions = {
     },
     "minimax": {
         "quick": [
+            ("MiniMax-M3 - 标准版旗舰 (所有套餐可用，当前默认)", "MiniMax-M3"),
             ("MiniMax-M2.7-highspeed - 高速版旗舰 (需极速版订阅)", "MiniMax-M2.7-highspeed"),
-            ("MiniMax-M2.5-highspeed - 高速版均衡 (需极速版订阅)", "MiniMax-M2.5-highspeed"),
-            ("MiniMax-M2.7 - 标准版旗舰 (所有套餐可用)", "MiniMax-M2.7"),
+            ("MiniMax-M2.7 - 上一代旗舰 (所有套餐可用)", "MiniMax-M2.7"),
             ("MiniMax-M2.5 - 标准版均衡 (所有套餐可用)", "MiniMax-M2.5"),
         ],
         "deep": [
-            ("MiniMax-M2.7 - 旗舰模型，最强能力 (所有套餐可用)", "MiniMax-M2.7"),
+            ("MiniMax-M3 - 旗舰模型，最强能力 (所有套餐可用，当前默认)", "MiniMax-M3"),
+            ("MiniMax-M2.7 - 上一代旗舰 (所有套餐可用)", "MiniMax-M2.7"),
             ("MiniMax-M2.5 - 均衡型号，性价比高 (所有套餐可用)", "MiniMax-M2.5"),
             ("MiniMax-M2.1 - 经济型号", "MiniMax-M2.1"),
             ("MiniMax-M2 - 基础模型", "MiniMax-M2"),

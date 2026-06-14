@@ -82,7 +82,7 @@ os.environ["NO_PROXY"] = f"{_existing},{_DOMESTIC_NO_PROXY}" if _existing else _
 # 要分析的股票代码（单只）
 # 多股票并发已彻底移除——LLM API 偶发假死 + multiprocessing.join 会形成死锁链
 # 如需分析多只，请顺序多次运行本脚本
-_TICKER = "688008"
+_TICKER = "300394"
 
 # 分析日期（默认今天）
 _ANALYSIS_DATE = datetime.datetime.now().strftime("%Y-%m-%d")
@@ -116,8 +116,8 @@ def _build_config() -> dict:
     config = DEFAULT_CONFIG.copy()
     config["llm_provider"] = "minimax"
     config["backend_url"] = "https://api.minimaxi.com/v1"
-    config["deep_think_llm"] = "MiniMax-M2.7"
-    config["quick_think_llm"] = "MiniMax-M2.7"
+    config["deep_think_llm"] = "MiniMax-M3"
+    config["quick_think_llm"] = "MiniMax-M3"
     config["use_deep_think_for_analysts"] = True
     # P1 LLM 选择配置（perf_02 保留）
     config["use_deep_for_trader"] = False       # trader 默认 quick_think
