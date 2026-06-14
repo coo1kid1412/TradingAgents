@@ -55,7 +55,7 @@ _API_CACHE_TTL_SEC = {
     "fina": _FINA_CACHE_TTL_SEC,      # fina_indicator：季度
     "income": _FINA_CACHE_TTL_SEC,    # 利润表：季度
     "daily_basic": 12 * 3600,         # EOD 估值快照：同一天内复用（盘中取到的也是前收）
-    "cyq": 12 * 3600,                 # 筹码分布：EOD 日频，1次/小时限流，同日复用
+    "cyq": 48 * 3600,                 # 筹码分布：5次/天硬限（逐股），TTL 48h 让暖到的值撑 2 天、省配额
     "bak_daily": 12 * 3600,           # 流通市值：EOD 日频，5次/天限流，同日复用
     "thshot": 12 * 3600,              # 同花顺热榜：全市场单次返回，按日期缓存，同日复用
 }
@@ -1134,7 +1134,7 @@ def get_ths_hot_rank(symbol: str, trade_date: str) -> Optional[int]:
 
 
 def get_chip_distribution(symbol: str, end_date: str) -> Optional[dict]:
-    """筹码分布（tushare cyq_perf，2000 档可用，1次/小时限流→套缓存）。
+    """筹码分布（tushare cyq_perf，2000 档可用，5次/天硬限→套缓存+预热）。
 
     winner_rate（获利盘%）是日频、可靠的散户套牢/筹码信号——替代项目里口径不可靠的
     retail_buy_amount_rate（实测 6-10% 远低于应有值）和季度滞后的股东户数。

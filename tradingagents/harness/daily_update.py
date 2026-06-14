@@ -146,22 +146,28 @@ def run_daily_update(db_path=None) -> dict:
     }
 
 
-def _warm_chip_and_hot_caches(tickers: list[str], trade_date: str) -> dict:
-    """预热 cyq_perf(筹码,逐股) + ths_hot(热榜,全市场单次)缓存。
+# cyq_perf 是 5次/天硬限（逐股）：预热只暖前 _CYQ_WARM_CAP 只（按 recency 排序，
+# 留 1 次余量给当天临时分析），配合 48h 缓存让暖到的值撑 2 天。ths_hot 是全市场单次，
+# 5次/天对它绰绰有余。
+_CYQ_WARM_CAP = 4
 
-    特色接口 1次/小时限流：_safe_call 对分钟级限流会自动等 65s 重试；命中小时级限流
-    则该股本轮跳过（缓存持久，下次 daily_update 再补）。全程防御，不影响主流程。
+
+def _warm_chip_and_hot_caches(tickers: list[str], trade_date: str) -> dict:
+    """预热 ths_hot(热榜,全市场单次) + cyq_perf(筹码,逐股,capped)缓存。
+
+    日配额硬限 5次/天：ths_hot 单次覆盖全市场；cyq 逐股，只暖前 4 只（留 1 次给临时
+    分析），48h 缓存让其撑 2 天。命中日限则跳过（缓存持久，次日 daily_update 再补）。
     """
     from tradingagents.dataflows.tushare_vendor import get_chip_distribution, get_ths_hot_rank
-    out = {"cyq_ok": 0, "cyq_fail": 0, "ths_hot": "未跑"}
-    # 热榜：全市场单次，按日期缓存——只需暖一次
+    out = {"cyq_ok": 0, "cyq_fail": 0, "cyq_capped_at": _CYQ_WARM_CAP, "ths_hot": "未跑"}
+    # 热榜：全市场单次，按日期缓存——只需暖一次（覆盖所有股）
     try:
-        rank = get_ths_hot_rank(tickers[0], trade_date) if tickers else None
-        out["ths_hot"] = "已暖（缓存全市场榜单）" if rank is not None or tickers else "无标的"
+        get_ths_hot_rank(tickers[0], trade_date) if tickers else None
+        out["ths_hot"] = "已暖（全市场榜单单次）" if tickers else "无标的"
     except Exception as e:
         out["ths_hot"] = f"失败 {str(e)[:40]}"
-    # 筹码：逐股暖（每股一次 cyq_perf）
-    for t in tickers:
+    # 筹码：逐股暖，capped（5次/天硬限，不烧光配额）
+    for t in tickers[:_CYQ_WARM_CAP]:
         try:
             chip = get_chip_distribution(t, trade_date)
             if chip and chip.get("winner_rate_pct") is not None:
