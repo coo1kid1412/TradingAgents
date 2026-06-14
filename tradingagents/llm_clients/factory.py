@@ -5,6 +5,7 @@ from .openai_client import OpenAIClient
 from .anthropic_client import AnthropicClient
 from .google_client import GoogleClient
 from .minimax_client import MiniMaxClient
+from .glm_client import GLMClient
 
 
 def create_llm_client(
@@ -49,5 +50,8 @@ def create_llm_client(
 
     if provider_lower == "minimax":
         return MiniMaxClient(model, base_url, **kwargs)
+
+    if provider_lower in ("glm", "zhipu", "zhipuai", "bigmodel"):
+        return GLMClient(model, base_url, **kwargs)
 
     raise ValueError(f"不支持的大模型服务商：{provider}")

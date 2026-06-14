@@ -69,6 +69,7 @@ _DOMESTIC_NO_PROXY = ",".join([
     ".baidu.com",           # 百度
     ".akshare.xyz",         # AKShare
     ".minimaxi.com",        # MiniMax (国内 LLM)
+    ".bigmodel.cn",         # 智谱 GLM (国内 LLM)
     "api.tauric.ai",        # Tauric
     ".pypi.org",            # pypi
 ])
@@ -114,13 +115,21 @@ def _build_config() -> dict:
     from tradingagents.default_config import DEFAULT_CONFIG
     
     config = DEFAULT_CONFIG.copy()
-    config["llm_provider"] = "minimax"
-    config["backend_url"] = "https://api.minimaxi.com/v1"
-    # M3 暂回退 M2.7：M3 输入层内容审核(422/1026 input new_sensitive)显著趋严，
-    # 半导体/科技股的新闻含地缘政治(芯片战/制裁/国产替代)被判敏感→ Bull Researcher 卡死。
-    # 现有 compliance-retry 只兜输出(1027)不兜输入(1026)。待输入兜底落地后再切 M3。
-    config["deep_think_llm"] = "MiniMax-M2.7"
-    config["quick_think_llm"] = "MiniMax-M2.7"
+    # 基模 provider 用环境变量切换（默认 minimax）：.env 里设 LLM_PROVIDER=glm 即切 GLM 试效果。
+    _provider = os.environ.get("LLM_PROVIDER", "minimax").strip().lower()
+    if _provider in ("glm", "zhipu", "zhipuai", "bigmodel"):
+        config["llm_provider"] = "glm"
+        config["backend_url"] = "https://open.bigmodel.cn/api/paas/v4/"
+        config["deep_think_llm"] = os.environ.get("GLM_MODEL", "glm-5.1")
+        config["quick_think_llm"] = os.environ.get("GLM_MODEL", "glm-5.1")
+    else:
+        config["llm_provider"] = "minimax"
+        config["backend_url"] = "https://api.minimaxi.com/v1"
+        # M3 暂回退 M2.7：M3 输入层内容审核(422/1026 input new_sensitive)显著趋严，
+        # 半导体/科技股的新闻含地缘政治(芯片战/制裁/国产替代)被判敏感→ Bull Researcher 卡死。
+        # 现有 compliance-retry 只兜输出(1027)不兜输入(1026)。待输入兜底落地后再切 M3。
+        config["deep_think_llm"] = "MiniMax-M2.7"
+        config["quick_think_llm"] = "MiniMax-M2.7"
     config["use_deep_think_for_analysts"] = True
     # P1 LLM 选择配置（perf_02 保留）
     config["use_deep_for_trader"] = False       # trader 默认 quick_think

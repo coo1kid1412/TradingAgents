@@ -77,6 +77,16 @@ MODEL_OPTIONS: ProviderModeOptions = {
             ("Qwen3:latest (8B, local)", "qwen3:latest"),
         ],
     },
+    "glm": {
+        "quick": [
+            ("glm-5.1 - 智谱旗舰 (OpenAI 兼容)", "glm-5.1"),
+            ("glm-4.6 - 上一代", "glm-4.6"),
+        ],
+        "deep": [
+            ("glm-5.1 - 智谱旗舰，最强能力 (OpenAI 兼容)", "glm-5.1"),
+            ("glm-4.6 - 上一代", "glm-4.6"),
+        ],
+    },
     "minimax": {
         "quick": [
             ("MiniMax-M3 - 标准版旗舰 (所有套餐可用，当前默认)", "MiniMax-M3"),
