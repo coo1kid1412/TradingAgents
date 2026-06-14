@@ -129,6 +129,11 @@ def run_daily_update(db_path=None) -> dict:
         brother_canary = f"❌异常 {str(e)[:80]}"
         logger.warning("PE 快照预热/自检失败（不影响 daily_update 主流程）: %s", str(e)[:120])
 
+    # Step 7: 预热筹码分布(cyq_perf) + 同花顺热榜(ths_hot)——1次/小时特色接口，
+    #          按需现取永远不可靠（配额太紧），盘后逐股预取落盘(12h缓存)，次日分析直接命中。
+    chip_warm = _warm_chip_and_hot_caches(tickers, _dt.date.today().strftime("%Y-%m-%d"))
+    logger.info("筹码/热榜预热：%s", chip_warm)
+
     return {
         "recent_tickers_count": len(tickers),
         "ticker_cache_stats": ticker_stats,
@@ -137,7 +142,35 @@ def run_daily_update(db_path=None) -> dict:
         "price_cache_stats": _pcache.get_cache_stats(db_path),
         "pe_snapshot_n": pe_snapshot_n,
         "brother_canary": brother_canary,
+        "chip_warm": chip_warm,
     }
+
+
+def _warm_chip_and_hot_caches(tickers: list[str], trade_date: str) -> dict:
+    """预热 cyq_perf(筹码,逐股) + ths_hot(热榜,全市场单次)缓存。
+
+    特色接口 1次/小时限流：_safe_call 对分钟级限流会自动等 65s 重试；命中小时级限流
+    则该股本轮跳过（缓存持久，下次 daily_update 再补）。全程防御，不影响主流程。
+    """
+    from tradingagents.dataflows.tushare_vendor import get_chip_distribution, get_ths_hot_rank
+    out = {"cyq_ok": 0, "cyq_fail": 0, "ths_hot": "未跑"}
+    # 热榜：全市场单次，按日期缓存——只需暖一次
+    try:
+        rank = get_ths_hot_rank(tickers[0], trade_date) if tickers else None
+        out["ths_hot"] = "已暖（缓存全市场榜单）" if rank is not None or tickers else "无标的"
+    except Exception as e:
+        out["ths_hot"] = f"失败 {str(e)[:40]}"
+    # 筹码：逐股暖（每股一次 cyq_perf）
+    for t in tickers:
+        try:
+            chip = get_chip_distribution(t, trade_date)
+            if chip and chip.get("winner_rate_pct") is not None:
+                out["cyq_ok"] += 1
+            else:
+                out["cyq_fail"] += 1
+        except Exception:
+            out["cyq_fail"] += 1
+    return out
 
 
 def _configure_logging() -> None:
@@ -187,6 +220,7 @@ def main():
     print(f"price_cache: tickers={result['price_cache_stats'].get('n_tickers', 0)} "
           f"/ rows={result['price_cache_stats'].get('n_rows', 0)} "
           f"/ 跨度 {result['price_cache_stats'].get('d_min')} → {result['price_cache_stats'].get('d_max')}")
+    print(f"筹码/热榜预热: {result.get('chip_warm')}")
     print(f"\n真值采集统计:")
     for k, v in result["fetch_summary"].items():
         print(f"  {k}: {v}")
