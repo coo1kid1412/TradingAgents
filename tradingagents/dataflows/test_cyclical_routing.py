@@ -20,7 +20,7 @@ from tradingagents.dataflows.profile_calc import (
 
 def test_cyclical_target_weights_slide_by_position():
     """正常化 vs 成长前瞻 目标价权重按周期位置滑动（治兆易 230↔723 摆动）。"""
-    assert cyclical_target_weights("top") == (0.7, 0.3)     # 顶部:正常化主导(谨慎)
+    assert cyclical_target_weights("top") == (0.5, 0.5)     # 顶部:谨慎但承认结构性成长(harness 待调超参)
     assert cyclical_target_weights("mid") == (0.5, 0.5)
     assert cyclical_target_weights("trough") == (0.3, 0.7)  # 谷底:成长主导(乐观)
     assert cyclical_target_weights("数据不足") == (0.6, 0.4)  # 缺位置:偏谨慎
