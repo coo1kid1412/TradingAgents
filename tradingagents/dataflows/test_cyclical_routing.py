@@ -14,7 +14,22 @@ from tradingagents.dataflows.profile_calc import (
     detect_cyclical,
     parse_sys_cyclical,
     compute_valuation_regime,
+    cyclical_target_weights,
 )
+
+
+def test_cyclical_target_weights_slide_by_position():
+    """正常化 vs 成长前瞻 目标价权重按周期位置滑动（治兆易 230↔723 摆动）。"""
+    assert cyclical_target_weights("top") == (0.7, 0.3)     # 顶部:正常化主导(谨慎)
+    assert cyclical_target_weights("mid") == (0.5, 0.5)
+    assert cyclical_target_weights("trough") == (0.3, 0.7)  # 谷底:成长主导(乐观)
+    assert cyclical_target_weights("数据不足") == (0.6, 0.4)  # 缺位置:偏谨慎
+    assert cyclical_target_weights(None) == (0.6, 0.4)
+    # 权重和恒为 1（混合不漏权）
+    for pos in ("top", "mid", "trough", "数据不足", None):
+        wn, wg = cyclical_target_weights(pos)
+        assert abs(wn + wg - 1.0) < 1e-9
+    print("✓ 周期目标价权重按位置滑动，和恒=1")
 from tradingagents.dataflows.tushare_vendor import _format_cyclical_line
 
 
@@ -87,4 +102,5 @@ if __name__ == "__main__":
     test_cyclical_line_top_and_trough()
     test_cyclical_line_guards()
     test_regime_cyclical_inversion()
-    print("\n全部 4 组通过 ✅")
+    test_cyclical_target_weights_slide_by_position()
+    print("\n全部 5 组通过 ✅")

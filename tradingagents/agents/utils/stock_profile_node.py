@@ -57,6 +57,7 @@ from tradingagents.dataflows.profile_calc import (
     parse_growth_deceleration,
     parse_distribution_signals,
     parse_sys_cyclical,
+    cyclical_target_weights,
 )
 
 logger = logging.getLogger(__name__)
@@ -629,15 +630,12 @@ def create_stock_profile_node(llm):
             prog_lines.append("⛔ **EPS 口径锁定（防 TTM 倍数 × 前瞻 EPS 双重计入）**：")
             prog_lines.append(f"- **EPS_TTM = {eps_ttm_disp} 元**（系统给值；下游 RM 直接用，禁止重算/换口径）")
             # 确定性 PEG 输入（钉死前瞻增速 + 前瞻 EPS，杜绝 LLM 自选致 PEG 目标价摆动）
-            # ⛔ 强周期股禁发（同 SYS_TARGET_PRIMARY）：周期增速无前瞻意义，且 RM 见到
-            # 现成 SYS_PEG 行就会拿去当腿（000725 实跑：禁 PEG 规则下仍用了 25% PEG 腿）
+            # 强周期股也算 PEG——它是周期目标价的「成长前瞻腿」（位置驱动滑动权重的一半），
+            # forward EPS 确定化掉 6.46↔8.55 的次级摆动；权重由 SYS_CYCLICAL_TARGET_WEIGHTS 锁，
+            # 不再靠禁发防 RM 误用（禁发治不住 LLM 自填的 primary_method=peg）。
             sys_g = parse_sys_net_growth_components(fund_raw + "\n" + fundamentals_report)
-            if cyc_info and cyc_info["class"] == "strong":
-                peg_det = None
-                logger.info("强周期股：SYS_PEG 禁发（PEG 对周期股无效，防 RM 拿现成行当腿）")
-            else:
-                peg_det = compute_deterministic_peg_inputs(
-                    eps_ttm_val, sys_g["annual"], sys_g["quarter"])
+            peg_det = compute_deterministic_peg_inputs(
+                eps_ttm_val, sys_g["annual"], sys_g["quarter"])
             if peg_det is not None:
                 conf_note = ("⚠️**低基数尖峰，前瞻高度不确定**" if peg_det["confidence"] == "low"
                              else "正常")
@@ -1007,6 +1005,15 @@ TRANSPARENCY:
                 f"SYS_CYCLICAL_PE_ON_NORMALIZED: {cyc_info['pe_on_normalized'] if cyc_info['pe_on_normalized'] is not None else 'N/A'}（当前价÷正常化EPS的『贵不贵』读数，⛔不是目标倍数）\n"
                 f"SYS_CYCLICAL_ROE_RANK: {cyc_info['roe_pct_rank'] if cyc_info['roe_pct_rank'] is not None else 'N/A'}\n"
             )
+            # 强周期目标价的「正常化 vs 成长前瞻」滑动权重（按周期位置锁死，RM 不得自选）——
+            # 治兆易式 230↔723 摆动根：同股同输入，RM 一次给正常化腿 50%、一次 0%，目标价 3 倍跳。
+            if cyc_info["class"] == "strong" and cyc_info["normalized_eps"] is not None:
+                w_norm, w_growth = cyclical_target_weights(cyc_info["position"])
+                content = content + (
+                    f"SYS_CYCLICAL_TARGET_WEIGHTS: normalized={w_norm} growth={w_growth}"
+                    f"（按 position={cyc_info['position']} 锁定：正常化腿 {w_norm:.0%} + 成长前瞻腿 {w_growth:.0%}，"
+                    f"RM Step4 强周期目标价必须按此权重，禁自选/禁用 primary_method 改判）\n"
+                )
             logger.info("SYS_CYCLICAL 已回显画像: class=%s position=%s",
                         cyc_info["class"], cyc_info["position"])
 

@@ -420,6 +420,22 @@ def detect_cyclical(industry: Optional[str], company_name: Optional[str]) -> Opt
     return None
 
 
+# 强周期股目标价的「正常化 vs 成长前瞻」滑动权重，按周期位置确定（防 RM 自选权重致摆动）。
+# 结构性上行周期（存储/面板）既有周期风险又有 AI 结构性需求——位置决定该信哪边更多：
+#   顶部 → 正常化主导（不为峰值盈利付钱，林奇纪律）；谷底 → 成长主导（周期底盈利差是常态，看前瞻修复）；
+#   中段 → 各半。权重锁死，RM 不得自选。
+_CYCLICAL_TARGET_WEIGHTS = {
+    "top":    (0.7, 0.3),   # (正常化, 成长前瞻)
+    "mid":    (0.5, 0.5),
+    "trough": (0.3, 0.7),
+}
+
+
+def cyclical_target_weights(position: Optional[str]) -> tuple[float, float]:
+    """周期位置 → (正常化腿权重, 成长前瞻腿权重)。未知/数据不足 → 偏谨慎 (0.6, 0.4)。"""
+    return _CYCLICAL_TARGET_WEIGHTS.get((position or "").strip().lower(), (0.6, 0.4))
+
+
 _SYS_CYCLICAL_RE = re.compile(
     r"【SYS_CYCLICAL[^】]*】\s*class=(?P<cls>strong|semi)"
     r"(?:\s*\|\s*position=(?P<pos>top|mid|trough|数据不足))?"
