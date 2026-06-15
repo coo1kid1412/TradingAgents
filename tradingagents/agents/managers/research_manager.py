@@ -536,7 +536,7 @@ bull_target / base_target / bear_target → 你刚设计的三情景目标价
 | quant_anticrowding | QUANT_SCORE.factor_scores.anticrowding | 0-100；拥挤的硬确认之一（≤30 = 真拥挤），缺失填 None |
 | retail_concentration_signal | 0.6 节 CAPITAL_FLOW.retail_concentration_signal | 散户高接盘 / 中性；拥挤的硬确认之二，缺失填 "" |
 | ths_hot_rank | 0.6 节 CAPITAL_FLOW.ths_hot_rank | 同花顺热榜排名（越小越热）；拥挤的硬确认之三（≤30=散户关注集中），未上榜/缺失填 None |
-| inflection_stage | 你 Step 3 的『当前周期阶段』 | 加速期 / 底部反转 / 顶部 / 衰退 / 拐点期 |
+| inflection_stage | 你 Step 3 的『当前周期阶段』 | **只能五选一**：加速期 / 底部反转 / 顶部 / 衰退 / 拐点期。⛔ 禁止复合标签（如『加速期顶部』『顶部加速期』）——既加速又顶部属信号矛盾,工具会判 neutral 不升不降。你必须二选一表态：业绩仍在加速且未见顶 → 加速期；已见顶/边际走弱 → 顶部 |
 | data_completeness | VALUATION_METHOD.data_completeness | L0-L3 |
 | red_flags_count | fundamentals.SUMMARY.red_flags 条数 | 整数 |
 | earnings_sustainability | 你 Step 3 的『可持续性』 | 持续 / 一次性 / 待验证 |

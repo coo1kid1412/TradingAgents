@@ -1233,6 +1233,28 @@ _THRESHOLD_BASE_UP = 35.0
 _FADING_UP_LOCK = 30.0   # 主题退潮期上沿锁定（主题反噬保护，不再放宽）
 
 
+def _classify_inflection(inflection_stage: str) -> str:
+    """把 inflection_stage 自由文本归一为单一类别 → accel / top / neutral。
+
+    修子串匹配 bug：LLM 会造复合标签（如『加速期顶部』），它同时含『加速』(升档触发)
+    和『顶部』(降档触发)，旧逻辑两个触发器都命中 → 既想升又被降。这里归一：
+    - 同时含 加速/反转 与 顶部/衰退 → neutral（信号矛盾，不升不降，交其他因子定）
+    - 仅 顶部/衰退 → top（降档）
+    - 仅 加速/底部反转 → accel（升档候选）
+    - 拐点期/空/其他 → neutral
+    """
+    s = inflection_stage or ""
+    has_accel = ("加速" in s) or ("底部反转" in s)
+    has_top = ("顶部" in s) or ("衰退" in s)
+    if has_accel and has_top:
+        return "neutral"
+    if has_top:
+        return "top"
+    if has_accel:
+        return "accel"
+    return "neutral"
+
+
 @tool
 def compute_step6_final_rating(
     current_price: float,
@@ -1479,6 +1501,7 @@ def compute_step6_final_rating(
     # ── 4) 第五步 对称升降档（原 LLM 徒手 → Python；含周期修正）──
     sym_notes: list[str] = []
     infl = (inflection_stage or "").strip()
+    infl_class = _classify_inflection(infl)   # accel / top / neutral（解决复合标签子串误匹配）
     dcl = (data_completeness or "").strip().upper()
     cyc = (cyclical_class or "").strip().lower()
     cyc_pos = (cycle_position or "").strip().lower()
@@ -1487,7 +1510,7 @@ def compute_step6_final_rating(
 
     upgrade = 0
     up_ok = (
-        ("加速" in infl or "底部反转" in infl)
+        infl_class == "accel"
         and dcl in ("L0", "L1")
         and red_flags_count <= 1
         and deviation_pct < 0
@@ -1499,6 +1522,8 @@ def compute_step6_final_rating(
     elif up_ok:
         upgrade = 1
         sym_notes.append("升档 +1：拐点加速/底部反转 + L0/L1 + 红旗≤1 + 低估区 + 非momentum")
+    elif infl_class == "neutral" and ("加速" in infl or "底部反转" in infl):
+        sym_notes.append(f"升降档对拐点静默：『{infl}』含加速与顶部矛盾信号→归 neutral，不升不降")
     else:
         sym_notes.append("升档不通过")
 
@@ -1509,7 +1534,7 @@ def compute_step6_final_rating(
     if red_flags_count >= 3:
         downgrade -= 1
         sym_notes.append(f"降档 -1：红旗 {red_flags_count} 条")
-    if "顶部" in infl or "衰退" in infl:
+    if infl_class == "top":
         if cyc_trough:
             sym_notes.append("『拐点顶部/衰退』降档静音：强周期谷底，盈利差是周期常态非恶化证据")
         else:

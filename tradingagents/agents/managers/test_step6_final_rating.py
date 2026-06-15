@@ -19,7 +19,32 @@ from tradingagents.agents.managers.rm_tools import (
     compute_step6_final_rating as F,
     compute_step6_rating_mapping as MAP,
     compute_step6_trend_overlay as OV,
+    _classify_inflection,
 )
+
+
+def test_inflection_classifier_compound_label():
+    """inflection 复合标签子串误匹配 bug（协创『加速期顶部』同时踩升档与降档触发器）。"""
+    assert _classify_inflection("加速期") == "accel"
+    assert _classify_inflection("底部反转") == "accel"
+    assert _classify_inflection("顶部") == "top"
+    assert _classify_inflection("衰退") == "top"
+    assert _classify_inflection("加速期顶部") == "neutral"   # 矛盾复合标签 → 不升不降
+    assert _classify_inflection("顶部加速期") == "neutral"
+    assert _classify_inflection("拐点期") == "neutral"
+    assert _classify_inflection("") == "neutral"
+    # 协创回放：低估 -25% + 复合标签 → 顶部降档不再误触发（只剩 bear anchor -1）
+    r = F.invoke({"current_price": 223.7, "target_price_mid": 300.65, "style": "high_beta_growth",
+                  "valuation_regime": "ride", "inflection_stage": "加速期顶部",
+                  "data_completeness": "L2", "bear_anchor_strong": True,
+                  "earnings_sustainability": "待验证"})
+    assert r["stages"]["symmetric"]["downgrade"] == -1     # 不再 -2（顶部子串不再误触发）
+    assert r["final_rating"] == "HOLD"                      # 干净路径到 HOLD（非靠不变量救过冲）
+    # 纯顶部仍正常降档
+    r2 = F.invoke({"current_price": 280, "target_price_mid": 248, "style": "high_beta_growth",
+                   "valuation_regime": "neutral", "inflection_stage": "顶部", "data_completeness": "L2"})
+    assert r2["stages"]["symmetric"]["downgrade"] == -1
+    print("✓ inflection 复合标签归 neutral，纯顶部正常降档（协创 bug 修复）")
 
 
 def _base(**kw):
@@ -337,5 +362,6 @@ if __name__ == "__main__":
     test_cyclical_top_blocks_upgrade_and_overlay()
     test_cyclical_trough_mutes_inflection_downgrade()
     test_semi_cyclical_not_affected()
+    test_inflection_classifier_compound_label()
     test_mapping_error_propagates()
-    print("\n全部 18 项通过 ✅")
+    print("\n全部 19 项通过 ✅")
