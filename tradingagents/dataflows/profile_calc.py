@@ -1098,6 +1098,25 @@ def compute_deterministic_peg_inputs(
     }
 
 
+# 确定性 PEG 倍数带（low, high），治 RM 自拍 PEG 倍数致目标价摆动（澜起 274↔189 根）。
+# 基准 PEG=1.0（Lynch 合理估值）；regime 决定能给多高成长溢价（主题溢价已包含在 regime 闸门）。
+# ⚠️ TODO(harness 超参)：这组带是人工先验，待回测按"PEG×后续收益"校准（尤其 ride 上沿 1.5）。
+_PEG_BAND_BY_REGIME = {
+    "ride":       (1.0, 1.5),   # 强基本面+主题：可给成长溢价
+    "neutral":    (0.9, 1.2),   # 中性：围绕合理估值
+    "discipline": (0.8, 1.0),   # 弱基本面（减速/派发/流出）：折价，不追
+}
+
+
+def compute_peg_band(valuation_regime: Optional[str],
+                     peg_confidence: Optional[str] = "") -> tuple[float, float]:
+    """regime → (PEG 下限, PEG 上限)。低置信前瞻时上沿压回（不为不确定的 EPS 付溢价）。"""
+    low, high = _PEG_BAND_BY_REGIME.get((valuation_regime or "").strip().lower(), (0.9, 1.2))
+    if (peg_confidence or "").strip().lower() == "low":
+        high = min(high, 1.1)
+    return (low, high)
+
+
 def compute_peer_anchored_pe_cap(
     peer_pe_median: Optional[float],
     pe_ttm: Optional[float],

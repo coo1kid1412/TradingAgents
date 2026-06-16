@@ -52,6 +52,7 @@ from tradingagents.dataflows.profile_calc import (
     parse_net_profit_growth,
     parse_sys_net_growth_components,
     compute_deterministic_peg_inputs,
+    compute_peg_band,
     compute_peer_anchored_pe_cap,
     compute_valuation_regime,
     parse_growth_deceleration,
@@ -1038,8 +1039,17 @@ TRANSPARENCY:
                 + (f"；单季{peg_det['quarter_growth_pct']}%>>年度(低基数尖峰)→置信low" if peg_det['low_base_spike'] else "")
                 + "\n"
             )
-            logger.info("SYS_PEG 已注入画像: growth=%s%% fwd_eps=%s conf=%s",
-                        peg_det['peg_growth_pct'], peg_det['forward_eps'], peg_det['confidence'])
+            # 确定性 PEG 倍数带（regime 派生）——治 RM 自拍 PEG 倍数致目标价摆动（澜起 274↔189）。
+            # RM Step4 PEG 腿必须用此带调 compute_peg_target_price，禁自选 0.8↔2.4 乱拍。
+            peg_low, peg_high = compute_peg_band(valuation_regime, peg_det['confidence'])
+            content = content + (
+                f"SYS_PEG_BAND: low={peg_low} high={peg_high}"
+                f"（regime={valuation_regime} 派生；PEG 腿 target_peg_low/high 照此调"
+                f" compute_peg_target_price，禁自选倍数）\n"
+            )
+            logger.info("SYS_PEG 已注入画像: growth=%s%% fwd_eps=%s conf=%s band=%s-%s",
+                        peg_det['peg_growth_pct'], peg_det['forward_eps'], peg_det['confidence'],
+                        peg_low, peg_high)
 
         return {"stock_profile": content}
 

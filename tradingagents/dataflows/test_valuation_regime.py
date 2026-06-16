@@ -14,7 +14,23 @@ from tradingagents.dataflows.profile_calc import (
     gate_premium_by_regime,
     parse_sys_net_growth_components,
     compute_deterministic_peg_inputs,
+    compute_peg_band,
 )
+
+
+def test_peg_band_by_regime():
+    """确定性 PEG 倍数带——治 RM 自拍倍数致目标价摆动（澜起 267↔401 根）。"""
+    assert compute_peg_band("ride") == (1.0, 1.5)        # 强基本面+主题可给溢价
+    assert compute_peg_band("neutral") == (0.9, 1.2)     # 中性围绕合理估值
+    assert compute_peg_band("discipline") == (0.8, 1.0)  # 弱基本面折价
+    assert compute_peg_band(None) == (0.9, 1.2)          # 缺 regime → 中性档
+    assert compute_peg_band("ride", "low") == (1.0, 1.1)  # 低置信前瞻压上沿
+    assert compute_peg_band("neutral", "low") == (0.9, 1.1)
+    # 下限 ≤ 上限恒成立
+    for reg in ("ride", "neutral", "discipline", None):
+        lo, hi = compute_peg_band(reg)
+        assert lo <= hi
+    print("✓ PEG 带按 regime 派生，低置信压上沿，下限≤上限")
 
 
 def test_deterministic_peg_inputs():
