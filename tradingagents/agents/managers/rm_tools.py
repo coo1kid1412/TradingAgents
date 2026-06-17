@@ -884,6 +884,7 @@ def compute_step6_catalyst_momentum_adjustment(
     institutional_holding_change_pct: float | None = None,
     northbound_flow_5d_direction: int | None = None,
     kol_bullish_ratio_trend_pct: float | None = None,
+    news_catalyst_score: float | None = None,
 ) -> dict:
     """催化动量硬数据调整（改造 C）。
 
@@ -976,6 +977,14 @@ def compute_step6_catalyst_momentum_adjustment(
         else:
             s = -15
         breakdown["kol"] = {"value_pct": v, "subscore": s}
+        score_sum += s
+        available_count += 1
+
+    # 5. 新闻事件催化（SYS_CATALYST.score，-30..+30，已由 Python 从 key_events 聚合）——
+    #    事件驱动维度，区别于上面 4 个流量信号；量级同 sell_side，直接计入。
+    if news_catalyst_score is not None:
+        s = int(max(-30, min(30, news_catalyst_score)))
+        breakdown["news_catalyst"] = {"score": s, "subscore": s}
         score_sum += s
         available_count += 1
 
@@ -1131,6 +1140,7 @@ def compute_step6_trend_overlay(
     institutional_holding_change_pct: float | None = None,
     northbound_flow_5d_direction: int | None = None,
     kol_bullish_ratio_trend_pct: float | None = None,
+    news_catalyst_score: float | None = None,
 ) -> dict:
     """Step 6 第六步「趋势叠加」一次性合成（style + 方向票 + 催化动量 → 最终评级）。
 
@@ -1191,6 +1201,7 @@ def compute_step6_trend_overlay(
         "institutional_holding_change_pct": institutional_holding_change_pct,
         "northbound_flow_5d_direction": northbound_flow_5d_direction,
         "kol_bullish_ratio_trend_pct": kol_bullish_ratio_trend_pct,
+        "news_catalyst_score": news_catalyst_score,
     })
     adj_catalyst = catalyst_res.get("adjustment", 0)
 
@@ -1291,6 +1302,7 @@ def compute_step6_final_rating(
     institutional_holding_change_pct: Optional[float] = None,
     northbound_flow_5d_direction: Optional[int] = None,
     kol_bullish_ratio_trend_pct: Optional[float] = None,
+    news_catalyst_score: Optional[float] = None,
     # ── 第七步 极端背离防御例外 ──
     inflection_confirmed_recent: Optional[bool] = False,
     # ── 周期股修正（画像 SYS_CYCLICAL_CLASS / SYS_CYCLICAL_POSITION 直读）──
@@ -1358,6 +1370,8 @@ def compute_step6_final_rating(
         composite_score / momentum_score: QUANT_SCORE
         market/news/sentiment_weight + *_direction_vote: 三报告方向票（同 trend_overlay）
         sell_side_target_change_pct 等四项: 催化动量硬数据（缺失 None，禁止编造）
+        news_catalyst_score: 新闻事件催化分（画像/新闻报告 SYS_CATALYST.score，-30..30，
+            Python 从 key_events 聚合，确定性；缺失 None）
         inflection_confirmed_recent: 业绩拐点刚被新数据确认（极端防御例外）
         cyclical_class / cycle_position: 周期股标记（strong/semi + top/mid/trough），
             来自画像 SYS_CYCLICAL 行。林奇铁律在评级链的落地（只对 strong）：
@@ -1571,6 +1585,7 @@ def compute_step6_final_rating(
         "institutional_holding_change_pct": institutional_holding_change_pct,
         "northbound_flow_5d_direction": northbound_flow_5d_direction,
         "kol_bullish_ratio_trend_pct": kol_bullish_ratio_trend_pct,
+        "news_catalyst_score": news_catalyst_score,
     })
     overlay_components = overlay.get("components", {})
     rating_overlay = overlay.get("final_rating", rating)

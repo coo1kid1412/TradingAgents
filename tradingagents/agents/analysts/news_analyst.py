@@ -242,6 +242,24 @@ def create_news_analyst(llm):
         if len(result.tool_calls) == 0:
             report = result.content
 
+        # 确定性催化信号注入（路2）：把 LLM 自产的结构化 key_events 聚合成 SYS_CATALYST 行，
+        # 让"新闻催化"确定性进评级链（催化腿第5信号），不再靠 RM 当散文二次解读。
+        if report:
+            try:
+                from tradingagents.dataflows.news_catalyst import aggregate_news_catalyst
+                cat = aggregate_news_catalyst(report)
+                if cat is not None:
+                    report = report + (
+                        f"\n\n<!-- ⚠️SYS_CATALYST｜Python 从 SUMMARY.key_events 确定性聚合，RM Step6 催化腿直读 -->\n"
+                        f"SYS_CATALYST: direction={cat['direction']} | strength={cat['strength']}"
+                        f" | score={cat['score']}"
+                        f"（净催化分{cat['net']}，{cat['n_events']}个事件按 impact×可信度×(1-已定价)×时间窗 聚合"
+                        + (f"；最近端：{cat['nearest']}" if cat['nearest'] else "")
+                        + "）\n"
+                    )
+            except Exception:
+                pass
+
         return {
             "messages": [result],
             "news_report": report,

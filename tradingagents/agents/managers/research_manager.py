@@ -549,6 +549,7 @@ bull_target / base_target / bear_target → 你刚设计的三情景目标价
 | institutional_holding_change_pct | 近 1 季机构持仓变化% | 缺失填 None，禁止编造 |
 | northbound_flow_5d_direction | **0.6 节 CAPITAL_FLOW.northbound_5d_direction 映射** | 净流入→1，净流出→-1，平衡/数据停滞→None；禁止从 news/sentiment 猜 |
 | kol_bullish_ratio_trend_pct | KOL 多头率相对 30 日均的变化(pp) | 缺失填 None |
+| news_catalyst_score | 新闻报告末尾 `SYS_CATALYST: ... score=__`（Python 从 key_events 确定性聚合的新闻事件催化分，-30..30） | 直读照抄,无此行填 None。⛔禁止自己从新闻里重判方向——聚合已确定性完成 |
 | inflection_confirmed_recent | 业绩拐点是否刚被新数据（如刚出的季报）确认 | true 时极端背离防御跳过（量化锚滞后于新数据） |
 | cyclical_class | 画像末尾 `SYS_CYCLICAL_CLASS:` 行 | strong / semi；非周期股（无此行）填 "" |
 | cycle_position | 画像末尾 `SYS_CYCLICAL_POSITION:` 行 | top / mid / trough；无此行填 ""。工具内周期修正：顶部禁升档+正向叠加钳零（顶部要下车不是骑），谷底『拐点衰退』降档静音（谷底盈利差是常态，不追杀） |
