@@ -337,6 +337,30 @@ def test_semi_cyclical_not_affected():
     print("✓ 半周期不触发周期修正")
 
 
+def test_discipline_clamps_positive_overlay():
+    """discipline regime 正向叠加钳零——治兆易同股 SELL↔UW 摆动（漏传周期参数也兜底）。"""
+    base = dict(current_price=586, target_price_mid=147, style="high_beta_growth",
+                valuation_regime="discipline",
+                market_direction_vote=1.0, news_direction_vote=0.5, sentiment_direction_vote=1.0,
+                market_weight=0.3, news_weight=0.2, sentiment_weight=0.15,
+                composite_score=40, momentum_score=70)
+    # 漏传 cyclical 参数（模拟 RM 08:40 漏传）→ discipline 兜底仍保 SELL
+    r1 = F.invoke(base)
+    assert r1["final_rating"] == "SELL", r1["explanation"]
+    assert "discipline" in r1["stages"]["overlay"]["clamp"]
+    # 传了 cyclical 参数（07:40）→ 同样 SELL，两份一致
+    r2 = F.invoke({**base, "cyclical_class": "strong", "cycle_position": "top"})
+    assert r2["final_rating"] == "SELL"
+    # 不误伤：neutral regime 正向叠加照常生效（低估区升 OW）
+    r3 = F.invoke(dict(current_price=90, target_price_mid=100, style="high_beta_growth",
+                       valuation_regime="neutral",
+                       market_direction_vote=1.0, news_direction_vote=1.0, sentiment_direction_vote=1.0,
+                       market_weight=0.4, news_weight=0.3, sentiment_weight=0.3,
+                       composite_score=60, momentum_score=75))
+    assert r3["final_rating"] == "OVERWEIGHT"
+    print("✓ discipline 正向叠加钳零（SELL↔UW 摆动消除），neutral 不误伤")
+
+
 def test_mapping_error_propagates():
     """target_price_mid ≤ 0 时返回错误而非崩溃。"""
     r = F.invoke(_base(target_price_mid=0.0))
@@ -363,5 +387,6 @@ if __name__ == "__main__":
     test_cyclical_trough_mutes_inflection_downgrade()
     test_semi_cyclical_not_affected()
     test_inflection_classifier_compound_label()
+    test_discipline_clamps_positive_overlay()
     test_mapping_error_propagates()
-    print("\n全部 19 项通过 ✅")
+    print("\n全部 20 项通过 ✅")

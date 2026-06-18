@@ -1590,9 +1590,14 @@ def compute_step6_final_rating(
     overlay_components = overlay.get("components", {})
     rating_overlay = overlay.get("final_rating", rating)
     overlay_clamp = ""
-    # 周期顶部：趋势叠加正向钳零——强动量在顶部是"最后一棒"风险不是骑的理由
-    if cyc_top and _RATINGS_ORDER.index(rating_overlay) > _RATINGS_ORDER.index(rating):
-        overlay_clamp = f"强周期顶部：叠加 +1（{rating} → {rating_overlay}）钳零，顶部不追涨"
+    # 正向趋势叠加钳零——动量/方向票不该在「该谨慎」的格局里软化看空：
+    #   - 强周期顶部：强动量是"最后一棒"风险不是骑的理由
+    #   - discipline regime（基本面弱：减速/派发/流出）：动量反弹不该把 SELL 软化成 UW
+    # discipline 钳零不依赖 RM 传周期参数（regime 可靠传入）——治兆易同股 SELL↔UW 摆动：
+    #   一份传了 cyclical 参数(钳零→SELL)、一份漏传(叠加+1→UW)，discipline 兜底保证一致。
+    if (cyc_top or reg == "discipline") and _RATINGS_ORDER.index(rating_overlay) > _RATINGS_ORDER.index(rating):
+        _why = "强周期顶部，顶部不追涨" if cyc_top else "discipline 基本面弱，动量不软化看空"
+        overlay_clamp = f"正向叠加钳零（{rating} → {rating_overlay} 被压回 {rating}）：{_why}"
         rating_overlay = rating
     rating, clamp_note = _clamp_to_bounds(rating_overlay)
     if not overlay_clamp and rating != rating_overlay:
