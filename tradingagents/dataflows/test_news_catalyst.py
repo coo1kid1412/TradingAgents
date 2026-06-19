@@ -8,6 +8,7 @@ LLM 判事件、Python 定方向、催化腿确定性消费，RM 不再二次解
 """
 from tradingagents.dataflows.news_catalyst import (
     aggregate_news_catalyst, parse_sys_catalyst, aggregate_catalyst_calendar,
+    compute_narrative_shift,
 )
 from tradingagents.agents.managers.rm_tools import compute_step6_catalyst_momentum_adjustment as C
 
@@ -85,6 +86,25 @@ def test_feeds_catalyst_leg():
     print("✓ 新闻催化进催化腿计分 + 覆盖不足保护")
 
 
+def test_narrative_shift():
+    """步骤3：叙事切换早期预警——水位 vs 动能/新闻论调背离。"""
+    def srep(net, trend):
+        return f"# 社媒\n```yaml\nSUMMARY:\n  net_sentiment: {net}\n  sentiment_trend_7d: {trend}\n```"
+    def nrep(net):
+        return f"# 新闻\n```yaml\nSUMMARY:\n  net_sentiment: {net}\n```"
+    # 社媒偏多但 7 日动能转负 → 见顶回落
+    assert compute_narrative_shift(srep("偏多", -45), nrep("中性"))["status"] == "见顶回落预警"
+    # 新闻先转空、社媒仍偏多 → 见顶回落
+    assert compute_narrative_shift(srep("偏多", 5), nrep("负面"))["status"] == "见顶回落预警"
+    # 社媒偏空但动能转正 → 筑底回升
+    assert compute_narrative_shift(srep("偏空", 40), nrep("中性"))["status"] == "筑底回升预警"
+    # 方向一致 → 无切换
+    assert compute_narrative_shift(srep("偏多", 20), nrep("正面"))["status"] == "无明显切换"
+    # 两份都缺 SUMMARY → None
+    assert compute_narrative_shift("无块", "也无块") is None
+    print("✓ 叙事切换：水位/动能/论调背离 → 见顶回落/筑底回升预警")
+
+
 if __name__ == "__main__":
     test_aggregate_bearish_near_term_dominates()
     test_priced_in_discounts()
@@ -92,4 +112,5 @@ if __name__ == "__main__":
     test_sys_catalyst_roundtrip()
     test_feeds_catalyst_leg()
     test_catalyst_calendar()
-    print("\n全部 6 组通过 ✅")
+    test_narrative_shift()
+    print("\n全部 7 组通过 ✅")

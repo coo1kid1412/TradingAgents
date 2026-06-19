@@ -157,3 +157,85 @@ def aggregate_catalyst_calendar(news_report: str, max_items: int = 6) -> Optiona
     undated = [c for c in cal if c["date"] == "未知"]
     dated.sort(key=lambda c: c["date"])
     return (dated + undated)[:max_items]
+
+
+# 舆情措辞 → 方向符号（社媒用 偏多/偏空/分歧；新闻用 正面/负面/中性）
+_SENTIMENT_SIGN = {
+    "偏多": 1, "正面": 1, "看多": 1,
+    "偏空": -1, "负面": -1, "看空": -1,
+    "分歧": 0, "中性": 0, "无明显": 0,
+}
+# sentiment_trend_7d（-100~+100）转向多少算"明显切换"——对标投研把 7 日舆情动能
+# 超过约 1/3 量程视为风向已变（leading，先于价格/基本面确认）
+_NARRATIVE_TREND_TH = 30.0
+
+
+def _sentiment_sign(value) -> Optional[int]:
+    if value is None:
+        return None
+    s = str(value).strip()
+    for k, v in _SENTIMENT_SIGN.items():
+        if k in s:
+            return v
+    return None
+
+
+def compute_narrative_shift(sentiment_report: str, news_report: str) -> Optional[dict]:
+    """叙事切换早期预警——舆情水位 vs 7 日动能/新闻论调的背离，先于价格预警。
+
+    对标投研"风向先于价格"：人群水位还偏多、但 7 日动能已转负，或新闻论调先于社媒
+    转空（聪明钱/卖方叙事先变），是顶部叙事见顶回落的领先信号；反之是底部筑底回升。
+    这不是评级信号（不参与确定性评级链），是给 PM 监控段的**早期预警观察项**。
+
+    输入：社媒 SUMMARY(net_sentiment 偏多/偏空/分歧 + sentiment_trend_7d -100~100)、
+          新闻 SUMMARY(net_sentiment 正面/负面/中性)。
+    Returns: {status(见顶回落预警/筑底回升预警/无明显切换), trend_7d, social_sign,
+              news_sign, note} 或 None（两份都缺 SUMMARY）。
+    """
+    s_sum = _find_summary_yaml(sentiment_report) or {}
+    n_sum = _find_summary_yaml(news_report) or {}
+    if not s_sum and not n_sum:
+        return None
+
+    social_sign = _sentiment_sign(s_sum.get("net_sentiment"))
+    news_sign = _sentiment_sign(n_sum.get("net_sentiment"))
+    try:
+        trend = float(s_sum.get("sentiment_trend_7d")) if s_sum.get("sentiment_trend_7d") not in (None, "null", "") else None
+    except (TypeError, ValueError):
+        trend = None
+
+    if social_sign is None and news_sign is None and trend is None:
+        return None
+
+    reasons = []
+    bearish = bearish_news = bullish = bullish_news = False
+    # 见顶回落：水位未转空(≥0) 但 7 日动能明显转负
+    if social_sign is not None and social_sign >= 0 and trend is not None and trend <= -_NARRATIVE_TREND_TH:
+        bearish = True
+        reasons.append(f"舆情水位仍{'偏多' if social_sign>0 else '中性'}但 7 日动能 {trend:.0f}≤-{_NARRATIVE_TREND_TH:.0f}（动能先转负）")
+    # 新闻论调先于社媒转空（聪明钱/卖方叙事先变）
+    if news_sign is not None and news_sign < 0 and social_sign is not None and social_sign > 0:
+        bearish_news = True
+        reasons.append("新闻论调已转空、社媒仍偏多（叙事先于人群转向）")
+    # 筑底回升：水位未转多(≤0) 但 7 日动能明显转正
+    if social_sign is not None and social_sign <= 0 and trend is not None and trend >= _NARRATIVE_TREND_TH:
+        bullish = True
+        reasons.append(f"舆情水位仍{'偏空' if social_sign<0 else '中性'}但 7 日动能 {trend:.0f}≥+{_NARRATIVE_TREND_TH:.0f}（动能先转正）")
+    if news_sign is not None and news_sign > 0 and social_sign is not None and social_sign < 0:
+        bullish_news = True
+        reasons.append("新闻论调已转多、社媒仍偏空（叙事先于人群转向）")
+
+    if bearish or bearish_news:
+        status = "见顶回落预警"
+    elif bullish or bullish_news:
+        status = "筑底回升预警"
+    else:
+        status = "无明显切换"
+
+    return {
+        "status": status,
+        "trend_7d": trend,
+        "social_sign": social_sign,
+        "news_sign": news_sign,
+        "note": "；".join(reasons) if reasons else "舆情水位与动能、新闻论调方向一致，无背离",
+    }
