@@ -182,6 +182,20 @@ def test_distribution_single_signal_not_confirm():
     assert not r["confirmed"] and r["score"] == 1 and r["retail_takeover"] == "中性"
 
 
+def test_distribution_block_trade_leg():
+    """步骤2扩展：折价大宗作第五路硬数据——折价大宗+户数增=确认。"""
+    r = compute_distribution_into_retail(holder_num_qoq_pct=8, block_trade_distribution=True)
+    assert r["confirmed"] and "折价大宗（机构让利出货，硬数据）" in r["drivers"]
+    # 折价大宗单路（主力仍流入）不足确认
+    r2 = compute_distribution_into_retail(block_trade_distribution=True, net_inflow_streak_days=2)
+    assert not r2["confirmed"] and r2["score"] == 1
+    # 五路满分 → strong
+    r3 = compute_distribution_into_retail(
+        sentiment_euphoric=True, winner_rate_pct=90, holder_num_4q_trend="持续上升",
+        net_inflow_streak_days=-4, block_trade_distribution=True)
+    assert r3["score"] == 5 and r3["strength"] == "strong"
+
+
 def test_distribution_enriches_retail_signal():
     """assemble：顶部派发(获利盘高+主力流出)即便 winner_rate>50 也判散户高接盘。
     旧套牢口径(winner_rate≤50)抓不到顶部进行中的派发，合成口径补上。"""

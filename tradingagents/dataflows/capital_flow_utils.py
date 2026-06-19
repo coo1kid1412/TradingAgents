@@ -221,24 +221,26 @@ def compute_distribution_into_retail(
     holder_num_qoq_pct: Optional[float] = None,
     holder_num_4q_trend: Optional[str] = None,
     net_inflow_streak_days: Optional[int] = None,
+    block_trade_distribution: Optional[bool] = None,
 ) -> dict:
-    """机构派发给散户强度——四路散落信号合成一个确定性"派发"强度分。
+    """机构派发给散户强度——五路散落信号合成一个确定性"派发"强度分。
 
     对标投研"顶部派发"判定：散户狂热接盘 + 人人获利(高位) + 筹码分散(户数增) +
-    主力悄悄出货(净流出)四者共振 = 机构在高位把货派给散户。任一单路都不足为凭
-    （狂热可能只是趋势确认、户数增可能是配股摊薄），需 ≥2 路共振才算确认。
+    主力悄悄出货(净流出) + 折价大宗（机构让利出货）共振 = 机构在高位把货派给散户。
+    任一单路都不足为凭（狂热可能只是趋势确认、户数增可能是配股摊薄），需 ≥2 路共振才算确认。
 
     这把"舆情狂热"从一个会投错方向的看多票（顶部狂热本该看空），改造成反向的
     派发预警输入——与砍掉的舆情方向票互补（见 rm_tools 加权方向票）。
 
-    四路（各 +1）：
+    五路（各 +1）：
       - 舆情狂热/拥挤多头（sentiment_euphoric）
       - 获利盘 ≥85%（winner_rate 高位，人人赚钱=顶部温床）
       - 股东户数增（环比 >3% 或 4 季持续上升=筹码分散到散户）
       - 主力净流出（连续 ≤ -3 日）
+      - 折价大宗（block_trade 折价成交，机构让利急出货——硬数据）
 
     Returns: {
-        score: 0-4, confirmed: bool(score≥2), strength: none/weak/medium/strong,
+        score: 0-5, confirmed: bool(score≥2), strength: none/weak/medium/strong,
         retail_takeover: "散户高接盘"/"中性"（供拥挤硬确认门）, drivers: [..], n_inputs: int
     }
     """
@@ -270,6 +272,11 @@ def compute_distribution_into_retail(
         if net_inflow_streak_days <= _STREAK_DISTRIBUTION:
             score += 1
             drivers.append(f"主力净流出（连续 {abs(net_inflow_streak_days)} 日）")
+    if block_trade_distribution is not None:
+        n_inputs += 1
+        if block_trade_distribution:
+            score += 1
+            drivers.append("折价大宗（机构让利出货，硬数据）")
 
     confirmed = score >= 2
     strength = ("strong" if score >= 4 else "medium" if score == 3
@@ -809,6 +816,7 @@ def assemble_capital_flow_metrics(
     latest_trade_date: Optional[str] = None,
     chip_metrics: Optional[dict] = None,
     ths_hot_rank: Optional[int] = None,
+    block_metrics: Optional[dict] = None,
 ) -> dict:
     """一次性组装所有资金流字段（含 regime 与 cf_score）。
 
@@ -836,6 +844,11 @@ def assemble_capital_flow_metrics(
     metrics["chip_weight_avg_cost"] = chip.get("weight_avg_cost")
     metrics["ths_hot_rank"] = ths_hot_rank   # 同花顺热榜排名（拥挤硬确认；未上榜=None）
 
+    # 大宗交易派发压力（block_trade 折价；新档位解锁）——喂派发合成第五路
+    block = block_metrics or {}
+    metrics["block_distribution_pressure"] = block.get("block_distribution_pressure")
+    metrics["block_trade_summary"] = block.get("summary")
+
     # 散户接盘信号（散户高位承接 + 主力派发）——优先筹码口径(winner_rate)，毛买/净流入占比兜底
     retail_sig = compute_retail_concentration_signal(
         metrics.get("retail_buy_amount_rate_5d_pct"),
@@ -853,6 +866,7 @@ def assemble_capital_flow_metrics(
         holder_num_qoq_pct=metrics.get("holder_num_qoq_pct"),
         holder_num_4q_trend=metrics.get("holder_num_4q_trend"),
         net_inflow_streak_days=metrics.get("net_inflow_streak_days"),
+        block_trade_distribution=metrics.get("block_distribution_pressure"),
     )
     metrics["distribution_into_retail"] = dist
     # 任一口径确认 → 散户高接盘（喂拥挤硬确认门）
@@ -885,6 +899,8 @@ FIELD_LABEL_ZH: dict[str, str] = {
     "retail_net_inflow_rate_5d_pct":    "散户净流入占比5日均值(%,可负)",
     "retail_concentration_signal":      "散户接盘信号",
     "distribution_into_retail":         "机构派发给散户合成(强度/驱动)",
+    "block_distribution_pressure":      "大宗交易派发压力(折价大宗)",
+    "block_trade_summary":              "大宗交易摘要",
     "northbound_5d_direction":          "北向资金5日方向",
     "northbound_20d_direction":         "北向资金20日方向",
     "northbound_data_status":           "北向数据状态",

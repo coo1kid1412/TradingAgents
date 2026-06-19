@@ -1166,6 +1166,82 @@ def get_chip_distribution(symbol: str, end_date: str) -> Optional[dict]:
     }
 
 
+# 大宗交易折价阈值：折价率 ≤ 此值(%) = 明显折价（卖方让利急出货，派发倾向）。
+# A 股大宗常见折价 0~10%，≥5% 折价属卖方明显让利；机构专用卖方折价信号更硬，阈值放宽。
+_BLOCK_DISCOUNT_TH_PCT = -5.0
+_BLOCK_INST_DISCOUNT_TH_PCT = -2.0
+
+
+def get_block_trade_metrics(symbol: str, end_date: str, lookback_days: int = 60) -> Optional[dict]:
+    """大宗交易派发信号（tushare block_trade，新档位解锁）。
+
+    折价大宗 = 卖方让利急于出货 = 派发倾向；机构专用卖方折价 = 机构在大宗把货派出去。
+    折价率 = (大宗成交价 − 当日收盘价) / 当日收盘价 × 100%。窗口内出现折价型大宗即记派发压力。
+    硬数据，比舆情/筹码更直接——喂 compute_distribution_into_retail 第五路。
+    窗口取 60 日：机构大宗派发常是多周过程，单笔大宗本就稀疏；作为 5 路之一需 ≥2 共振才确认，故可放宽。
+
+    Returns: {n_blocks, discount_block_count, inst_sell_block_count, max_discount_pct,
+              block_distribution_pressure(bool), latest_block_date, summary} 或 None。
+    """
+    ts_code = to_tushare_format(symbol)
+    end_compact = end_date.replace("-", "")
+    start_compact = (datetime.strptime(end_compact, "%Y%m%d") - timedelta(days=lookback_days)).strftime("%Y%m%d")
+    pro = _get_tushare_api()
+    try:
+        bt = _safe_call(pro.block_trade, ts_code=ts_code,
+                        start_date=start_compact, end_date=end_compact, api_name="block_trade")
+    except (TushareUnavailableError, TushareRateLimitError) as e:
+        logger.info("get_block_trade_metrics: block_trade 不可用: %s", e)
+        return None
+    if bt is None or bt.empty or "price" not in bt.columns:
+        return None
+
+    # 对照收盘价算折价率
+    close_map: dict = {}
+    try:
+        db = _safe_call(pro.daily, ts_code=ts_code, start_date=start_compact,
+                        end_date=end_compact, fields="trade_date,close", api_name="daily")
+        if db is not None and not db.empty:
+            close_map = {str(r["trade_date"]): float(r["close"])
+                         for _, r in db.iterrows() if pd.notna(r.get("close"))}
+    except (TushareUnavailableError, TushareRateLimitError):
+        pass
+
+    n = len(bt)
+    discount_cnt = inst_sell_cnt = 0
+    max_disc = 0.0
+    latest_date = None
+    for _, r in bt.iterrows():
+        td = str(r["trade_date"])
+        latest_date = max(latest_date, td) if latest_date else td
+        seller_inst = "机构专用" in str(r.get("seller", ""))
+        if seller_inst:
+            inst_sell_cnt += 1
+        close = close_map.get(td)
+        if close and pd.notna(r.get("price")):
+            disc = round((float(r["price"]) - close) / close * 100, 2)
+            th = _BLOCK_INST_DISCOUNT_TH_PCT if seller_inst else _BLOCK_DISCOUNT_TH_PCT
+            if disc <= th:
+                discount_cnt += 1
+            max_disc = min(max_disc, disc)
+
+    pressure = discount_cnt >= 1
+    if pressure:
+        summary = f"{lookback_days}日内{discount_cnt}笔折价大宗（最大折价{max_disc:.1f}%" + \
+                  (f"，{inst_sell_cnt}笔机构专用卖出" if inst_sell_cnt else "") + "）"
+    else:
+        summary = f"{lookback_days}日内{n}笔大宗无明显折价（无派发压力）" if n else "无大宗交易"
+    return {
+        "n_blocks": n,
+        "discount_block_count": discount_cnt,
+        "inst_sell_block_count": inst_sell_cnt,
+        "max_discount_pct": round(max_disc, 2) if max_disc < 0 else 0.0,
+        "block_distribution_pressure": pressure,
+        "latest_block_date": latest_date,
+        "summary": summary,
+    }
+
+
 # ---------------------------------------------------------------------------
 # 10. get_capital_flow —— 资金流主力/超大/大/中/小单 + 流通市值 + 龙虎榜 30 日计数
 # ---------------------------------------------------------------------------

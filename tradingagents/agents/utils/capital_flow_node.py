@@ -118,6 +118,8 @@ _REPORT_FIELD_GROUPS: list[tuple[str, list[str]]] = [
         "retail_buy_amount_rate_5d_pct",
         "retail_net_inflow_rate_5d_pct",
         "retail_concentration_signal",
+        "block_distribution_pressure",
+        "block_trade_summary",
     ]),
     ("三、北向资金", [
         "northbound_5d_direction",
@@ -195,13 +197,13 @@ def _build_markdown_report(
         drivers_str = "; ".join(dist.get("drivers", [])) or "无"
         lines.append(
             f"SYS_DISTRIBUTION: strength={dist.get('strength', 'none')} | "
-            f"score={dist.get('score', 0)}/4 | "
+            f"score={dist.get('score', 0)}/5 | "
             f"retail_takeover={dist.get('retail_takeover', '中性')} | "
             f"drivers={drivers_str}"
         )
         lines.append(
-            "> 注：此为资金面三路合成（舆情狂热未计入）；RM 拥挤门会把舆情狂热作第四路补入。"
-            "≥2 路共振=派发确认→拥挤硬确认门触发。"
+            "> 注：此为资金面合成（获利盘高位/户数增/主力流出/折价大宗，舆情狂热未计入）；"
+            "RM 拥挤门会把舆情狂热作另一路补入。≥2 路共振=派发确认→拥挤硬确认门触发。"
         )
         lines.append("")
 
@@ -310,6 +312,14 @@ def create_capital_flow_node():
         except Exception as e:
             logger.info("capital_flow_node: get_ths_hot_rank 失败（不影响主流程）: %s", e)
 
+        # 6. 大宗交易派发压力（block_trade 折价；新档位解锁，派发合成第五路硬数据）
+        block_metrics = None
+        try:
+            from tradingagents.dataflows.tushare_vendor import get_block_trade_metrics
+            block_metrics = get_block_trade_metrics(symbol, trade_date)
+        except Exception as e:
+            logger.info("capital_flow_node: get_block_trade_metrics 失败（不影响主流程）: %s", e)
+
         # 装配
         if cap_data is None:
             cap_data = {
@@ -330,6 +340,7 @@ def create_capital_flow_node():
             latest_trade_date=cap_data.get("latest_trade_date"),
             chip_metrics=chip_metrics,
             ths_hot_rank=ths_hot_rank,
+            block_metrics=block_metrics,
         )
 
         # 序列化
