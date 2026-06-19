@@ -534,7 +534,7 @@ bull_target / base_target / bear_target → 你刚设计的三情景目标价
 | consensus_crowded | consensus_snapshot.crowded | true/false（软标志，工具内须经硬数据确认才生效） |
 | consensus_direction | consensus_snapshot.direction | 偏多 / 偏空 / 中性 |
 | quant_anticrowding | QUANT_SCORE.factor_scores.anticrowding | 0-100；拥挤的硬确认之一（≤30 = 真拥挤），缺失填 None |
-| retail_concentration_signal | 0.6 节 CAPITAL_FLOW.retail_concentration_signal | 散户高接盘 / 中性；拥挤的硬确认之二，缺失填 ""。⛔已含「机构派发给散户」合成：资金流报告里 `SYS_DISTRIBUTION:` 若 retail_takeover=散户高接盘（获利盘高位+户数增+主力流出≥2 路共振=顶部派发），此处即为「散户高接盘」，照抄即可 |
+| retail_concentration_signal | 0.6 节 CAPITAL_FLOW.retail_concentration_signal | 散户高接盘 / 中性；拥挤的硬确认之二，缺失填 ""。⛔已含「机构派发给散户」合成：上方 CAPITAL_FLOW YAML 的 `distribution_into_retail.retail_takeover` 若=散户高接盘（获利盘高位+户数增+主力流出≥2 路共振=顶部派发），此字段即已为「散户高接盘」，直接照抄即可 |
 | ths_hot_rank | 0.6 节 CAPITAL_FLOW.ths_hot_rank | 同花顺热榜排名（越小越热）；拥挤的硬确认之三（≤30=散户关注集中），未上榜/缺失填 None |
 | inflection_stage | 你 Step 3 的『当前周期阶段』 | **只能五选一**：加速期 / 底部反转 / 顶部 / 衰退 / 拐点期。⛔ 禁止复合标签（如『加速期顶部』『顶部加速期』）——既加速又顶部属信号矛盾,工具会判 neutral 不升不降。你必须二选一表态：业绩仍在加速且未见顶 → 加速期；已见顶/边际走弱 → 顶部 |
 | data_completeness | VALUATION_METHOD.data_completeness | L0-L3 |
