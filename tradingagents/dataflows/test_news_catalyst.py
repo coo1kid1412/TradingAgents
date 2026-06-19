@@ -6,8 +6,29 @@ LLM 判事件、Python 定方向、催化腿确定性消费，RM 不再二次解
 
 运行：python tradingagents/dataflows/test_news_catalyst.py
 """
-from tradingagents.dataflows.news_catalyst import aggregate_news_catalyst, parse_sys_catalyst
+from tradingagents.dataflows.news_catalyst import (
+    aggregate_news_catalyst, parse_sys_catalyst, aggregate_catalyst_calendar,
+)
 from tradingagents.agents.managers.rm_tools import compute_step6_catalyst_momentum_adjustment as C
+
+
+def test_catalyst_calendar():
+    """步骤1：催化日历——只收 thesis 相关有方向事件，按日期排，边缘过滤。"""
+    nr = ("# 新闻\n```yaml\nSUMMARY:\n  key_events:\n"
+          "    - title: 中报\n      event_date: 2026-07-15\n      thesis_relevance: 核心\n      impact: +中\n      priced_in_p: 40\n"
+          "    - title: 出口管制\n      event_date: 2026Q3\n      thesis_relevance: 核心\n      impact: -大\n"
+          "    - title: 八卦\n      event_date: 未知\n      thesis_relevance: 边缘\n      impact: +小\n"
+          "    - title: 量产\n      event_date: 未知\n      thesis_relevance: 相关\n      impact: +大\n```")
+    cal = aggregate_catalyst_calendar(nr)
+    titles = [c["title"] for c in cal]
+    assert "八卦" not in titles                       # 边缘过滤
+    assert titles[0] == "中报" and titles[1] == "出口管制"  # 有日期按日期升序
+    assert titles[-1] == "量产"                        # 未知日期排末
+    assert cal[1]["direction"] == "-"                  # -大 → 方向 -
+    # 全是边缘/0 影响 → None
+    nr2 = "# 新闻\n```yaml\nSUMMARY:\n  key_events:\n    - title: x\n      thesis_relevance: 边缘\n      impact: +小\n```"
+    assert aggregate_catalyst_calendar(nr2) is None
+    print("✓ 催化日历：thesis 相关过滤 + 日期排序 + 边缘剔除")
 
 
 def _report(events_yaml: str) -> str:
@@ -70,4 +91,5 @@ if __name__ == "__main__":
     test_guards()
     test_sys_catalyst_roundtrip()
     test_feeds_catalyst_leg()
-    print("\n全部 5 组通过 ✅")
+    test_catalyst_calendar()
+    print("\n全部 6 组通过 ✅")

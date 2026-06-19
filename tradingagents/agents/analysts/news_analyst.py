@@ -192,10 +192,12 @@ def create_news_analyst(llm):
             "  key_events:\n"
             "    - title: <≤30 字>\n"
             "      category: 公司 / 行业 / 宏观 / 机构\n"
+            "      event_date: <预期发生/验证日期：YYYY-MM-DD（精确）或 2026Q3（季度）或 未知>\n"
             "      horizon: 短期(≤1周) / 中期(1-3月) / 长期(>3月)\n"
             "      priced_in_p: <0-100>\n"
             "      impact: +大 / +中 / +小 / 0 / -小 / -中 / -大\n"
             "      credibility: 高 / 中 / 低\n"
+            "      thesis_relevance: 核心 / 相关 / 边缘     # 该事件对投资逻辑(thesis)的相关度\n"
             "      second_order_chain: <≤50 字描述二阶传导链路，无则填 null>\n"
             "  cumulative_patterns:\n"
             "    - <识别到的累积模式，≤30 字>\n"
@@ -246,7 +248,9 @@ def create_news_analyst(llm):
         # 让"新闻催化"确定性进评级链（催化腿第5信号），不再靠 RM 当散文二次解读。
         if report:
             try:
-                from tradingagents.dataflows.news_catalyst import aggregate_news_catalyst
+                from tradingagents.dataflows.news_catalyst import (
+                    aggregate_news_catalyst, aggregate_catalyst_calendar,
+                )
                 cat = aggregate_news_catalyst(report)
                 if cat is not None:
                     report = report + (
@@ -256,6 +260,17 @@ def create_news_analyst(llm):
                         f"（净催化分{cat['net']}，{cat['n_events']}个事件按 impact×可信度×(1-已定价)×时间窗 聚合"
                         + (f"；最近端：{cat['nearest']}" if cat['nearest'] else "")
                         + "）\n"
+                    )
+                # 催化日历（步骤1）：thesis 相关的有方向事件，按日期排——供 PM 时间止损/监控直读
+                cal = aggregate_catalyst_calendar(report)
+                if cal:
+                    lines = "\n".join(
+                        f"  - {c['date']} | {c['direction']} {c['impact']} | {c['thesis_relevance']}"
+                        f" | {c['title']}" + (f"（已定价{c['priced_in_p']}%）" if c['priced_in_p'] not in (None, "null") else "")
+                        for c in cal)
+                    report = report + (
+                        f"\n<!-- ⚠️SYS_CATALYST_CALENDAR｜Python 抽 thesis 相关催化事件按日期排，PM 时间止损/监控直读 -->\n"
+                        f"SYS_CATALYST_CALENDAR:\n{lines}\n"
                     )
             except Exception:
                 pass

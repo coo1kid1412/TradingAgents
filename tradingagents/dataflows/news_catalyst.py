@@ -110,3 +110,50 @@ def parse_sys_catalyst(text: str) -> Optional[dict]:
                 "score": int(m.group("score"))}
     except ValueError:
         return None
+
+
+_IMPACT_SIGN = {"+大": "+", "+中": "+", "+小": "+", "0": "·",
+                "-小": "-", "-中": "-", "-大": "-"}
+
+
+def aggregate_catalyst_calendar(news_report: str, max_items: int = 6) -> Optional[list[dict]]:
+    """从 SUMMARY.key_events 抽确定性催化日历——对标投研"催化剂日历驱动仓位时机/止损"。
+
+    只收**有日期、且 thesis 相关度≥相关、impact≠0** 的事件，按日期排序（未知日期排末）。
+    每条：{date, title, direction(+/-/·), impact, thesis_relevance, priced_in_p}。
+    供 PM 时间止损/监控段直读，不再让 LLM 凭空写"下一验证点"。
+    """
+    summary = _find_summary_yaml(news_report)
+    if not summary:
+        return None
+    events = summary.get("key_events") or []
+    if not isinstance(events, list):
+        return None
+
+    cal = []
+    for e in events:
+        if not isinstance(e, dict):
+            continue
+        impact = str(e.get("impact", "0")).strip()
+        if impact in ("0", "", "null", None):
+            continue
+        relevance = str(e.get("thesis_relevance", "")).strip()
+        if relevance not in ("核心", "相关"):
+            continue   # 只要 thesis 相关的（边缘/无标的不进监控）
+        date = str(e.get("event_date", "未知")).strip() or "未知"
+        cal.append({
+            "date": date,
+            "title": str(e.get("title", ""))[:30],
+            "direction": _IMPACT_SIGN.get(impact, "·"),
+            "impact": impact,
+            "thesis_relevance": relevance,
+            "priced_in_p": e.get("priced_in_p"),
+        })
+
+    if not cal:
+        return None
+    # 有日期的优先且按日期升序；未知日期排末（保持原序）
+    dated = [c for c in cal if c["date"] != "未知"]
+    undated = [c for c in cal if c["date"] == "未知"]
+    dated.sort(key=lambda c: c["date"])
+    return (dated + undated)[:max_items]
