@@ -534,7 +534,7 @@ bull_target / base_target / bear_target → 你刚设计的三情景目标价
 | consensus_crowded | consensus_snapshot.crowded | true/false（软标志，工具内须经硬数据确认才生效） |
 | consensus_direction | consensus_snapshot.direction | 偏多 / 偏空 / 中性 |
 | quant_anticrowding | QUANT_SCORE.factor_scores.anticrowding | 0-100；拥挤的硬确认之一（≤30 = 真拥挤），缺失填 None |
-| retail_concentration_signal | 0.6 节 CAPITAL_FLOW.retail_concentration_signal | 散户高接盘 / 中性；拥挤的硬确认之二，缺失填 "" |
+| retail_concentration_signal | 0.6 节 CAPITAL_FLOW.retail_concentration_signal | 散户高接盘 / 中性；拥挤的硬确认之二，缺失填 ""。⛔已含「机构派发给散户」合成：资金流报告里 `SYS_DISTRIBUTION:` 若 retail_takeover=散户高接盘（获利盘高位+户数增+主力流出≥2 路共振=顶部派发），此处即为「散户高接盘」，照抄即可 |
 | ths_hot_rank | 0.6 节 CAPITAL_FLOW.ths_hot_rank | 同花顺热榜排名（越小越热）；拥挤的硬确认之三（≤30=散户关注集中），未上榜/缺失填 None |
 | inflection_stage | 你 Step 3 的『当前周期阶段』 | **只能五选一**：加速期 / 底部反转 / 顶部 / 衰退 / 拐点期。⛔ 禁止复合标签（如『加速期顶部』『顶部加速期』）——既加速又顶部属信号矛盾,工具会判 neutral 不升不降。你必须二选一表态：业绩仍在加速且未见顶 → 加速期；已见顶/边际走弱 → 顶部 |
 | data_completeness | VALUATION_METHOD.data_completeness | L0-L3 |
@@ -544,7 +544,8 @@ bull_target / base_target / bear_target → 你刚设计的三情景目标价
 | decision_style | stock_profile.DECISION_STYLE | momentum 风格不靠低估升档 |
 | composite_score / momentum_score | QUANT_SCORE.composite / factor_scores.momentum | 数值 |
 | market_weight / news_weight / sentiment_weight | stock_profile.REPORT_WEIGHTS | 0-1 |
-| market/news/sentiment_direction_vote | 你读完三份报告后各给一票 | +1.0 全面看多 / +0.5 偏多有保留 / 0 中性 / -0.5 偏空有保留 / -1.0 全面看空 |
+| market/news_direction_vote | 你读完市场/新闻两份报告后各给一票 | +1.0 全面看多 / +0.5 偏多有保留 / 0 中性 / -0.5 偏空有保留 / -1.0 全面看空 |
+| sentiment_direction_vote | **已废弃，固定填 0**（工具内确定性置零） | ⛔舆情不做趋势方向票——顶部狂热是反向指标，naive 方向票会在狂热时投 +1 把评级抬反。舆情改走「机构派发给散户」反向检测（见 consensus_crowded + SYS_DISTRIBUTION），不进趋势方向 |
 | sell_side_target_change_pct | 近 30 日卖方目标价中位变化% | **缺失填 None，禁止编造** |
 | institutional_holding_change_pct | 近 1 季机构持仓变化% | 缺失填 None，禁止编造 |
 | northbound_flow_5d_direction | **0.6 节 CAPITAL_FLOW.northbound_5d_direction 映射** | 净流入→1，净流出→-1，平衡/数据停滞→None；禁止从 news/sentiment 猜 |

@@ -782,20 +782,24 @@ def compute_step6_report_weighted_vote_adjustment(
 ) -> dict:
     """非估值方向票加权调整（改造 B）。
 
-    把 stock_profile.REPORT_WEIGHTS 真正接入评级——市场/新闻/情绪 三个非估值维度
-    的方向投票（LLM 给定 -1~+1）按权重加权，超过阈值则触发 ±1 档调整。
+    把 stock_profile.REPORT_WEIGHTS 真正接入评级——市场/新闻 两个非估值维度的方向
+    投票（LLM 给定 -1~+1）按权重加权，超过阈值则触发 ±1 档调整。
+
+    ⚠️ 舆情方向票已废（确定性置零）：舆情作"方向票"是反向指标——顶部狂热本该看空，
+    naive 方向票却会在狂热时投 +1 把评级抬高，正好抬反。对标投研：舆情不进趋势方向，
+    改喂"机构派发给散户"反向检测（见 capital_flow_utils.compute_distribution_into_retail）。
+    这里保留 sentiment_weight/sentiment_direction_vote 入参仅为兼容，方向票贡献恒为 0。
 
     设计动机：之前 REPORT_WEIGHTS 只影响 Bull/Bear 写论据来源，不影响评级生成。
-    现在题材股情绪权重 30%，能在情绪强烈看多时真正把评级抬一档。
 
     Args:
         rating_after_style_adj: Step 6 第六步 style 调整后的评级
         market_weight: stock_profile.REPORT_WEIGHTS.market（0-100 整数）
         news_weight: stock_profile.REPORT_WEIGHTS.news（0-100 整数）
-        sentiment_weight: stock_profile.REPORT_WEIGHTS.sentiment（0-100 整数）
+        sentiment_weight: 已废，仅兼容（不进方向票）
         market_direction_vote: LLM 读 market 报告后给的方向票（-1 全看空 ~ +1 全看多）
         news_direction_vote: 读 news 报告后给的方向票
-        sentiment_direction_vote: 读 sentiment 报告后给的方向票
+        sentiment_direction_vote: 已废，确定性置零（不进方向票）
 
     Returns:
         dict: {
@@ -809,21 +813,22 @@ def compute_step6_report_weighted_vote_adjustment(
     if rating_after_style_adj not in _RATINGS_ORDER:
         return {"error": f"未知评级: {rating_after_style_adj}"}
 
-    total_weight = market_weight + news_weight + sentiment_weight
+    # 舆情方向票确定性置零——只用市场+新闻两路方向（舆情改走派发检测，不进方向）
+    total_weight = market_weight + news_weight
     if total_weight <= 0:
         return {
             "adjustment": 0,
             "new_rating": rating_after_style_adj,
             "rule_applied": "skipped",
-            "skip_reason": f"非估值权重总和={total_weight} 无效",
+            "skip_reason": f"市场+新闻权重总和={total_weight} 无效（舆情不计方向票）",
         }
 
-    # 每个 vote clamp 到 [-1, +1]
+    # 每个 vote clamp 到 [-1, +1]；舆情票强制 0
     mv = max(-1.0, min(1.0, market_direction_vote))
     nv = max(-1.0, min(1.0, news_direction_vote))
-    sv = max(-1.0, min(1.0, sentiment_direction_vote))
+    sv = 0.0   # 舆情方向票废弃：顶部狂热是反向指标，不进趋势方向
 
-    weighted_vote = (market_weight * mv + news_weight * nv + sentiment_weight * sv) / total_weight
+    weighted_vote = (market_weight * mv + news_weight * nv) / total_weight
     weighted_vote = round(weighted_vote, 3)
 
     THRESHOLD = 0.3

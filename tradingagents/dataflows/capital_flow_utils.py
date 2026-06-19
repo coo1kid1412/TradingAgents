@@ -209,6 +209,81 @@ def compute_retail_concentration_signal(
     return None
 
 
+# 顶部派发：获利盘 ≥ 此值 = 人人赚钱（普涨到位），机构高位派货温床
+_WINNER_RATE_EUPHORIA_PCT = 85.0
+# 股东户数环比增 ≥ 此值（%）= 筹码从集中→分散（散户进场接盘）
+_HOLDER_NUM_RISING_QOQ_PCT = 3.0
+
+
+def compute_distribution_into_retail(
+    sentiment_euphoric: Optional[bool] = None,
+    winner_rate_pct: Optional[float] = None,
+    holder_num_qoq_pct: Optional[float] = None,
+    holder_num_4q_trend: Optional[str] = None,
+    net_inflow_streak_days: Optional[int] = None,
+) -> dict:
+    """机构派发给散户强度——四路散落信号合成一个确定性"派发"强度分。
+
+    对标投研"顶部派发"判定：散户狂热接盘 + 人人获利(高位) + 筹码分散(户数增) +
+    主力悄悄出货(净流出)四者共振 = 机构在高位把货派给散户。任一单路都不足为凭
+    （狂热可能只是趋势确认、户数增可能是配股摊薄），需 ≥2 路共振才算确认。
+
+    这把"舆情狂热"从一个会投错方向的看多票（顶部狂热本该看空），改造成反向的
+    派发预警输入——与砍掉的舆情方向票互补（见 rm_tools 加权方向票）。
+
+    四路（各 +1）：
+      - 舆情狂热/拥挤多头（sentiment_euphoric）
+      - 获利盘 ≥85%（winner_rate 高位，人人赚钱=顶部温床）
+      - 股东户数增（环比 >3% 或 4 季持续上升=筹码分散到散户）
+      - 主力净流出（连续 ≤ -3 日）
+
+    Returns: {
+        score: 0-4, confirmed: bool(score≥2), strength: none/weak/medium/strong,
+        retail_takeover: "散户高接盘"/"中性"（供拥挤硬确认门）, drivers: [..], n_inputs: int
+    }
+    """
+    drivers = []
+    score = 0
+    n_inputs = 0
+
+    if sentiment_euphoric is not None:
+        n_inputs += 1
+        if sentiment_euphoric:
+            score += 1
+            drivers.append("舆情狂热/拥挤多头")
+    if winner_rate_pct is not None:
+        n_inputs += 1
+        if winner_rate_pct >= _WINNER_RATE_EUPHORIA_PCT:
+            score += 1
+            drivers.append(f"获利盘 {winner_rate_pct:.0f}%≥85（人人获利=顶部派发温床）")
+    holder_rising = (
+        (holder_num_qoq_pct is not None and holder_num_qoq_pct > _HOLDER_NUM_RISING_QOQ_PCT)
+        or holder_num_4q_trend == "持续上升"
+    )
+    if holder_num_qoq_pct is not None or holder_num_4q_trend is not None:
+        n_inputs += 1
+        if holder_rising:
+            score += 1
+            drivers.append("股东户数增（筹码从集中→分散到散户）")
+    if net_inflow_streak_days is not None:
+        n_inputs += 1
+        if net_inflow_streak_days <= _STREAK_DISTRIBUTION:
+            score += 1
+            drivers.append(f"主力净流出（连续 {abs(net_inflow_streak_days)} 日）")
+
+    confirmed = score >= 2
+    strength = ("strong" if score >= 4 else "medium" if score == 3
+                else "weak" if score == 2 else "none")
+    return {
+        "score": score,
+        "confirmed": confirmed,
+        "strength": strength,
+        "retail_takeover": "散户高接盘" if confirmed else "中性",
+        "drivers": drivers,
+        "n_inputs": n_inputs,
+    }
+
+
 def _compute_streak_days(series: pd.Series, max_streak: int = 10) -> int:
     """连续净流入(+) / 净流出(-) 天数，截断至 ±max_streak。
 
@@ -762,12 +837,28 @@ def assemble_capital_flow_metrics(
     metrics["ths_hot_rank"] = ths_hot_rank   # 同花顺热榜排名（拥挤硬确认；未上榜=None）
 
     # 散户接盘信号（散户高位承接 + 主力派发）——优先筹码口径(winner_rate)，毛买/净流入占比兜底
-    metrics["retail_concentration_signal"] = compute_retail_concentration_signal(
+    retail_sig = compute_retail_concentration_signal(
         metrics.get("retail_buy_amount_rate_5d_pct"),
         metrics.get("net_inflow_streak_days"),
         retail_net_inflow_rate_5d_pct=metrics.get("retail_net_inflow_rate_5d_pct"),
         winner_rate_pct=metrics.get("winner_rate_pct"),
     )
+
+    # 机构派发给散户合成（顶部派发变体：获利盘高位 + 户数增 + 主力流出；
+    # 舆情狂热这一路在评级层 RM 拥挤门补入，此层无舆情→sentiment_euphoric=None）。
+    # 与上面套牢口径(winner_rate 低)互补：本合成抓"顶部派发进行中"，套牢口径抓"派发已完成"。
+    dist = compute_distribution_into_retail(
+        sentiment_euphoric=None,
+        winner_rate_pct=metrics.get("winner_rate_pct"),
+        holder_num_qoq_pct=metrics.get("holder_num_qoq_pct"),
+        holder_num_4q_trend=metrics.get("holder_num_4q_trend"),
+        net_inflow_streak_days=metrics.get("net_inflow_streak_days"),
+    )
+    metrics["distribution_into_retail"] = dist
+    # 任一口径确认 → 散户高接盘（喂拥挤硬确认门）
+    if dist["confirmed"] and retail_sig != "散户高接盘":
+        retail_sig = "散户高接盘"
+    metrics["retail_concentration_signal"] = retail_sig
 
     regime_info = compute_capital_flow_regime(metrics)
     metrics.update(regime_info)
@@ -793,6 +884,7 @@ FIELD_LABEL_ZH: dict[str, str] = {
     "retail_buy_amount_rate_5d_pct":    "散户毛买盘占比5日均值(%)",
     "retail_net_inflow_rate_5d_pct":    "散户净流入占比5日均值(%,可负)",
     "retail_concentration_signal":      "散户接盘信号",
+    "distribution_into_retail":         "机构派发给散户合成(强度/驱动)",
     "northbound_5d_direction":          "北向资金5日方向",
     "northbound_20d_direction":         "北向资金20日方向",
     "northbound_data_status":           "北向数据状态",

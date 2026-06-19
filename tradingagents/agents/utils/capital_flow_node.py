@@ -76,6 +76,16 @@ def _to_yaml(metrics: dict) -> str:
                 for k, v in value.items():
                     lines.append(f"    {k}: \"{v}\"")
             continue
+        if field == "distribution_into_retail":
+            # 派发合成（嵌套 dict + drivers 列表）——扁平化便于下游解析
+            v = value if isinstance(value, dict) else {}
+            lines.append(f"  {field}:")
+            lines.append(f"    score: {v.get('score', 0)}")
+            lines.append(f"    confirmed: {str(bool(v.get('confirmed'))).lower()}")
+            lines.append(f"    strength: \"{v.get('strength', 'none')}\"")
+            lines.append(f"    retail_takeover: \"{v.get('retail_takeover', '中性')}\"")
+            lines.append(f"    drivers: \"{'; '.join(v.get('drivers', [])) or '无'}\"")
+            continue
         if value is None:
             lines.append(f"  {field}: null")
         elif isinstance(value, str):
@@ -178,6 +188,22 @@ def _build_markdown_report(
         lines.append(f"- 资金面综合状态：**{regime}**，capital_flow_score = **{score_str}** / 100")
         lines.append(f"- 解释：{reasoning}")
     lines.append("")
+
+    # 机构派发给散户合成（资金面三路：获利盘高位/户数增/主力流出；舆情狂热由 RM 拥挤门补入）
+    dist = metrics.get("distribution_into_retail")
+    if isinstance(dist, dict):
+        drivers_str = "; ".join(dist.get("drivers", [])) or "无"
+        lines.append(
+            f"SYS_DISTRIBUTION: strength={dist.get('strength', 'none')} | "
+            f"score={dist.get('score', 0)}/4 | "
+            f"retail_takeover={dist.get('retail_takeover', '中性')} | "
+            f"drivers={drivers_str}"
+        )
+        lines.append(
+            "> 注：此为资金面三路合成（舆情狂热未计入）；RM 拥挤门会把舆情狂热作第四路补入。"
+            "≥2 路共振=派发确认→拥挤硬确认门触发。"
+        )
+        lines.append("")
 
     # 投票明细
     votes = metrics.get("capital_flow_votes", {})

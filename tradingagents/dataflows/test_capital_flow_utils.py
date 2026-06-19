@@ -11,6 +11,7 @@ from tradingagents.dataflows.capital_flow_utils import (
     compute_lhb_metrics,
     compute_capital_flow_regime,
     compute_capital_flow_score,
+    compute_distribution_into_retail,
     assemble_capital_flow_metrics,
 )
 
@@ -161,6 +162,39 @@ def test_orthogonality_single_outflow_day_not_deteriorating():
          "lhb_inst_direction": None}
     regime = compute_capital_flow_regime(m)["capital_flow_regime"]
     assert regime != "恶化"
+
+
+def test_distribution_top_variant_confirms():
+    """步骤2：机构派发给散户——获利盘高位+户数增+主力流出≥2 路共振=确认。"""
+    r = compute_distribution_into_retail(
+        winner_rate_pct=90, holder_num_qoq_pct=8, net_inflow_streak_days=-4)
+    assert r["confirmed"] and r["score"] == 3 and r["retail_takeover"] == "散户高接盘"
+    # 加舆情狂热 → 满分 strong
+    r2 = compute_distribution_into_retail(
+        sentiment_euphoric=True, winner_rate_pct=90, net_inflow_streak_days=-4,
+        holder_num_4q_trend="持续上升")
+    assert r2["score"] == 4 and r2["strength"] == "strong"
+
+
+def test_distribution_single_signal_not_confirm():
+    """单路（趋势中获利盘高，但主力仍在流入）不算派发。"""
+    r = compute_distribution_into_retail(winner_rate_pct=90, net_inflow_streak_days=3)
+    assert not r["confirmed"] and r["score"] == 1 and r["retail_takeover"] == "中性"
+
+
+def test_distribution_enriches_retail_signal():
+    """assemble：顶部派发(获利盘高+主力流出)即便 winner_rate>50 也判散户高接盘。
+    旧套牢口径(winner_rate≤50)抓不到顶部进行中的派发，合成口径补上。"""
+    mf = pd.DataFrame({
+        "trade_date": [f"2026010{i}" for i in range(1, 6)],
+        "main_force_net_amount_yi": [-1.0, -1.2, -0.8, -1.5, -2.0],  # streak -5
+    })
+    m = assemble_capital_flow_metrics(
+        moneyflow_df=mf,
+        chip_metrics={"winner_rate_pct": 92},   # 获利盘高位（套牢口径会判中性）
+    )
+    assert m["distribution_into_retail"]["confirmed"]
+    assert m["retail_concentration_signal"] == "散户高接盘"
 
 
 if __name__ == "__main__":
