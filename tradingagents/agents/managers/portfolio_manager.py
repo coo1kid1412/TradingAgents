@@ -394,8 +394,31 @@ PM 必须明确"thesis 兑现"的具体里程碑（如"Q2 营收增速 >25%"、"
 | Core Thesis 核心逻辑 | 1. __ 2. __ 3. __（每条 ≤30 字，单行编号）|
 | Key Risks 核心风险 | 1. __ 2. __ 3. __（每条 ≤30 字，单行编号）|
 
+### 各 Agent 核心结论一览
+
+| Agent | 核心结论（一句话 ≤40 字，含方向/评级，直读该 agent 报告） |
+|------|------|
+| 基本面分析师 | __ |
+| 市场分析师（技术面）| __ |
+| 资金流官 | __ |
+| 新闻分析师 | __ |
+| 舆情分析师 | __ |
+| 量化打分官 | __ |
+| 板块对照官 | __ |
+| 共识识别官 | __ |
+| 股票画像识别官 | __ |
+| 多空研究员（辩论）| __ |
+| 研究主管（RM）| __ |
+| 风控团队（流动性/事件/尾部）| __ |
+
 ---
 ```
+
+**"各 Agent 核心结论一览"填写约束**：
+- 每行**直读对应 agent 报告的 SUMMARY / 评级 / data_implied_direction / 结论段**，一句话扼要概括其核心观点 + 方向（≤40 字）。**禁止编造、禁止用别的 agent 的结论顶替**。
+- 取数对照：基本面→fundamentals SUMMARY；市场分析师→market SUMMARY（momentum/rating/data_implied）；资金流官→market 第四节 CAPITAL_FLOW（regime + 主力/散户/派发）；新闻→news SUMMARY（net_sentiment + SYS_CATALYST 方向）；舆情→sentiment SUMMARY（net_sentiment + data_implied）；量化打分官→quant_score（composite + 最弱因子）；板块对照官→sector（本股 vs 主题 ETF 的 30d RS + 主题内排名）；共识识别官→consensus_snapshot（direction + crowded）；股票画像→stock_profile（style + SYS_VALUATION_REGIME + 范式/周期）；多空研究员→RM thesis 里的多空辩论结论（|d| + 哪方占优）；研究主管→RM 最终评级 + 一句话 thesis；风控团队→风险辩论记录里三方各自最强一条（一句合并）。
+- 某 agent 报告缺失/未产出 → 该行填"未产出/数据缺失"，**不留空、不硬凑**。
+- 方向措辞要忠实：偏多/偏空/中性/看多/看空各按其报告原意，**不得为了和最终评级一致而篡改某 agent 的真实结论**（出现分歧正是这张表的价值）。
 
 **字段填写约束**：
 - 全部字段必填，**禁止** "TBD"/"待评估"/"灵活调整"
@@ -442,7 +465,7 @@ PM 必须明确"thesis 兑现"的具体里程碑（如"Q2 营收增速 >25%"、"
 
 ⚠️ **只用下面 "Trade Ticket + 五个一级标题"**，不再拆成十几个平行章节；旧内容全部保留，只是作为各主题段下的**子节**。一级标题用 `## 一、…`，子节用 `### 1.1 …`。
 
-1. **Trade Ticket 决策卡**（上述格式：At-a-glance + 核心交易参数 + 关键背景）
+1. **Trade Ticket 决策卡**（上述格式：At-a-glance + 核心交易参数 + 关键背景 + **各 Agent 核心结论一览**）
 
 2. **## 一、投资决策与入场时机**
    - **### 1.1 投资判断**（该不该投资？YES / NO / CONDITIONAL）—— 1 段推理 + 条件
