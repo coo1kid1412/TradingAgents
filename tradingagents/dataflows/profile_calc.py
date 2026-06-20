@@ -1498,11 +1498,15 @@ def compute_valuation_regime(
     # 范式成长反转（镜像周期反转 3b）：确认范式股(secular hardtech) + 真加速(earnings=+1) +
     # 无 blowoff 证据 → ride 门槛 +2 降到 +1，且"反拥挤致的 crowding -1"在主升浪属常态(非顶部
     # 证据)抬 0。对标投研：secular re-rating 期间，拥挤/高位是加速特征不是该收的理由。
-    # 护栏(防骑顶)：peak信号 / 派发确认 / 破位(tech=-1) / 散户高接盘 任一出现 → 反转失效回纪律。
+    # 护栏(防骑顶)只认**硬证据**：peak信号 / 破位(tech=-1) / 散户高接盘(硬派发合成确认)。
+    # ⚠️ 不用 distribution_detected(软)做护栏——它是 parse_distribution_signals 读新闻散文的
+    # 旧减持口径，18倍股必有陈旧减持新闻(中际旭创实测：5个月前大股东减持 0.5% 触发软派发，
+    # 但硬数据股东户数 -15.78%=吸筹、大宗无折价=无派发，软信号误杀 ride)。硬派发由 peak/破位/
+    # 散户高接盘三路把关，陈旧减持新闻不该否决范式骑乘(内部人减持硬口径见待办 A)。
     paradigm_note = ""
     ride_threshold = 2
     if is_paradigm and legs.get("earnings") == 1:
-        blowoff = (has_peak_signal or distribution_detected
+        blowoff = (has_peak_signal
                    or legs.get("tech") == -1
                    or retail_concentration_signal == "散户高接盘")
         if not blowoff:
@@ -1513,7 +1517,7 @@ def compute_valuation_regime(
             else:
                 paradigm_note = "；范式成长加速期：ride门槛降至+1（无blowoff证据）"
         else:
-            paradigm_note = "；范式股但 blowoff(peak/派发/破位/散户高接盘)→反转失效，回纪律"
+            paradigm_note = "；范式股但 blowoff硬证据(peak/破位/散户高接盘)→反转失效，回纪律"
 
     score = sum(legs.values())
     # 有效路 < 3 → 数据不足，给 neutral（不轻易骑/收）

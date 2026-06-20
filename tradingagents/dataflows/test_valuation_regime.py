@@ -166,6 +166,20 @@ def test_paradigm_blowoff_guard_no_ride():
     assert r2["legs"]["crowding"] == -1, r2
 
 
+def test_paradigm_stale_soft_distribution_not_blocks_ride():
+    """中际旭创实测回归：陈旧减持新闻(软派发 distribution_detected)不该否决范式 ride——
+    硬数据(retail=中性/户数减少吸筹/大宗无折价)说无派发时，5个月前的减持新闻不是 blowoff 证据。"""
+    r = compute_valuation_regime(
+        momentum_score=72, rsi_percentile_1y=75, has_peak_signal=False,
+        main_force_streak_days=2, net_profit_growth=0.9, growth_direction="accelerating",
+        retail_concentration_signal="中性",          # 硬：非散户高接盘
+        theme_stage_inferred="acceleration", quant_anticrowding=25,  # 拥挤
+        distribution_detected=True,                    # 软：陈旧减持新闻
+        is_paradigm=True)
+    assert r["valuation_regime"] == "ride", r          # 软派发不否决
+    assert r["legs"]["crowding"] == 0                   # 拥挤腿抬 0
+
+
 def test_insufficient_data_neutral():
     r = compute_valuation_regime(momentum_score=80)  # 仅 1 路
     assert r["valuation_regime"] == "neutral", r
