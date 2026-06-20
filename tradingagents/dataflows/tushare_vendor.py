@@ -536,6 +536,23 @@ def _format_cyclical_line(industry, stock_name, fina, close_price) -> str:
         return ""
 
 
+def _format_paradigm_line(industry, stock_name) -> str:
+    """范式成长机读行（AI/算力硬科技 secular）——下游 regime 走加速期 ride-by-default。
+
+    识别：profile_calc.detect_paradigm_growth（龙头名单 + 半导体行业关键词，周期股让位）。
+    非范式股返回空串不发射。防御式：任何失败返回空串。
+    """
+    from tradingagents.dataflows.profile_calc import detect_paradigm_growth
+
+    try:
+        if detect_paradigm_growth(industry, stock_name) is None:
+            return ""
+        return "【SYS_PARADIGM｜tushare】 class=paradigm（AI/算力硬科技 secular，regime 加速期走 ride-by-default；peak/派发/破位则回纪律）"
+    except Exception as e:
+        logger.debug("_format_paradigm_line 失败: %s", e)
+        return ""
+
+
 def _format_landmine_line(stock_name, fina) -> str:
     """地雷排查可确定性判定项 → 固定格式行，RM 第负一步直读（不再让 LLM 从 prose 猜）。
 
@@ -811,6 +828,11 @@ def get_fundamentals(
         cyclical_line = _format_cyclical_line(stock_industry, stock_name, fina, close_price)
         if cyclical_line:
             sections.append(cyclical_line)
+
+        # 范式成长机读行（非范式/周期股返回空串不发射）——下游 regime 加速期 ride-by-default
+        paradigm_line = _format_paradigm_line(stock_industry, stock_name)
+        if paradigm_line:
+            sections.append(paradigm_line)
 
         # 静态 PE：收盘价 / 年度 EPS
         if fina is not None and not fina.empty and close_price:

@@ -58,6 +58,7 @@ from tradingagents.dataflows.profile_calc import (
     parse_growth_deceleration,
     parse_distribution_signals,
     parse_sys_cyclical,
+    parse_sys_paradigm,
     cyclical_target_weights,
 )
 
@@ -414,6 +415,10 @@ def create_stock_profile_node(llm):
             logger.info("SYS_CYCLICAL: class=%s position=%s roe_rank=%s normalized_eps=%s",
                         cyc_info["class"], cyc_info["position"],
                         cyc_info["roe_pct_rank"], cyc_info["normalized_eps"])
+        # 范式成长机读行（AI/算力硬科技 secular）——regime 加速期 ride-by-default
+        is_paradigm = parse_sys_paradigm(fundamentals_report + "\n" + fund_raw)
+        if is_paradigm:
+            logger.info("SYS_PARADIGM: 范式成长股识别命中 → regime 加速期走 ride-by-default")
         regime_info = compute_valuation_regime(
             momentum_score=momentum_score,
             rsi_percentile_1y=price_signals.get("rsi_percentile_1y"),
@@ -431,6 +436,7 @@ def create_stock_profile_node(llm):
             recurring_loss=gq["recurring_loss"],
             cyclical_class=cyc_info["class"] if cyc_info else None,
             roe_pct_rank_10y=cyc_info["roe_pct_rank"] if cyc_info else None,
+            is_paradigm=is_paradigm,
         )
         valuation_regime = regime_info["valuation_regime"]
         if dist_sig["detected"]:
@@ -984,6 +990,8 @@ TRANSPARENCY:
             f"SYS_VALUATION_REGIME_NETSCORE: {regime_info.get('score')}\n"
             f"SYS_VALUATION_REGIME_LEGS: {regime_legs}\n"
             f"SYS_VALUATION_REGIME_REASON: {regime_info.get('reasoning', '')}\n"
+            + (f"SYS_PARADIGM_CLASS: paradigm（AI/算力硬科技 secular；regime 加速期已走 ride-by-default，下游 RM 直读勿改）\n"
+               if is_paradigm else "")
         )
         logger.info("SYS_VALUATION_REGIME 已注入画像: %s", valuation_regime)
 

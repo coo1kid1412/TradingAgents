@@ -420,6 +420,66 @@ def detect_cyclical(industry: Optional[str], company_name: Optional[str]) -> Opt
     return None
 
 
+# ============================================================================
+# 范式成长（secular hardtech）识别 —— AI/算力硬科技结构性成长
+# ----------------------------------------------------------------------------
+# 对标投研：secular re-rating 期间倍数可多年不回归（NVDA/中际旭创式），不能用历史 PE band
+# 均值回归估。识别后让 regime 在"真加速期"走 ride-by-default（见 compute_valuation_regime
+# 范式反转），但 peak/派发/破位任一出现即回纪律（不骑顶）。
+# tushare industry 太粗（分不出 CPO/光刻胶/PCB），主用龙头名单（同周期股，零误伤优先）+
+# 少量干净行业关键词。维护：新龙头进名单。AI应用(软件)/固态电池暂不纳入。
+# ============================================================================
+_PARADIGM_INDUSTRY_KW = ("半导体",)   # tushare industry 里能干净映射的只有半导体；其余靠名单
+_PARADIGM_NAMES = (
+    # CPO / 光模块 / 光器件
+    "中际旭创", "新易盛", "天孚通信", "光迅科技", "华工科技", "剑桥科技", "太辰光", "仕佳光子",
+    # 算力 / AI 芯片 / GPU
+    "海光信息", "寒武纪", "景嘉微", "龙芯中科", "芯原股份", "瑞芯微", "澜起科技",
+    # 光刻胶 / 半导体材料
+    "晶瑞电材", "南大光电", "彤程新材", "华懋科技", "雅克科技", "鼎龙股份", "安集科技",
+    # PCB（AI 服务器 / 算力）
+    "沪电股份", "生益科技", "深南电路", "胜宏科技", "兴森科技", "广合科技",
+    # MLCC / 被动元件
+    "三环集团", "风华高科", "洁美科技",
+    # 算力租赁 / IDC
+    "润泽科技", "光环新网", "数据港", "云赛智联", "奥飞数据", "科华数据",
+    # 机器人（盈利兑现度较弱；regime 的盈利动能门控会自然过滤未兑现的）
+    "汇川技术", "绿的谐波", "埃斯顿", "拓斯达", "鸣志电器", "雷赛智能", "三花智控",
+)
+
+
+def detect_paradigm_growth(industry: Optional[str], company_name: Optional[str]) -> Optional[str]:
+    """范式成长确定性识别 → "paradigm" / None。
+
+    ⛔ 周期优先：已是周期股（detect_cyclical 命中，如存储/面板）→ 让位周期轨（返回 None）。
+    存储等结构性周期股的成长 β 已由周期轨的滑动权重（谷底偏成长前瞻）表达，不让它双轨打架。
+    Python 优先判（防 LLM 漂移）；LLM 只能对漏网者加注，不能摘帽（同周期股）。
+    """
+    if detect_cyclical(industry, company_name) is not None:
+        return None
+    name = (company_name or "").strip()
+    if name:
+        for kw in _PARADIGM_NAMES:
+            if kw in name:
+                return "paradigm"
+    ind = (industry or "").strip()
+    if ind:
+        for kw in _PARADIGM_INDUSTRY_KW:
+            if kw in ind:
+                return "paradigm"
+    return None
+
+
+_SYS_PARADIGM_RE = re.compile(r"【SYS_PARADIGM[^】]*】\s*class=(?P<cls>paradigm)")
+
+
+def parse_sys_paradigm(text: str) -> bool:
+    """从 fundamentals 报告解析 SYS_PARADIGM 机读行（Python 转录保证在场）。命中→True。"""
+    if not text:
+        return False
+    return bool(_SYS_PARADIGM_RE.search(text))
+
+
 # 强周期股目标价的「正常化 vs 成长前瞻」滑动权重，按周期位置确定（防 RM 自选权重致摆动）。
 # 结构性上行周期（存储/面板）既有周期风险又有 AI 结构性需求——位置决定该信哪边更多：
 #   顶部 → 偏正常化（谨慎，但承认结构性成长，不一杆打到纯正常化）；
@@ -1325,6 +1385,7 @@ def compute_valuation_regime(
     recurring_loss: Optional[bool] = None,
     cyclical_class: Optional[str] = None,
     roe_pct_rank_10y: Optional[float] = None,
+    is_paradigm: bool = False,
 ) -> dict:
     """客观估值 regime（骑趋势 / 中性 / 收纪律）——六路分析师信号合成，纯 Python 确定性。
 
@@ -1434,11 +1495,31 @@ def compute_valuation_regime(
     if distribution_detected and not strong_inflow:
         legs["distribution"] = -1
 
+    # 范式成长反转（镜像周期反转 3b）：确认范式股(secular hardtech) + 真加速(earnings=+1) +
+    # 无 blowoff 证据 → ride 门槛 +2 降到 +1，且"反拥挤致的 crowding -1"在主升浪属常态(非顶部
+    # 证据)抬 0。对标投研：secular re-rating 期间，拥挤/高位是加速特征不是该收的理由。
+    # 护栏(防骑顶)：peak信号 / 派发确认 / 破位(tech=-1) / 散户高接盘 任一出现 → 反转失效回纪律。
+    paradigm_note = ""
+    ride_threshold = 2
+    if is_paradigm and legs.get("earnings") == 1:
+        blowoff = (has_peak_signal or distribution_detected
+                   or legs.get("tech") == -1
+                   or retail_concentration_signal == "散户高接盘")
+        if not blowoff:
+            ride_threshold = 1
+            if legs.get("crowding") == -1:   # 此时非散户高接盘(否则 blowoff)，纯反拥挤分 → 主升浪常态抬0
+                legs["crowding"] = 0
+                paradigm_note = "；范式成长加速期：拥挤属主升浪常态(crowding抬0)+ride门槛降至+1"
+            else:
+                paradigm_note = "；范式成长加速期：ride门槛降至+1（无blowoff证据）"
+        else:
+            paradigm_note = "；范式股但 blowoff(peak/派发/破位/散户高接盘)→反转失效，回纪律"
+
     score = sum(legs.values())
     # 有效路 < 3 → 数据不足，给 neutral（不轻易骑/收）
     if len(legs) < 3:
         regime = "neutral"
-    elif score >= 2:        # 对称阈值（无方向先验）：净 +2 → ride，-2 → discipline
+    elif score >= ride_threshold:   # 对称阈值；范式加速期门槛降至 +1（见上）
         regime = "ride"
     elif score <= -2:
         regime = "discipline"
@@ -1450,7 +1531,7 @@ def compute_valuation_regime(
         regime = "neutral"
 
     reasoning = (f"六路净分={score}（{legs}）→ {regime}"
-                 + ("；peak信号压制不骑" if has_peak_signal else "") + cyc_note)
+                 + ("；peak信号压制不骑" if has_peak_signal else "") + cyc_note + paradigm_note)
     return {"valuation_regime": regime, "score": score, "legs": legs, "reasoning": reasoning}
 
 

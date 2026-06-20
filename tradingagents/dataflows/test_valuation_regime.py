@@ -15,6 +15,8 @@ from tradingagents.dataflows.profile_calc import (
     parse_sys_net_growth_components,
     compute_deterministic_peg_inputs,
     compute_peg_band,
+    detect_paradigm_growth,
+    parse_sys_paradigm,
 )
 
 
@@ -114,6 +116,54 @@ def test_neutral_mixed():
         net_profit_growth=0.2, retail_concentration_signal="中性",
         theme_stage_inferred="none", quant_anticrowding=50)
     assert r["valuation_regime"] == "neutral", r
+
+
+def test_detect_paradigm_growth():
+    """范式识别：硬科技 secular 命中；周期股(存储)让位；非赛道 None。"""
+    assert detect_paradigm_growth(None, "中际旭创") == "paradigm"      # CPO 龙头
+    assert detect_paradigm_growth("半导体", "某芯片股") == "paradigm"   # 行业关键词
+    assert detect_paradigm_growth(None, "沪电股份") == "paradigm"      # PCB
+    # 周期优先：兆易创新是 strong 周期(存储) → 让位周期轨，不抢范式
+    assert detect_paradigm_growth(None, "兆易创新") is None
+    assert detect_paradigm_growth("钢铁", "某钢铁股") is None          # 传统周期
+    assert detect_paradigm_growth("白酒", "贵州茅台") is None          # 非赛道
+    # SYS_PARADIGM 解析往返
+    assert parse_sys_paradigm("【SYS_PARADIGM｜tushare】 class=paradigm | sector=CPO") is True
+    assert parse_sys_paradigm("无此行") is False
+
+
+def test_paradigm_ride_in_acceleration():
+    """范式股加速期：原本 neutral 的边际组合(拥挤拖累)，反转后 → ride。"""
+    base = dict(
+        momentum_score=70, rsi_percentile_1y=78, has_peak_signal=False,
+        capital_flow_regime="中性", main_force_streak_days=1, lhb_inst_direction=0,
+        net_profit_growth=0.5, retail_concentration_signal="中性",
+        theme_stage_inferred="acceleration", quant_anticrowding=25)  # 拥挤(anticrowding≤30)→crowding -1
+    # 非范式：earnings+1 / theme+1 / crowding-1 / tech+1(动量70未超买) → 净≈+2? 用拥挤压一下看 baseline
+    non_para = compute_valuation_regime(**base)
+    para = compute_valuation_regime(**base, is_paradigm=True)
+    # 范式反转：crowding -1 抬 0 + 门槛降 → ride；且不低于非范式
+    assert para["valuation_regime"] == "ride", para
+    assert para["legs"]["crowding"] == 0      # 拥挤腿被抬 0
+
+
+def test_paradigm_blowoff_guard_no_ride():
+    """范式股但 blowoff（peak/派发/破位）→ 反转失效，不骑顶（天孚式）。"""
+    # 天孚式：破位(动量弱) + peak + 派发
+    r = compute_valuation_regime(
+        momentum_score=30, rsi_percentile_1y=30, has_peak_signal=True,
+        capital_flow_regime="中性", main_force_streak_days=-1, lhb_inst_direction=0,
+        net_profit_growth=0.5, retail_concentration_signal="中性",
+        theme_stage_inferred="peak", quant_anticrowding=50, is_paradigm=True)
+    assert r["valuation_regime"] != "ride", r   # 破位+peak → 护栏生效
+    # 散户高接盘也触发护栏
+    r2 = compute_valuation_regime(
+        momentum_score=70, rsi_percentile_1y=80, has_peak_signal=False,
+        capital_flow_regime="中性", main_force_streak_days=1,
+        net_profit_growth=0.5, retail_concentration_signal="散户高接盘",
+        theme_stage_inferred="acceleration", quant_anticrowding=25, is_paradigm=True)
+    # 散户高接盘 → blowoff → 不降门槛；crowding 因散户高接盘本就 -1
+    assert r2["legs"]["crowding"] == -1, r2
 
 
 def test_insufficient_data_neutral():
