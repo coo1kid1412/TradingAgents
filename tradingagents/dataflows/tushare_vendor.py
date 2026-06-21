@@ -553,6 +553,56 @@ def _format_paradigm_line(industry, stock_name) -> str:
         return ""
 
 
+def get_main_business_breakdown(symbol: str, top_n: int = 6) -> Optional[dict]:
+    """主营业务构成（tushare fina_mainbz 按产品）→ 各产品营收占比（确定性）。
+
+    取最新报告期、按销售额降序的产品营收占比——给下游"热门概念归属%"提供硬数据
+    （是公司主营的百分之多少属于某概念）。无权限/无数据返回 None。
+    Returns: {period, items:[(产品名, 占比%), ...]} 或 None。
+    """
+    ts_code = to_tushare_format(symbol)
+    pro = _get_tushare_api()
+    try:
+        df = _safe_call(pro.fina_mainbz, ts_code=ts_code, type="P", api_name="fina_mainbz")
+    except (TushareUnavailableError, TushareRateLimitError) as e:
+        logger.info("get_main_business_breakdown: fina_mainbz 不可用: %s", e)
+        return None
+    if df is None or df.empty or "bz_sales" not in df.columns or "end_date" not in df.columns:
+        return None
+    df = df.dropna(subset=["bz_sales"]).copy()
+    if df.empty:
+        return None
+    latest = df["end_date"].astype(str).max()        # 最新报告期
+    df = df[df["end_date"].astype(str) == latest]
+    df["bz_sales"] = df["bz_sales"].astype(float)
+    total = df["bz_sales"].sum()
+    if total <= 0:
+        return None
+    df = df.sort_values("bz_sales", ascending=False).head(top_n)
+    items = [(str(r["bz_item"]).strip(), round(float(r["bz_sales"]) / total * 100, 1))
+             for _, r in df.iterrows()]
+    return {"period": latest, "items": items}
+
+
+def _format_main_business_line(symbol) -> str:
+    """主营构成机读行（fina_mainbz 按产品营收占比）——下游 PM 判"热门概念归属%"直读。
+
+    现状痛点：raw_data 常不披露产品线收入构成，基本面分析师只能"按属性推断"占比。
+    这里确定性补上。无数据返回空串。
+    """
+    try:
+        mb = get_main_business_breakdown(symbol)
+        if not mb or not mb["items"]:
+            return ""
+        seg = " / ".join(f"{item} {pct:.0f}%" for item, pct in mb["items"])
+        yr = str(mb["period"])[:4]
+        return (f"【SYS_MAIN_BUSINESS｜tushare fina_mainbz {yr}报】 {seg}"
+                "（按产品营收占比，PM 判热门概念归属% 直读此行，禁自行推断占比）")
+    except Exception as e:
+        logger.debug("_format_main_business_line 失败: %s", e)
+        return ""
+
+
 def _format_landmine_line(stock_name, fina) -> str:
     """地雷排查可确定性判定项 → 固定格式行，RM 第负一步直读（不再让 LLM 从 prose 猜）。
 
@@ -833,6 +883,11 @@ def get_fundamentals(
         paradigm_line = _format_paradigm_line(stock_industry, stock_name)
         if paradigm_line:
             sections.append(paradigm_line)
+
+        # 主营业务构成机读行（fina_mainbz 按产品营收占比）——下游 PM 判"热门概念归属%"直读
+        main_business_line = _format_main_business_line(ticker)
+        if main_business_line:
+            sections.append(main_business_line)
 
         # 静态 PE：收盘价 / 年度 EPS
         if fina is not None and not fina.empty and close_price:
