@@ -60,6 +60,7 @@ from tradingagents.dataflows.profile_calc import (
     parse_sys_cyclical,
     parse_sys_paradigm,
     cyclical_target_weights,
+    compute_cyclical_scenario_target,
 )
 
 logger = logging.getLogger(__name__)
@@ -1058,6 +1059,35 @@ TRANSPARENCY:
             logger.info("SYS_PEG 已注入画像: growth=%s%% fwd_eps=%s conf=%s band=%s-%s",
                         peg_det['peg_growth_pct'], peg_det['forward_eps'], peg_det['confidence'],
                         peg_low, peg_high)
+
+            # 强周期股双轨情景目标价（确定性算死，RM Step4 直读，根治"硬平均两腿致摆动"）——
+            # bear=周期均值回归(正常化×mid-cycle PE) / bull=结构成长(前瞻PEG) / base=位置权重概率加权；
+            # 两腿离散≥2.5x 标低置信(双峰中间数不可信)。治兆易 SELL↔UW 残留摆动。
+            if cyc_info and cyc_info["class"] == "strong" and cyc_info["normalized_eps"] is not None:
+                cyc_tgt = compute_cyclical_scenario_target(
+                    normalized_eps=cyc_info["normalized_eps"],
+                    forward_eps=peg_det["forward_eps"],
+                    forward_growth_pct=peg_det["peg_growth_pct"],
+                    position=cyc_info["position"],
+                    peg_low=peg_low, peg_high=peg_high,
+                )
+                if cyc_tgt is not None:
+                    content = content + (
+                        f"\n<!-- ⚠️SYS_CYCLICAL_TARGET｜Python 双轨情景目标价(算死)，RM Step4 强周期目标价直读勿重算 -->\n"
+                        f"SYS_CYCLICAL_TARGET: bear={cyc_tgt['bear_low']}~{cyc_tgt['bear_high']}"
+                        f" | bull={cyc_tgt['bull_low']}~{cyc_tgt['bull_high']}"
+                        f" | base={cyc_tgt['base_low']}~{cyc_tgt['base_high']}"
+                        f"（normalize {cyc_tgt['weights']['normalize']:.0%}/growth {cyc_tgt['weights']['growth']:.0%}）"
+                        f" | 离散={cyc_tgt['dispersion']}x | 置信={cyc_tgt['confidence']}\n"
+                        f"SYS_CYCLICAL_TARGET_REASON: bear=周期均值回归(正常化EPS×mid-cycle PE {cyc_tgt['normalize_pe_band'][0]:.0f}-{cyc_tgt['normalize_pe_band'][1]:.0f}) "
+                        f"/ bull=结构成长(前瞻PEG) / base=位置权重概率加权；**RM Step4 综合目标价直读 base，禁现场重算两腿/重选PE倍数**。"
+                        + ("⚠️离散≥2.5x=双峰(周期崩vs结构成长分歧大)，base 是折中锚非真公允值，"
+                           "评级临近阈值时偏保守不下强方向单。" if cyc_tgt["confidence"] == "low" else "")
+                        + "\n"
+                    )
+                    logger.info("SYS_CYCLICAL_TARGET 已注入: base=%s~%s 离散=%sx 置信=%s",
+                                cyc_tgt["base_low"], cyc_tgt["base_high"],
+                                cyc_tgt["dispersion"], cyc_tgt["confidence"])
 
         return {"stock_profile": content}
 

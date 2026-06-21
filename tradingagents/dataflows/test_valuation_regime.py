@@ -17,6 +17,7 @@ from tradingagents.dataflows.profile_calc import (
     compute_peg_band,
     detect_paradigm_growth,
     parse_sys_paradigm,
+    compute_cyclical_scenario_target,
 )
 
 
@@ -178,6 +179,25 @@ def test_paradigm_stale_soft_distribution_not_blocks_ride():
         is_paradigm=True)
     assert r["valuation_regime"] == "ride", r          # 软派发不否决
     assert r["legs"]["crowding"] == 0                   # 拥挤腿抬 0
+
+
+def test_cyclical_scenario_target():
+    """强周期双轨情景目标价（兆易实测复现）：bear/bull/base + 双峰低置信。"""
+    r = compute_cyclical_scenario_target(
+        normalized_eps=3.99, forward_eps=6.25, forward_growth_pct=45,
+        position="top", peg_low=0.8, peg_high=1.0)   # discipline PEG band
+    assert (r["bear_low"], r["bear_high"]) == (39.9, 59.85)        # 周期均值回归
+    assert (r["bull_low"], r["bull_high"]) == (225.0, 281.25)      # 结构成长
+    assert (r["base_low"], r["base_high"]) == (132.45, 170.55)     # 概率加权(top 50/50)
+    assert r["confidence"] == "low" and r["dispersion"] >= 2.5     # 5x 离散=双峰
+    # 谷底偏成长权重(0.3/0.7)→ base 更靠 bull
+    r2 = compute_cyclical_scenario_target(3.99, 6.25, 45, "trough", 0.9, 1.2)
+    assert r2["weights"] == {"normalize": 0.3, "growth": 0.7}
+    # 缺正常化 EPS → None（退回原路径）
+    assert compute_cyclical_scenario_target(None, 6.25, 45, "top", 0.8, 1.0) is None
+    # 两腿接近(非周期式)→ normal 置信
+    r3 = compute_cyclical_scenario_target(10.0, 11.0, 20, "mid", 0.9, 1.2)
+    assert r3["confidence"] == "normal"
 
 
 def test_insufficient_data_neutral():

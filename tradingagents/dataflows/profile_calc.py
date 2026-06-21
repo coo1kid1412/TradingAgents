@@ -1177,6 +1177,61 @@ def compute_peg_band(valuation_regime: Optional[str],
     return (low, high)
 
 
+# 强周期股正常化腿的 mid-cycle PE 带（对标投研：周期股峰值盈利不可线性外推，给跨周期合理倍数）。
+# 存储/面板类 10-15x 是行业惯用 mid-cycle 区间。⚠️ TODO(harness 超参)：待回测校准。
+_CYCLICAL_NORMALIZE_PE_BAND = (10.0, 15.0)
+# 两腿离散度 ≥ 此倍数 = 双峰（周期崩 vs 结构成长分歧大）→ 综合目标低置信（中间数不可信）
+_CYCLICAL_DISPERSION_BIMODAL = 2.5
+
+
+def compute_cyclical_scenario_target(
+    normalized_eps: Optional[float],
+    forward_eps: Optional[float],
+    forward_growth_pct: Optional[float],
+    position: Optional[str],
+    peg_low: float,
+    peg_high: float,
+    normalize_pe_band: tuple = _CYCLICAL_NORMALIZE_PE_BAND,
+) -> Optional[dict]:
+    """强周期股双轨情景目标价（确定性，替代 RM 现场硬平均两条腿致摆动）。
+
+    两条腿是**互斥的未来**，不是同一估值的不同输入：
+      - 周期均值回归(bear)：normalized_eps × mid-cycle PE —— 峰值盈利不可持续、回归正常化；
+      - 结构成长(bull)：forward_eps × (PEG × 前瞻增速) —— AI 结构需求支撑前瞻溢价。
+    按周期位置滑动权重做概率加权出 base；两腿离散 ≥2.5x 时标低置信（双峰，中间数谁都不信）。
+    Python 算死、RM 直读 SYS_CYCLICAL_TARGET 不再现场算 → 根治残留摆动（兆易 SELL↔UW）。
+    对标投研：估值分歧 5 倍时不做算术平均，而是情景概率加权 + 显式标注双峰不确定性。
+
+    Returns: {bear_low/high, bull_low/high, base_low/high, weights, dispersion, confidence,
+              normalize_pe_band} 或 None（缺正常化/前瞻 EPS）。
+    """
+    if (normalized_eps is None or forward_eps is None or forward_growth_pct is None
+            or normalized_eps <= 0 or forward_eps <= 0 or forward_growth_pct <= 0):
+        return None
+    pe_lo, pe_hi = normalize_pe_band
+    bear_low = round(normalized_eps * pe_lo, 2)
+    bear_high = round(normalized_eps * pe_hi, 2)
+    # 成长腿：target_PE = PEG × 增速%；price = forward_eps × target_PE（同 compute_peg_target_price）
+    bull_low = round(forward_eps * peg_low * forward_growth_pct, 2)
+    bull_high = round(forward_eps * peg_high * forward_growth_pct, 2)
+    w_norm, w_growth = cyclical_target_weights(position)
+    base_low = round(w_norm * bear_low + w_growth * bull_low, 2)
+    base_high = round(w_norm * bear_high + w_growth * bull_high, 2)
+    bear_mid = (bear_low + bear_high) / 2
+    bull_mid = (bull_low + bull_high) / 2
+    dispersion = round(bull_mid / bear_mid, 2) if bear_mid > 0 else None
+    confidence = ("low" if dispersion is not None and dispersion >= _CYCLICAL_DISPERSION_BIMODAL
+                  else "normal")
+    return {
+        "bear_low": bear_low, "bear_high": bear_high,     # 周期均值回归视角（正常化）
+        "bull_low": bull_low, "bull_high": bull_high,     # 结构成长视角（前瞻 PEG）
+        "base_low": base_low, "base_high": base_high,     # 概率加权（位置滑动权重）
+        "weights": {"normalize": w_norm, "growth": w_growth},
+        "dispersion": dispersion, "confidence": confidence,
+        "normalize_pe_band": [pe_lo, pe_hi],
+    }
+
+
 def compute_peer_anchored_pe_cap(
     peer_pe_median: Optional[float],
     pe_ttm: Optional[float],
