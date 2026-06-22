@@ -481,6 +481,25 @@ def parse_sys_paradigm(text: str) -> bool:
     return bool(_SYS_PARADIGM_RE.search(text))
 
 
+_SYS_MAIN_BUSINESS_RE = re.compile(r"【SYS_MAIN_BUSINESS[^】]*】\s*(?P<seg>.+?)（按")
+
+
+def parse_sys_main_business(text: str) -> Optional[str]:
+    """从 fundamentals 原始数据解析 SYS_MAIN_BUSINESS 的产品营收占比段。
+
+    画像识别官据此把它确定性转录到画像末尾，PM 直读画像、不经基本面分析师改写——
+    防"分析师转写丢真值"（实测虽多数转录无误，但应去掉这道 LLM 转手）。
+    Returns: "芯片量产 47% / 芯片设计 28% / ..." 或 None。
+    """
+    if not text:
+        return None
+    m = _SYS_MAIN_BUSINESS_RE.search(text)
+    if not m:
+        return None
+    seg = m.group("seg").strip()
+    return seg or None
+
+
 # 强周期股目标价的「正常化 vs 成长前瞻」滑动权重，按周期位置确定（防 RM 自选权重致摆动）。
 # 结构性上行周期（存储/面板）既有周期风险又有 AI 结构性需求——位置决定该信哪边更多：
 #   顶部 → 偏正常化（谨慎，但承认结构性成长，不一杆打到纯正常化）；

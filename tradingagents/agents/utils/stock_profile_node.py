@@ -59,6 +59,7 @@ from tradingagents.dataflows.profile_calc import (
     parse_distribution_signals,
     parse_sys_cyclical,
     parse_sys_paradigm,
+    parse_sys_main_business,
     cyclical_target_weights,
     compute_cyclical_scenario_target,
 )
@@ -420,6 +421,8 @@ def create_stock_profile_node(llm):
         is_paradigm = parse_sys_paradigm(fundamentals_report + "\n" + fund_raw)
         if is_paradigm:
             logger.info("SYS_PARADIGM: 范式成长股识别命中 → regime 加速期走 ride-by-default")
+        # 主营构成（fina_mainbz 产品营收占比）——确定性转录到画像，PM 判热门概念归属% 直读
+        main_business_seg = parse_sys_main_business(fundamentals_report + "\n" + fund_raw)
         regime_info = compute_valuation_regime(
             momentum_score=momentum_score,
             rsi_percentile_1y=price_signals.get("rsi_percentile_1y"),
@@ -993,8 +996,12 @@ TRANSPARENCY:
             f"SYS_VALUATION_REGIME_REASON: {regime_info.get('reasoning', '')}\n"
             + (f"SYS_PARADIGM_CLASS: paradigm（AI/算力硬科技 secular；regime 加速期已走 ride-by-default，下游 RM 直读勿改）\n"
                if is_paradigm else "")
+            + (f"SYS_MAIN_BUSINESS: {main_business_seg}（fina_mainbz 产品营收占比，Python 确定性转录；PM 判热门概念归属% 直读此行、禁自行推断）\n"
+               if main_business_seg else "")
         )
         logger.info("SYS_VALUATION_REGIME 已注入画像: %s", valuation_regime)
+        if main_business_seg:
+            logger.info("SYS_MAIN_BUSINESS 已转录画像: %s", main_business_seg[:60])
 
         # 主题溢价（regime 闸门后）—— 机器可读，RM Step6 动态阈值直读，禁止用 LLM 选的 theme_stage 重算
         content = content + (
