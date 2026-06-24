@@ -177,7 +177,14 @@ def create_news_analyst(llm):
             "- 多家机构同主题集中调研（如近 30 天 ≥3 次）→ 极强的机构关注度信号\n"
             "- 调研观点与卖方研报评级方向不一致 → 需特别警惕（可能机构内部认知分歧）\n\n"
             "若 news 报告中无调研类信号，明确填\"无渠道调研纪要识别到\"。**禁止**编造调研内容。\n\n"
-            + "## 输出格式\n"
+            + "## 信息时效与新鲜度（必输出，对标投研：陈旧信息边际驱动力衰减）\n\n"
+            "新闻的价值随时间衰减——一条三周前的'卖方上调'，市场多半已消化，对未来边际影响远小于今天的同类信号。\n\n"
+            "1. **每条事件标注见报日期 source_date**（从工具返回的新闻时间戳取），区别于 event_date（事件预期发生日）。\n"
+            "2. **对陈旧但尚未兑现的信号显式降权**：source_date 距当前分析日 >3 周的非财报类信号，在'对股价影响'里相应下调一档，并在备注说明'信息已偏旧'。\n"
+            f"3. **数据时效声明（报告必含一句）**：本分析基于截至 {current_date} 可获取的新闻/公告，"
+            "**当日盘中或最新实时事件可能尚未被数据源覆盖**；若处于快速行情（板块大幅异动日），"
+            "结论的时效性应相应打折，以最新行情和公告为准。\n\n"
+            "## 输出格式\n"
             "请用中文撰写报告，按上述维度分节组织内容。在报告末尾附上一个 Markdown 汇总表格，包含以下列：\n"
             "| 信息来源 | 日期 | 分类 | 关键内容 | 可信度 | 对股价影响 | 时间窗 | 已定价概率 |\n"
             "股票代码、专有名词和评级关键词（BUY/SELL/HOLD）请保留英文原文。"
@@ -193,6 +200,7 @@ def create_news_analyst(llm):
             "    - title: <≤30 字>\n"
             "      category: 公司 / 行业 / 宏观 / 机构\n"
             "      event_date: <预期发生/验证日期：YYYY-MM-DD（精确）或 2026Q3（季度）或 未知>\n"
+            "      source_date: <该新闻的见报/发布日期：YYYY-MM-DD，从工具返回的新闻时间戳取；未知填 未知>\n"
             "      horizon: 短期(≤1周) / 中期(1-3月) / 长期(>3月)\n"
             "      priced_in_p: <0-100>\n"
             "      impact: +大 / +中 / +小 / 0 / -小 / -中 / -大\n"
@@ -252,7 +260,7 @@ def create_news_analyst(llm):
                     aggregate_news_catalyst, aggregate_catalyst_calendar,
                     compute_narrative_shift,
                 )
-                cat = aggregate_news_catalyst(report)
+                cat = aggregate_news_catalyst(report, current_date=current_date)
                 if cat is not None:
                     report = report + (
                         f"\n\n<!-- ⚠️SYS_CATALYST｜Python 从 SUMMARY.key_events 确定性聚合，RM Step6 催化腿直读 -->\n"

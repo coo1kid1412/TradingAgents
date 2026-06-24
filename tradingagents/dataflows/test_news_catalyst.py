@@ -9,6 +9,7 @@ LLM 判事件、Python 定方向、催化腿确定性消费，RM 不再二次解
 from tradingagents.dataflows.news_catalyst import (
     aggregate_news_catalyst, parse_sys_catalyst, aggregate_catalyst_calendar,
     compute_narrative_shift, compute_earnings_revision, parse_sys_earnings_revision,
+    _recency_weight,
 )
 from tradingagents.agents.managers.rm_tools import compute_step6_catalyst_momentum_adjustment as C
 
@@ -135,6 +136,31 @@ def test_earnings_revision():
     print("✓ 盈利上修/下修：累积模式+机构事件 → 上修/停修/下修，非机构不误计")
 
 
+def test_recency_weight():
+    """#3：新鲜度权重——见报越旧权重越低；缺日期不衰减（向后兼容）。"""
+    cd = "2026-06-24"
+    assert _recency_weight("2026-06-20", cd) == 1.0     # 4 天，新鲜
+    assert _recency_weight("2026-06-10", cd) == 0.75    # 14 天
+    assert _recency_weight("2026-05-20", cd) == 0.5     # 35 天
+    assert _recency_weight("2026-04-01", cd) == 0.35    # >45 天
+    assert _recency_weight("20260620", cd) == 1.0       # YYYYMMDD 也能解析
+    # 缺见报日期 / 缺当前日期 / 未知 → 1.0（不惩罚缺失）
+    assert _recency_weight(None, cd) == 1.0
+    assert _recency_weight("未知", cd) == 1.0
+    assert _recency_weight("2026-06-20", None) == 1.0
+    # 端到端：陈旧正面事件被新鲜度压低净催化
+    fresh = ("# 新闻\n```yaml\nSUMMARY:\n  key_events:\n"
+             "    - title: 卖方上调\n      impact: +大\n      source_date: 2026-06-23\n      horizon: 短期\n      priced_in_p: 20\n```")
+    stale = fresh.replace("2026-06-23", "2026-04-01")
+    cf_fresh = aggregate_news_catalyst(fresh, current_date=cd)
+    cf_stale = aggregate_news_catalyst(stale, current_date=cd)
+    assert cf_stale["net"] < cf_fresh["net"], (cf_fresh, cf_stale)
+    # 不传 current_date → 不衰减（向后兼容，net 与 fresh 同）
+    cf_nodate = aggregate_news_catalyst(stale)
+    assert cf_nodate["net"] == cf_fresh["net"], (cf_nodate, cf_fresh)
+    print("✓ 新鲜度：见报越旧权重越低，缺日期/缺current_date 不衰减（向后兼容）")
+
+
 if __name__ == "__main__":
     test_aggregate_bearish_near_term_dominates()
     test_priced_in_discounts()
@@ -144,4 +170,5 @@ if __name__ == "__main__":
     test_catalyst_calendar()
     test_narrative_shift()
     test_earnings_revision()
-    print("\n全部 8 组通过 ✅")
+    test_recency_weight()
+    print("\n全部 9 组通过 ✅")

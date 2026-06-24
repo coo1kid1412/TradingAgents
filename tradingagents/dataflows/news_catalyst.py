@@ -23,6 +23,42 @@ _CRED_MAP = {"高": 1.0, "中": 0.7, "低": 0.4}
 _HORIZON_MAP = {"短期": 1.0, "中期": 0.7, "长期": 0.4}
 
 
+def _parse_iso_date(s) -> Optional["datetime.date"]:
+    """宽松解析 YYYY-MM-DD / YYYY/MM/DD / YYYY.MM.DD / YYYYMMDD → date；失败/季度/未知 → None。"""
+    import datetime
+    if s in (None, "", "未知", "null"):
+        return None
+    text = str(s).strip()
+    for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%Y.%m.%d", "%Y%m%d"):
+        try:
+            return datetime.datetime.strptime(text[:10] if "-" in text or "/" in text or "." in text
+                                              else text[:8], fmt).date()
+        except ValueError:
+            continue
+    return None
+
+
+def _recency_weight(source_date, current_date) -> float:
+    """新闻见报日期 → 新鲜度权重（对标投研：信息越陈旧，边际驱动力越弱）。
+
+    ≤7 日=1.0 / ≤21 日=0.75 / ≤45 日=0.5 / >45 日=0.35。
+    缺见报日期或当前日期无法解析 → 1.0（向后兼容，不惩罚缺失，只在有日期时生效）。
+    与 priced_in 是不同的轴：priced_in 问"市场吸收没"，recency 问"信息新不新"。
+    """
+    sd = _parse_iso_date(source_date)
+    cd = _parse_iso_date(current_date)
+    if sd is None or cd is None:
+        return 1.0
+    age = (cd - sd).days
+    if age <= 7:
+        return 1.0
+    if age <= 21:
+        return 0.75
+    if age <= 45:
+        return 0.5
+    return 0.35
+
+
 def _find_summary_yaml(news_report: str) -> Optional[dict]:
     """从新闻报告里抽 ```yaml ... ``` 的 SUMMARY 块并解析。"""
     if not news_report:
@@ -39,11 +75,12 @@ def _find_summary_yaml(news_report: str) -> Optional[dict]:
     return None
 
 
-def aggregate_news_catalyst(news_report: str) -> Optional[dict]:
+def aggregate_news_catalyst(news_report: str, current_date: Optional[str] = None) -> Optional[dict]:
     """把 SUMMARY.key_events 聚合成净催化信号。
 
-    单事件分 = impact × 可信度 × (1 − priced_in%) × 时间窗权重。
-    已定价的事件不再驱动（priced_in 高→权重低）；可信度低、远端的事件权重低。
+    单事件分 = impact × 可信度 × (1 − priced_in%) × 时间窗权重 × 新鲜度权重。
+    已定价的事件不再驱动（priced_in 高→权重低）；可信度低、远端的事件权重低；
+    见报日期(source_date)越陈旧→新鲜度权重越低（缺日期或缺 current_date 则不衰减）。
 
     Returns: {net, direction(+1/0/-1), strength(high/medium/low), score(-30..30),
               n_events, nearest} 或 None（无 SUMMARY/无事件）。
@@ -72,7 +109,8 @@ def aggregate_news_catalyst(news_report: str) -> Optional[dict]:
         priced_frac = min(max(priced_frac, 0.0), 1.0)
         hz_key = next((k for k in _HORIZON_MAP if k in str(e.get("horizon", ""))), None)
         hz = _HORIZON_MAP.get(hz_key, 0.7)
-        net += impact * cred * (1.0 - priced_frac) * hz
+        rec = _recency_weight(e.get("source_date"), current_date)
+        net += impact * cred * (1.0 - priced_frac) * hz * rec
         counted += 1
 
     if counted == 0:
