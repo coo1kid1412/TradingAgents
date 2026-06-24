@@ -266,7 +266,7 @@ def create_news_analyst(llm):
                         f"\n\n<!-- ⚠️SYS_CATALYST｜Python 从 SUMMARY.key_events 确定性聚合，RM Step6 催化腿直读 -->\n"
                         f"SYS_CATALYST: direction={cat['direction']} | strength={cat['strength']}"
                         f" | score={cat['score']}"
-                        f"（净催化分{cat['net']}，{cat['n_events']}个事件按 impact×可信度×(1-已定价)×时间窗 聚合"
+                        f"（净催化分{cat['net']}，{cat['n_events']}个事件按 impact×可信度×(1-已定价)×时间窗×新鲜度 聚合"
                         + (f"；最近端：{cat['nearest']}" if cat['nearest'] else "")
                         + "）\n"
                     )
