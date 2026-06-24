@@ -424,6 +424,14 @@ def create_stock_profile_node(llm):
             logger.info("SYS_PARADIGM: 范式成长股识别命中 → regime 加速期走 ride-by-default")
         # 主营构成（fina_mainbz 产品营收占比）——确定性转录到画像，PM 判热门概念归属% 直读
         main_business_seg = parse_sys_main_business(fundamentals_report + "\n" + fund_raw)
+        # 盈利预期上修/下修（新闻 SUMMARY 粗代理）——喂 earnings 腿，让前瞻修正中和后视镜减速。
+        # 对标投研：revision 方向才是成长股"骑还是收"的真判据（report_rc 没权限前的零成本代理）。
+        from tradingagents.dataflows.news_catalyst import compute_earnings_revision
+        rev_info = compute_earnings_revision(news_report)
+        earnings_revision = rev_info["direction"] if rev_info else None
+        if rev_info and rev_info["direction"] != "停修":
+            logger.info("SYS_EARNINGS_REVISION: %s（up=%s down=%s 据=%s）",
+                        rev_info["direction"], rev_info["up"], rev_info["down"], rev_info["evidence"])
         regime_info = compute_valuation_regime(
             momentum_score=momentum_score,
             rsi_percentile_1y=price_signals.get("rsi_percentile_1y"),
@@ -442,6 +450,7 @@ def create_stock_profile_node(llm):
             cyclical_class=cyc_info["class"] if cyc_info else None,
             roe_pct_rank_10y=cyc_info["roe_pct_rank"] if cyc_info else None,
             is_paradigm=is_paradigm,
+            earnings_revision=earnings_revision,
         )
         valuation_regime = regime_info["valuation_regime"]
         if dist_sig["detected"]:
@@ -995,6 +1004,8 @@ TRANSPARENCY:
             f"SYS_VALUATION_REGIME_NETSCORE: {regime_info.get('score')}\n"
             f"SYS_VALUATION_REGIME_LEGS: {regime_legs}\n"
             f"SYS_VALUATION_REGIME_REASON: {regime_info.get('reasoning', '')}\n"
+            + (f"SYS_EARNINGS_REVISION: {rev_info['direction']}（卖方盈利预期方向，新闻 SUMMARY 粗代理；up={rev_info['up']}/down={rev_info['down']}；已用于中和 earnings 腿后视镜减速，RM 勿重复计入）\n"
+               if rev_info and rev_info["direction"] != "停修" else "")
             + (f"SYS_PARADIGM_CLASS: paradigm（AI/算力硬科技 secular；regime 加速期已走 ride-by-default，下游 RM 直读勿改）\n"
                if is_paradigm else "")
             + (f"SYS_MAIN_BUSINESS: {main_business_seg}（fina_mainbz 产品营收占比，Python 确定性转录；PM 判热门概念归属% 直读此行、禁自行推断）\n"

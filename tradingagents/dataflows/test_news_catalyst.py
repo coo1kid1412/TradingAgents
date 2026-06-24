@@ -8,7 +8,7 @@ LLM 判事件、Python 定方向、催化腿确定性消费，RM 不再二次解
 """
 from tradingagents.dataflows.news_catalyst import (
     aggregate_news_catalyst, parse_sys_catalyst, aggregate_catalyst_calendar,
-    compute_narrative_shift,
+    compute_narrative_shift, compute_earnings_revision, parse_sys_earnings_revision,
 )
 from tradingagents.agents.managers.rm_tools import compute_step6_catalyst_momentum_adjustment as C
 
@@ -105,6 +105,36 @@ def test_narrative_shift():
     print("✓ 叙事切换：水位/动能/论调背离 → 见顶回落/筑底回升预警")
 
 
+def test_earnings_revision():
+    """A：从新闻 SUMMARY 抽卖方上修/下修方向（喂 regime earnings 腿）。"""
+    def nr(patterns=None, events=None):
+        body = "# 新闻\n```yaml\nSUMMARY:\n"
+        if patterns is not None:
+            body += "  cumulative_patterns:\n" + "".join(f"    - {p}\n" for p in patterns)
+        if events is not None:
+            body += "  key_events:\n" + "".join(
+                f"    - title: {t}\n      category: {c}\n" for t, c in events)
+        return body + "```"
+    # 累积模式"多次评级上调" → 上修
+    r = compute_earnings_revision(nr(patterns=["近30日多次评级上调", "机构密集调研"]))
+    assert r["direction"] == "上修" and r["up"] == 1 and r["down"] == 0, r
+    # 累积模式"多次评级下调" → 下修
+    assert compute_earnings_revision(nr(patterns=["多次评级下调"]))["direction"] == "下修"
+    # 机构类事件标题"上调目标价" → 上修
+    r2 = compute_earnings_revision(nr(events=[("中金上调目标价至350元", "机构"), ("行业政策", "行业")]))
+    assert r2["direction"] == "上修", r2
+    # 非机构类事件不计入（行业类"下调"不算盈利下修）
+    r3 = compute_earnings_revision(nr(events=[("行业景气下调", "行业")]))
+    assert r3["direction"] == "停修", r3
+    # 无相关关键词 → 停修；无 SUMMARY → None
+    assert compute_earnings_revision(nr(patterns=["机构密集调研"]))["direction"] == "停修"
+    assert compute_earnings_revision("无 SUMMARY 块") is None
+    # SYS 行往返
+    assert parse_sys_earnings_revision("SYS_EARNINGS_REVISION: 上修（卖方…）") == "上修"
+    assert parse_sys_earnings_revision("无该行") is None
+    print("✓ 盈利上修/下修：累积模式+机构事件 → 上修/停修/下修，非机构不误计")
+
+
 if __name__ == "__main__":
     test_aggregate_bearish_near_term_dominates()
     test_priced_in_discounts()
@@ -113,4 +143,5 @@ if __name__ == "__main__":
     test_feeds_catalyst_leg()
     test_catalyst_calendar()
     test_narrative_shift()
-    print("\n全部 7 组通过 ✅")
+    test_earnings_revision()
+    print("\n全部 8 组通过 ✅")

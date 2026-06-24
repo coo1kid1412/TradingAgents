@@ -1490,6 +1490,7 @@ def compute_valuation_regime(
     cyclical_class: Optional[str] = None,
     roe_pct_rank_10y: Optional[float] = None,
     is_paradigm: bool = False,
+    earnings_revision: Optional[str] = None,
 ) -> dict:
     """客观估值 regime（骑趋势 / 中性 / 收纪律）——六路分析师信号合成，纯 Python 确定性。
 
@@ -1574,6 +1575,20 @@ def compute_valuation_regime(
             legs["earnings"] = 0
             cyc_note = f"；强周期谷底(ROE分位{roe_pct_rank_10y:.2f})盈利差是周期常态，earnings腿抬0"
 
+    # 3c 前瞻盈利上修中和后视镜减速（对标投研：revision 方向才是"骑还是收"的真判据）——
+    #   主升浪里龙头单季高基数回落被 SYS_GROWTH 判 decelerating(-1)，但卖方此时在上修前瞻预期，
+    #   把 -1 中和到 0（前瞻方向优先于后视镜）；下修则把高增速 +1 削到 0（预期恶化预警）。
+    #   ⚠️ 范围克制：只动 earnings 腿，不碰 blowoff 护栏(硬派发仍生效)、不碰 PEG 带——避免把
+    #   澜起式顶部(卖方维持但目标价低于现价、非上修)重新放松。源自新闻粗代理(report_rc 没权限前)。
+    rev_note = ""
+    if earnings_revision and "earnings" in legs:
+        if earnings_revision == "上修" and legs["earnings"] == -1:
+            legs["earnings"] = 0
+            rev_note = "；卖方上修前瞻→earnings后视镜减速-1中和到0(revision方向优先)"
+        elif earnings_revision == "下修" and legs["earnings"] == 1:
+            legs["earnings"] = 0
+            rev_note = "；卖方下修前瞻→earnings高增速+1削到0(预期恶化预警)"
+
     # 4 舆情拥挤
     crowd_vote = 0
     if retail_concentration_signal == "散户高接盘" or (
@@ -1639,7 +1654,8 @@ def compute_valuation_regime(
         regime = "neutral"
 
     reasoning = (f"六路净分={score}（{legs}）→ {regime}"
-                 + ("；peak信号压制不骑" if has_peak_signal else "") + cyc_note + paradigm_note)
+                 + ("；peak信号压制不骑" if has_peak_signal else "")
+                 + cyc_note + rev_note + paradigm_note)
     return {"valuation_regime": regime, "score": score, "legs": legs, "reasoning": reasoning}
 
 

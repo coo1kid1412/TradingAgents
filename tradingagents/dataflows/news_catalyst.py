@@ -92,6 +92,68 @@ def aggregate_news_catalyst(news_report: str) -> Optional[dict]:
             "score": score, "n_events": counted, "nearest": nearest}
 
 
+# 卖方盈利预期上修/下修关键词（成长股 ride 真判据——对标投研：revision 方向决定该骑还是该收，
+# 而非 TTM 后视镜增速）。从新闻 SUMMARY 的累积模式 + 机构类事件里抽，做粗代理(零成本，无 report_rc)。
+_REVISION_UP_KW = (
+    "评级上调", "上调评级", "上调目标价", "目标价上调", "上修", "盈利预测上调",
+    "调高盈利", "上调盈利", "一致预期改善", "预期改善", "上调至", "增持评级",
+)
+_REVISION_DOWN_KW = (
+    "评级下调", "下调评级", "下调目标价", "目标价下调", "下修", "盈利预测下调",
+    "调低盈利", "下调盈利", "一致预期恶化", "预期恶化", "下调至", "减持评级",
+)
+
+
+def compute_earnings_revision(news_report: str) -> Optional[dict]:
+    """从新闻 SUMMARY 抽确定性"盈利预期修正方向"（上修/停修/下修）——喂 regime earnings 腿。
+
+    背景：earnings 腿原只看 TTM 后视镜增速，主升浪里龙头单季高基数回落被判 decelerating→-1，
+    但卖方此时常在**上修前瞻预期**（真正的 ride 判据）。这条把"上修方向"确定性抽出来，让前瞻
+    修正能中和后视镜减速（见 compute_valuation_regime 3c）。report_rc 没权限前的零成本粗代理。
+
+    取数优先级：① cumulative_patterns（agent 已蒸馏的"多次评级上调/下调"≥2家口径，可信度高）；
+    ② 机构类 key_events 标题。两者命中关键词计票，净方向定上修/停修/下修。
+
+    Returns: {direction: 上修/停修/下修, score: up-down, up, down, evidence:[...]}
+             或 None（无 SUMMARY 块）。
+    """
+    summary = _find_summary_yaml(news_report)
+    if not summary:
+        return None
+    blobs: list[str] = []
+    patterns = summary.get("cumulative_patterns")
+    if isinstance(patterns, list):
+        blobs += [str(p) for p in patterns if p]
+    for e in (summary.get("key_events") or []):
+        if isinstance(e, dict) and "机构" in str(e.get("category", "")):
+            blobs.append(str(e.get("title", "")))
+    up = down = 0
+    evidence: list[str] = []
+    for blob in blobs:
+        if any(k in blob for k in _REVISION_UP_KW):
+            up += 1
+            evidence.append(blob[:30])
+        if any(k in blob for k in _REVISION_DOWN_KW):
+            down += 1
+            evidence.append(blob[:30])
+    if up == 0 and down == 0:
+        return {"direction": "停修", "score": 0, "up": 0, "down": 0, "evidence": []}
+    direction = "上修" if up > down else ("下修" if down > up else "停修")
+    return {"direction": direction, "score": up - down, "up": up, "down": down,
+            "evidence": evidence[:3]}
+
+
+_SYS_REVISION_RE = re.compile(r"SYS_EARNINGS_REVISION:\s*(?P<dir>上修|停修|下修)")
+
+
+def parse_sys_earnings_revision(text: str) -> Optional[str]:
+    """从注入文本解析 SYS_EARNINGS_REVISION 方向回来（下游确定性消费用）。"""
+    if not text:
+        return None
+    m = _SYS_REVISION_RE.search(text)
+    return m.group("dir") if m else None
+
+
 _SYS_CATALYST_RE = re.compile(
     r"SYS_CATALYST:\s*direction=(?P<dir>[-\d]+)\s*\|\s*strength=(?P<str>\w+)"
     r"\s*\|\s*score=(?P<score>[-\d]+)"

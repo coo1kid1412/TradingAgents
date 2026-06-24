@@ -283,6 +283,36 @@ def test_earnings_accelerating_votes_positive():
     assert r["legs"]["earnings"] == 1, r
 
 
+def test_earnings_revision_up_neutralizes_deceleration():
+    """A：卖方上修前瞻 → 后视镜减速 -1 中和到 0（主升浪龙头单季高基数回落不该判 discipline）。"""
+    base = dict(momentum_score=55, net_profit_growth=0.58, growth_direction="decelerating",
+                capital_flow_regime="中性", theme_stage_inferred="none")
+    r0 = compute_valuation_regime(**base)
+    assert r0["legs"]["earnings"] == -1                       # 无上修：减速 -1
+    r1 = compute_valuation_regime(**base, earnings_revision="上修")
+    assert r1["legs"]["earnings"] == 0, r1                    # 上修：中和到 0（非 +1，不过度）
+    assert "revision方向优先" in r1["reasoning"]
+    # 上修不凭空把非减速的腿抬高：earnings 已是 +1 时上修不动它
+    r2 = compute_valuation_regime(momentum_score=55, net_profit_growth=0.58,
+                                  growth_direction="accelerating", capital_flow_regime="中性",
+                                  theme_stage_inferred="none", earnings_revision="上修")
+    assert r2["legs"]["earnings"] == 1, r2
+
+
+def test_earnings_revision_down_cuts_high_growth():
+    """A：卖方下修 → 高增速 +1 削到 0（预期恶化预警，即便 TTM 增速仍高）。"""
+    r = compute_valuation_regime(
+        momentum_score=55, net_profit_growth=0.58, growth_direction="accelerating",
+        capital_flow_regime="中性", theme_stage_inferred="none", earnings_revision="下修")
+    assert r["legs"]["earnings"] == 0, r
+    assert "预期恶化预警" in r["reasoning"]
+    # 停修不动腿
+    r2 = compute_valuation_regime(
+        momentum_score=55, net_profit_growth=0.58, growth_direction="accelerating",
+        capital_flow_regime="中性", theme_stage_inferred="none", earnings_revision="停修")
+    assert r2["legs"]["earnings"] == 1, r2
+
+
 def test_distribution_leg():
     r = compute_valuation_regime(
         momentum_score=55, net_profit_growth=0.2, capital_flow_regime="中性",
