@@ -1471,6 +1471,11 @@ def parse_distribution_signals(news_str: str, fund_str: str = "", sentiment_str:
     return {"detected": len(reasons) > 0, "reasons": reasons}
 
 
+# blowoff 护栏价格极端门：获利盘≥此值=狂热接盘(顶部温床)，与 RSI 1年分位≥85 并列作"价格极端"。
+# 同 capital_flow_utils._WINNER_RATE_EUPHORIA_PCT(派发腿2)；范式股 blowoff 须"派发+价格极端"共振。
+_BLOWOFF_WINNER_EUPHORIA_PCT = 85.0
+
+
 def compute_valuation_regime(
     *,
     momentum_score: Optional[float] = None,
@@ -1491,6 +1496,7 @@ def compute_valuation_regime(
     roe_pct_rank_10y: Optional[float] = None,
     is_paradigm: bool = False,
     earnings_revision: Optional[str] = None,
+    winner_rate_pct: Optional[float] = None,
 ) -> dict:
     """客观估值 regime（骑趋势 / 中性 / 收纪律）——六路分析师信号合成，纯 Python 确定性。
 
@@ -1625,9 +1631,18 @@ def compute_valuation_regime(
     paradigm_note = ""
     ride_threshold = 2
     if is_paradigm and legs.get("earnings") == 1:
+        # blowoff 护栏（Option A）：peak信号 / 趋势破位 是**价格行为**硬证据，单独成立即否决 ride；
+        # 但"散户高接盘"是**筹码派发(流向)**信号、不等于价格 blowoff——必须叠加**价格极端**
+        # (RSI 1年分位≥85 或 获利盘≥85% 狂热) 才算真抛物线顶。否则把"已回调/趋势健康但散户参与
+        # 升高"的龙头误判见顶(天孚实测：6/12 已跌32%、获利盘74%、RSI中段，无价格 blowoff，却被
+        # 筹码派发信号否决 ride)。派发的看空已由 capital/crowding 两腿承担，不让同一信号第三次否决。
+        price_extreme = (
+            (rsi_percentile_1y is not None and rsi_percentile_1y >= 85)
+            or (winner_rate_pct is not None and winner_rate_pct >= _BLOWOFF_WINNER_EUPHORIA_PCT)
+        )
         blowoff = (has_peak_signal
                    or legs.get("tech") == -1
-                   or retail_concentration_signal == "散户高接盘")
+                   or (retail_concentration_signal == "散户高接盘" and price_extreme))
         if not blowoff:
             ride_threshold = 1
             if legs.get("crowding") == -1:   # 此时非散户高接盘(否则 blowoff)，纯反拥挤分 → 主升浪常态抬0
@@ -1636,7 +1651,7 @@ def compute_valuation_regime(
             else:
                 paradigm_note = "；范式成长加速期：ride门槛降至+1（无blowoff证据）"
         else:
-            paradigm_note = "；范式股但 blowoff硬证据(peak/破位/散户高接盘)→反转失效，回纪律"
+            paradigm_note = "；范式股但 blowoff硬证据(peak/破位/散户高接盘+价格极端)→反转失效，回纪律"
 
     score = sum(legs.values())
     # 有效路 < 3 → 数据不足，给 neutral（不轻易骑/收）

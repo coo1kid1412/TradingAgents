@@ -203,7 +203,8 @@ def _fetch_fundamentals_raw(ticker: str, trade_date: str) -> str:
 
 def _parse_capital_flow_signals(cf_yaml: str) -> dict:
     """从 capital_flow_yaml 抽 valuation_regime 需要的资金面信号（容错，缺失返回 None）。"""
-    out = {"regime": None, "streak": None, "lhb_inst_dir": None, "retail_signal": None, "score": None}
+    out = {"regime": None, "streak": None, "lhb_inst_dir": None, "retail_signal": None,
+           "score": None, "winner_rate": None}
     if not cf_yaml:
         return out
 
@@ -233,6 +234,11 @@ def _parse_capital_flow_signals(cf_yaml: str) -> dict:
         out["score"] = float(sc) if sc is not None else None
     except ValueError:
         out["score"] = None
+    wr = _grab("winner_rate_pct")
+    try:
+        out["winner_rate"] = float(wr) if wr is not None else None
+    except ValueError:
+        out["winner_rate"] = None
     return out
 
 
@@ -451,6 +457,7 @@ def create_stock_profile_node(llm):
             roe_pct_rank_10y=cyc_info["roe_pct_rank"] if cyc_info else None,
             is_paradigm=is_paradigm,
             earnings_revision=earnings_revision,
+            winner_rate_pct=cf_sig["winner_rate"],
         )
         valuation_regime = regime_info["valuation_regime"]
         if dist_sig["detected"]:

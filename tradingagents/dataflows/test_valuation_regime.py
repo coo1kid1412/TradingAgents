@@ -150,22 +150,37 @@ def test_paradigm_ride_in_acceleration():
 
 
 def test_paradigm_blowoff_guard_no_ride():
-    """范式股但 blowoff（peak/派发/破位）→ 反转失效，不骑顶（天孚式）。"""
-    # 天孚式：破位(动量弱) + peak + 派发
+    """范式股但 blowoff（peak/破位）→ 反转失效，不骑顶。"""
+    # 破位(动量弱) + peak → 价格行为硬证据，单独成立即否决 ride
     r = compute_valuation_regime(
         momentum_score=30, rsi_percentile_1y=30, has_peak_signal=True,
         capital_flow_regime="中性", main_force_streak_days=-1, lhb_inst_direction=0,
         net_profit_growth=0.5, retail_concentration_signal="中性",
         theme_stage_inferred="peak", quant_anticrowding=50, is_paradigm=True)
     assert r["valuation_regime"] != "ride", r   # 破位+peak → 护栏生效
-    # 散户高接盘也触发护栏
-    r2 = compute_valuation_regime(
-        momentum_score=70, rsi_percentile_1y=80, has_peak_signal=False,
+
+
+def test_paradigm_blowoff_needs_price_extreme():
+    """Option A：散户高接盘(筹码派发)非价格 blowoff——须叠加价格极端(RSI≥85/获利盘≥85)才否决 ride。
+    天孚式：散户高接盘但已回调(RSI中段/获利盘74%)→ 不再误判见顶，ride 反转生效。"""
+    # 边际组合(theme=none)：靠范式反转(crowding抬0+门槛降1)才骑得起来，便于看护栏是否生效
+    base = dict(
+        momentum_score=70, rsi_percentile_1y=55, has_peak_signal=False,
         capital_flow_regime="中性", main_force_streak_days=1,
         net_profit_growth=0.5, retail_concentration_signal="散户高接盘",
-        theme_stage_inferred="acceleration", quant_anticrowding=25, is_paradigm=True)
-    # 散户高接盘 → blowoff → 不降门槛；crowding 因散户高接盘本就 -1
-    assert r2["legs"]["crowding"] == -1, r2
+        theme_stage_inferred="none", quant_anticrowding=25, is_paradigm=True)
+    # 无价格极端(RSI55/无获利盘)：散户高接盘不构成 blowoff → 反转生效(crowding 抬0+门槛降) → ride
+    r = compute_valuation_regime(**base)
+    assert r["legs"]["crowding"] == 0, r          # 反转生效，拥挤腿抬 0
+    assert r["valuation_regime"] == "ride", r
+    # 获利盘≥85% 狂热 → 价格极端成立 → blowoff 触发 → 反转失效，crowding 仍 -1，不骑
+    r_wr = compute_valuation_regime(**base, winner_rate_pct=88)
+    assert r_wr["legs"]["crowding"] == -1, r_wr
+    assert r_wr["valuation_regime"] != "ride", r_wr
+    # RSI 1年分位≥85 → 价格极端成立 → blowoff 触发（且超买使 tech 腿落 0）
+    r_rsi = compute_valuation_regime(**{**base, "rsi_percentile_1y": 90})
+    assert r_rsi["legs"]["crowding"] == -1, r_rsi
+    assert r_rsi["valuation_regime"] != "ride", r_rsi
 
 
 def test_paradigm_stale_soft_distribution_not_blocks_ride():
