@@ -15,6 +15,7 @@ from tradingagents.dataflows.profile_calc import (
     parse_sys_net_growth_components,
     compute_deterministic_peg_inputs,
     compute_peg_band,
+    compute_peg_leg_target,
     detect_paradigm_growth,
     parse_sys_paradigm,
     compute_cyclical_scenario_target,
@@ -198,6 +199,22 @@ def test_cyclical_scenario_target():
     # 两腿接近(非周期式)→ normal 置信
     r3 = compute_cyclical_scenario_target(10.0, 11.0, 20, "mid", 0.9, 1.2)
     assert r3["confidence"] == "normal"
+
+
+def test_peg_leg_target():
+    """确定性 PEG 腿目标价（天孚实测复现）：钉死后不再被 RM 现场塞错参数。"""
+    # 天孚 06-24：前瞻 EPS 3.8 / 增速 45 / neutral PEG 带 0.9-1.2
+    r = compute_peg_leg_target(forward_eps=3.8, growth_pct=45, peg_low=0.9, peg_high=1.2)
+    # 正确值 = 3.8×(0.9×45) ~ 3.8×(1.2×45) = 153.9 ~ 205.2，中位 179.55
+    assert (r["low"], r["mid"], r["high"]) == (153.9, 179.55, 205.2), r
+    # 隐含 PE = PEG×增速 = 40.5 ~ 54（绝非 RM 乱填出的 90-120）
+    assert r["implied_pe_range"] == [40.5, 54.0], r
+    # discipline 带 0.8-1.0 → 更低
+    r2 = compute_peg_leg_target(3.8, 45, 0.8, 1.0)
+    assert (r2["low"], r2["high"]) == (136.8, 171.0), r2
+    # 缺前瞻 EPS/增速 → None（退回原路径）
+    assert compute_peg_leg_target(None, 45, 0.9, 1.2) is None
+    assert compute_peg_leg_target(3.8, 0, 0.9, 1.2) is None
 
 
 def test_insufficient_data_neutral():

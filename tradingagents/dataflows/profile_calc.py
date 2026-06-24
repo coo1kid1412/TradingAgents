@@ -1197,6 +1197,35 @@ def compute_peg_band(valuation_regime: Optional[str],
     return (low, high)
 
 
+def compute_peg_leg_target(
+    forward_eps: Optional[float],
+    growth_pct: Optional[float],
+    peg_low: float,
+    peg_high: float,
+) -> Optional[dict]:
+    """确定性 PEG 腿目标价（= compute_peg_target_price 同公式），Python 算死供 RM Step4 直读。
+
+    根治成长股 PEG 腿被 LLM 现场乱填参数致目标价摆动：天孚同股同输入(前瞻EPS 3.8/增速45/
+    PEG 0.9-1.2)三跑 PEG 腿 194↔269↔342-456 乱跳，把 SELL 抬成 HOLD——根因是 RM 调
+    compute_peg_target_price 时无视 SYS_PEG_BAND/SYS_PEG_GROWTH_PCT，自塞高一倍的增速/PEG。
+    钉死后 RM 直读 SYS_PEG_TARGET_PRICE，不再有塞错参数的入口。
+
+    目标价 = forward_eps × (PEG × 增速%)，隐含 PE = PEG × 增速%（同 rm_tools.compute_peg_target_price）。
+
+    Returns: {low, mid, high, implied_pe_range} 或 None（缺前瞻 EPS/增速）。
+    """
+    if (forward_eps is None or growth_pct is None
+            or forward_eps <= 0 or growth_pct <= 0):
+        return None
+    low = round(forward_eps * peg_low * growth_pct, 2)
+    high = round(forward_eps * peg_high * growth_pct, 2)
+    mid = round((low + high) / 2, 2)
+    return {
+        "low": low, "mid": mid, "high": high,
+        "implied_pe_range": [round(peg_low * growth_pct, 1), round(peg_high * growth_pct, 1)],
+    }
+
+
 # 强周期股正常化腿的 mid-cycle PE 带（对标投研：周期股峰值盈利不可线性外推，给跨周期合理倍数）。
 # 存储/面板类 10-15x 是行业惯用 mid-cycle 区间。⚠️ TODO(harness 超参)：待回测校准。
 _CYCLICAL_NORMALIZE_PE_BAND = (10.0, 15.0)

@@ -53,6 +53,7 @@ from tradingagents.dataflows.profile_calc import (
     parse_sys_net_growth_components,
     compute_deterministic_peg_inputs,
     compute_peg_band,
+    compute_peg_leg_target,
     compute_peer_anchored_pe_cap,
     compute_valuation_regime,
     parse_growth_deceleration,
@@ -1063,9 +1064,24 @@ TRANSPARENCY:
                 f"（regime={valuation_regime} 派生；PEG 腿 target_peg_low/high 照此调"
                 f" compute_peg_target_price，禁自选倍数）\n"
             )
-            logger.info("SYS_PEG 已注入画像: growth=%s%% fwd_eps=%s conf=%s band=%s-%s",
+            # 确定性 PEG 腿目标价（Python 算死，RM Step4 直读）——根治成长股 PEG 腿摆动：
+            # 天孚同输入(EPS3.8/增速45/PEG0.9-1.2)三跑 194↔269↔342-456 乱跳，根因是 RM 调
+            # compute_peg_target_price 时无视 SYS 值自塞高一倍参数。钉死后无塞错入口。
+            peg_tgt = compute_peg_leg_target(
+                forward_eps=peg_det['forward_eps'],
+                growth_pct=peg_det['peg_growth_pct'],
+                peg_low=peg_low, peg_high=peg_high,
+            )
+            if peg_tgt is not None:
+                content = content + (
+                    f"<!-- ⚠️SYS_PEG_TARGET_PRICE｜Python 确定性 PEG 腿目标价(算死)，RM Step4 PEG 腿直读勿重算 -->\n"
+                    f"SYS_PEG_TARGET_PRICE: low={peg_tgt['low']} mid={peg_tgt['mid']} high={peg_tgt['high']}"
+                    f"（= SYS_FORWARD_EPS×(SYS_PEG_BAND×SYS_PEG_GROWTH_PCT)，隐含PE {peg_tgt['implied_pe_range'][0]}-{peg_tgt['implied_pe_range'][1]}；"
+                    f"**RM Step4 PEG 腿直读此三值，禁再调 compute_peg_target_price 重填参数**）\n"
+                )
+            logger.info("SYS_PEG 已注入画像: growth=%s%% fwd_eps=%s conf=%s band=%s-%s peg_tgt=%s",
                         peg_det['peg_growth_pct'], peg_det['forward_eps'], peg_det['confidence'],
-                        peg_low, peg_high)
+                        peg_low, peg_high, (peg_tgt or {}).get('mid'))
 
             # 强周期股双轨情景目标价（确定性算死，RM Step4 直读，根治"硬平均两腿致摆动"）——
             # bear=周期均值回归(正常化×mid-cycle PE) / bull=结构成长(前瞻PEG) / base=位置权重概率加权；
