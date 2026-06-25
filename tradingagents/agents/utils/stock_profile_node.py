@@ -1076,12 +1076,23 @@ TRANSPARENCY:
             )
             # 确定性 PEG 倍数带（regime 派生）——治 RM 自拍 PEG 倍数致目标价摆动（澜起 274↔189）。
             # RM Step4 PEG 腿必须用此带调 compute_peg_target_price，禁自选 0.8↔2.4 乱拍。
-            peg_low, peg_high = compute_peg_band(valuation_regime, peg_det['confidence'])
+            # 范式 ride 档（Phase2②）：范式股 + 确认 ride + earnings腿=+1 → 抬到 1.2-1.8（secular
+            # 多年跑道只由 PEG 这一通道表达，避免与多年 EPS 双重计入）。闸门里 confidence 由函数把关。
+            is_paradigm_ride = (
+                is_paradigm and valuation_regime == "ride"
+                and regime_info.get("legs", {}).get("earnings") == 1
+            )
+            peg_low, peg_high = compute_peg_band(
+                valuation_regime, peg_det['confidence'], is_paradigm_ride=is_paradigm_ride)
             content = content + (
                 f"SYS_PEG_BAND: low={peg_low} high={peg_high}"
-                f"（regime={valuation_regime} 派生；PEG 腿 target_peg_low/high 照此调"
-                f" compute_peg_target_price，禁自选倍数）\n"
+                + (f"（范式成长 ride 档：secular 龙头多年跑道，PEG 腿 target_peg_low/high 照此调"
+                   f" compute_peg_target_price，禁自选倍数）\n" if is_paradigm_ride else
+                   f"（regime={valuation_regime} 派生；PEG 腿 target_peg_low/high 照此调"
+                   f" compute_peg_target_price，禁自选倍数）\n")
             )
+            if is_paradigm_ride:
+                logger.info("SYS_PEG_BAND 范式 ride 档生效: %s-%s (secular 龙头)", peg_low, peg_high)
             # 确定性 PEG 腿目标价（Python 算死，RM Step4 直读）——根治成长股 PEG 腿摆动：
             # 天孚同输入(EPS3.8/增速45/PEG0.9-1.2)三跑 194↔269↔342-456 乱跳，根因是 RM 调
             # compute_peg_target_price 时无视 SYS 值自塞高一倍参数。钉死后无塞错入口。

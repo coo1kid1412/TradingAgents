@@ -30,11 +30,17 @@ def test_peg_band_by_regime():
     assert compute_peg_band(None) == (0.9, 1.2)          # 缺 regime → 中性档
     assert compute_peg_band("ride", "low") == (1.0, 1.1)  # 低置信前瞻压上沿
     assert compute_peg_band("neutral", "low") == (0.9, 1.1)
+    # 范式 ride 档（Phase2②）：paradigm+ride+earnings=+1 → 1.2-1.8
+    assert compute_peg_band("ride", "", is_paradigm_ride=True) == (1.2, 1.8)
+    # 低基数尖峰(confidence=low)不享范式高沿 → 退回通用 ride 再压
+    assert compute_peg_band("ride", "low", is_paradigm_ride=True) == (1.0, 1.1)
+    # 非 ride 不受 is_paradigm_ride 影响（调用方只在 ride+earnings=+1 时才传 True，双保险）
+    assert compute_peg_band("neutral", "", is_paradigm_ride=False) == (0.9, 1.2)
     # 下限 ≤ 上限恒成立
     for reg in ("ride", "neutral", "discipline", None):
         lo, hi = compute_peg_band(reg)
         assert lo <= hi
-    print("✓ PEG 带按 regime 派生，低置信压上沿，下限≤上限")
+    print("✓ PEG 带按 regime 派生（含范式 ride 档 1.2-1.8），低置信压上沿，下限≤上限")
 
 
 def test_deterministic_peg_inputs():

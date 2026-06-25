@@ -1187,12 +1187,26 @@ _PEG_BAND_BY_REGIME = {
     "discipline": (0.8, 1.0),   # 弱基本面（减速/派发/流出）：折价，不追
 }
 
+# 范式成长 ride 档（Phase 2 ②）：AI/算力硬科技 secular 龙头在确认 ride 时，比通用 ride
+# (1.0-1.5) 抬一档——对标卖方对 AI 龙头爬坡期常给 PEG 1.5-2.5，此处取**保守**上沿避免追顶。
+# 闸门严（见 compute_peg_band：is_paradigm_ride 须 paradigm+ride+earnings腿==1，且 confidence
+# 非 low 才享高沿）。⚠️ TODO(harness 超参)：上沿 1.8 待 T+30 回测校准，偏多则下调。
+_PARADIGM_RIDE_PEG_BAND = (1.2, 1.8)
+
 
 def compute_peg_band(valuation_regime: Optional[str],
-                     peg_confidence: Optional[str] = "") -> tuple[float, float]:
-    """regime → (PEG 下限, PEG 上限)。低置信前瞻时上沿压回（不为不确定的 EPS 付溢价）。"""
+                     peg_confidence: Optional[str] = "",
+                     is_paradigm_ride: bool = False) -> tuple[float, float]:
+    """regime → (PEG 下限, PEG 上限)。低置信前瞻时上沿压回（不为不确定的 EPS 付溢价）。
+
+    is_paradigm_ride=True（范式股 + 确认 ride + earnings腿=+1，由调用方判定）→ 用范式 ride 档
+    (1.2-1.8) 表达 secular 多年跑道；但**低置信前瞻(低基数尖峰)不享高沿**，退回通用 ride 再压。
+    """
+    conf_low = (peg_confidence or "").strip().lower() == "low"
+    if is_paradigm_ride and not conf_low:
+        return _PARADIGM_RIDE_PEG_BAND   # 范式 ride 档；多年 secular 跑道只由 PEG 这一通道表达
     low, high = _PEG_BAND_BY_REGIME.get((valuation_regime or "").strip().lower(), (0.9, 1.2))
-    if (peg_confidence or "").strip().lower() == "low":
+    if conf_low:
         high = min(high, 1.1)
     return (low, high)
 
