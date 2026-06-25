@@ -236,6 +236,25 @@ def test_ai_main_uptrend_blocked_by_distribution_blowoff():
     assert any("blowoff" in x or "价格极端" in x for x in r["blockers"])
 
 
+def test_ai_main_uptrend_corrected_leader_not_blocked():
+    """天孚 06-26 修复：散户高接盘 + 获利盘 88% 但 RSI 35-40分位(已回调) →
+    价格极端不成立(纯 RSI 判定) → blowoff 不再 block AI 主升升档资格。"""
+    from tradingagents.dataflows.profile_calc import _is_price_blowoff_extreme
+    # 共享 helper：纯价格行为(RSI≥85)，获利盘不参与
+    assert _is_price_blowoff_extreme(90) is True
+    assert _is_price_blowoff_extreme(40) is False
+    assert _is_price_blowoff_extreme(None) is False
+    r = compute_ai_main_uptrend_signal(
+        company_name="天孚通信", industry="光器件", main_business="光器件 90%",
+        is_paradigm=True, net_profit_growth=0.5, momentum_score=86,
+        theme_stage_inferred="acceleration", valuation_regime="ride",
+        retail_concentration_signal="散户高接盘",
+        rsi_percentile_1y=38,    # 已回调，35-40 分位
+        winner_rate_pct=88,      # 获利盘高，但不再当价格极端
+    )
+    assert not any("blowoff" in x or "价格极端" in x for x in r["blockers"]), r
+
+
 def test_paradigm_ride_in_acceleration():
     """范式股加速期：原本 neutral 的边际组合(拥挤拖累)，反转后 → ride。"""
     base = dict(
@@ -263,23 +282,23 @@ def test_paradigm_blowoff_guard_no_ride():
 
 
 def test_paradigm_blowoff_needs_price_extreme():
-    """Option A：散户高接盘(筹码派发)非价格 blowoff——须叠加价格极端(RSI≥85/获利盘≥85)才否决 ride。
-    天孚式：散户高接盘但已回调(RSI中段/获利盘74%)→ 不再误判见顶，ride 反转生效。"""
+    """blowoff 的"价格极端"= 纯价格行为(RSI 1年分位≥85)，**不含滞后的获利盘**。
+    天孚式：散户高接盘 + 已回调(RSI 中低位)即便获利盘高 → 不再误判见顶，ride 反转生效。"""
     # 边际组合(theme=none)：靠范式反转(crowding抬0+门槛降1)才骑得起来，便于看护栏是否生效
     base = dict(
         momentum_score=70, rsi_percentile_1y=55, has_peak_signal=False,
         capital_flow_regime="中性", main_force_streak_days=1,
         net_profit_growth=0.5, retail_concentration_signal="散户高接盘",
         theme_stage_inferred="none", quant_anticrowding=25, is_paradigm=True)
-    # 无价格极端(RSI55/无获利盘)：散户高接盘不构成 blowoff → 反转生效(crowding 抬0+门槛降) → ride
+    # 无价格极端(RSI55)：散户高接盘不构成 blowoff → 反转生效(crowding 抬0+门槛降) → ride
     r = compute_valuation_regime(**base)
     assert r["legs"]["crowding"] == 0, r          # 反转生效，拥挤腿抬 0
     assert r["valuation_regime"] == "ride", r
-    # 获利盘≥85% 狂热 → 价格极端成立 → blowoff 触发 → 反转失效，crowding 仍 -1，不骑
+    # 关键回归：获利盘 88%≥85 但 RSI 仅 55(已回调) → **不再**触发 blowoff → 仍骑（天孚 06-26 修复）
     r_wr = compute_valuation_regime(**base, winner_rate_pct=88)
-    assert r_wr["legs"]["crowding"] == -1, r_wr
-    assert r_wr["valuation_regime"] != "ride", r_wr
-    # RSI 1年分位≥85 → 价格极端成立 → blowoff 触发（且超买使 tech 腿落 0）
+    assert r_wr["legs"]["crowding"] == 0, r_wr
+    assert r_wr["valuation_regime"] == "ride", r_wr
+    # 仅当 RSI 1年分位≥85（真价格极端）→ blowoff 触发（且超买使 tech 腿落 0）→ 不骑
     r_rsi = compute_valuation_regime(**{**base, "rsi_percentile_1y": 90})
     assert r_rsi["legs"]["crowding"] == -1, r_rsi
     assert r_rsi["valuation_regime"] != "ride", r_rsi

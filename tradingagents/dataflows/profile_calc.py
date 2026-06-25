@@ -578,10 +578,9 @@ def compute_ai_main_uptrend_signal(
         blockers.append("扣非/主业亏损")
     if has_peak_signal:
         blockers.append("peak信号触发")
-    price_extreme = (
-        (rsi_percentile_1y is not None and rsi_percentile_1y >= 85)
-        or (winner_rate_pct is not None and winner_rate_pct >= _BLOWOFF_WINNER_EUPHORIA_PCT)
-    )
+    # 价格极端=纯价格行为(RSI≥85)，不含滞后的获利盘——见 _is_price_blowoff_extreme。
+    # winner_rate_pct 入参保留(向后兼容/未来扩展)，当前不参与 blowoff 判定。
+    price_extreme = _is_price_blowoff_extreme(rsi_percentile_1y)
     if retail_concentration_signal == "散户高接盘" and price_extreme:
         blockers.append("散户高接盘+价格极端 blowoff")
     if earnings_revision == "下修":
@@ -1634,9 +1633,23 @@ def parse_distribution_signals(news_str: str, fund_str: str = "", sentiment_str:
     return {"detected": len(reasons) > 0, "reasons": reasons, "stale_skipped": stale_skipped}
 
 
-# blowoff 护栏价格极端门：获利盘≥此值=狂热接盘(顶部温床)，与 RSI 1年分位≥85 并列作"价格极端"。
-# 同 capital_flow_utils._WINNER_RATE_EUPHORIA_PCT(派发腿2)；范式股 blowoff 须"派发+价格极端"共振。
-_BLOWOFF_WINNER_EUPHORIA_PCT = 85.0
+# blowoff 护栏"价格极端"门槛：RSI 1年分位≥此值=真抛物线/超买顶（**纯价格行为**）。
+_BLOWOFF_RSI_PCTL = 85.0
+
+
+def _is_price_blowoff_extreme(rsi_percentile_1y: Optional[float]) -> bool:
+    """blowoff 护栏的"价格极端"判定——**纯价格行为**(RSI 1年分位≥85)，单一真值源。
+
+    ⚠️ 刻意**不含获利盘(winner_rate)**：获利盘是滞后筹码指标，个股冲高后回调仍多数浮盈
+    → 获利盘照样高，会把**已回调、RSI 中低位**的票误判成"价格见顶"，从而同时掐死范式
+    ride 档与 AI 主升升档（天孚 06-26 实测：RSI 45.69/35-40分位明显回调，却因获利盘 86%
+    误触 blowoff→压在 neutral→SELL，而同期花旗目标价 419）。获利盘的"派发"含义已在
+    compute_distribution_into_retail(散户高接盘合成,派发腿2)表达，不在此处再冒充价格信号。
+
+    compute_valuation_regime(regime blowoff) 与 compute_ai_main_uptrend_signal(AI主升 blocker)
+    共用此判定，保证两处"价格极端"定义一致、不分叉。
+    """
+    return rsi_percentile_1y is not None and rsi_percentile_1y >= _BLOWOFF_RSI_PCTL
 
 
 def compute_valuation_regime(
@@ -1796,13 +1809,11 @@ def compute_valuation_regime(
     if is_paradigm and legs.get("earnings") == 1:
         # blowoff 护栏（Option A）：peak信号 / 趋势破位 是**价格行为**硬证据，单独成立即否决 ride；
         # 但"散户高接盘"是**筹码派发(流向)**信号、不等于价格 blowoff——必须叠加**价格极端**
-        # (RSI 1年分位≥85 或 获利盘≥85% 狂热) 才算真抛物线顶。否则把"已回调/趋势健康但散户参与
-        # 升高"的龙头误判见顶(天孚实测：6/12 已跌32%、获利盘74%、RSI中段，无价格 blowoff，却被
-        # 筹码派发信号否决 ride)。派发的看空已由 capital/crowding 两腿承担，不让同一信号第三次否决。
-        price_extreme = (
-            (rsi_percentile_1y is not None and rsi_percentile_1y >= 85)
-            or (winner_rate_pct is not None and winner_rate_pct >= _BLOWOFF_WINNER_EUPHORIA_PCT)
-        )
+        # (RSI 1年分位≥85，纯价格行为) 才算真抛物线顶。价格极端判定收敛到 _is_price_blowoff_extreme
+        # 单一真值源（**已剔除滞后的获利盘**：天孚 06-26 RSI 35-40分位明显回调、获利盘 86% 误触，
+        # 把范式 ride 档+AI主升升档一锅端，而同期花旗目标价 419）。派发的看空已由 capital/crowding
+        # 两腿承担，不让同一信号第三次否决 ride。winner_rate_pct 入参保留但不再参与判定。
+        price_extreme = _is_price_blowoff_extreme(rsi_percentile_1y)
         blowoff = (has_peak_signal
                    or legs.get("tech") == -1
                    or (retail_concentration_signal == "散户高接盘" and price_extreme))
