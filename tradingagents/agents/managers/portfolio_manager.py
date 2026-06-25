@@ -1,4 +1,5 @@
 import logging
+import json
 
 from langchain_core.messages import HumanMessage
 
@@ -42,6 +43,12 @@ def create_portfolio_manager(llm, memory):
         stock_profile = state.get("stock_profile", "")
         quant_score = state.get("quant_score", "")
         sector_comparison = state.get("sector_comparison", "")
+        market_risk_snapshot = state.get("market_risk_snapshot") or {}
+        market_risk_block = (
+            json.dumps(market_risk_snapshot, ensure_ascii=False, indent=2)
+            if market_risk_snapshot
+            else "未找到当日市场风险快照：不得假设低风险；短期动作只能为 WAIT，仓位为 0%。"
+        )
 
         # 决策卡头部信息
         pm_ticker = state["company_of_interest"]
@@ -62,20 +69,32 @@ def create_portfolio_manager(llm, memory):
 
 ## ⚠️ 数值计算必须调用工具（强制约束）
 
-你已绑定 3 个计算工具。**以下数值必须通过工具调用完成，禁止心算**：
+你已绑定 4 个计算工具。**以下数值必须通过工具调用完成，禁止心算**：
 
 | 计算场景 | 必须调用的工具 |
 |---------|-------------|
 | 1R / TP1-3 / SL_soft / SL_hard 完整 R-multiple 价位体系 | `compute_r_multiple_levels`（输入 Entry + SL_hard）|
 | Conviction 五星 + 仓位上限（基于 RM Conviction + 赔率 R，\|d\| 仅微调）| `compute_conviction_position_map` |
 | 4 情景概率加权 E（含黑天鹅档）| `compute_pm_scenario_e` |
+| 市场风险闸门后的实际动作与仓位 | `apply_market_risk_gate` |
 
 **规则**：
 - 决定 Entry 和 SL_hard 后**必须**调 `compute_r_multiple_levels` 算 TP1/TP2/TP3/SL_soft，**禁止心算"+1R/+2R/+3R"**
 - 决定 Conviction 时**必须**调 `compute_conviction_position_map`，仓位严格采用工具返回的区间
 - 输出 4 情景表后**必须**调 `compute_pm_scenario_e` 算加权 E，**禁止自己加权**
+- 决定原始 Action/Size 后**必须**调 `apply_market_risk_gate`；Trade Ticket 与 PM_SUMMARY 只能使用工具返回的 effective 值
 
 {instrument_context}
+
+## 当日 Market Risk Officer 快照（硬约束）
+
+```json
+{market_risk_block}
+```
+
+该快照不改变 RM 的长期评级，但严格约束短期动作：`WAIT` 时禁止 BUY_NOW/追高；
+`CONDITIONAL` 时 BUY_NOW 必须改为条件入场；建议仓位不得超过 `position_cap_pct`。
+快照缺失等同于 WAIT + 0% 仓位。必须在决策卡与入场时机中引用 as_of_date/as_of_time。
 
 ---
 
@@ -366,6 +385,9 @@ PM 必须明确"thesis 兑现"的具体里程碑（如"Q2 营收增速 >25%"、"
 | Conviction 信心 | <⭐⭐⭐ Medium>（RM=高/中/低，R=X.XX，\|d\|=X.XX） |
 | 投资判断 | <YES / NO / CONDITIONAL>（含等待条件） |
 | 入场判断 | <BUY NOW / WAIT / DON'T BUY>（含等待条件） |
+| Market Risk 市场风险 | <风险等级> / <T+1 偏向>，快照生效 <as_of_date as_of_time> |
+| 未来 5 日趋势 | <上涨 / 震荡 / 下跌>（置信度：高/中/低；失效条件：__） |
+| 12 月主题判断 | <扩张 / 兑现 / 降速 / 破裂>（增长兑现/估值溢价/拥挤度：__） |
 
 ### 核心交易参数（Trade Parameters）
 
@@ -393,6 +415,7 @@ PM 必须明确"thesis 兑现"的具体里程碑（如"Q2 营收增速 >25%"、"
 | **资金面快照（主力 vs 散户）** | **主力**：近5日净流入 __亿/近20日 __亿（capital_flow_score __/100，regime __，DDX 1年分位 __）；**筹码迁徙**：股东户数环比 __%（**截至 __ 季报**，填 `holder_num_latest_report_date`；↑=机构派发给散户/顶部，↓=筹码集中/吸筹；缺失则写"股东户数数据缺失"）；**散户接盘**：__（散户高接盘/中性）；近 __ 日主力连续净流入/流出 → 主导方为 **主力/散户** |
 | Core Thesis 核心逻辑 | 1. __ 2. __ 3. __（每条 ≤30 字，单行编号）|
 | Key Risks 核心风险 | 1. __ 2. __ 3. __（每条 ≤30 字，单行编号）|
+| 市场闸门 | <OPEN / CONDITIONAL / WAIT>；新增仓位上限 <X>%；必须为 `apply_market_risk_gate` 的工具返回值 |
 
 ### 热门概念归属（这股属于哪个最热的板块/概念，占主营多少）
 
@@ -484,6 +507,8 @@ PM 必须明确"thesis 兑现"的具体里程碑（如"Q2 营收增速 >25%"、"
 2. **## 一、投资决策与入场时机**
    - **### 1.1 投资判断**（该不该投资？YES / NO / CONDITIONAL）—— 1 段推理 + 条件
    - **### 1.2 入场时机**（现阶段该不该买？BUY NOW / WAIT / DON'T BUY）—— 1 段推理 + 等待条件
+   - **### 1.3 未来 5 个交易日趋势** —— 上涨 / 震荡 / 下跌、置信度、关键支撑阻力、入场条件和失效条件；必须与市场风险快照一致
+   - **### 1.4 12 个月主题判断** —— 扩张 / 兑现 / 降速 / 破裂；解释增长兑现、估值溢价、拥挤度和主题风险。AI/科技股不得仅因静态 PE 高而降级
 
 3. **## 二、操作计划**
    - **### 2.1 操作动作表（按持仓场景）**
@@ -626,6 +651,12 @@ PM_SUMMARY:
   pm_horizon_months_low: <int>           # Time Stop 时间窗口下沿（月）
   pm_horizon_months_high: <int>          # Time Stop 时间窗口上沿
   pm_rating_adjusted_from_rm: <bool>     # PM 是否相对 RM 评级做了 ±1 档微调
+  market_risk_level: <低 / 中 / 高 / 极高 / 数据不足>
+  market_entry_gate: <OPEN / CONDITIONAL / WAIT>
+  market_position_cap_pct: <float>
+  short_term_trend: <上涨 / 震荡 / 下跌>
+  short_term_confidence: <高 / 中 / 低>
+  theme_outlook_12m: <扩张 / 兑现 / 降速 / 破裂>
 ```
 
 **约束**：

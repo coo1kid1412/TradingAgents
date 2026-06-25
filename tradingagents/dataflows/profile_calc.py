@@ -500,6 +500,112 @@ def parse_sys_main_business(text: str) -> Optional[str]:
     return seg or None
 
 
+_AI_MAIN_UPTREND_KEYWORDS = (
+    "AI服务器", "AI芯片", "AI算力", "算力", "CPO", "光模块", "光器件", "光通信", "800G", "1.6T", "数据中心",
+    "服务器", "交换机", "PCB", "高速互联", "液冷", "英伟达", "NVIDIA",
+    "GPU", "云厂商", "半导体", "芯片",
+)
+
+
+def compute_ai_main_uptrend_signal(
+    *,
+    company_name: Optional[str] = None,
+    industry: Optional[str] = None,
+    main_business: Optional[str] = None,
+    is_paradigm: bool = False,
+    net_profit_growth: Optional[float] = None,
+    revenue_growth: Optional[float] = None,
+    earnings_revision: Optional[str] = None,
+    has_hard_order_evidence: bool = False,
+    momentum_score: Optional[float] = None,
+    theme_stage_inferred: Optional[str] = None,
+    sector_rs_30d: Optional[float] = None,
+    valuation_regime: Optional[str] = None,
+    recurring_loss: Optional[bool] = None,
+    has_peak_signal: bool = False,
+    retail_concentration_signal: Optional[str] = None,
+    rsi_percentile_1y: Optional[float] = None,
+    winner_rate_pct: Optional[float] = None,
+    capital_flow_regime: Optional[str] = None,
+    main_force_streak_days: Optional[int] = None,
+) -> dict:
+    """识别 AI 算力链主升兑现票（纯确定性信号，不读外部状态）。
+
+    该信号只表达"是否有资格在市场 risk_on 时获得克制升档"，不是买入建议。
+    排除条件优先级最高：纪律 regime、扣非亏损、价格 blowoff、下修/资金恶化等都
+    会关闭信号，避免把纯叙事或会亏钱的票误抬。
+    """
+    text = " ".join([company_name or "", industry or "", main_business or ""])
+    upper_text = text.upper()
+    ai_chain = bool(is_paradigm) or any(kw.upper() in upper_text for kw in _AI_MAIN_UPTREND_KEYWORDS)
+
+    reasons: list[str] = []
+    blockers: list[str] = []
+
+    if ai_chain:
+        reasons.append("AI算力链/硬科技赛道命中")
+    else:
+        blockers.append("未命中AI算力链硬科技赛道")
+
+    if net_profit_growth is not None and net_profit_growth >= 0.40:
+        reasons.append(f"净利润兑现增长{net_profit_growth * 100:.0f}%")
+    if revenue_growth is not None and revenue_growth >= 0.30:
+        reasons.append(f"营收兑现增长{revenue_growth * 100:.0f}%")
+    if earnings_revision == "上修":
+        reasons.append("卖方盈利预期上修")
+    if has_hard_order_evidence:
+        reasons.append("订单/核心客户/产能放量硬证据")
+
+    has_confirmed_delivery = any(
+        marker in reason for reason in reasons
+        for marker in ("净利润兑现", "营收兑现", "上修")
+    )
+    has_delivery = has_confirmed_delivery or has_hard_order_evidence
+
+    trend_reasons: list[str] = []
+    if momentum_score is not None and momentum_score >= 65:
+        trend_reasons.append(f"momentum={momentum_score:.0f}>=65")
+    if theme_stage_inferred == "acceleration":
+        trend_reasons.append("theme_stage=acceleration")
+    if sector_rs_30d is not None and sector_rs_30d > 5:
+        trend_reasons.append(f"板块RS 30d={sector_rs_30d:+.1f}%")
+    reasons.extend(trend_reasons)
+
+    reg = (valuation_regime or "").strip().lower()
+    if reg == "discipline":
+        blockers.append("valuation_regime=discipline")
+    if recurring_loss is True:
+        blockers.append("扣非/主业亏损")
+    if has_peak_signal:
+        blockers.append("peak信号触发")
+    price_extreme = (
+        (rsi_percentile_1y is not None and rsi_percentile_1y >= 85)
+        or (winner_rate_pct is not None and winner_rate_pct >= _BLOWOFF_WINNER_EUPHORIA_PCT)
+    )
+    if retail_concentration_signal == "散户高接盘" and price_extreme:
+        blockers.append("散户高接盘+价格极端 blowoff")
+    if earnings_revision == "下修":
+        blockers.append("卖方盈利预期下修")
+    strong_outflow = (
+        capital_flow_regime == "恶化"
+        or (main_force_streak_days is not None and main_force_streak_days <= -3)
+    )
+    if strong_outflow and earnings_revision != "上修":
+        blockers.append("资金面持续恶化且无卖方上修")
+
+    if not has_delivery:
+        blockers.append("缺少业绩/订单/上修兑现证据")
+    if not trend_reasons:
+        blockers.append("缺少趋势确认")
+
+    enabled = ai_chain and has_delivery and bool(trend_reasons) and not blockers
+    if not enabled:
+        return {"enabled": False, "class": "none", "reasons": reasons, "blockers": blockers}
+
+    signal_class = "confirmed" if has_confirmed_delivery else "early"
+    return {"enabled": True, "class": signal_class, "reasons": reasons, "blockers": []}
+
+
 # 强周期股目标价的「正常化 vs 成长前瞻」滑动权重，按周期位置确定（防 RM 自选权重致摆动）。
 # 结构性上行周期（存储/面板）既有周期风险又有 AI 结构性需求——位置决定该信哪边更多：
 #   顶部 → 偏正常化（谨慎，但承认结构性成长，不一杆打到纯正常化）；
@@ -1460,18 +1566,55 @@ _DISTRIBUTION_PATTERNS = (
 )
 _DISTRIBUTION_NEGATION = (r"未(?:发现|出现)[^。\n]{0,20}减持", r"无[^。\n]{0,10}减持")
 
+# 减持/派发证据的"陈旧"阈值：附近日期距分析日 >此天数 → 视为旧事，不投 distribution 腿。
+# 对标投研：内部人减持信号约 1 季度内有意义，半年前在 1/3 价位的减持对当前判断无增量。
+# 治范式龙头被陈旧减持敲出 ride（天孚 06-25：2026-01 高管@198-219 / 2025-03 大股东@98 误投）。
+_DISTRIBUTION_STALE_DAYS = 120
+# 匹配 YYYY-MM-DD / YYYY/MM/DD / YYYY.MM.DD / YYYY年MM月[DD日]（日可缺，缺则按当月1日）
+_EVENT_DATE_RE = re.compile(r"(20\d{2})\s*[-/.年]\s*(\d{1,2})(?:\s*[-/.月]\s*(\d{1,2}))?")
 
-def parse_distribution_signals(news_str: str, fund_str: str = "", sentiment_str: str = "") -> dict:
+
+def _nearest_event_date(text: str, pos: int, radius: int = 45):
+    """匹配位置 pos 附近窗口内、距 pos 最近的日期 → datetime.date 或 None。"""
+    import datetime
+    lo, hi = max(0, pos - radius), min(len(text), pos + radius)
+    window = text[lo:hi]
+    best, best_dist = None, 1 << 30
+    for m in _EVENT_DATE_RE.finditer(window):
+        try:
+            y, mo, d = int(m.group(1)), int(m.group(2)), int(m.group(3) or 1)
+            dt = datetime.date(y, mo, d)
+        except (ValueError, TypeError):
+            continue
+        center = lo + (m.start() + m.end()) // 2
+        dist = abs(center - pos)
+        if dist < best_dist:
+            best, best_dist = dt, dist
+    return best
+
+
+def parse_distribution_signals(news_str: str, fund_str: str = "", sentiment_str: str = "",
+                               current_date: Optional[str] = None) -> dict:
     """检测"大股东/机构派发"硬证据（减持/折价询价转让/机构减仓/筹码分散）。
 
     这是澜起式派发股最硬的看空信号，但散落在 news/fundamentals/sentiment，
-    之前没喂进 regime。返回 {detected: bool, reasons: [...]}（用于 regime 的 distribution 腿投负）。
+    之前没喂进 regime。返回 {detected, reasons, stale_skipped}（用于 regime 的 distribution 腿投负）。
+
+    recency 门（current_date 给定时生效）：每条减持/派发证据附近若有日期且 >120 天，视为陈旧、
+    不计入——治软口径把一年前低位减持当当前派发、把范式龙头敲出 ride。无日期的当期结构信号
+    （如"股东户数增加"）照常保留。缺 current_date 则不过滤（向后兼容）。
     """
-    import re
+    import datetime
     text = "\n".join([news_str or "", fund_str or "", sentiment_str or ""])
     if not text.strip():
-        return {"detected": False, "reasons": []}
-    reasons = []
+        return {"detected": False, "reasons": [], "stale_skipped": 0}
+    cd = None
+    if current_date:
+        try:
+            cd = datetime.date.fromisoformat(str(current_date)[:10])
+        except ValueError:
+            cd = None
+    reasons, stale_skipped = [], 0
     for pat in _DISTRIBUTION_PATTERNS:
         for m in re.finditer(pat, text):
             seg = m.group(0)
@@ -1479,10 +1622,16 @@ def parse_distribution_signals(news_str: str, fund_str: str = "", sentiment_str:
             ctx = text[max(0, m.start() - 8):m.start()]
             if any(re.search(neg, ctx + seg) for neg in _DISTRIBUTION_NEGATION):
                 continue
+            # recency 门：附近日期 >120 天 → 陈旧，跳过（无日期则保留，当期结构信号不丢）
+            if cd is not None:
+                ev = _nearest_event_date(text, m.start())
+                if ev is not None and (cd - ev).days > _DISTRIBUTION_STALE_DAYS:
+                    stale_skipped += 1
+                    continue
             reasons.append(seg.strip())
     # 去重
     reasons = list(dict.fromkeys(reasons))[:5]
-    return {"detected": len(reasons) > 0, "reasons": reasons}
+    return {"detected": len(reasons) > 0, "reasons": reasons, "stale_skipped": stale_skipped}
 
 
 # blowoff 护栏价格极端门：获利盘≥此值=狂热接盘(顶部温床)，与 RSI 1年分位≥85 并列作"价格极端"。

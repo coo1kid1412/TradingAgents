@@ -56,6 +56,7 @@ from tradingagents.dataflows.profile_calc import (
     compute_peg_leg_target,
     compute_peer_anchored_pe_cap,
     compute_valuation_regime,
+    compute_ai_main_uptrend_signal,
     parse_growth_deceleration,
     parse_distribution_signals,
     parse_sys_cyclical,
@@ -270,6 +271,15 @@ def _enforce_target_pe_cap(content: str, cap: float) -> str:
     return pat.sub(_repl, content)
 
 
+def _has_ai_order_evidence(text: str) -> bool:
+    """粗粒度硬证据代理：订单/核心客户/产能放量等词与 AI 链条词共现。"""
+    if not text:
+        return False
+    ai_terms = ("AI服务器", "AI芯片", "AI算力", "算力", "英伟达", "NVIDIA", "云厂商", "数据中心", "CPO", "光模块", "服务器", "PCB", "GPU", "800G", "1.6T")
+    evidence_terms = ("订单", "独家", "供应商", "认证", "量产", "放量", "绑定", "客户", "份额", "产能")
+    return any(t in text for t in ai_terms) and any(t in text for t in evidence_terms)
+
+
 # ---------------------------------------------------------------------------
 # 主节点
 # ---------------------------------------------------------------------------
@@ -416,7 +426,8 @@ def create_stock_profile_node(llm):
         # 散文跑跑之间漂会让 regime 在 discipline/neutral 间翻（澜起 SELL↔HOLD 摆动根源）。
         growth_dir = parse_growth_deceleration(fundamentals_report + "\n" + fund_raw, strict=True)
         net_growth_strict = parse_net_profit_growth(fundamentals_report + "\n" + fund_raw, strict=True)
-        dist_sig = parse_distribution_signals(news_report, fundamentals_report, sentiment_report)
+        dist_sig = parse_distribution_signals(
+            news_report, fundamentals_report, sentiment_report, current_date=trade_date)
         gq = parse_growth_quality(fund_raw + "\n" + fundamentals_report)  # 扣非口径成长质量
         # 周期股机读行（vendor Python 发射 + fundamentals 转录兜底保证在场）
         cyc_info = parse_sys_cyclical(fundamentals_report + "\n" + fund_raw)
@@ -462,7 +473,37 @@ def create_stock_profile_node(llm):
         valuation_regime = regime_info["valuation_regime"]
         if dist_sig["detected"]:
             logger.info("派发证据: %s", dist_sig["reasons"][:3])
+        if dist_sig.get("stale_skipped"):
+            logger.info("派发证据 recency 门：跳过 %d 条陈旧减持(>%d天)",
+                        dist_sig["stale_skipped"], 120)
         logger.info("valuation_regime: %s | %s", valuation_regime, regime_info["reasoning"])
+
+        ai_main_uptrend = compute_ai_main_uptrend_signal(
+            company_name=company_name,
+            industry=fund_raw,
+            main_business=main_business_seg,
+            is_paradigm=is_paradigm,
+            net_profit_growth=net_growth_strict,
+            revenue_growth=None,
+            earnings_revision=earnings_revision,
+            has_hard_order_evidence=_has_ai_order_evidence(news_report + "\n" + fundamentals_report),
+            momentum_score=momentum_score,
+            theme_stage_inferred=theme_inferred,
+            sector_rs_30d=sector_rs_30d,
+            valuation_regime=valuation_regime,
+            recurring_loss=gq["recurring_loss"],
+            has_peak_signal=peak_check["force_peak"],
+            retail_concentration_signal=cf_sig["retail_signal"],
+            rsi_percentile_1y=price_signals.get("rsi_percentile_1y"),
+            winner_rate_pct=cf_sig["winner_rate"],
+            capital_flow_regime=cf_sig["regime"],
+            main_force_streak_days=cf_sig["streak"],
+        )
+        logger.info(
+            "SYS_AI_MAIN_UPTREND: enabled=%s class=%s reasons=%s blockers=%s",
+            ai_main_uptrend["enabled"], ai_main_uptrend["class"],
+            ai_main_uptrend["reasons"][:3], ai_main_uptrend["blockers"][:3],
+        )
 
         # 主题溢价容忍度按 regime 闸门：ride 满/neutral 半/discipline 零（确定性，防澜起式阈值飘）
         premium_gated, premium_gate_note = gate_premium_by_regime(default_premium_pct, valuation_regime)
@@ -1017,6 +1058,11 @@ TRANSPARENCY:
                if is_paradigm else "")
             + (f"SYS_MAIN_BUSINESS: {main_business_seg}（fina_mainbz 产品营收占比，Python 确定性转录；PM 判热门概念归属% 直读此行、禁自行推断）\n"
                if main_business_seg else "")
+            + "<!-- ⚠️SYS_AI_MAIN_UPTREND｜Python 确定性AI主升兑现信号；仅在market_risk允许时给RM克制升档资格，不能绕过硬风险 -->\n"
+            + f"SYS_AI_MAIN_UPTREND_ENABLED: {str(ai_main_uptrend['enabled']).lower()}\n"
+            + f"SYS_AI_MAIN_UPTREND_CLASS: {ai_main_uptrend['class']}\n"
+            + f"SYS_AI_MAIN_UPTREND_REASONS: {'；'.join(ai_main_uptrend['reasons']) if ai_main_uptrend['reasons'] else '无'}\n"
+            + f"SYS_AI_MAIN_UPTREND_BLOCKERS: {'；'.join(ai_main_uptrend['blockers']) if ai_main_uptrend['blockers'] else '无'}\n"
         )
         logger.info("SYS_VALUATION_REGIME 已注入画像: %s", valuation_regime)
         if main_business_seg:

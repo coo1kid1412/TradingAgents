@@ -19,6 +19,7 @@ from tradingagents.dataflows.profile_calc import (
     detect_paradigm_growth,
     parse_sys_paradigm,
     compute_cyclical_scenario_target,
+    compute_ai_main_uptrend_signal,
 )
 
 
@@ -138,6 +139,101 @@ def test_detect_paradigm_growth():
     # SYS_PARADIGM 解析往返
     assert parse_sys_paradigm("【SYS_PARADIGM｜tushare】 class=paradigm | sector=CPO") is True
     assert parse_sys_paradigm("无此行") is False
+
+
+def test_ai_main_uptrend_confirmed_signal():
+    """AI 算力链 + 业绩兑现 + 强趋势 + 无硬排除 → confirmed。"""
+    r = compute_ai_main_uptrend_signal(
+        company_name="中际旭创",
+        industry="光模块",
+        main_business="高速光模块 85%",
+        is_paradigm=True,
+        net_profit_growth=0.9,
+        revenue_growth=0.66,
+        earnings_revision="上修",
+        momentum_score=82,
+        theme_stage_inferred="acceleration",
+        sector_rs_30d=18,
+        valuation_regime="ride",
+        recurring_loss=False,
+        has_peak_signal=False,
+        retail_concentration_signal="中性",
+        rsi_percentile_1y=70,
+        winner_rate_pct=72,
+    )
+    assert r["enabled"] is True, r
+    assert r["class"] == "confirmed", r
+    assert any("兑现" in x or "上修" in x for x in r["reasons"])
+    assert r["blockers"] == []
+
+
+def test_ai_main_uptrend_early_signal():
+    """链条地位明确 + 趋势强，但兑现证据较弱 → early。"""
+    r = compute_ai_main_uptrend_signal(
+        company_name="某AI服务器链",
+        industry="AI服务器",
+        main_business="AI 服务器代工 70%",
+        is_paradigm=False,
+        net_profit_growth=0.18,
+        revenue_growth=0.22,
+        earnings_revision="停修",
+        has_hard_order_evidence=True,
+        momentum_score=72,
+        theme_stage_inferred="none",
+        sector_rs_30d=12,
+        valuation_regime="neutral",
+    )
+    assert r["enabled"] is True, r
+    assert r["class"] == "early", r
+
+
+def test_ai_main_uptrend_rejects_non_ai_stock():
+    r = compute_ai_main_uptrend_signal(
+        company_name="贵州茅台",
+        industry="白酒",
+        main_business="白酒 99%",
+        net_profit_growth=0.5,
+        momentum_score=80,
+        theme_stage_inferred="acceleration",
+        valuation_regime="ride",
+    )
+    assert r["enabled"] is False
+    assert r["class"] == "none"
+    assert any("赛道" in x for x in r["blockers"])
+
+
+def test_ai_main_uptrend_blocked_by_discipline_and_losses():
+    r = compute_ai_main_uptrend_signal(
+        company_name="某AI概念",
+        industry="算力设备",
+        main_business="AI 设备 60%",
+        net_profit_growth=0.8,
+        momentum_score=90,
+        valuation_regime="discipline",
+        recurring_loss=True,
+    )
+    assert r["enabled"] is False
+    assert r["class"] == "none"
+    assert any("discipline" in x for x in r["blockers"])
+    assert any("扣非" in x or "亏损" in x for x in r["blockers"])
+
+
+def test_ai_main_uptrend_blocked_by_distribution_blowoff():
+    r = compute_ai_main_uptrend_signal(
+        company_name="天孚通信",
+        industry="光器件",
+        main_business="光器件 90%",
+        is_paradigm=True,
+        net_profit_growth=0.5,
+        momentum_score=88,
+        theme_stage_inferred="acceleration",
+        valuation_regime="ride",
+        retail_concentration_signal="散户高接盘",
+        rsi_percentile_1y=90,
+        winner_rate_pct=88,
+    )
+    assert r["enabled"] is False
+    assert any("blowoff" in x or "价格极端" in x for x in r["blockers"])
 
 
 def test_paradigm_ride_in_acceleration():
@@ -519,6 +615,24 @@ def test_parse_distribution_signals():
     assert d["detected"] and len(d["reasons"]) >= 2, d
     # 否定语境不误报
     assert parse_distribution_signals("未发现明显治理红旗（无高管密集减持）")["detected"] is False
+
+
+def test_distribution_recency_gate():
+    """第6腿 recency 门：陈旧减持(>120天)不投，当期减持仍投；无 current_date 不过滤。"""
+    # 天孚式：一年前减持，现价已远高于减持价
+    stale = "2026-01-29 大股东减持39.5万股，均价218.97元；2025-03-21 大股东减持345万股"
+    # current_date=2026-06-25：两笔都 >120 天 → 全部跳过
+    r_stale = parse_distribution_signals(stale, current_date="2026-06-25")
+    assert r_stale["detected"] is False and r_stale["stale_skipped"] >= 1, r_stale
+    # 当期减持（30天前）→ 仍投
+    fresh = "2026-06-01 大股东减持39.5万股"
+    r_fresh = parse_distribution_signals(fresh, current_date="2026-06-25")
+    assert r_fresh["detected"] is True, r_fresh
+    # 无日期的当期结构信号（户数增）不受 recency 影响
+    r_struct = parse_distribution_signals("股东户数持续增加，筹码分散", current_date="2026-06-25")
+    assert r_struct["detected"] is True, r_struct
+    # 向后兼容：不传 current_date → 不过滤，陈旧减持照旧检出
+    assert parse_distribution_signals(stale)["detected"] is True
 
 
 if __name__ == "__main__":

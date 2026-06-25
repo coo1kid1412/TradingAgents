@@ -20,6 +20,7 @@ from tradingagents.agents.managers.rm_tools import (
     compute_step6_rating_mapping as MAP,
     compute_step6_trend_overlay as OV,
     _classify_inflection,
+    derive_market_mode,
 )
 
 
@@ -361,6 +362,89 @@ def test_discipline_clamps_positive_overlay():
     print("✓ discipline 正向叠加钳零（SELL↔UW 摆动消除），neutral 不误伤")
 
 
+def test_market_mode_derivation():
+    assert derive_market_mode({"entry_gate": "OPEN", "risk_level": "低", "t_plus_1_bias": "偏多"}) == "risk_on"
+    assert derive_market_mode({"entry_gate": "CONDITIONAL", "risk_level": "中", "t_plus_1_bias": "震荡"}) == "conditional"
+    assert derive_market_mode({"entry_gate": "WAIT", "risk_level": "高", "t_plus_1_bias": "偏空"}) == "risk_off"
+    assert derive_market_mode({}) == "risk_off"
+    assert derive_market_mode(None) == "risk_off"
+    print("✓ market_risk 快照 → market_mode 派生")
+
+
+def test_ai_main_uptrend_risk_on_hold_to_overweight():
+    """AI主升 confirmed + risk_on：允许 HOLD → OVERWEIGHT。"""
+    r = F.invoke(_base(
+        current_price=90.0, target_price_mid=100.0,  # HOLD 区且隐含收益为正
+        ai_main_uptrend=True, ai_main_uptrend_class="confirmed", market_mode="risk_on",
+        momentum_score=70.0,
+    ))
+    assert r["final_rating"] == "OVERWEIGHT", r["explanation"]
+    assert r["stages"]["ai_main_uptrend"]["adjustment"] == 1
+    print("✓ AI主升 confirmed+risk_on：HOLD → OVERWEIGHT")
+
+
+def test_ai_main_uptrend_risk_on_strong_confirm_overweight_to_buy():
+    """AI主升 confirmed + 强确认：允许 OVERWEIGHT → BUY。"""
+    r = F.invoke(_base(
+        current_price=70.0, target_price_mid=100.0,  # blue_chip 阈值下 rating_raw=OVERWEIGHT
+        ai_main_uptrend=True, ai_main_uptrend_class="confirmed", market_mode="risk_on",
+        momentum_score=85.0,
+    ))
+    assert r["rating_raw"] == "OVERWEIGHT"
+    assert r["final_rating"] == "BUY", r["explanation"]
+    assert r["stages"]["ai_main_uptrend"]["adjustment"] == 1
+    print("✓ AI主升 confirmed+risk_on+强确认：OVERWEIGHT → BUY")
+
+
+def test_ai_main_uptrend_conditional_caps_buy_upgrade():
+    """conditional 市场只允许 HOLD→OW，不允许 OW→BUY。"""
+    r = F.invoke(_base(
+        current_price=70.0, target_price_mid=100.0,
+        ai_main_uptrend=True, ai_main_uptrend_class="confirmed", market_mode="conditional",
+        momentum_score=90.0,
+    ))
+    assert r["rating_raw"] == "OVERWEIGHT"
+    assert r["final_rating"] == "OVERWEIGHT", r["explanation"]
+    assert r["stages"]["ai_main_uptrend"]["adjustment"] == 0
+    print("✓ AI主升 conditional：不把 OVERWEIGHT 升 BUY")
+
+
+def test_ai_main_uptrend_risk_off_no_upgrade():
+    r = F.invoke(_base(
+        current_price=90.0, target_price_mid=100.0,
+        ai_main_uptrend=True, ai_main_uptrend_class="confirmed", market_mode="risk_off",
+        momentum_score=90.0,
+    ))
+    assert r["final_rating"] == "HOLD", r["explanation"]
+    assert r["stages"]["ai_main_uptrend"]["adjustment"] == 0
+    assert "risk_off" in r["stages"]["ai_main_uptrend"]["note"]
+    print("✓ AI主升 risk_off：不升档")
+
+
+def test_ai_main_uptrend_respects_discipline_ceiling():
+    r = F.invoke(_base(
+        current_price=90.0, target_price_mid=100.0,
+        valuation_regime="discipline",
+        ai_main_uptrend=True, ai_main_uptrend_class="confirmed", market_mode="risk_on",
+        momentum_score=90.0,
+    ))
+    assert r["final_rating"] == "HOLD", r["explanation"]
+    assert r["stages"]["ai_main_uptrend"]["rating_after"] == "HOLD"
+    print("✓ AI主升不越过 discipline 天花板")
+
+
+def test_ai_main_uptrend_respects_crowded_buy_ceiling():
+    r = F.invoke(_base(
+        current_price=70.0, target_price_mid=100.0,
+        consensus_crowded=True, consensus_direction="偏多", quant_anticrowding=20.0,
+        ai_main_uptrend=True, ai_main_uptrend_class="confirmed", market_mode="risk_on",
+        momentum_score=90.0,
+    ))
+    assert r["final_rating"] == "OVERWEIGHT", r["explanation"]
+    assert any("拥挤多头" in s for s in r["bounds"]["sources"])
+    print("✓ AI主升不越过拥挤多头 BUY 天花板")
+
+
 def test_mapping_error_propagates():
     """target_price_mid ≤ 0 时返回错误而非崩溃。"""
     r = F.invoke(_base(target_price_mid=0.0))
@@ -388,5 +472,12 @@ if __name__ == "__main__":
     test_semi_cyclical_not_affected()
     test_inflection_classifier_compound_label()
     test_discipline_clamps_positive_overlay()
+    test_market_mode_derivation()
+    test_ai_main_uptrend_risk_on_hold_to_overweight()
+    test_ai_main_uptrend_risk_on_strong_confirm_overweight_to_buy()
+    test_ai_main_uptrend_conditional_caps_buy_upgrade()
+    test_ai_main_uptrend_risk_off_no_upgrade()
+    test_ai_main_uptrend_respects_discipline_ceiling()
+    test_ai_main_uptrend_respects_crowded_buy_ceiling()
     test_mapping_error_propagates()
-    print("\n全部 20 项通过 ✅")
+    print("\n全部 27 项通过 ✅")

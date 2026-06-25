@@ -1249,6 +1249,23 @@ _THRESHOLD_BASE_UP = 35.0
 _FADING_UP_LOCK = 30.0   # 主题退潮期上沿锁定（主题反噬保护，不再放宽）
 
 
+def derive_market_mode(market_risk_snapshot: dict | None) -> str:
+    """把 market_risk_daily 快照压成 AI 主升升档权限。
+
+    缺失快照按 risk_off 处理，避免在没有开盘前风险数据时默认乐观。
+    """
+    if not market_risk_snapshot:
+        return "risk_off"
+    gate = str(market_risk_snapshot.get("entry_gate") or "").upper()
+    risk = str(market_risk_snapshot.get("risk_level") or "")
+    bias = str(market_risk_snapshot.get("t_plus_1_bias") or "")
+    if gate == "OPEN" and risk == "低" and bias == "偏多":
+        return "risk_on"
+    if gate == "CONDITIONAL" or risk == "中":
+        return "conditional"
+    return "risk_off"
+
+
 def _classify_inflection(inflection_stage: str) -> str:
     """把 inflection_stage 自由文本归一为单一类别 → accel / top / neutral。
 
@@ -1308,11 +1325,16 @@ def compute_step6_final_rating(
     northbound_flow_5d_direction: Optional[int] = None,
     kol_bullish_ratio_trend_pct: Optional[float] = None,
     news_catalyst_score: Optional[float] = None,
+    earnings_revision: Optional[str] = "",
     # ── 第七步 极端背离防御例外 ──
     inflection_confirmed_recent: Optional[bool] = False,
     # ── 周期股修正（画像 SYS_CYCLICAL_CLASS / SYS_CYCLICAL_POSITION 直读）──
     cyclical_class: Optional[str] = "",
     cycle_position: Optional[str] = "",
+    # ── AI 主升兑现信号（画像 SYS_AI_MAIN_UPTREND + market_risk_daily 总闸）──
+    ai_main_uptrend: Optional[bool] = False,
+    ai_main_uptrend_class: Optional[str] = "",
+    market_mode: Optional[str] = "",
 ) -> dict:
     """Step 6 评级终段一次合议：阈值→映射→拥挤→升降档→趋势叠加→极端防御 全链 Python。
 
@@ -1406,10 +1428,14 @@ def compute_step6_final_rating(
     decision_style = decision_style or ""
     cyclical_class = cyclical_class or ""
     cycle_position = cycle_position or ""
+    ai_main_uptrend_class = ai_main_uptrend_class or ""
+    market_mode = market_mode or "risk_off"
+    earnings_revision = earnings_revision or ""
     theme_premium_pct = float(theme_premium_pct or 0.0)
     consensus_crowded = bool(consensus_crowded)
     bear_anchor_strong = bool(bear_anchor_strong)
     inflection_confirmed_recent = bool(inflection_confirmed_recent)
+    ai_main_uptrend = bool(ai_main_uptrend)
     red_flags_count = int(red_flags_count or 0)
     market_weight = float(market_weight or 0.0)
     news_weight = float(news_weight or 0.0)
@@ -1574,6 +1600,55 @@ def compute_step6_final_rating(
     stages["symmetric"] = {"upgrade": upgrade, "downgrade": downgrade,
                            "rating_after": rating, "notes": sym_notes}
 
+    # ── 4b) AI 主升兑现信号（market_risk_daily 总闸 + 个股 SYS_AI_MAIN_UPTREND）──
+    ai_note = "未触发：SYS_AI_MAIN_UPTREND disabled"
+    ai_adjustment = 0
+    if ai_main_uptrend:
+        cls = (ai_main_uptrend_class or "").strip().lower()
+        mode = (market_mode or "risk_off").strip().lower()
+        if reg == "discipline":
+            ai_note = "valuation_regime=discipline：AI主升升档禁用"
+        elif mode == "risk_off":
+            ai_note = "risk_off：市场风险快照不允许进攻，AI主升仅作长期观察，不升档"
+        elif rating == "HOLD":
+            new_rating, cap_reason = _shift_rating(rating, +1, no_cross_hold=True)
+            new_rating, clamp_note = _clamp_to_bounds(new_rating)
+            ai_adjustment = 1 if new_rating != rating else 0
+            rating = new_rating
+            ai_note = (
+                f"{mode}+{cls or 'unknown'}：HOLD→{rating}"
+                + (f"（{cap_reason or clamp_note}）" if (cap_reason or clamp_note) else "")
+            )
+        elif rating == "OVERWEIGHT" and mode == "risk_on" and cls == "confirmed":
+            strong_confirm = (
+                (momentum_score is not None and momentum_score >= 80)
+                or (news_catalyst_score is not None and news_catalyst_score > 0)
+                or earnings_revision == "上修"
+            )
+            if strong_confirm:
+                new_rating, cap_reason = _shift_rating(rating, +1, no_cross_hold=True)
+                new_rating, clamp_note = _clamp_to_bounds(new_rating)
+                ai_adjustment = 1 if new_rating != rating else 0
+                rating = new_rating
+                ai_note = (
+                    f"risk_on+confirmed+强确认：OVERWEIGHT→{rating}"
+                    + (f"（{cap_reason or clamp_note}）" if (cap_reason or clamp_note) else "")
+                )
+            else:
+                ai_note = "risk_on+confirmed 但缺少强确认：OVERWEIGHT 不升 BUY"
+        elif rating == "OVERWEIGHT" and mode == "conditional":
+            ai_note = "conditional：只允许 HOLD→OVERWEIGHT，不允许 OVERWEIGHT→BUY"
+        else:
+            ai_note = f"{mode}+{cls or 'unknown'}：当前评级 {rating} 不在AI主升升档范围"
+    stages["ai_main_uptrend"] = {
+        "enabled": ai_main_uptrend,
+        "class": ai_main_uptrend_class or "none",
+        "market_mode": market_mode or "risk_off",
+        "adjustment": ai_adjustment,
+        "rating_after": rating,
+        "note": ai_note,
+    }
+
     # ── 5) 第六步 趋势叠加（复用既有工具，行为不变；结果受边界钳制——堵绕道）──
     overlay = compute_step6_trend_overlay.invoke({
         "rating_after_symmetric": rating,
@@ -1643,6 +1718,7 @@ def compute_step6_final_rating(
         f"阈值 ±{threshold_dn:.1f}/±{threshold_up:.1f} → 映射 {rating_raw}"
         f"（regime 闸门后 {mapping['rating']}）→ 拥挤 {stages['crowding']['rating_after']}"
         f" → 升降档 {stages['symmetric']['rating_after']}"
+        f" → AI主升 {stages['ai_main_uptrend']['rating_after']}"
         f" → 趋势叠加 {stages['overlay']['rating_after']}"
         f" → 极端防御 {stages['extreme_defense']['rating_after']}"
         f" → 不变量终检 {rating}"

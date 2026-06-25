@@ -4,7 +4,7 @@ import json
 from langchain_core.messages import HumanMessage, AIMessage, ToolMessage, SystemMessage
 
 from tradingagents.agents.utils.agent_utils import build_instrument_context, RISK_DEBATE_PHRASING_RULES
-from tradingagents.agents.managers.rm_tools import RM_TOOLS, RM_TOOLS_BY_NAME
+from tradingagents.agents.managers.rm_tools import RM_TOOLS, RM_TOOLS_BY_NAME, derive_market_mode
 
 logger = logging.getLogger(__name__)
 
@@ -138,6 +138,13 @@ def create_research_manager(llm):
         quant_score = state.get("quant_score", "")
         sector_comparison = state.get("sector_comparison", "")
         capital_flow_yaml = state.get("capital_flow_yaml", "")
+        market_risk_snapshot = state.get("market_risk_snapshot") or {}
+        market_mode = derive_market_mode(market_risk_snapshot)
+        market_risk_block = (
+            json.dumps(market_risk_snapshot, ensure_ascii=False, indent=2)
+            if market_risk_snapshot
+            else "未找到当日市场风险快照：market_mode=risk_off，AI主升升档禁用。"
+        )
 
         investment_debate_state = state["investment_debate_state"]
 
@@ -219,6 +226,19 @@ def create_research_manager(llm):
 **用法**：
 - Step 1 行业景气度判断必须叠加宏观顺/逆风修正（如行业本身上行但宏观强逆风 → 实际景气度降一档）
 - Step 6 动态阈值计算时，stock_profile.THEMATIC_PREMIUM 已经吸收了宏观修正，你按其最终值使用即可
+
+### 0.3B 市场风险快照（由 market_risk_daily 确定性生成）
+
+```json
+{market_risk_block}
+```
+
+**派生 market_mode = {market_mode}**
+
+用法：market_mode 只控制 AI 主升升档权限，不直接改变长期评级方向。
+- `risk_on`：允许 AI 主升 confirmed 完整升档。
+- `conditional`：只允许 AI 主升轻度升档，不允许追成 BUY。
+- `risk_off`：AI 主升升档禁用；缺失快照也按 risk_off。
 
 ### 0.4 量化锚（由量化打分官 Python 确定性输出，无 LLM 主观空间）
 
@@ -558,6 +578,10 @@ bull_target / base_target / bear_target → 你刚设计的三情景目标价
 | northbound_flow_5d_direction | **0.6 节 CAPITAL_FLOW.northbound_5d_direction 映射** | 净流入→1，净流出→-1，平衡/数据停滞→None；禁止从 news/sentiment 猜 |
 | kol_bullish_ratio_trend_pct | KOL 多头率相对 30 日均的变化(pp) | 缺失填 None |
 | news_catalyst_score | 新闻报告末尾 `SYS_CATALYST: ... score=__`（Python 从 key_events 确定性聚合的新闻事件催化分，-30..30） | 直读照抄,无此行填 None。⛔禁止自己从新闻里重判方向——聚合已确定性完成 |
+| earnings_revision | 画像末尾 `SYS_EARNINGS_REVISION:` 行 | 上修 / 下修 / 停修；无此行填 "" |
+| ai_main_uptrend | 画像末尾 `SYS_AI_MAIN_UPTREND_ENABLED:` 行 | true/false。AI 算力链主升兑现资格，Python 确定性输出；无此行填 false |
+| ai_main_uptrend_class | 画像末尾 `SYS_AI_MAIN_UPTREND_CLASS:` 行 | confirmed / early / none；无此行填 "" |
+| market_mode | 本 prompt 0.3B 派生值 | 必须填 `{market_mode}`；缺失快照时为 risk_off，禁止自行改乐观 |
 | inflection_confirmed_recent | 业绩拐点是否刚被新数据（如刚出的季报）确认 | true 时极端背离防御跳过（量化锚滞后于新数据） |
 | cyclical_class | 画像末尾 `SYS_CYCLICAL_CLASS:` 行 | strong / semi；非周期股（无此行）填 "" |
 | cycle_position | 画像末尾 `SYS_CYCLICAL_POSITION:` 行 | top / mid / trough；无此行填 ""。工具内周期修正：顶部禁升档+正向叠加钳零（顶部要下车不是骑），谷底『拐点衰退』降档静音（谷底盈利差是常态，不追杀） |
@@ -571,17 +595,18 @@ bull_target / base_target / bear_target → 你刚设计的三情景目标价
 2. 估值五档映射 + regime 闸门（ride 把 UNDERWEIGHT/SELL 托底 HOLD；discipline 把 OVERWEIGHT/BUY 封顶 HOLD、SELL 保留；neutral 收敛三档）+ PEG 低置信边界收敛
 3. 拥挤度（拥挤多头禁 BUY、拥挤空头禁 SELL；**禁令固化为边界，对后续所有步骤持续生效，趋势叠加绕不过**。共识官的 crowded 只是软标志，须经硬数据确认——反拥挤分 ≤30 或 散户高接盘——才触发；无硬确认不动评级，对标投研用持仓/成交数据判拥挤而非舆情观感）
 4. 对称升降档（升档需同时满足：拐点加速/底部反转 + L0/L1 + 红旗≤1 + 低估区 + 非 momentum，且仅 HOLD→OW / OW→BUY；降档 L3 / 红旗≥3 / 拐点顶部衰退 / 空头anchor强+待验证 各 -1，合计最多 -2）
-5. 趋势叠加三路（style 动量 / 报告加权方向票 / 催化硬数据，合成最多 ±1）
-6. 极端背离防御（composite ≤20 压看多 → HOLD；≥80 托看空 → HOLD）
-7. **两条全链不变量**：
+5. AI 主升兑现升档（`SYS_AI_MAIN_UPTREND` + `market_mode` 总闸）：risk_on 可完整生效，conditional 只轻度升档，risk_off 禁用；不能越过 discipline / 拥挤多头 BUY 天花板 / 不变量
+6. 趋势叠加三路（style 动量 / 报告加权方向票 / 催化硬数据，合成最多 ±1）
+7. 极端背离防御（composite ≤20 压看多 → HOLD；≥80 托看空 → HOLD）
+8. **两条全链不变量**：
    - **闸门边界不可被下游反转**：ride 托底产生的 HOLD 设地板、discipline 封顶产生的 HOLD 设天花板，后续任何升降档不得越过
    - **评级方向必须与隐含收益同号**：最终看多（BUY/OVERWEIGHT）要求目标价中位 > 现价；看空（UNDERWEIGHT/SELL）要求 < 现价；违反者收敛 HOLD——真实投研不存在『看多但目标价在现价下方』的票
 
 #### 输出格式（强制）
 
 > 工具调用：`compute_step6_final_rating`
-> 关键输入：current_price=__, target_price_mid=__（来源：__）, style=__, SYS_THEME_PREMIUM_PCT=__, SYS_VALUATION_REGIME=__, peg_confidence=__, crowded=__/方向__, 拐点=__, 数据完整度=__, 红旗=__, composite=__, momentum=__, 三票=__/__/__
-> 工具返回：阈值 ±__/±__ | 偏离 __% | rating_raw=__ → regime 闸门 __ → 拥挤 __ → 升降档 __ → 趋势叠加 __（style __ / vote __ / catalyst __）→ 极端防御 __ → 不变量终检 → **final_rating = __**
+> 关键输入：current_price=__, target_price_mid=__（来源：__）, style=__, SYS_THEME_PREMIUM_PCT=__, SYS_VALUATION_REGIME=__, peg_confidence=__, crowded=__/方向__, 拐点=__, 数据完整度=__, 红旗=__, composite=__, momentum=__, 三票=__/__/__, AI主升=__/__, market_mode=__
+> 工具返回：阈值 ±__/±__ | 偏离 __% | rating_raw=__ → regime 闸门 __ → 拥挤 __ → 升降档 __ → AI主升 __ → 趋势叠加 __（style __ / vote __ / catalyst __）→ 极端防御 __ → 不变量终检 → **final_rating = __**
 > 边界与不变量：__（照抄工具返回 bounds.sources 与 stages.e_sign_invariant.note）
 
 ### 第三步：评级 COT（200-300 字）
@@ -791,6 +816,10 @@ RM_SUMMARY:
   regime_legs: "<照抄画像 SYS_VALUATION_REGIME_LEGS 行冒号后的内容，整体加双引号>"
   rating_raw: BUY / OVERWEIGHT / HOLD / UNDERWEIGHT / SELL  # 工具返回 rating_raw（估值原始倾向，未过闸门）
   peg_confidence: normal / low / null    # 画像 SYS_PEG_CONFIDENCE（无该行填 null）
+  ai_main_uptrend_enabled: true / false  # 画像 SYS_AI_MAIN_UPTREND_ENABLED
+  ai_main_uptrend_class: confirmed / early / none / null
+  market_mode: risk_on / conditional / risk_off
+  ai_main_uptrend_adj: <int>             # 工具 stages.ai_main_uptrend.adjustment（-1/0/+1；当前只会 0/+1）
   overlay_style_adj: <int>               # 工具返回 overlay_components.style（-1/0/+1）
   overlay_vote_adj: <int>                # 工具返回 overlay_components.vote
   overlay_catalyst_adj: <int>            # 工具返回 overlay_components.catalyst

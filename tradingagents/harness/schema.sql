@@ -79,6 +79,12 @@ CREATE TABLE IF NOT EXISTS predictions (
     pm_horizon_months_low INTEGER,
     pm_horizon_months_high INTEGER,
     pm_rating_adjusted_from_rm INTEGER,       -- 0/1 (SQLite 没原生 bool)
+    market_risk_level TEXT,
+    market_entry_gate TEXT,
+    market_position_cap_pct REAL,
+    short_term_trend TEXT,
+    short_term_confidence TEXT,
+    theme_outlook_12m TEXT,
 
     -- 元
     rm_yaml_parsed INTEGER DEFAULT 0,         -- 0/1: RM_SUMMARY 是否成功解析
@@ -159,3 +165,26 @@ CREATE TABLE IF NOT EXISTS price_cache (
 
 CREATE INDEX IF NOT EXISTS idx_price_cache_ticker ON price_cache(ticker);
 CREATE INDEX IF NOT EXISTS idx_price_cache_date ON price_cache(trade_date);
+
+-- ============================================================================
+-- market_risk_snapshots: 开盘前市场风险快照（A 股 / 美股）
+-- ============================================================================
+CREATE TABLE IF NOT EXISTS market_risk_snapshots (
+    market TEXT NOT NULL,
+    as_of_date DATE NOT NULL,
+    as_of_time TEXT NOT NULL,
+    snapshot_version TEXT NOT NULL,
+    risk_level TEXT NOT NULL,
+    risk_score REAL,
+    t_plus_1_bias TEXT NOT NULL,
+    entry_gate TEXT NOT NULL,
+    position_cap_pct REAL NOT NULL,
+    data_status TEXT NOT NULL,
+    factor_breakdown_json TEXT NOT NULL,
+    reasons_json TEXT NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (market, as_of_date)
+);
+
+CREATE INDEX IF NOT EXISTS idx_market_risk_snapshot_date
+    ON market_risk_snapshots(as_of_date);
