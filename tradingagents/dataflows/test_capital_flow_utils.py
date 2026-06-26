@@ -198,25 +198,31 @@ def test_distribution_block_trade_leg():
 
 
 def test_insider_distribution():
-    """item1：stk_holdertrade → 确定性内部人派发信号（净减持/清仓式/recency）。"""
+    """item1：stk_holdertrade → 确定性内部人派发信号。**只清仓式/大额(≥1%)才投**，
+    常规减持(改善生活)是噪音不投（secular 主升里内部人卖出弱信号）。"""
     cd = "2026-06-26"
+    # 清仓式：第1笔 3M/(3M+1M)=75%≥50%
     df = pd.DataFrame({
         "in_de": ["DE", "DE"],
         "change_vol": [3000000, 1000000],
-        "change_ratio": [0.8, 0.3],          # 占总股本%
-        "after_share": [1000000, 5000000],   # 第1笔：3M/(3M+1M)=75%≥50% 清仓式
+        "change_ratio": [0.8, 0.3],
+        "after_share": [1000000, 5000000],
         "ann_date": ["20260610", "20260601"],
     })
     r = compute_insider_distribution(df, current_date=cd)
     assert r["insider_net_selling"] is True and r["clearing_style"] is True, r
-    assert r["net_sell_ratio_pct"] == 1.1 and r["n_sells"] == 2 and r["n_buys"] == 0, r
     # recency：陈旧减持(>120天)被过滤 → None
     assert compute_insider_distribution(df.assign(ann_date=["20250101", "20250101"]),
                                         current_date=cd) is None
-    # 小额净减持(<0.3%)且非清仓 → 不投
-    small = pd.DataFrame({"in_de": ["DE"], "change_vol": [1000], "change_ratio": [0.1],
-                          "after_share": [9_000_000], "ann_date": ["20260610"]})
-    assert compute_insider_distribution(small, current_date=cd)["insider_net_selling"] is False
+    # 关键：常规"改善生活"减持(净0.6% <1%、非清仓) → **不投**(噪音)
+    routine = pd.DataFrame({"in_de": ["DE"], "change_vol": [500000], "change_ratio": [0.6],
+                            "after_share": [50_000_000], "ann_date": ["20260610"]})
+    rr = compute_insider_distribution(routine, current_date=cd)
+    assert rr["insider_net_selling"] is False and rr["clearing_style"] is False, rr
+    # 大额非清仓(净1.2% ≥1%) → 投
+    big = pd.DataFrame({"in_de": ["DE"], "change_vol": [2000000], "change_ratio": [1.2],
+                        "after_share": [100_000_000], "ann_date": ["20260610"]})
+    assert compute_insider_distribution(big, current_date=cd)["insider_net_selling"] is True
     # 净增持 → 不投
     buy = pd.DataFrame({"in_de": ["IN"], "change_vol": [1000000], "change_ratio": [0.5],
                         "after_share": [9000000], "ann_date": ["20260610"]})

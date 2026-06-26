@@ -213,9 +213,14 @@ def compute_retail_concentration_signal(
 _WINNER_RATE_EUPHORIA_PCT = 85.0
 # 股东户数环比增 ≥ 此值（%）= 筹码从集中→分散（散户进场接盘）
 _HOLDER_NUM_RISING_QOQ_PCT = 3.0
-# 内部人净减持占总股本 ≥ 此值（%）= 有意义的派发（小额噪音不投）
-_INSIDER_NET_SELL_RATIO_PCT = 0.3
-# 单笔减持占内部人自身持股 ≥ 此值 = 清仓式（教科书派发确认，如朱国栋减持 62.43%）
+# 内部人净减持占总股本 ≥ 此值（%）= 大额抛售（控股股东级别）才投。
+# ⚠️ 刻意设高（1.0%，非 0.3%）：内部人"卖"是弱信号——改善生活/缴税/分散持仓都会卖，跟
+# 基本面无关；secular 主升里高层连自家估值都评不准、习惯性卖早，**常规减持(改善生活)= 噪音**，
+# 减持完照样涨。只有控股股东大额抛 / 清仓式才有信息量（对标学术：buy for one reason,
+# sell for many）。门设低会把 AI 龙头误扣分、重新变保守。
+_INSIDER_NET_SELL_RATIO_PCT = 1.0
+# 单笔减持占内部人自身持股 ≥ 此值 = 清仓式（教科书派发确认，如朱国栋减持 62.43%）——
+# 这是内部人卖出里唯一的强信号，不论占总股本多少都投。
 _INSIDER_CLEARING_FRAC = 0.5
 # 内部人增减持的"近期"窗口（天）：陈旧减持不算（对标 profile_calc 派发腿 recency）
 _INSIDER_LOOKBACK_DAYS = 120
