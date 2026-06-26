@@ -213,6 +213,92 @@ def compute_retail_concentration_signal(
 _WINNER_RATE_EUPHORIA_PCT = 85.0
 # 股东户数环比增 ≥ 此值（%）= 筹码从集中→分散（散户进场接盘）
 _HOLDER_NUM_RISING_QOQ_PCT = 3.0
+# 内部人净减持占总股本 ≥ 此值（%）= 有意义的派发（小额噪音不投）
+_INSIDER_NET_SELL_RATIO_PCT = 0.3
+# 单笔减持占内部人自身持股 ≥ 此值 = 清仓式（教科书派发确认，如朱国栋减持 62.43%）
+_INSIDER_CLEARING_FRAC = 0.5
+# 内部人增减持的"近期"窗口（天）：陈旧减持不算（对标 profile_calc 派发腿 recency）
+_INSIDER_LOOKBACK_DAYS = 120
+
+
+def _parse_ann_date(value):
+    """宽松解析 ann_date（YYYYMMDD / YYYY-MM-DD）→ date 或 None。"""
+    import datetime
+    if value is None:
+        return None
+    s = str(value).strip().replace("-", "").replace("/", "")[:8]
+    if len(s) != 8 or not s.isdigit():
+        try:
+            return datetime.date.fromisoformat(str(value)[:10])
+        except ValueError:
+            return None
+    try:
+        return datetime.date(int(s[:4]), int(s[4:6]), int(s[6:8]))
+    except ValueError:
+        return None
+
+
+def compute_insider_distribution(df, current_date=None,
+                                 lookback_days: int = _INSIDER_LOOKBACK_DAYS) -> Optional[dict]:
+    """从 stk_holdertrade(大股东/董监高增减持明细)算确定性内部人派发信号——喂派发合成第6路。
+
+    对标投研：大股东/高管近期**净减持**、尤其**清仓式**(减持过自身持股一半)是教科书派发确认，
+    硬数据，比滞后的股东户数季报硬得多（户数是 T-1 季度口径，增减持是公告日近期口径）。
+    recency：只看 ann_date 距 current_date ≤lookback_days 的记录（陈旧减持不算，对标派发腿 recency）。
+
+    Args:
+        df: stk_holdertrade DataFrame（列含 in_de(IN/DE)/change_vol/change_ratio/after_share/ann_date）
+        current_date: 分析日 'YYYY-MM-DD'；给定则按 recency 过滤
+    Returns:
+        {insider_net_selling, clearing_style, net_sell_ratio_pct, n_sells, n_buys, summary} 或 None。
+        insider_net_selling = 净减持且占总股本≥0.3% 或 清仓式（喂第6腿）。
+    """
+    if df is None or len(df) == 0:
+        return None
+    import datetime
+    cd = None
+    if current_date:
+        try:
+            cd = datetime.date.fromisoformat(str(current_date)[:10])
+        except ValueError:
+            cd = None
+    rows = []
+    for _, r in df.iterrows():
+        in_de = str(r.get("in_de", "")).strip().upper()
+        if in_de not in ("IN", "DE"):
+            continue
+        if cd is not None:
+            ann = _parse_ann_date(r.get("ann_date"))
+            if ann is not None and (cd - ann).days > lookback_days:
+                continue
+        def _f(key):
+            try:
+                return abs(float(r.get(key) or 0))
+            except (TypeError, ValueError):
+                return 0.0
+        rows.append((in_de, _f("change_vol"), _f("change_ratio"), _f("after_share")))
+    if not rows:
+        return None
+    sell_vol = sum(v for d, v, rt, af in rows if d == "DE")
+    buy_vol = sum(v for d, v, rt, af in rows if d == "IN")
+    net_sell_ratio = round(sum(rt for d, v, rt, af in rows if d == "DE")
+                           - sum(rt for d, v, rt, af in rows if d == "IN"), 2)
+    n_sells = sum(1 for d, *_ in rows if d == "DE")
+    n_buys = sum(1 for d, *_ in rows if d == "IN")
+    # 清仓式：任一减持笔，减持量占其减持后剩余+减持量(=减持前持股)的一半以上
+    clearing = any(d == "DE" and af >= 0 and v > 0 and v / (v + af) >= _INSIDER_CLEARING_FRAC
+                   for d, v, rt, af in rows)
+    net_selling = sell_vol > buy_vol
+    signal = (net_selling and net_sell_ratio >= _INSIDER_NET_SELL_RATIO_PCT) or clearing
+    summary = (f"近{lookback_days}日内部人{n_sells}减/{n_buys}增，净减持占总股本{net_sell_ratio:.2f}%"
+               + ("，含清仓式减持(过半)" if clearing else ""))
+    return {
+        "insider_net_selling": signal,
+        "clearing_style": clearing,
+        "net_sell_ratio_pct": net_sell_ratio,
+        "n_sells": n_sells, "n_buys": n_buys,
+        "summary": summary,
+    }
 
 
 def compute_distribution_into_retail(
@@ -222,25 +308,28 @@ def compute_distribution_into_retail(
     holder_num_4q_trend: Optional[str] = None,
     net_inflow_streak_days: Optional[int] = None,
     block_trade_distribution: Optional[bool] = None,
+    insider_net_selling: Optional[bool] = None,
 ) -> dict:
-    """机构派发给散户强度——五路散落信号合成一个确定性"派发"强度分。
+    """机构派发给散户强度——六路散落信号合成一个确定性"派发"强度分。
 
     对标投研"顶部派发"判定：散户狂热接盘 + 人人获利(高位) + 筹码分散(户数增) +
-    主力悄悄出货(净流出) + 折价大宗（机构让利出货）共振 = 机构在高位把货派给散户。
-    任一单路都不足为凭（狂热可能只是趋势确认、户数增可能是配股摊薄），需 ≥2 路共振才算确认。
+    主力悄悄出货(净流出) + 折价大宗（机构让利出货）+ 内部人近期净减持 共振 =
+    机构/大股东在高位把货派给散户。任一单路都不足为凭（狂热可能只是趋势确认、
+    户数增可能是配股摊薄），需 ≥2 路共振才算确认。
 
     这把"舆情狂热"从一个会投错方向的看多票（顶部狂热本该看空），改造成反向的
     派发预警输入——与砍掉的舆情方向票互补（见 rm_tools 加权方向票）。
 
-    五路（各 +1）：
+    六路（各 +1）：
       - 舆情狂热/拥挤多头（sentiment_euphoric）
       - 获利盘 ≥85%（winner_rate 高位，人人赚钱=顶部温床）
       - 股东户数增（环比 >3% 或 4 季持续上升=筹码分散到散户）
       - 主力净流出（连续 ≤ -3 日）
       - 折价大宗（block_trade 折价成交，机构让利急出货——硬数据）
+      - 内部人近期净减持（stk_holdertrade，大股东/高管净减持或清仓式——最硬聪明钱看空）
 
     Returns: {
-        score: 0-5, confirmed: bool(score≥2), strength: none/weak/medium/strong,
+        score: 0-6, confirmed: bool(score≥2), strength: none/weak/medium/strong,
         retail_takeover: "散户高接盘"/"中性"（供拥挤硬确认门）, drivers: [..], n_inputs: int
     }
     """
@@ -277,6 +366,11 @@ def compute_distribution_into_retail(
         if block_trade_distribution:
             score += 1
             drivers.append("折价大宗（机构让利出货，硬数据）")
+    if insider_net_selling is not None:
+        n_inputs += 1
+        if insider_net_selling:
+            score += 1
+            drivers.append("内部人近期净减持（大股东/高管，硬数据）")
 
     confirmed = score >= 2
     strength = ("strong" if score >= 4 else "medium" if score == 3
@@ -817,6 +911,7 @@ def assemble_capital_flow_metrics(
     chip_metrics: Optional[dict] = None,
     ths_hot_rank: Optional[int] = None,
     block_metrics: Optional[dict] = None,
+    insider_metrics: Optional[dict] = None,
 ) -> dict:
     """一次性组装所有资金流字段（含 regime 与 cf_score）。
 
@@ -849,6 +944,12 @@ def assemble_capital_flow_metrics(
     metrics["block_distribution_pressure"] = block.get("block_distribution_pressure")
     metrics["block_trade_summary"] = block.get("summary")
 
+    # 内部人增减持（stk_holdertrade）——喂派发合成第六路（最硬聪明钱看空）
+    insider = insider_metrics or {}
+    metrics["insider_net_selling"] = insider.get("insider_net_selling")
+    metrics["insider_clearing_style"] = insider.get("clearing_style")
+    metrics["insider_summary"] = insider.get("summary")
+
     # 散户接盘信号（散户高位承接 + 主力派发）——优先筹码口径(winner_rate)，毛买/净流入占比兜底
     retail_sig = compute_retail_concentration_signal(
         metrics.get("retail_buy_amount_rate_5d_pct"),
@@ -867,6 +968,7 @@ def assemble_capital_flow_metrics(
         holder_num_4q_trend=metrics.get("holder_num_4q_trend"),
         net_inflow_streak_days=metrics.get("net_inflow_streak_days"),
         block_trade_distribution=metrics.get("block_distribution_pressure"),
+        insider_net_selling=metrics.get("insider_net_selling"),
     )
     metrics["distribution_into_retail"] = dist
     # 任一口径确认 → 散户高接盘（喂拥挤硬确认门）

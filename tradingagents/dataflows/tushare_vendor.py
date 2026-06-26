@@ -1179,6 +1179,23 @@ def get_insider_transactions(
     return header + csv_string
 
 
+def get_insider_distribution_metrics(symbol: str, current_date: Optional[str] = None) -> Optional[dict]:
+    """从 stk_holdertrade 算确定性内部人派发信号（喂派发合成第6路）。
+
+    取增减持明细 → compute_insider_distribution（纯函数，近120日 recency + 清仓式识别）。
+    失败/无数据/无权限 → None（优雅降级，不影响主流程）。
+    """
+    from tradingagents.dataflows.capital_flow_utils import compute_insider_distribution
+    pro = _get_tushare_api()
+    ts_code = to_tushare_format(symbol)
+    try:
+        df = _safe_call(pro.stk_holdertrade, ts_code=ts_code, limit=50, api_name="stk_holdertrade")
+    except (TushareUnavailableError, TushareRateLimitError) as e:
+        logger.info("get_insider_distribution_metrics: stk_holdertrade 不可用: %s", e)
+        return None
+    return compute_insider_distribution(df, current_date=current_date)
+
+
 def get_ths_hot_rank(symbol: str, trade_date: str) -> Optional[int]:
     """同花顺热榜排名（tushare ths_hot，2000 档可用）。
 

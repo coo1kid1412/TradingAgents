@@ -12,6 +12,7 @@ from tradingagents.dataflows.capital_flow_utils import (
     compute_capital_flow_regime,
     compute_capital_flow_score,
     compute_distribution_into_retail,
+    compute_insider_distribution,
     assemble_capital_flow_metrics,
 )
 
@@ -194,6 +195,47 @@ def test_distribution_block_trade_leg():
         sentiment_euphoric=True, winner_rate_pct=90, holder_num_4q_trend="持续上升",
         net_inflow_streak_days=-4, block_trade_distribution=True)
     assert r3["score"] == 5 and r3["strength"] == "strong"
+
+
+def test_insider_distribution():
+    """item1：stk_holdertrade → 确定性内部人派发信号（净减持/清仓式/recency）。"""
+    cd = "2026-06-26"
+    df = pd.DataFrame({
+        "in_de": ["DE", "DE"],
+        "change_vol": [3000000, 1000000],
+        "change_ratio": [0.8, 0.3],          # 占总股本%
+        "after_share": [1000000, 5000000],   # 第1笔：3M/(3M+1M)=75%≥50% 清仓式
+        "ann_date": ["20260610", "20260601"],
+    })
+    r = compute_insider_distribution(df, current_date=cd)
+    assert r["insider_net_selling"] is True and r["clearing_style"] is True, r
+    assert r["net_sell_ratio_pct"] == 1.1 and r["n_sells"] == 2 and r["n_buys"] == 0, r
+    # recency：陈旧减持(>120天)被过滤 → None
+    assert compute_insider_distribution(df.assign(ann_date=["20250101", "20250101"]),
+                                        current_date=cd) is None
+    # 小额净减持(<0.3%)且非清仓 → 不投
+    small = pd.DataFrame({"in_de": ["DE"], "change_vol": [1000], "change_ratio": [0.1],
+                          "after_share": [9_000_000], "ann_date": ["20260610"]})
+    assert compute_insider_distribution(small, current_date=cd)["insider_net_selling"] is False
+    # 净增持 → 不投
+    buy = pd.DataFrame({"in_de": ["IN"], "change_vol": [1000000], "change_ratio": [0.5],
+                        "after_share": [9000000], "ann_date": ["20260610"]})
+    assert compute_insider_distribution(buy, current_date=cd)["insider_net_selling"] is False
+    # 空/None → None
+    assert compute_insider_distribution(None) is None
+    assert compute_insider_distribution(pd.DataFrame()) is None
+
+
+def test_distribution_insider_leg():
+    """第六路：内部人净减持 + 户数增 = 确认；六路满分 score=6。"""
+    r = compute_distribution_into_retail(holder_num_qoq_pct=8, insider_net_selling=True)
+    assert r["confirmed"] and "内部人近期净减持（大股东/高管，硬数据）" in r["drivers"], r
+    r2 = compute_distribution_into_retail(insider_net_selling=True, net_inflow_streak_days=2)
+    assert not r2["confirmed"] and r2["score"] == 1, r2
+    r3 = compute_distribution_into_retail(
+        sentiment_euphoric=True, winner_rate_pct=90, holder_num_4q_trend="持续上升",
+        net_inflow_streak_days=-4, block_trade_distribution=True, insider_net_selling=True)
+    assert r3["score"] == 6 and r3["strength"] == "strong", r3
 
 
 def test_distribution_enriches_retail_signal():

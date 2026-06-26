@@ -136,6 +136,8 @@ _REPORT_FIELD_GROUPS: list[tuple[str, list[str]]] = [
         "holder_num_latest_report_date",
         "holder_num_4q_trend",
         "chip_concentration_signal",
+        "insider_net_selling",
+        "insider_summary",
     ]),
     ("五、综合判定", [
         "circulating_market_value_yi",
@@ -320,6 +322,13 @@ def create_capital_flow_node():
         except Exception as e:
             logger.info("capital_flow_node: get_block_trade_metrics 失败（不影响主流程）: %s", e)
 
+        insider_metrics = None
+        try:
+            from tradingagents.dataflows.tushare_vendor import get_insider_distribution_metrics
+            insider_metrics = get_insider_distribution_metrics(symbol, trade_date)
+        except Exception as e:
+            logger.info("capital_flow_node: get_insider_distribution_metrics 失败（不影响主流程）: %s", e)
+
         # 装配
         if cap_data is None:
             cap_data = {
@@ -341,6 +350,7 @@ def create_capital_flow_node():
             chip_metrics=chip_metrics,
             ths_hot_rank=ths_hot_rank,
             block_metrics=block_metrics,
+            insider_metrics=insider_metrics,
         )
 
         # 序列化
