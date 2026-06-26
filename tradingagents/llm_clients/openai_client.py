@@ -24,10 +24,63 @@ _COMPLIANCE_RETRY_PATCH = """
 """
 
 
+# 输入层审核（MiniMax 422/1026 input new_sensitive）触发时，把 prompt 里的敏感地缘政治
+# 措辞替换为中性等义词后重试——半导体/科技股新闻常含芯片战/制裁/国产替代，被输入审核拦
+# 会让 Bull/Bear Researcher 卡死。这是"切 M3"的前置兜底（M3 输入审核显著趋严，见 main.py）。
+_INPUT_SANITIZE_MAP = {
+    "芯片战": "半导体产业竞争",
+    "科技战": "科技产业竞争",
+    "贸易战": "贸易摩擦",
+    "卡脖子": "供应链约束",
+    "国产替代": "国产化",
+    "自主可控": "供应链安全",
+    "脱钩": "供应链调整",
+    "实体清单": "出口管制名单",
+    "断供": "供应中断",
+    "制裁": "出口管制",
+    "封锁": "限制",
+    "打压": "限制措施",
+}
+
+
 def _is_output_sensitive_error(err: BaseException) -> bool:
-    """Detect MiniMax-style output content moderation rejection (422 + 1027)."""
+    """Detect MiniMax-style OUTPUT content moderation rejection (422 + 1027)。
+    排除 1026（输入层）——那条走输入净化分支，不走输出措辞补丁。"""
     msg = str(err)
+    if "1026" in msg:
+        return False
     return ("new_sensitive" in msg) or ("1027" in msg and "422" in msg)
+
+
+def _is_input_sensitive_error(err: BaseException) -> bool:
+    """Detect MiniMax-style INPUT content moderation rejection (422 + 1026)。"""
+    msg = str(err)
+    return "1026" in msg or ("input" in msg.lower() and "new_sensitive" in msg)
+
+
+def _sanitize_text_for_compliance(text: str) -> str:
+    """把文本里的敏感地缘政治措辞替换为中性等义词（输入层审核兜底用）。"""
+    for bad, neutral in _INPUT_SANITIZE_MAP.items():
+        text = text.replace(bad, neutral)
+    return text
+
+
+def _sanitize_input_for_compliance(input):
+    """对 LLM 输入做敏感措辞净化后返回（用于 1026 输入审核重试）。"""
+    if isinstance(input, str):
+        return _sanitize_text_for_compliance(input)
+    if isinstance(input, list):
+        out = []
+        for m in input:
+            if hasattr(m, "content") and isinstance(m.content, str):
+                out.append(m.model_copy(update={"content": _sanitize_text_for_compliance(m.content)})
+                           if hasattr(m, "model_copy") else m)
+            else:
+                out.append(m)
+        return out
+    if hasattr(input, "content") and isinstance(input.content, str) and hasattr(input, "model_copy"):
+        return input.model_copy(update={"content": _sanitize_text_for_compliance(input.content)})
+    return input
 
 
 def _patch_input_for_compliance(input):
@@ -71,24 +124,42 @@ class NormalizedChatOpenAI(ChatOpenAI):
         try:
             result = super().invoke(input, config, **kwargs)
         except Exception as e:
-            if not _is_output_sensitive_error(e):
-                raise
             import sys
-            sys.stderr.write(
-                f"[LLM #{seq}] Output sensitivity rejected ({type(e).__name__}); "
-                f"retrying once with compliance patch...\n"
-            )
-            sys.stderr.flush()
-            patched_input = _patch_input_for_compliance(input)
-            try:
-                result = super().invoke(patched_input, config, **kwargs)
-                sys.stderr.write(f"[LLM #{seq}] Compliance-patch retry succeeded.\n")
-                sys.stderr.flush()
-            except Exception as retry_err:
+            # 输入层审核(1026)：净化 prompt 敏感措辞后重试（输出补丁对输入审核无效）
+            if _is_input_sensitive_error(e):
                 sys.stderr.write(
-                    f"[LLM #{seq}] Compliance-patch retry also failed: {retry_err}\n"
+                    f"[LLM #{seq}] Input sensitivity rejected ({type(e).__name__}); "
+                    f"retrying once with sanitized input...\n"
                 )
                 sys.stderr.flush()
+                try:
+                    result = super().invoke(_sanitize_input_for_compliance(input), config, **kwargs)
+                    sys.stderr.write(f"[LLM #{seq}] Input-sanitize retry succeeded.\n")
+                    sys.stderr.flush()
+                except Exception as retry_err:
+                    sys.stderr.write(
+                        f"[LLM #{seq}] Input-sanitize retry also failed: {retry_err}\n"
+                    )
+                    sys.stderr.flush()
+                    raise
+            elif _is_output_sensitive_error(e):
+                sys.stderr.write(
+                    f"[LLM #{seq}] Output sensitivity rejected ({type(e).__name__}); "
+                    f"retrying once with compliance patch...\n"
+                )
+                sys.stderr.flush()
+                patched_input = _patch_input_for_compliance(input)
+                try:
+                    result = super().invoke(patched_input, config, **kwargs)
+                    sys.stderr.write(f"[LLM #{seq}] Compliance-patch retry succeeded.\n")
+                    sys.stderr.flush()
+                except Exception as retry_err:
+                    sys.stderr.write(
+                        f"[LLM #{seq}] Compliance-patch retry also failed: {retry_err}\n"
+                    )
+                    sys.stderr.flush()
+                    raise
+            else:
                 raise
         elapsed = time.time() - start
 
