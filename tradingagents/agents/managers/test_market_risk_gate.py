@@ -23,3 +23,21 @@ def test_medium_risk_keeps_conditional_entry_but_caps_size():
     assert result["effective_action"] == "CONDITIONAL"
     assert result["effective_size_low_pct"] == 4
     assert result["effective_size_high_pct"] == 6
+
+
+if __name__ == "__main__":
+    import sys
+    fns = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
+    failed = 0
+    for fn in fns:
+        try:
+            fn()
+            print(f"  ✓ {fn.__name__}")
+        except AssertionError as e:
+            failed += 1
+            print(f"  ✗ {fn.__name__}: {e}")
+        except Exception as e:  # noqa: BLE001
+            failed += 1
+            print(f"  ✗ {fn.__name__}: [{type(e).__name__}] {e}")
+    print(f"\n{len(fns) - failed}/{len(fns)} passed")
+    sys.exit(1 if failed else 0)

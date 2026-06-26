@@ -21,3 +21,21 @@ def test_archive_extracts_market_risk_and_dual_horizon_fields():
     assert fields["market_risk_level"] == "高"
     assert fields["short_term_trend"] == "下跌"
     assert fields["theme_outlook_12m"] == "扩张"
+
+
+if __name__ == "__main__":
+    import sys
+    fns = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
+    failed = 0
+    for fn in fns:
+        try:
+            fn()
+            print(f"  ✓ {fn.__name__}")
+        except AssertionError as e:
+            failed += 1
+            print(f"  ✗ {fn.__name__}: {e}")
+        except Exception as e:  # noqa: BLE001
+            failed += 1
+            print(f"  ✗ {fn.__name__}: [{type(e).__name__}] {e}")
+    print(f"\n{len(fns) - failed}/{len(fns)} passed")
+    sys.exit(1 if failed else 0)
