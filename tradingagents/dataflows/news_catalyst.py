@@ -280,35 +280,67 @@ def _sentiment_sign(value) -> Optional[int]:
     return None
 
 
-def compute_narrative_shift(sentiment_report: str, news_report: str) -> Optional[dict]:
-    """叙事切换早期预警——舆情水位 vs 7 日动能/新闻论调的背离，先于价格预警。
+def _market_trend_sign(value) -> Optional[int]:
+    """market SUMMARY 的 trend（上行/下行/震荡）→ +1/-1/0。"""
+    if value is None:
+        return None
+    s = str(value).strip()
+    if "上行" in s:
+        return 1
+    if "下行" in s:
+        return -1
+    if "震荡" in s:
+        return 0
+    return None
+
+
+def compute_narrative_shift(sentiment_report: str, news_report: str,
+                            market_report: str = "") -> Optional[dict]:
+    """叙事切换早期预警——舆情水位 vs 7 日动能/新闻论调/价格 的背离，领先观察。
 
     对标投研"风向先于价格"：人群水位还偏多、但 7 日动能已转负，或新闻论调先于社媒
     转空（聪明钱/卖方叙事先变），是顶部叙事见顶回落的领先信号；反之是底部筑底回升。
+    **价量背离（item4）**：价格已转弱（日线下行/破位）但舆情仍狂热——价格先于人群转向，
+    是最危险的顶部（天孚 6/12 破位 -43.5% 而舆情还 +25 狂热的盲区）。
     这不是评级信号（不参与确定性评级链），是给 PM 监控段的**早期预警观察项**。
 
-    输入：社媒 SUMMARY(net_sentiment 偏多/偏空/分歧 + sentiment_trend_7d -100~100)、
-          新闻 SUMMARY(net_sentiment 正面/负面/中性)。
+    输入：社媒 SUMMARY(net_sentiment + sentiment_trend_7d)、新闻 SUMMARY(net_sentiment)、
+          market SUMMARY(trend_daily/trend_weekly 上行/下行/震荡)。
     Returns: {status(见顶回落预警/筑底回升预警/无明显切换), trend_7d, social_sign,
-              news_sign, note} 或 None（两份都缺 SUMMARY）。
+              news_sign, price_sign, note} 或 None（三份都缺 SUMMARY）。
     """
     s_sum = _find_summary_yaml(sentiment_report) or {}
     n_sum = _find_summary_yaml(news_report) or {}
-    if not s_sum and not n_sum:
+    m_sum = _find_summary_yaml(market_report) or {}
+    if not s_sum and not n_sum and not m_sum:
         return None
 
     social_sign = _sentiment_sign(s_sum.get("net_sentiment"))
     news_sign = _sentiment_sign(n_sum.get("net_sentiment"))
+    # 价格近端方向：优先日线（近端转向），日线缺则用周线
+    price_sign = _market_trend_sign(m_sum.get("trend_daily"))
+    if price_sign is None:
+        price_sign = _market_trend_sign(m_sum.get("trend_weekly"))
     try:
         trend = float(s_sum.get("sentiment_trend_7d")) if s_sum.get("sentiment_trend_7d") not in (None, "null", "") else None
     except (TypeError, ValueError):
         trend = None
 
-    if social_sign is None and news_sign is None and trend is None:
+    if social_sign is None and news_sign is None and trend is None and price_sign is None:
         return None
 
     reasons = []
     bearish = bearish_news = bullish = bullish_news = False
+    # 价量背离（item4）：价格已转弱(日线下行) 但 舆情仍偏多且动能未明显转负 → 最危险顶部
+    if (price_sign is not None and price_sign < 0 and social_sign is not None and social_sign > 0
+            and (trend is None or trend > -_NARRATIVE_TREND_TH)):
+        bearish = True
+        reasons.append("价格已转弱(日线下行/破位)但舆情仍偏多（价量背离，价格先于人群转向=最危险顶部）")
+    # 价量背离（底）：价格已转强(日线上行) 但 舆情仍偏空且动能未明显转正 → 筑底领先
+    if (price_sign is not None and price_sign > 0 and social_sign is not None and social_sign < 0
+            and (trend is None or trend < _NARRATIVE_TREND_TH)):
+        bullish = True
+        reasons.append("价格已转强(日线上行)但舆情仍偏空（价量背离，价格先于人群回升）")
     # 见顶回落：水位未转空(≥0) 但 7 日动能明显转负
     if social_sign is not None and social_sign >= 0 and trend is not None and trend <= -_NARRATIVE_TREND_TH:
         bearish = True
@@ -337,5 +369,6 @@ def compute_narrative_shift(sentiment_report: str, news_report: str) -> Optional
         "trend_7d": trend,
         "social_sign": social_sign,
         "news_sign": news_sign,
-        "note": "；".join(reasons) if reasons else "舆情水位与动能、新闻论调方向一致，无背离",
+        "price_sign": price_sign,
+        "note": "；".join(reasons) if reasons else "舆情水位与动能、新闻论调、价格方向一致，无背离",
     }

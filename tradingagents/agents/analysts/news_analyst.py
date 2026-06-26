@@ -300,7 +300,8 @@ def create_news_analyst(llm):
                     )
                 # 叙事切换早期预警（步骤3）：舆情水位 vs 7日动能/新闻论调背离——先于价格预警，
                 # 供 PM 监控段做领先观察项（不进确定性评级链）。社媒报告此时已在 state 里。
-                nar = compute_narrative_shift(state.get("sentiment_report", ""), report)
+                nar = compute_narrative_shift(
+                    state.get("sentiment_report", ""), report, state.get("market_report", ""))
                 if nar is not None and nar["status"] != "无明显切换":
                     report = report + (
                         f"\n<!-- ⚠️SYS_NARRATIVE｜舆情水位 vs 动能/新闻论调背离，PM 监控段早期预警（非评级信号） -->\n"

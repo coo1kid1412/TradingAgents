@@ -101,9 +101,21 @@ def test_narrative_shift():
     assert compute_narrative_shift(srep("偏空", 40), nrep("中性"))["status"] == "筑底回升预警"
     # 方向一致 → 无切换
     assert compute_narrative_shift(srep("偏多", 20), nrep("正面"))["status"] == "无明显切换"
-    # 两份都缺 SUMMARY → None
+    # 三份都缺 SUMMARY → None
     assert compute_narrative_shift("无块", "也无块") is None
-    print("✓ 叙事切换：水位/动能/论调背离 → 见顶回落/筑底回升预警")
+    # item4 价量背离：价格日线下行 + 舆情仍偏多(动能未转负) → 见顶回落(最危险顶部)
+    def mrep(trend_daily):
+        return f"# market\n```yaml\nSUMMARY:\n  trend_daily: {trend_daily}\n```"
+    r = compute_narrative_shift(srep("偏多", 10), nrep("中性"), mrep("下行"))
+    assert r["status"] == "见顶回落预警" and r["price_sign"] == -1, r
+    assert "价量背离" in r["note"]
+    # 价格上行 + 舆情仍偏空 → 筑底回升
+    assert compute_narrative_shift(srep("偏空", -10), nrep("中性"),
+                                   mrep("上行"))["status"] == "筑底回升预警"
+    # 价格与舆情同向(都偏多) → 无背离
+    assert compute_narrative_shift(srep("偏多", 20), nrep("正面"),
+                                   mrep("上行"))["status"] == "无明显切换"
+    print("✓ 叙事切换：水位/动能/论调/价量背离 → 见顶回落/筑底回升预警")
 
 
 def test_earnings_revision():
