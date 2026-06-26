@@ -1155,6 +1155,32 @@ def get_global_news(
 # ---------------------------------------------------------------------------
 # 9. get_insider_transactions
 # ---------------------------------------------------------------------------
+def _format_insider_direction_summary(df) -> str:
+    """从 in_de 字段算死的"增减持方向"摘要——杜绝 LLM 把减持读成增持（天孚实测：
+    新闻 agent 把朱国栋 62% 减持读成'增持'当利好）。in_de 是铁证：DE=减持 / IN=增持。"""
+    if df is None or df.empty or "in_de" not in df.columns:
+        return ""
+    de = df[df["in_de"].astype(str).str.upper() == "DE"]
+    inc = df[df["in_de"].astype(str).str.upper() == "IN"]
+    lines = [
+        "# 【SYS_INSIDER｜确定性增减持方向，以 in_de 字段为准，⛔严禁自行判断增/减或方向反转】",
+        "# in_de 图例：DE=减持(看空) / IN=增持(看多)。本表方向以此列为唯一真相，措辞必须与之一致。",
+        f"# 汇总：减持(DE) {len(de)} 笔 / 增持(IN) {len(inc)} 笔 → "
+        + ("整体净减持(看空)" if len(de) > len(inc) else
+           "整体净增持(看多)" if len(inc) > len(de) else "增减相当"),
+    ]
+    for _, r in df.head(8).iterrows():
+        d = "减持" if str(r.get("in_de")).upper() == "DE" else "增持"
+        try:
+            vol = f"{float(r.get('change_vol') or 0):,.0f}股"
+        except (TypeError, ValueError):
+            vol = str(r.get("change_vol"))
+        lines.append(
+            f"#   {r.get('ann_date')} {r.get('holder_name')} {d} {vol}"
+            f"（占总股本{r.get('change_ratio')}%，in_de={r.get('in_de')}）")
+    return "\n".join(lines) + "\n\n"
+
+
 def get_insider_transactions(
     symbol: Annotated[str, "ticker symbol of the company"],
 ) -> str:
@@ -1175,6 +1201,7 @@ def get_insider_transactions(
         f"# Insider Transactions for {symbol}\n"
         f"# Source: Tushare Pro\n"
         f"# Data retrieved on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+        + _format_insider_direction_summary(df)
     )
     return header + csv_string
 

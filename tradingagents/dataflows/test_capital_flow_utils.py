@@ -232,6 +232,25 @@ def test_insider_distribution():
     assert compute_insider_distribution(pd.DataFrame()) is None
 
 
+def test_insider_direction_summary():
+    """SYS_INSIDER 方向头：以 in_de 为准，杜绝 LLM 把减持读成增持（天孚实测 bug）。"""
+    from tradingagents.dataflows.tushare_vendor import _format_insider_direction_summary
+    df = pd.DataFrame({
+        "ann_date": ["20260129", "20250321"], "holder_name": ["王志弘", "朱国栋"],
+        "in_de": ["DE", "DE"], "change_vol": [394800, 3451200], "change_ratio": [0.05, 0.62]})
+    s = _format_insider_direction_summary(df)
+    assert "整体净减持(看空)" in s and "DE=减持" in s
+    assert "王志弘 减持" in s and "朱国栋 减持" in s
+    # 增持样本 → 净增持
+    assert "整体净增持(看多)" in _format_insider_direction_summary(df.assign(in_de=["IN", "IN"]))
+    # 混合：2减1增 → 净减持
+    mix = pd.DataFrame({"ann_date": ["20260101"] * 3, "holder_name": ["a", "b", "c"],
+                        "in_de": ["DE", "DE", "IN"], "change_vol": [1, 2, 3], "change_ratio": [0.1, 0.2, 0.3]})
+    assert "整体净减持(看空)" in _format_insider_direction_summary(mix)
+    # 空 → 空串
+    assert _format_insider_direction_summary(pd.DataFrame()) == ""
+
+
 def test_distribution_insider_leg():
     """第六路：内部人净减持 + 户数增 = 确认；六路满分 score=6。"""
     r = compute_distribution_into_retail(holder_num_qoq_pct=8, insider_net_selling=True)
