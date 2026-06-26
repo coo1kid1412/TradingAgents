@@ -281,6 +281,24 @@ def test_paradigm_blowoff_guard_no_ride():
     assert r["valuation_regime"] != "ride", r   # 破位+peak → 护栏生效
 
 
+def test_paradigm_top_phase_no_ride_by_default():
+    """item3：范式股主题处 peak/fading(派发顶/退潮)→不享 ride-by-default(门槛不降)，
+    即便 earnings 正、未触发 has_peak_signal 硬标。acceleration 不受影响。"""
+    base = dict(
+        momentum_score=70, rsi_percentile_1y=55, has_peak_signal=False,
+        capital_flow_regime="中性", main_force_streak_days=1,
+        net_profit_growth=0.5, retail_concentration_signal="中性",
+        quant_anticrowding=25, is_paradigm=True)
+    # acceleration：享 ride-by-default → crowding 抬0 + ride
+    r_acc = compute_valuation_regime(**base, theme_stage_inferred="acceleration")
+    assert r_acc["legs"]["crowding"] == 0 and r_acc["valuation_regime"] == "ride", r_acc
+    # fading：不享 ride-by-default → crowding 仍 -1、门槛回 +2 → 不 ride
+    r_fad = compute_valuation_regime(**base, theme_stage_inferred="fading")
+    assert r_fad["legs"]["crowding"] == -1, r_fad
+    assert r_fad["valuation_regime"] != "ride", r_fad
+    assert "不享 ride-by-default" in r_fad["reasoning"]
+
+
 def test_paradigm_blowoff_needs_price_extreme():
     """blowoff 的"价格极端"= 纯价格行为(RSI 1年分位≥85)，**不含滞后的获利盘**。
     天孚式：散户高接盘 + 已回调(RSI 中低位)即便获利盘高 → 不再误判见顶，ride 反转生效。"""

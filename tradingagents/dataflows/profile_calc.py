@@ -1817,15 +1817,22 @@ def compute_valuation_regime(
         blowoff = (has_peak_signal
                    or legs.get("tech") == -1
                    or (retail_concentration_signal == "散户高接盘" and price_extreme))
-        if not blowoff:
+        # secular_phase 阶段判别（item3/Phase3）：secular 龙头也有"加速→派发顶"的阶段切换，
+        # 不能一路 ride 到顶。主题处 peak/fading(派发顶/退潮期)→不享 ride-by-default，即便
+        # earnings 仍正、未触发 has_peak_signal 硬标。acceleration / 中性/未知 → 仍可骑(不误伤)。
+        ts = (theme_stage_inferred or "").strip()
+        is_top_phase = ts in ("peak", "fading")
+        if blowoff:
+            paradigm_note = "；范式股但 blowoff硬证据(peak/破位/散户高接盘+价格极端)→反转失效，回纪律"
+        elif is_top_phase:
+            paradigm_note = f"；范式股但主题处 {ts}(派发顶/退潮期)→不享 ride-by-default，按标准+2阈值"
+        else:
             ride_threshold = 1
             if legs.get("crowding") == -1:   # 此时非散户高接盘(否则 blowoff)，纯反拥挤分 → 主升浪常态抬0
                 legs["crowding"] = 0
                 paradigm_note = "；范式成长加速期：拥挤属主升浪常态(crowding抬0)+ride门槛降至+1"
             else:
                 paradigm_note = "；范式成长加速期：ride门槛降至+1（无blowoff证据）"
-        else:
-            paradigm_note = "；范式股但 blowoff硬证据(peak/破位/散户高接盘+价格极端)→反转失效，回纪律"
 
     score = sum(legs.values())
     # 有效路 < 3 → 数据不足，给 neutral（不轻易骑/收）
