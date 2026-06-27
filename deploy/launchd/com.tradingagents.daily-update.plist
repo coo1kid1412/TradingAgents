@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.tradingagents.daily-update</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/lailixiang/WorkSpace/QoderWorkspace/TradingAgents/.venv/bin/python</string>
+        <string>-m</string>
+        <string>tradingagents.harness.daily_update</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/lailixiang/WorkSpace/QoderWorkspace/TradingAgents</string>
+
+    <!-- 每天 21:00 跑。与 cron 的关键区别：若到点时机器在睡眠/关机，
+         launchd 会在下次唤醒时补跑一次（cron 直接跳过）——根治真值采集被饿死。 -->
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>21</integer>
+        <key>Minute</key>
+        <integer>0</integer>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>/Users/lailixiang/WorkSpace/QoderWorkspace/TradingAgents/harness_data/daily_update.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/lailixiang/WorkSpace/QoderWorkspace/TradingAgents/harness_data/daily_update.log</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <false/>
+</dict>
+</plist>
