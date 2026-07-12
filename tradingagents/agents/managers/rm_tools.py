@@ -1266,6 +1266,91 @@ def derive_market_mode(market_risk_snapshot: dict | None) -> str:
     return "risk_off"
 
 
+_ENTRY_TIMING_BY_STRUCTURE = {
+    "trend_pullback": "分批介入",
+    "breakout_ready": "等放量突破",
+    "healthy_trend": "等回踩",
+    "exhaustion": "暂不介入",
+    "broken": "退出观察",
+    "neutral": "继续观察",
+    "insufficient_data": "数据不足",
+}
+
+
+def compute_entry_timing(
+    *,
+    structure_class: str,
+    market_mode: str,
+    recurring_loss: bool = False,
+    earnings_revision: Optional[str] = None,
+    valuation_regime: Optional[str] = None,
+    has_peak_signal: bool = False,
+    retail_concentration_signal: Optional[str] = None,
+    rsi_percentile_1y: Optional[float] = None,
+    capital_flow_regime: Optional[str] = None,
+    main_force_streak_days: Optional[int] = None,
+) -> dict:
+    """Map deterministic structure to entry timing with hard risk gates.
+
+    This helper changes execution timing only. It never receives or mutates
+    the long-term five-level rating.
+    """
+    structure = (structure_class or "").strip().lower()
+    base_action = _ENTRY_TIMING_BY_STRUCTURE.get(structure, "数据不足")
+    normalized_mode = (market_mode or "risk_off").strip().lower()
+    if normalized_mode not in {"risk_on", "conditional", "risk_off"}:
+        normalized_mode = "risk_off"
+
+    blockers: list[str] = []
+    if recurring_loss:
+        blockers.append("扣非/主业持续亏损")
+    if (earnings_revision or "").strip() == "下修":
+        blockers.append("盈利预期下修")
+    if (valuation_regime or "").strip().lower() == "discipline":
+        blockers.append("valuation_regime=discipline")
+    if has_peak_signal:
+        blockers.append("peak 信号触发")
+    if (
+        (retail_concentration_signal or "").strip() == "散户高接盘"
+        and rsi_percentile_1y is not None
+        and rsi_percentile_1y >= 85
+    ):
+        blockers.append("散户高接盘叠加价格极端")
+
+    strong_outflow = (
+        (capital_flow_regime or "").strip() == "恶化"
+        or (main_force_streak_days is not None and main_force_streak_days <= -3)
+    )
+    if strong_outflow and (earnings_revision or "").strip() != "上修":
+        blockers.append("资金持续恶化且无盈利上修")
+
+    effective_action = base_action
+    if blockers:
+        effective_action = "退出观察" if structure == "broken" else "暂不介入"
+    elif normalized_mode == "risk_off":
+        if base_action in {"分批介入", "小仓试探", "等回踩", "等放量突破"}:
+            effective_action = "暂不介入"
+    elif normalized_mode == "conditional" and base_action == "分批介入":
+        effective_action = "小仓试探"
+
+    reasons = list(blockers)
+    if normalized_mode == "risk_off" and effective_action == "暂不介入":
+        reasons.append("market_risk_daily 总闸=risk_off")
+    elif normalized_mode == "conditional" and base_action == "分批介入":
+        reasons.append("market_risk_daily 总闸=conditional，积极动作降级")
+    if not reasons:
+        reasons.append(f"短线结构={structure or 'unknown'}")
+
+    return {
+        "structure_class": structure or "unknown",
+        "base_action": base_action,
+        "effective_action": effective_action,
+        "market_mode": normalized_mode,
+        "vetoed": bool(blockers),
+        "reasons": reasons,
+    }
+
+
 def _classify_inflection(inflection_stage: str) -> str:
     """把 inflection_stage 自由文本归一为单一类别 → accel / top / neutral。
 
