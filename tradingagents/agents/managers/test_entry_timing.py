@@ -11,6 +11,7 @@ from pathlib import Path
 from tradingagents.agents.managers.rm_tools import compute_entry_timing
 from tradingagents.agents.managers.research_manager import (
     _derive_entry_timing_from_profile,
+    _enforce_entry_timing_truth,
     _extract_rm_rating,
 )
 
@@ -140,6 +141,24 @@ def test_rm_rating_extraction_prefers_summary_field():
     report = "正文曾讨论 BUY\nRM_SUMMARY:\n  rm_rating: HOLD\n"
     assert _extract_rm_rating(report) == "HOLD"
     assert _extract_rm_rating("无摘要") is None
+
+
+def test_output_truth_overrides_m3_summary_and_trade_ticket_drift():
+    content = """| 结构时机 | 等回踩；结构=healthy_trend |
+RM_SUMMARY:
+  market_mode: risk_on
+  short_term_structure: neutral
+  entry_timing: 等回踩
+"""
+    timing = {
+        "structure_class": "healthy_trend",
+        "effective_action": "暂不介入",
+    }
+    fixed = _enforce_entry_timing_truth(content, timing)
+    assert "short_term_structure: healthy_trend" in fixed
+    assert "entry_timing: 暂不介入" in fixed
+    assert "| 结构时机 | 暂不介入；结构=healthy_trend |" in fixed
+    assert "entry_timing: 等回踩" not in fixed
 
 
 def test_rm_and_pm_prompt_contracts_keep_rating_and_timing_separate():

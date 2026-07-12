@@ -1,5 +1,6 @@
 import logging
 import json
+import re
 
 from langchain_core.messages import HumanMessage
 
@@ -7,6 +8,7 @@ from tradingagents.agents.utils.agent_utils import build_instrument_context, get
 from tradingagents.agents.managers.pm_tools import PM_TOOLS, PM_TOOLS_BY_NAME
 from tradingagents.agents.managers.research_manager import (
     _derive_entry_timing_from_profile,
+    _enforce_entry_timing_truth,
     _extract_rm_rating,
     _run_tool_calling_loop,
 )
@@ -693,6 +695,16 @@ Be decisive and ground every conclusion in specific evidence from the analysts.{
         # 绑定 PM 计算工具，让 LLM 调工具算 R-multiple / Conviction / 4 情景 E
         llm_with_tools = llm.bind_tools(PM_TOOLS)
         response = _pm_tool_loop(llm_with_tools, [HumanMessage(content=prompt)])
+        pm_rating_match = re.findall(
+            r"(?m)^\s*pm_rating:\s*(BUY|OVERWEIGHT|HOLD|UNDERWEIGHT|SELL)\s*$",
+            response.content or "",
+        )
+        final_rating = pm_rating_match[-1] if pm_rating_match else rm_rating
+        final_entry_timing = _derive_entry_timing_from_profile(
+            stock_profile, market_mode, long_term_rating=final_rating,
+        )
+        response = AIMessage(content=_enforce_entry_timing_truth(response.content, final_entry_timing))
+        logger.info("PM entry_timing 出口真值: %s", final_entry_timing)
 
         new_risk_debate_state = {
             "judge_decision": response.content,

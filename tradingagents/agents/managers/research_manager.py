@@ -45,6 +45,41 @@ def _extract_rm_rating(report: str):
     return matches[-1] if matches else None
 
 
+def _enforce_entry_timing_truth(content: str, timing: dict) -> str:
+    """Overwrite M3 timing drift at report output boundaries."""
+    structure = timing.get("structure_class") or "insufficient_data"
+    action = timing.get("effective_action") or "数据不足"
+    text = content or ""
+
+    text, structure_count = re.subn(
+        r"(?m)^(\s*short_term_structure:\s*).*$",
+        rf"\g<1>{structure}",
+        text,
+    )
+    text, timing_count = re.subn(
+        r"(?m)^(\s*entry_timing:\s*).*$",
+        rf"\g<1>{action}",
+        text,
+    )
+    text = re.sub(
+        r"(?m)^\|\s*结构时机\s*\|.*$",
+        f"| 结构时机 | {action}；结构={structure} |",
+        text,
+    )
+
+    if not structure_count or not timing_count:
+        summary = re.search(r"(?m)^(RM_SUMMARY|PM_SUMMARY):\s*$", text)
+        if summary:
+            insert_at = summary.end()
+            missing = ""
+            if not structure_count:
+                missing += f"\n  short_term_structure: {structure}"
+            if not timing_count:
+                missing += f"\n  entry_timing: {action}"
+            text = text[:insert_at] + missing + text[insert_at:]
+    return text
+
+
 def _derive_entry_timing_from_profile(
     profile: str,
     market_mode: str,
@@ -903,6 +938,11 @@ RM_SUMMARY:
         # 替代之前 LLM 心算导致的 Bull Score / 目标价区间 等计算 bug
         llm_with_tools = llm.bind_tools(RM_TOOLS)
         response = _run_tool_calling_loop(llm_with_tools, [HumanMessage(content=prompt)])
+        final_entry_timing = _derive_entry_timing_from_profile(
+            stock_profile, market_mode, long_term_rating=_extract_rm_rating(response.content),
+        )
+        response = AIMessage(content=_enforce_entry_timing_truth(response.content, final_entry_timing))
+        logger.info("RM entry_timing 出口真值: %s", final_entry_timing)
 
         new_investment_debate_state = {
             "judge_decision": response.content,
