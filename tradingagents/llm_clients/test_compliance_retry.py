@@ -9,7 +9,9 @@ from tradingagents.llm_clients.openai_client import (
     _is_input_sensitive_error,
     _is_output_sensitive_error,
     _sanitize_text_for_compliance,
+    _sanitize_text_for_output_compliance,
     _sanitize_input_for_compliance,
+    _sanitize_input_for_output_compliance,
 )
 
 
@@ -50,6 +52,27 @@ def test_sanitize_input_preserves_message_structure():
     assert msgs[1].content == "正常内容"
     # 纯字符串输入
     assert _sanitize_input_for_compliance("脱钩风险") == "供应链调整风险"
+
+
+def test_output_sanitize_replaces_trading_phrasing():
+    """1027 重试：净化容易诱导模型复述的口语化风险措辞。"""
+    t = _sanitize_text_for_output_compliance("接飞刀、恐慌抛售、主力出货、death cross")
+    assert "接飞刀" not in t
+    assert "恐慌抛售" not in t
+    assert "主力出货" not in t
+    assert "death cross" not in t
+    assert "逆势承接风险" in t
+    assert "集中卖压释放" in t
+    assert "主力减仓" in t
+
+
+def test_output_sanitize_preserves_message_structure():
+    """1027 重试净化消息列表时保持 role/条数不变。"""
+    msgs = _sanitize_input_for_output_compliance(
+        [SystemMessage(content="避免接飞刀"), HumanMessage(content="正常内容")])
+    assert len(msgs) == 2
+    assert msgs[0].content == "避免逆势承接风险"
+    assert msgs[1].content == "正常内容"
 
 
 if __name__ == "__main__":

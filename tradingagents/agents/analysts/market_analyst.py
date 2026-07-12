@@ -20,7 +20,7 @@ logger = logging.getLogger(__name__)
 _INDICATOR_CATALOG = """
 Moving Averages:
 - close_50_sma: 50 SMA: A medium-term trend indicator. Usage: Identify trend direction and serve as dynamic support/resistance. Tips: It lags price; combine with faster indicators for timely signals.
-- close_200_sma: 200 SMA: A long-term trend benchmark. Usage: Confirm overall market trend and identify golden/death cross setups. Tips: It reacts slowly; best for strategic trend confirmation rather than frequent trading entries.
+- close_200_sma: 200 SMA: A long-term trend benchmark. Usage: Confirm overall market trend and identify bullish/bearish moving-average cross setups. Tips: It reacts slowly; best for strategic trend confirmation rather than frequent trading entries.
 - close_10_ema: 10 EMA: A responsive short-term average. Usage: Capture quick shifts in momentum and potential entry points. Tips: Prone to noise in choppy markets; use alongside longer averages for filtering false signals.
 
 MACD Related:
@@ -178,7 +178,7 @@ def create_market_analyst(llm):
             + "\n\n"
             "## 输出结构（必须按以下章节撰写）\n\n"
             "### 一、多周期趋势背景（为 execution 定位服务；方向以 QUANT_SCORE 为准，此处简明扼要不展开论证）\n"
-            "**经典原则：大周期定方向，小周期找入场**。强制双周期分析，避免日线看似超卖但周线趋势恶化的'接飞刀'陷阱"
+            "**经典原则：大周期定方向，小周期找入场**。强制双周期分析，避免日线看似超卖但周线趋势恶化的'逆势承接风险'"
             "（仅作'在哪个位置进出'的背景，**不与 QUANT 客观分争评级方向**）：\n\n"
             "**1.1 周线趋势（中长期方向，把日线数据按周聚合分析）**：\n"
             "- 周线 K 线形态（多头排列/空头排列/盘整）\n"
@@ -191,9 +191,9 @@ def create_market_analyst(llm):
             "- 日线在周线趋势中的相对位置（强趋势中的回调位 vs 弱趋势中的反弹位）\n\n"
             "**1.3 多周期一致性判定**（必输出）：\n"
             "- ✅ 周线上行 + 日线回调 = 强势回调，逢低入场机会\n"
-            "- ⚠️ 周线下行 + 日线超卖反弹 = 弱反弹，**典型接飞刀陷阱**\n"
+            "- ⚠️ 周线下行 + 日线超卖反弹 = 弱反弹，**典型逆势承接风险**\n"
             "- ⚠️ 周线上行 + 日线突破乏力 = 趋势衰竭警告\n"
-            "- ✅ 周线下行 + 日线持续走弱 = 趋势性下跌，回避\n\n"
+            "- ✅ 周线下行 + 日线持续走弱 = 趋势性走弱，回避\n\n"
             "### 二、核心技术指标分析\n"
             "逐一分析所选指标（RSI/MACD/均线/布林带/ATR 等），每个指标给出：\n"
             "- 当前数值与状态\n"
@@ -208,7 +208,7 @@ def create_market_analyst(llm):
             "| 量价模式 | 判定标准 | 含义 |\n"
             "|---------|---------|------|\n"
             "| **放量上涨** | 近 5 日均量 > 20 日均量 1.5 倍且收阳 | 主力增仓，趋势确认 |\n"
-            "| **放量下跌** | 近 5 日均量 > 20 日均量 1.5 倍且收阴 | 主力出货/恐慌抛售 |\n"
+            "| **放量下跌** | 近 5 日均量 > 20 日均量 1.5 倍且收阴 | 主力减仓/集中卖压释放 |\n"
             "| **缩量整理** | 近 5 日均量 < 20 日均量 0.7 倍 | 观望期，等方向选择 |\n"
             "| **无量背离** | 价格新高/新低但成交萎缩 | 趋势衰竭警告 |\n"
             "| **量价齐升** | 量价同向放大，温和上涨 | 健康上行 |\n"

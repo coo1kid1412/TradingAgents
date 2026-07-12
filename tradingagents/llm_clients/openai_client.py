@@ -17,9 +17,9 @@ _COMPLIANCE_RETRY_PATCH = """
 
 【追加合规约束（上次输出被审核拦截，重试触发）】
 你的上一次输出被供应商输出层合规审核拦截，请重新生成并严格遵守：
-- 禁止使用情绪化/煽动性词汇："暴雷/爆雷/崩盘/崩塌/血洗/腰斩/砸盘/做空获利/时间炸弹/引爆/踩雷"
-- 涉及下行风险时改用中性表述："显著下行/深度回调/估值大幅压缩/下行幅度 N%"
-- 涉及损失估算时改用："潜在下行幅度/下行风险敞口"，禁用"亏多少/巨亏/血亏"
+- 使用中性、审慎、机构化措辞，避免灾难化、煽动性、攻击性或交易煽动式表达。
+- 涉及下行风险时改用中性表述，例如"显著下行/深度回调/估值大幅压缩/下行幅度 N%"。
+- 涉及损失估算时改用"潜在下行幅度/下行风险敞口"。
 - 保留所有定量分析与数字，仅替换措辞
 """
 
@@ -40,6 +40,33 @@ _INPUT_SANITIZE_MAP = {
     "制裁": "出口管制",
     "封锁": "限制",
     "打压": "限制措施",
+}
+
+_OUTPUT_SANITIZE_MAP = {
+    "暴雷": "业绩显著低于预期",
+    "爆雷": "业绩显著低于预期",
+    "崩盘": "深度回调",
+    "崩塌": "大幅走弱",
+    "崩溃": "大幅走弱",
+    "血洗": "大幅调整",
+    "腰斩": "跌幅超过 50%",
+    "砸盘": "卖压释放",
+    "做空获利": "下行情景的对冲收益",
+    "亏多少": "潜在下行幅度",
+    "巨亏": "显著亏损",
+    "血亏": "显著亏损",
+    "时间炸弹": "潜在风险事件",
+    "引爆": "触发",
+    "爆炸": "快速释放",
+    "踩雷": "命中风险点",
+    "雷区": "高风险区域",
+    "接飞刀": "逆势承接风险",
+    "恐慌抛售": "集中卖压释放",
+    "恐慌": "情绪快速降温",
+    "主力出货": "主力减仓",
+    "趋势性下跌": "趋势性走弱",
+    "死亡交叉": "均线空头交叉",
+    "death cross": "bearish moving-average cross",
 }
 
 
@@ -65,21 +92,39 @@ def _sanitize_text_for_compliance(text: str) -> str:
     return text
 
 
+def _sanitize_text_for_output_compliance(text: str) -> str:
+    """净化容易诱导输出层审核的 prompt 措辞（1027 重试用）。"""
+    text = _sanitize_text_for_compliance(text)
+    for bad, neutral in _OUTPUT_SANITIZE_MAP.items():
+        text = text.replace(bad, neutral)
+    return text
+
+
 def _sanitize_input_for_compliance(input):
     """对 LLM 输入做敏感措辞净化后返回（用于 1026 输入审核重试）。"""
+    return _sanitize_input_text(input, _sanitize_text_for_compliance)
+
+
+def _sanitize_input_for_output_compliance(input):
+    """对 LLM 输入做输出层敏感措辞净化后返回（用于 1027 输出审核重试）。"""
+    return _sanitize_input_text(input, _sanitize_text_for_output_compliance)
+
+
+def _sanitize_input_text(input, sanitizer):
+    """Apply a text sanitizer while preserving LangChain message structure."""
     if isinstance(input, str):
-        return _sanitize_text_for_compliance(input)
+        return sanitizer(input)
     if isinstance(input, list):
         out = []
         for m in input:
             if hasattr(m, "content") and isinstance(m.content, str):
-                out.append(m.model_copy(update={"content": _sanitize_text_for_compliance(m.content)})
+                out.append(m.model_copy(update={"content": sanitizer(m.content)})
                            if hasattr(m, "model_copy") else m)
             else:
                 out.append(m)
         return out
     if hasattr(input, "content") and isinstance(input.content, str) and hasattr(input, "model_copy"):
-        return input.model_copy(update={"content": _sanitize_text_for_compliance(input.content)})
+        return input.model_copy(update={"content": sanitizer(input.content)})
     return input
 
 
@@ -145,10 +190,12 @@ class NormalizedChatOpenAI(ChatOpenAI):
             elif _is_output_sensitive_error(e):
                 sys.stderr.write(
                     f"[LLM #{seq}] Output sensitivity rejected ({type(e).__name__}); "
-                    f"retrying once with compliance patch...\n"
+                    f"retrying once with sanitized input and compliance patch...\n"
                 )
                 sys.stderr.flush()
-                patched_input = _patch_input_for_compliance(input)
+                patched_input = _patch_input_for_compliance(
+                    _sanitize_input_for_output_compliance(input)
+                )
                 try:
                     result = super().invoke(patched_input, config, **kwargs)
                     sys.stderr.write(f"[LLM #{seq}] Compliance-patch retry succeeded.\n")
