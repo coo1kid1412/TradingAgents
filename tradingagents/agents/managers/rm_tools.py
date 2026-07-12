@@ -1289,6 +1289,7 @@ def compute_entry_timing(
     rsi_percentile_1y: Optional[float] = None,
     capital_flow_regime: Optional[str] = None,
     main_force_streak_days: Optional[int] = None,
+    long_term_rating: Optional[str] = None,
 ) -> dict:
     """Map deterministic structure to entry timing with hard risk gates.
 
@@ -1324,9 +1325,15 @@ def compute_entry_timing(
     if strong_outflow and (earnings_revision or "").strip() != "上修":
         blockers.append("资金持续恶化且无盈利上修")
 
+    rating = (long_term_rating or "").strip().upper()
+    if rating in {"UNDERWEIGHT", "SELL"}:
+        blockers.append(f"长期评级={rating}，禁止积极入场")
+
     effective_action = base_action
     if blockers:
         effective_action = "退出观察" if structure == "broken" else "暂不介入"
+    elif rating == "HOLD" and base_action == "分批介入":
+        effective_action = "等回踩"
     elif normalized_mode == "risk_off":
         if base_action in {"分批介入", "小仓试探", "等回踩", "等放量突破"}:
             effective_action = "暂不介入"
@@ -1346,6 +1353,7 @@ def compute_entry_timing(
         "base_action": base_action,
         "effective_action": effective_action,
         "market_mode": normalized_mode,
+        "long_term_rating": rating or None,
         "vetoed": bool(blockers),
         "reasons": reasons,
     }

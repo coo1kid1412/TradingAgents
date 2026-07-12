@@ -1101,6 +1101,12 @@ TRANSPARENCY:
             + _format_short_term_structure_line(short_term_structure) + "\n"
             + f"SYS_SHORT_TERM_STRUCTURE_REASONS: {'；'.join(short_term_structure['reasons']) if short_term_structure['reasons'] else '无'}\n"
             + f"SYS_SHORT_TERM_STRUCTURE_BLOCKERS: {'；'.join(short_term_structure['blockers']) if short_term_structure['blockers'] else '无'}\n"
+            + f"SYS_ENTRY_RECURRING_LOSS: {str(bool(gq['recurring_loss'])).lower()}\n"
+            + f"SYS_ENTRY_HAS_PEAK_SIGNAL: {str(bool(peak_check['force_peak'])).lower()}\n"
+            + f"SYS_ENTRY_RETAIL_CONCENTRATION: {cf_sig.get('retail_signal') or '中性'}\n"
+            + f"SYS_ENTRY_RSI_PERCENTILE_1Y: {price_signals.get('rsi_percentile_1y') if price_signals.get('rsi_percentile_1y') is not None else 'N/A'}\n"
+            + f"SYS_ENTRY_CAPITAL_FLOW_REGIME: {cf_sig.get('regime') or '数据不足'}\n"
+            + f"SYS_ENTRY_MAIN_FORCE_STREAK_DAYS: {cf_sig.get('streak') if cf_sig.get('streak') is not None else 'N/A'}\n"
         )
         logger.info("SYS_VALUATION_REGIME 已注入画像: %s", valuation_regime)
         if main_business_seg:

@@ -5,7 +5,12 @@ from langchain_core.messages import HumanMessage
 
 from tradingagents.agents.utils.agent_utils import build_instrument_context, get_language_instruction, RISK_DEBATE_PHRASING_RULES
 from tradingagents.agents.managers.pm_tools import PM_TOOLS, PM_TOOLS_BY_NAME
-from tradingagents.agents.managers.research_manager import _run_tool_calling_loop
+from tradingagents.agents.managers.research_manager import (
+    _derive_entry_timing_from_profile,
+    _extract_rm_rating,
+    _run_tool_calling_loop,
+)
+from tradingagents.agents.managers.rm_tools import derive_market_mode
 
 logger = logging.getLogger(__name__)
 
@@ -44,6 +49,11 @@ def create_portfolio_manager(llm, memory):
         quant_score = state.get("quant_score", "")
         sector_comparison = state.get("sector_comparison", "")
         market_risk_snapshot = state.get("market_risk_snapshot") or {}
+        market_mode = derive_market_mode(market_risk_snapshot)
+        rm_rating = _extract_rm_rating(research_plan)
+        entry_timing = _derive_entry_timing_from_profile(
+            stock_profile, market_mode, long_term_rating=rm_rating,
+        )
         market_risk_block = (
             json.dumps(market_risk_snapshot, ensure_ascii=False, indent=2)
             if market_risk_snapshot
@@ -95,6 +105,17 @@ def create_portfolio_manager(llm, memory):
 该快照不改变 RM 的长期评级，但严格约束短期动作：`WAIT` 时禁止 BUY_NOW/追高；
 `CONDITIONAL` 时 BUY_NOW 必须改为条件入场；建议仓位不得超过 `position_cap_pct`。
 快照缺失等同于 WAIT + 0% 仓位。必须在决策卡与入场时机中引用 as_of_date/as_of_time。
+
+## 确定性短线结构与入场时机（权威约束）
+
+```json
+{json.dumps(entry_timing, ensure_ascii=False, indent=2)}
+```
+
+该结果由画像 `SYS_SHORT_TERM_STRUCTURE`、RM 长期评级和 `market_risk_daily` 共同确定。
+**短线结构不得改变长期评级**，只决定当前时机。Trade Ticket 的“结构时机”必须逐字采用
+`effective_action`；原有 `apply_market_risk_gate` 继续决定最终 Action/Size，若两者不一致，采用更保守者。
+禁止把“等回踩/等放量突破/暂不介入”改写成 BUY NOW。
 
 ---
 
@@ -385,6 +406,7 @@ PM 必须明确"thesis 兑现"的具体里程碑（如"Q2 营收增速 >25%"、"
 | Conviction 信心 | <⭐⭐⭐ Medium>（RM=高/中/低，R=X.XX，\|d\|=X.XX） |
 | 投资判断 | <YES / NO / CONDITIONAL>（含等待条件） |
 | 入场判断 | <BUY NOW / WAIT / DON'T BUY>（含等待条件） |
+| 结构时机 | <逐字填写上方确定性 entry_timing.effective_action>；结构=<structure_class> |
 | Market Risk 市场风险 | <风险等级> / <T+1 偏向>，快照生效 <as_of_date as_of_time> |
 | 未来 5 日趋势 | <上涨 / 震荡 / 下跌>（置信度：高/中/低；失效条件：__） |
 | 12 月主题判断 | <扩张 / 兑现 / 降速 / 破裂>（增长兑现/估值溢价/拥挤度：__） |
@@ -654,6 +676,8 @@ PM_SUMMARY:
   market_risk_level: <低 / 中 / 高 / 极高 / 数据不足>
   market_entry_gate: <OPEN / CONDITIONAL / WAIT>
   market_position_cap_pct: <float>
+  short_term_structure: trend_pullback / breakout_ready / healthy_trend / exhaustion / broken / neutral / insufficient_data
+  entry_timing: 分批介入 / 小仓试探 / 等回踩 / 等放量突破 / 暂不介入 / 退出观察 / 继续观察 / 数据不足
   short_term_trend: <上涨 / 震荡 / 下跌>
   short_term_confidence: <高 / 中 / 低>
   theme_outlook_12m: <扩张 / 兑现 / 降速 / 破裂>

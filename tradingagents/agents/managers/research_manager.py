@@ -1,10 +1,16 @@
 import logging
 import json
+import re
 
 from langchain_core.messages import HumanMessage, AIMessage, ToolMessage, SystemMessage
 
 from tradingagents.agents.utils.agent_utils import build_instrument_context, RISK_DEBATE_PHRASING_RULES
-from tradingagents.agents.managers.rm_tools import RM_TOOLS, RM_TOOLS_BY_NAME, derive_market_mode
+from tradingagents.agents.managers.rm_tools import (
+    RM_TOOLS,
+    RM_TOOLS_BY_NAME,
+    compute_entry_timing,
+    derive_market_mode,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -12,6 +18,56 @@ logger = logging.getLogger(__name__)
 # Step 6 评级终段已合并为 compute_step6_final_rating 一次调用（阈值/映射/拥挤/
 # 升降档/叠加/极端防御一次合议），典型轮数 ~6-9，15 是宽裕缓冲
 _MAX_TOOL_ITERATIONS = 15
+
+
+def _profile_scalar(profile: str, key: str):
+    match = re.search(rf"(?m)^{re.escape(key)}:\s*([^\n（|]+)", profile or "")
+    return match.group(1).strip() if match else None
+
+
+def _profile_bool(profile: str, key: str) -> bool:
+    return (_profile_scalar(profile, key) or "").lower() == "true"
+
+
+def _profile_float(profile: str, key: str):
+    value = _profile_scalar(profile, key)
+    try:
+        return float(value) if value not in (None, "", "N/A", "None") else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _extract_rm_rating(report: str):
+    matches = re.findall(
+        r"(?m)^\s*rm_rating:\s*(BUY|OVERWEIGHT|HOLD|UNDERWEIGHT|SELL)\s*$",
+        report or "",
+    )
+    return matches[-1] if matches else None
+
+
+def _derive_entry_timing_from_profile(
+    profile: str,
+    market_mode: str,
+    long_term_rating: str | None = None,
+) -> dict:
+    """Parse stock-profile truth lines and apply the deterministic timing gate."""
+    structure_match = re.search(
+        r"(?m)^SYS_SHORT_TERM_STRUCTURE:\s*class=([a-z_]+)", profile or ""
+    )
+    structure_class = structure_match.group(1) if structure_match else "unknown"
+    return compute_entry_timing(
+        structure_class=structure_class,
+        market_mode=market_mode,
+        recurring_loss=_profile_bool(profile, "SYS_ENTRY_RECURRING_LOSS"),
+        earnings_revision=_profile_scalar(profile, "SYS_EARNINGS_REVISION"),
+        valuation_regime=_profile_scalar(profile, "SYS_VALUATION_REGIME"),
+        has_peak_signal=_profile_bool(profile, "SYS_ENTRY_HAS_PEAK_SIGNAL"),
+        retail_concentration_signal=_profile_scalar(profile, "SYS_ENTRY_RETAIL_CONCENTRATION"),
+        rsi_percentile_1y=_profile_float(profile, "SYS_ENTRY_RSI_PERCENTILE_1Y"),
+        capital_flow_regime=_profile_scalar(profile, "SYS_ENTRY_CAPITAL_FLOW_REGIME"),
+        main_force_streak_days=_profile_float(profile, "SYS_ENTRY_MAIN_FORCE_STREAK_DAYS"),
+        long_term_rating=long_term_rating,
+    )
 
 
 def _run_tool_calling_loop(llm_with_tools, initial_messages, *,
@@ -140,6 +196,7 @@ def create_research_manager(llm):
         capital_flow_yaml = state.get("capital_flow_yaml", "")
         market_risk_snapshot = state.get("market_risk_snapshot") or {}
         market_mode = derive_market_mode(market_risk_snapshot)
+        entry_timing = _derive_entry_timing_from_profile(stock_profile, market_mode)
         market_risk_block = (
             json.dumps(market_risk_snapshot, ensure_ascii=False, indent=2)
             if market_risk_snapshot
@@ -239,6 +296,16 @@ def create_research_manager(llm):
 - `risk_on`：允许 AI 主升 confirmed 完整升档。
 - `conditional`：只允许 AI 主升轻度升档，不允许追成 BUY。
 - `risk_off`：AI 主升升档禁用；缺失快照也按 risk_off。
+
+### 0.3C 确定性短线结构与入场时机（只管时机，不管评级）
+
+```json
+{json.dumps(entry_timing, ensure_ascii=False, indent=2)}
+```
+
+这是 `SYS_SHORT_TERM_STRUCTURE` 经 Python 风险总闸得到的权威执行约束。你必须先独立完成长期评级，
+再单独报告 `entry_timing`；**短线结构不得改变长期评级**。若最终评级为 HOLD，积极动作最多写“等回踩”；
+若为 UNDERWEIGHT/SELL，必须写“暂不介入”。不得把 `healthy_trend` 擅自升级为立即买入。
 
 ### 0.4 量化锚（由量化打分官 Python 确定性输出，无 LLM 主观空间）
 
@@ -819,6 +886,8 @@ RM_SUMMARY:
   ai_main_uptrend_enabled: true / false  # 画像 SYS_AI_MAIN_UPTREND_ENABLED
   ai_main_uptrend_class: confirmed / early / none / null
   market_mode: risk_on / conditional / risk_off
+  short_term_structure: trend_pullback / breakout_ready / healthy_trend / exhaustion / broken / neutral / insufficient_data
+  entry_timing: 分批介入 / 小仓试探 / 等回踩 / 等放量突破 / 暂不介入 / 退出观察 / 继续观察 / 数据不足
   ai_main_uptrend_adj: <int>             # 工具 stages.ai_main_uptrend.adjustment（-1/0/+1；当前只会 0/+1）
   overlay_style_adj: <int>               # 工具返回 overlay_components.style（-1/0/+1）
   overlay_vote_adj: <int>                # 工具返回 overlay_components.vote

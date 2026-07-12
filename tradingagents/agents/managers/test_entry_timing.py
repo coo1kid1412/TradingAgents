@@ -6,8 +6,13 @@ Run: .venv/bin/python tradingagents/agents/managers/test_entry_timing.py
 from __future__ import annotations
 
 import sys
+from pathlib import Path
 
 from tradingagents.agents.managers.rm_tools import compute_entry_timing
+from tradingagents.agents.managers.research_manager import (
+    _derive_entry_timing_from_profile,
+    _extract_rm_rating,
+)
 
 
 def _timing(structure_class="trend_pullback", market_mode="risk_on", **kwargs):
@@ -22,6 +27,7 @@ def _timing(structure_class="trend_pullback", market_mode="risk_on", **kwargs):
         rsi_percentile_1y=kwargs.get("rsi_percentile_1y", 60),
         capital_flow_regime=kwargs.get("capital_flow_regime", "中性"),
         main_force_streak_days=kwargs.get("main_force_streak_days", 0),
+        long_term_rating=kwargs.get("long_term_rating"),
     )
 
 
@@ -89,6 +95,63 @@ def test_unknown_structure_returns_data_insufficient():
     result = _timing("new_unrecognized_state")
     assert result["base_action"] == "数据不足", result
     assert result["effective_action"] == "数据不足", result
+
+
+def test_long_term_rating_caps_positive_timing():
+    hold = _timing(long_term_rating="HOLD")
+    assert hold["effective_action"] == "等回踩", hold
+    for rating in ("UNDERWEIGHT", "SELL"):
+        result = _timing(long_term_rating=rating)
+        assert result["effective_action"] == "暂不介入", result
+        assert result["vetoed"] is True, result
+
+
+def test_positive_ratings_allow_active_timing():
+    for rating in ("BUY", "OVERWEIGHT"):
+        result = _timing(long_term_rating=rating)
+        assert result["effective_action"] == "分批介入", result
+
+
+def test_profile_truth_lines_drive_entry_timing():
+    profile = """
+SYS_VALUATION_REGIME: ride
+SYS_EARNINGS_REVISION: 上修（卖方盈利预期方向）
+SYS_SHORT_TERM_STRUCTURE: class=trend_pullback | ma10_slope_5d_pct=2.35 | price_vs_ma10_pct=0.50 | volume_ratio_5d_20d=0.71 | breakout_confirmed=false
+SYS_ENTRY_RECURRING_LOSS: false
+SYS_ENTRY_HAS_PEAK_SIGNAL: false
+SYS_ENTRY_RETAIL_CONCENTRATION: 中性
+SYS_ENTRY_RSI_PERCENTILE_1Y: 60
+SYS_ENTRY_CAPITAL_FLOW_REGIME: 强势
+SYS_ENTRY_MAIN_FORCE_STREAK_DAYS: 2
+"""
+    result = _derive_entry_timing_from_profile(profile, "conditional")
+    assert result["structure_class"] == "trend_pullback", result
+    assert result["base_action"] == "分批介入", result
+    assert result["effective_action"] == "小仓试探", result
+
+
+def test_missing_profile_truth_fails_closed():
+    result = _derive_entry_timing_from_profile("", "risk_on")
+    assert result["structure_class"] == "unknown", result
+    assert result["effective_action"] == "数据不足", result
+
+
+def test_rm_rating_extraction_prefers_summary_field():
+    report = "正文曾讨论 BUY\nRM_SUMMARY:\n  rm_rating: HOLD\n"
+    assert _extract_rm_rating(report) == "HOLD"
+    assert _extract_rm_rating("无摘要") is None
+
+
+def test_rm_and_pm_prompt_contracts_keep_rating_and_timing_separate():
+    root = Path(__file__).resolve().parents[3]
+    for relative in (
+        "tradingagents/agents/managers/research_manager.py",
+        "tradingagents/agents/managers/portfolio_manager.py",
+    ):
+        source = (root / relative).read_text(encoding="utf-8")
+        assert "SYS_SHORT_TERM_STRUCTURE" in source, relative
+        assert "entry_timing" in source, relative
+        assert "短线结构不得改变长期评级" in source, relative
 
 
 if __name__ == "__main__":
