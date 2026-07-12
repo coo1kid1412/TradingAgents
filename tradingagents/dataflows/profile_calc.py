@@ -205,6 +205,214 @@ def get_default_weights(style: Optional[str]) -> Optional[dict[str, int]]:
 # ---------------------------------------------------------------------------
 # 价格 / 估值数据提取（从 OHLCV / fundamentals 原始数据）
 # ---------------------------------------------------------------------------
+def compute_short_term_structure(
+    price_df,
+    *,
+    rsi_percentile_1y: Optional[float] = None,
+    has_vol_divergence: bool = False,
+) -> dict:
+    """Classify short-term price/volume structure from daily OHLCV.
+
+    The result is deterministic and uses only rows available through the
+    current bar. Risk states take precedence over constructive states.
+    """
+    import math
+    import pandas as pd
+
+    result = {
+        "as_of_date": None,
+        "structure_class": "insufficient_data",
+        "ma10": None,
+        "ma20": None,
+        "ma10_slope_5d_pct": None,
+        "price_vs_ma10_pct": None,
+        "price_vs_ma20_pct": None,
+        "volume_ratio_5d_20d": None,
+        "volume_ratio_1d_20d": None,
+        "atr14_pct": None,
+        "distance_from_prior_20d_high_pct": None,
+        "breakout_confirmed": False,
+        "reasons": [],
+        "blockers": [],
+    }
+    if price_df is None or len(price_df) == 0:
+        result["reasons"] = ["OHLCV 数据为空"]
+        return result
+
+    columns = {str(col).lower(): col for col in price_df.columns}
+    close_col = columns.get("close")
+    if close_col is None:
+        result["reasons"] = ["缺少 Close 列"]
+        return result
+
+    frame = pd.DataFrame(index=price_df.index)
+    frame["close"] = pd.to_numeric(price_df[close_col], errors="coerce")
+    for name in ("open", "high", "low", "volume"):
+        source = columns.get(name)
+        frame[name] = pd.to_numeric(price_df[source], errors="coerce") if source is not None else math.nan
+    frame = frame.replace([math.inf, -math.inf], math.nan).dropna(subset=["close"])
+    frame = frame[frame["close"] > 0].reset_index(drop=True)
+    if len(frame) < 20:
+        result["reasons"] = [f"有效收盘数据不足 20 日（{len(frame)} 日）"]
+        return result
+
+    date_col = columns.get("date")
+    if date_col is not None:
+        raw_date = price_df.loc[price_df[close_col].notna(), date_col]
+        if len(raw_date):
+            result["as_of_date"] = str(raw_date.iloc[-1])[:10]
+
+    close = frame["close"]
+    ma10_series = close.rolling(10).mean()
+    ma20_series = close.rolling(20).mean()
+    ma10 = float(ma10_series.iloc[-1])
+    ma20 = float(ma20_series.iloc[-1])
+    latest = float(close.iloc[-1])
+    ma10_slope = None
+    if len(frame) >= 15 and ma10_series.iloc[-6] > 0:
+        ma10_slope = float((ma10 / ma10_series.iloc[-6] - 1) * 100)
+
+    result.update({
+        "ma10": round(ma10, 4),
+        "ma20": round(ma20, 4),
+        "ma10_slope_5d_pct": round(ma10_slope, 4) if ma10_slope is not None else None,
+        "price_vs_ma10_pct": round((latest / ma10 - 1) * 100, 4),
+        "price_vs_ma20_pct": round((latest / ma20 - 1) * 100, 4),
+    })
+
+    high = frame["high"].where(frame["high"] > 0, close).fillna(close)
+    low = frame["low"].where(frame["low"] > 0, close).fillna(close)
+    prev_close = close.shift(1)
+    true_range = pd.concat([
+        high - low,
+        (high - prev_close).abs(),
+        (low - prev_close).abs(),
+    ], axis=1).max(axis=1)
+    atr14 = float(true_range.tail(14).mean())
+    atr14_pct = (atr14 / latest * 100) if latest > 0 and math.isfinite(atr14) else 2.0
+    if not math.isfinite(atr14_pct) or atr14_pct <= 0:
+        atr14_pct = 2.0
+        result["blockers"].append("ATR 无效，使用 2% 降级值")
+    result["atr14_pct"] = round(atr14_pct, 4)
+
+    near_band = min(max(0.75 * atr14_pct, 1.5), 4.0)
+    break_band = min(max(atr14_pct, 2.0), 5.0)
+    extended_band = min(max(2.0 * atr14_pct, 6.0), 12.0)
+
+    prior_20d_high = float(close.iloc[-21:-1].max()) if len(close) >= 21 else float(close.iloc[:-1].max())
+    distance_high = (latest / prior_20d_high - 1) * 100 if prior_20d_high > 0 else None
+    result["distance_from_prior_20d_high_pct"] = round(distance_high, 4) if distance_high is not None else None
+
+    volume = frame["volume"]
+    volume_valid = len(volume) >= 20 and volume.tail(5).notna().all() and (volume.tail(5) > 0).all()
+    volume_ratio_5d_20d = None
+    volume_ratio_1d_20d = None
+    if volume_valid:
+        volume_20d = float(volume.tail(20).mean())
+        if volume_20d > 0 and math.isfinite(volume_20d):
+            volume_ratio_5d_20d = float(volume.tail(5).mean() / volume_20d)
+            volume_ratio_1d_20d = float(volume.iloc[-1] / volume_20d)
+            result["volume_ratio_5d_20d"] = round(volume_ratio_5d_20d, 4)
+            result["volume_ratio_1d_20d"] = round(volume_ratio_1d_20d, 4)
+    else:
+        result["blockers"].append("近期成交量缺失或为零，关闭积极量价分类")
+
+    breakout = bool(distance_high is not None and distance_high > 0)
+    result["breakout_confirmed"] = bool(
+        breakout and volume_ratio_1d_20d is not None and volume_ratio_1d_20d >= 1.3
+    )
+
+    previous_ma20 = float(ma20_series.iloc[-2]) if len(ma20_series.dropna()) >= 2 else ma20
+    prior_above_ma20 = float(close.iloc[-2]) >= previous_ma20
+    broken = bool(
+        (latest < ma20 and ma10_slope is not None and ma10_slope <= -1.0)
+        or (
+            len(close) >= 2
+            and (close.tail(2) < ma10_series.tail(2)).all()
+            and result["price_vs_ma10_pct"] < -near_band
+            and ma10_slope is not None
+            and ma10_slope < 0
+        )
+        or (
+            prior_above_ma20
+            and latest < ma20
+            and volume_ratio_1d_20d is not None
+            and volume_ratio_1d_20d >= 1.5
+        )
+    )
+
+    five_day_return_pct = float((latest / close.iloc[-6] - 1) * 100) if len(close) >= 6 else 0.0
+    exhaustion = bool(
+        (
+            result["price_vs_ma10_pct"] > extended_band
+            and rsi_percentile_1y is not None
+            and rsi_percentile_1y >= 85
+        )
+        or (breakout and volume_ratio_1d_20d is not None and volume_ratio_1d_20d < 0.8)
+        or (
+            five_day_return_pct >= max(5.0, 2.0 * atr14_pct)
+            and ma10_slope is not None
+            and ma10_slope > 0
+            and bool(has_vol_divergence)
+        )
+    )
+
+    trend_pullback = bool(
+        volume_ratio_5d_20d is not None
+        and ma10_slope is not None
+        and ma10_slope >= 1.0
+        and ma10 > ma20
+        and abs(result["price_vs_ma10_pct"]) <= near_band
+        and latest >= ma20
+        and volume_ratio_5d_20d <= 0.85
+    )
+    ten_day_range_pct = float((close.tail(10).max() / close.tail(10).min() - 1) * 100)
+    breakout_ready = bool(
+        volume_ratio_5d_20d is not None
+        and distance_high is not None
+        and -break_band <= distance_high <= 0
+        and ten_day_range_pct <= max(8.0, 3.0 * atr14_pct)
+        and volume_ratio_5d_20d <= 0.85
+        and ma10_slope is not None
+        and ma10_slope >= 0
+        and latest >= ma20
+        and not result["breakout_confirmed"]
+    )
+    healthy_trend = bool(
+        ma10_slope is not None and ma10_slope > 0 and ma10 > ma20 and latest > ma10
+    )
+
+    if broken:
+        structure_class = "broken"
+        reasons = [f"短线破位：收盘/MA20={result['price_vs_ma20_pct']:+.2f}%"]
+    elif exhaustion:
+        structure_class = "exhaustion"
+        reasons = ["价格扩张与量能/拥挤不匹配"]
+    elif trend_pullback:
+        structure_class = "trend_pullback"
+        reasons = [
+            f"MA10 五日斜率={ma10_slope:+.2f}%",
+            f"价格/MA10={result['price_vs_ma10_pct']:+.2f}%",
+            f"5/20 日量比={volume_ratio_5d_20d:.2f}",
+        ]
+    elif breakout_ready:
+        structure_class = "breakout_ready"
+        reasons = [
+            f"距前20日高点={distance_high:+.2f}%",
+            f"5/20 日量比={volume_ratio_5d_20d:.2f}",
+        ]
+    elif healthy_trend:
+        structure_class = "healthy_trend"
+        reasons = [f"MA10 五日斜率={ma10_slope:+.2f}%，且 MA10>MA20"]
+    else:
+        structure_class = "neutral"
+        reasons = ["未形成明确的积极或风险短线结构"]
+
+    result["structure_class"] = structure_class
+    result["reasons"] = reasons
+    return result
+
+
 def compute_price_signals(price_df) -> dict:
     """从 OHLCV DataFrame 提取技术面信号：RSI / 乖离率 / 量价背离 / 60 日日均成交额。
 
