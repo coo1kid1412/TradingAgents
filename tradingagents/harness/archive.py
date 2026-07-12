@@ -42,6 +42,8 @@ _PRED_FIELDS = [
     "pm_sl_soft", "pm_sl_hard",
     "pm_horizon_months_low", "pm_horizon_months_high",
     "pm_rating_adjusted_from_rm",
+    "market_risk_level", "market_entry_gate", "market_position_cap_pct",
+    "short_term_trend", "short_term_confidence", "theme_outlook_12m",
 ]
 
 
@@ -57,6 +59,15 @@ def _get_git_commit() -> str | None:
     except Exception as e:
         logger.debug("get_git_commit 失败: %s", e)
     return None
+
+
+def resolve_trade_date(parsed: dict, extract: ExtractResult) -> str:
+    """优先使用 PM_SUMMARY 的分析日，目录时间只代表报告生成时刻。"""
+    candidate = (extract.pm_summary or {}).get("trade_date") or (extract.rm_summary or {}).get("trade_date")
+    try:
+        return _dt.date.fromisoformat(str(candidate)).isoformat()
+    except (TypeError, ValueError):
+        return parsed["trade_date"]
 
 
 def _merge_pred_fields(extract: ExtractResult) -> dict:
@@ -97,7 +108,9 @@ def _merge_pred_fields(extract: ExtractResult) -> dict:
               "pm_entry_low", "pm_entry_high",
               "pm_tp1", "pm_tp2", "pm_tp3",
               "pm_sl_soft", "pm_sl_hard",
-              "pm_horizon_months_low", "pm_horizon_months_high"):
+              "pm_horizon_months_low", "pm_horizon_months_high",
+              "market_risk_level", "market_entry_gate", "market_position_cap_pct",
+              "short_term_trend", "short_term_confidence", "theme_outlook_12m"):
         out[k] = pm.get(k)
 
     # bool → int
@@ -130,8 +143,9 @@ def archive_run(report_dir: Path, db_path=None) -> int | None:
         logger.debug("跳过：已归档 %s", report_dir.name)
         return None
 
-    window = classify_window(parsed["report_timestamp"])
     extract = extract_from_report(report_dir)
+    parsed["trade_date"] = resolve_trade_date(parsed, extract)
+    window = classify_window(parsed["report_timestamp"])
     pred_fields = _merge_pred_fields(extract)
 
     # 判定归档状态

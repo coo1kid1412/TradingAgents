@@ -11,6 +11,8 @@ from tradingagents.dataflows.capital_flow_utils import (
     compute_lhb_metrics,
     compute_capital_flow_regime,
     compute_capital_flow_score,
+    compute_distribution_into_retail,
+    compute_insider_distribution,
     assemble_capital_flow_metrics,
 )
 
@@ -161,6 +163,119 @@ def test_orthogonality_single_outflow_day_not_deteriorating():
          "lhb_inst_direction": None}
     regime = compute_capital_flow_regime(m)["capital_flow_regime"]
     assert regime != "恶化"
+
+
+def test_distribution_top_variant_confirms():
+    """步骤2：机构派发给散户——获利盘高位+户数增+主力流出≥2 路共振=确认。"""
+    r = compute_distribution_into_retail(
+        winner_rate_pct=90, holder_num_qoq_pct=8, net_inflow_streak_days=-4)
+    assert r["confirmed"] and r["score"] == 3 and r["retail_takeover"] == "散户高接盘"
+    # 加舆情狂热 → 满分 strong
+    r2 = compute_distribution_into_retail(
+        sentiment_euphoric=True, winner_rate_pct=90, net_inflow_streak_days=-4,
+        holder_num_4q_trend="持续上升")
+    assert r2["score"] == 4 and r2["strength"] == "strong"
+
+
+def test_distribution_single_signal_not_confirm():
+    """单路（趋势中获利盘高，但主力仍在流入）不算派发。"""
+    r = compute_distribution_into_retail(winner_rate_pct=90, net_inflow_streak_days=3)
+    assert not r["confirmed"] and r["score"] == 1 and r["retail_takeover"] == "中性"
+
+
+def test_distribution_block_trade_leg():
+    """步骤2扩展：折价大宗作第五路硬数据——折价大宗+户数增=确认。"""
+    r = compute_distribution_into_retail(holder_num_qoq_pct=8, block_trade_distribution=True)
+    assert r["confirmed"] and "折价大宗（机构让利出货，硬数据）" in r["drivers"]
+    # 折价大宗单路（主力仍流入）不足确认
+    r2 = compute_distribution_into_retail(block_trade_distribution=True, net_inflow_streak_days=2)
+    assert not r2["confirmed"] and r2["score"] == 1
+    # 五路满分 → strong
+    r3 = compute_distribution_into_retail(
+        sentiment_euphoric=True, winner_rate_pct=90, holder_num_4q_trend="持续上升",
+        net_inflow_streak_days=-4, block_trade_distribution=True)
+    assert r3["score"] == 5 and r3["strength"] == "strong"
+
+
+def test_insider_distribution():
+    """item1：stk_holdertrade → 确定性内部人派发信号。**只清仓式/大额(≥1%)才投**，
+    常规减持(改善生活)是噪音不投（secular 主升里内部人卖出弱信号）。"""
+    cd = "2026-06-26"
+    # 清仓式：第1笔 3M/(3M+1M)=75%≥50%
+    df = pd.DataFrame({
+        "in_de": ["DE", "DE"],
+        "change_vol": [3000000, 1000000],
+        "change_ratio": [0.8, 0.3],
+        "after_share": [1000000, 5000000],
+        "ann_date": ["20260610", "20260601"],
+    })
+    r = compute_insider_distribution(df, current_date=cd)
+    assert r["insider_net_selling"] is True and r["clearing_style"] is True, r
+    # recency：陈旧减持(>120天)被过滤 → None
+    assert compute_insider_distribution(df.assign(ann_date=["20250101", "20250101"]),
+                                        current_date=cd) is None
+    # 关键：常规"改善生活"减持(净0.6% <1%、非清仓) → **不投**(噪音)
+    routine = pd.DataFrame({"in_de": ["DE"], "change_vol": [500000], "change_ratio": [0.6],
+                            "after_share": [50_000_000], "ann_date": ["20260610"]})
+    rr = compute_insider_distribution(routine, current_date=cd)
+    assert rr["insider_net_selling"] is False and rr["clearing_style"] is False, rr
+    # 大额非清仓(净1.2% ≥1%) → 投
+    big = pd.DataFrame({"in_de": ["DE"], "change_vol": [2000000], "change_ratio": [1.2],
+                        "after_share": [100_000_000], "ann_date": ["20260610"]})
+    assert compute_insider_distribution(big, current_date=cd)["insider_net_selling"] is True
+    # 净增持 → 不投
+    buy = pd.DataFrame({"in_de": ["IN"], "change_vol": [1000000], "change_ratio": [0.5],
+                        "after_share": [9000000], "ann_date": ["20260610"]})
+    assert compute_insider_distribution(buy, current_date=cd)["insider_net_selling"] is False
+    # 空/None → None
+    assert compute_insider_distribution(None) is None
+    assert compute_insider_distribution(pd.DataFrame()) is None
+
+
+def test_insider_direction_summary():
+    """SYS_INSIDER 方向头：以 in_de 为准，杜绝 LLM 把减持读成增持（天孚实测 bug）。"""
+    from tradingagents.dataflows.tushare_vendor import _format_insider_direction_summary
+    df = pd.DataFrame({
+        "ann_date": ["20260129", "20250321"], "holder_name": ["王志弘", "朱国栋"],
+        "in_de": ["DE", "DE"], "change_vol": [394800, 3451200], "change_ratio": [0.05, 0.62]})
+    s = _format_insider_direction_summary(df)
+    assert "整体净减持(看空)" in s and "DE=减持" in s
+    assert "王志弘 减持" in s and "朱国栋 减持" in s
+    # 增持样本 → 净增持
+    assert "整体净增持(看多)" in _format_insider_direction_summary(df.assign(in_de=["IN", "IN"]))
+    # 混合：2减1增 → 净减持
+    mix = pd.DataFrame({"ann_date": ["20260101"] * 3, "holder_name": ["a", "b", "c"],
+                        "in_de": ["DE", "DE", "IN"], "change_vol": [1, 2, 3], "change_ratio": [0.1, 0.2, 0.3]})
+    assert "整体净减持(看空)" in _format_insider_direction_summary(mix)
+    # 空 → 空串
+    assert _format_insider_direction_summary(pd.DataFrame()) == ""
+
+
+def test_distribution_insider_leg():
+    """第六路：内部人净减持 + 户数增 = 确认；六路满分 score=6。"""
+    r = compute_distribution_into_retail(holder_num_qoq_pct=8, insider_net_selling=True)
+    assert r["confirmed"] and "内部人近期净减持（大股东/高管，硬数据）" in r["drivers"], r
+    r2 = compute_distribution_into_retail(insider_net_selling=True, net_inflow_streak_days=2)
+    assert not r2["confirmed"] and r2["score"] == 1, r2
+    r3 = compute_distribution_into_retail(
+        sentiment_euphoric=True, winner_rate_pct=90, holder_num_4q_trend="持续上升",
+        net_inflow_streak_days=-4, block_trade_distribution=True, insider_net_selling=True)
+    assert r3["score"] == 6 and r3["strength"] == "strong", r3
+
+
+def test_distribution_enriches_retail_signal():
+    """assemble：顶部派发(获利盘高+主力流出)即便 winner_rate>50 也判散户高接盘。
+    旧套牢口径(winner_rate≤50)抓不到顶部进行中的派发，合成口径补上。"""
+    mf = pd.DataFrame({
+        "trade_date": [f"2026010{i}" for i in range(1, 6)],
+        "main_force_net_amount_yi": [-1.0, -1.2, -0.8, -1.5, -2.0],  # streak -5
+    })
+    m = assemble_capital_flow_metrics(
+        moneyflow_df=mf,
+        chip_metrics={"winner_rate_pct": 92},   # 获利盘高位（套牢口径会判中性）
+    )
+    assert m["distribution_into_retail"]["confirmed"]
+    assert m["retail_concentration_signal"] == "散户高接盘"
 
 
 if __name__ == "__main__":

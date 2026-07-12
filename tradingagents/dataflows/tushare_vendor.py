@@ -536,6 +536,73 @@ def _format_cyclical_line(industry, stock_name, fina, close_price) -> str:
         return ""
 
 
+def _format_paradigm_line(industry, stock_name) -> str:
+    """范式成长机读行（AI/算力硬科技 secular）——下游 regime 走加速期 ride-by-default。
+
+    识别：profile_calc.detect_paradigm_growth（龙头名单 + 半导体行业关键词，周期股让位）。
+    非范式股返回空串不发射。防御式：任何失败返回空串。
+    """
+    from tradingagents.dataflows.profile_calc import detect_paradigm_growth
+
+    try:
+        if detect_paradigm_growth(industry, stock_name) is None:
+            return ""
+        return "【SYS_PARADIGM｜tushare】 class=paradigm（AI/算力硬科技 secular，regime 加速期走 ride-by-default；peak/派发/破位则回纪律）"
+    except Exception as e:
+        logger.debug("_format_paradigm_line 失败: %s", e)
+        return ""
+
+
+def get_main_business_breakdown(symbol: str, top_n: int = 6) -> Optional[dict]:
+    """主营业务构成（tushare fina_mainbz 按产品）→ 各产品营收占比（确定性）。
+
+    取最新报告期、按销售额降序的产品营收占比——给下游"热门概念归属%"提供硬数据
+    （是公司主营的百分之多少属于某概念）。无权限/无数据返回 None。
+    Returns: {period, items:[(产品名, 占比%), ...]} 或 None。
+    """
+    ts_code = to_tushare_format(symbol)
+    pro = _get_tushare_api()
+    try:
+        df = _safe_call(pro.fina_mainbz, ts_code=ts_code, type="P", api_name="fina_mainbz")
+    except (TushareUnavailableError, TushareRateLimitError) as e:
+        logger.info("get_main_business_breakdown: fina_mainbz 不可用: %s", e)
+        return None
+    if df is None or df.empty or "bz_sales" not in df.columns or "end_date" not in df.columns:
+        return None
+    df = df.dropna(subset=["bz_sales"]).copy()
+    if df.empty:
+        return None
+    latest = df["end_date"].astype(str).max()        # 最新报告期
+    df = df[df["end_date"].astype(str) == latest]
+    df["bz_sales"] = df["bz_sales"].astype(float)
+    total = df["bz_sales"].sum()
+    if total <= 0:
+        return None
+    df = df.sort_values("bz_sales", ascending=False).head(top_n)
+    items = [(str(r["bz_item"]).strip(), round(float(r["bz_sales"]) / total * 100, 1))
+             for _, r in df.iterrows()]
+    return {"period": latest, "items": items}
+
+
+def _format_main_business_line(symbol) -> str:
+    """主营构成机读行（fina_mainbz 按产品营收占比）——下游 PM 判"热门概念归属%"直读。
+
+    现状痛点：raw_data 常不披露产品线收入构成，基本面分析师只能"按属性推断"占比。
+    这里确定性补上。无数据返回空串。
+    """
+    try:
+        mb = get_main_business_breakdown(symbol)
+        if not mb or not mb["items"]:
+            return ""
+        seg = " / ".join(f"{item} {pct:.0f}%" for item, pct in mb["items"])
+        yr = str(mb["period"])[:4]
+        return (f"【SYS_MAIN_BUSINESS｜tushare fina_mainbz {yr}报】 {seg}"
+                "（按产品营收占比，PM 判热门概念归属% 直读此行，禁自行推断占比）")
+    except Exception as e:
+        logger.debug("_format_main_business_line 失败: %s", e)
+        return ""
+
+
 def _format_landmine_line(stock_name, fina) -> str:
     """地雷排查可确定性判定项 → 固定格式行，RM 第负一步直读（不再让 LLM 从 prose 猜）。
 
@@ -812,6 +879,16 @@ def get_fundamentals(
         if cyclical_line:
             sections.append(cyclical_line)
 
+        # 范式成长机读行（非范式/周期股返回空串不发射）——下游 regime 加速期 ride-by-default
+        paradigm_line = _format_paradigm_line(stock_industry, stock_name)
+        if paradigm_line:
+            sections.append(paradigm_line)
+
+        # 主营业务构成机读行（fina_mainbz 按产品营收占比）——下游 PM 判"热门概念归属%"直读
+        main_business_line = _format_main_business_line(ticker)
+        if main_business_line:
+            sections.append(main_business_line)
+
         # 静态 PE：收盘价 / 年度 EPS
         if fina is not None and not fina.empty and close_price:
             annual_mask = fina["end_date"].astype(str).str.endswith("1231")
@@ -1078,6 +1155,32 @@ def get_global_news(
 # ---------------------------------------------------------------------------
 # 9. get_insider_transactions
 # ---------------------------------------------------------------------------
+def _format_insider_direction_summary(df) -> str:
+    """从 in_de 字段算死的"增减持方向"摘要——杜绝 LLM 把减持读成增持（天孚实测：
+    新闻 agent 把朱国栋 62% 减持读成'增持'当利好）。in_de 是铁证：DE=减持 / IN=增持。"""
+    if df is None or df.empty or "in_de" not in df.columns:
+        return ""
+    de = df[df["in_de"].astype(str).str.upper() == "DE"]
+    inc = df[df["in_de"].astype(str).str.upper() == "IN"]
+    lines = [
+        "# 【SYS_INSIDER｜确定性增减持方向，以 in_de 字段为准，⛔严禁自行判断增/减或方向反转】",
+        "# in_de 图例：DE=减持(看空) / IN=增持(看多)。本表方向以此列为唯一真相，措辞必须与之一致。",
+        f"# 汇总：减持(DE) {len(de)} 笔 / 增持(IN) {len(inc)} 笔 → "
+        + ("整体净减持(看空)" if len(de) > len(inc) else
+           "整体净增持(看多)" if len(inc) > len(de) else "增减相当"),
+    ]
+    for _, r in df.head(8).iterrows():
+        d = "减持" if str(r.get("in_de")).upper() == "DE" else "增持"
+        try:
+            vol = f"{float(r.get('change_vol') or 0):,.0f}股"
+        except (TypeError, ValueError):
+            vol = str(r.get("change_vol"))
+        lines.append(
+            f"#   {r.get('ann_date')} {r.get('holder_name')} {d} {vol}"
+            f"（占总股本{r.get('change_ratio')}%，in_de={r.get('in_de')}）")
+    return "\n".join(lines) + "\n\n"
+
+
 def get_insider_transactions(
     symbol: Annotated[str, "ticker symbol of the company"],
 ) -> str:
@@ -1098,8 +1201,26 @@ def get_insider_transactions(
         f"# Insider Transactions for {symbol}\n"
         f"# Source: Tushare Pro\n"
         f"# Data retrieved on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+        + _format_insider_direction_summary(df)
     )
     return header + csv_string
+
+
+def get_insider_distribution_metrics(symbol: str, current_date: Optional[str] = None) -> Optional[dict]:
+    """从 stk_holdertrade 算确定性内部人派发信号（喂派发合成第6路）。
+
+    取增减持明细 → compute_insider_distribution（纯函数，近120日 recency + 清仓式识别）。
+    失败/无数据/无权限 → None（优雅降级，不影响主流程）。
+    """
+    from tradingagents.dataflows.capital_flow_utils import compute_insider_distribution
+    pro = _get_tushare_api()
+    ts_code = to_tushare_format(symbol)
+    try:
+        df = _safe_call(pro.stk_holdertrade, ts_code=ts_code, limit=50, api_name="stk_holdertrade")
+    except (TushareUnavailableError, TushareRateLimitError) as e:
+        logger.info("get_insider_distribution_metrics: stk_holdertrade 不可用: %s", e)
+        return None
+    return compute_insider_distribution(df, current_date=current_date)
 
 
 def get_ths_hot_rank(symbol: str, trade_date: str) -> Optional[int]:
@@ -1163,6 +1284,82 @@ def get_chip_distribution(symbol: str, end_date: str) -> Optional[dict]:
         "weight_avg_cost": round(float(latest["weight_avg"]), 2) if pd.notna(latest.get("weight_avg")) else None,
         "cost_50pct": round(float(latest["cost_50pct"]), 2) if pd.notna(latest.get("cost_50pct")) else None,
         "winner_rate_chg_5d": chg5,
+    }
+
+
+# 大宗交易折价阈值：折价率 ≤ 此值(%) = 明显折价（卖方让利急出货，派发倾向）。
+# A 股大宗常见折价 0~10%，≥5% 折价属卖方明显让利；机构专用卖方折价信号更硬，阈值放宽。
+_BLOCK_DISCOUNT_TH_PCT = -5.0
+_BLOCK_INST_DISCOUNT_TH_PCT = -2.0
+
+
+def get_block_trade_metrics(symbol: str, end_date: str, lookback_days: int = 60) -> Optional[dict]:
+    """大宗交易派发信号（tushare block_trade，新档位解锁）。
+
+    折价大宗 = 卖方让利急于出货 = 派发倾向；机构专用卖方折价 = 机构在大宗把货派出去。
+    折价率 = (大宗成交价 − 当日收盘价) / 当日收盘价 × 100%。窗口内出现折价型大宗即记派发压力。
+    硬数据，比舆情/筹码更直接——喂 compute_distribution_into_retail 第五路。
+    窗口取 60 日：机构大宗派发常是多周过程，单笔大宗本就稀疏；作为 5 路之一需 ≥2 共振才确认，故可放宽。
+
+    Returns: {n_blocks, discount_block_count, inst_sell_block_count, max_discount_pct,
+              block_distribution_pressure(bool), latest_block_date, summary} 或 None。
+    """
+    ts_code = to_tushare_format(symbol)
+    end_compact = end_date.replace("-", "")
+    start_compact = (datetime.strptime(end_compact, "%Y%m%d") - timedelta(days=lookback_days)).strftime("%Y%m%d")
+    pro = _get_tushare_api()
+    try:
+        bt = _safe_call(pro.block_trade, ts_code=ts_code,
+                        start_date=start_compact, end_date=end_compact, api_name="block_trade")
+    except (TushareUnavailableError, TushareRateLimitError) as e:
+        logger.info("get_block_trade_metrics: block_trade 不可用: %s", e)
+        return None
+    if bt is None or bt.empty or "price" not in bt.columns:
+        return None
+
+    # 对照收盘价算折价率
+    close_map: dict = {}
+    try:
+        db = _safe_call(pro.daily, ts_code=ts_code, start_date=start_compact,
+                        end_date=end_compact, fields="trade_date,close", api_name="daily")
+        if db is not None and not db.empty:
+            close_map = {str(r["trade_date"]): float(r["close"])
+                         for _, r in db.iterrows() if pd.notna(r.get("close"))}
+    except (TushareUnavailableError, TushareRateLimitError):
+        pass
+
+    n = len(bt)
+    discount_cnt = inst_sell_cnt = 0
+    max_disc = 0.0
+    latest_date = None
+    for _, r in bt.iterrows():
+        td = str(r["trade_date"])
+        latest_date = max(latest_date, td) if latest_date else td
+        seller_inst = "机构专用" in str(r.get("seller", ""))
+        if seller_inst:
+            inst_sell_cnt += 1
+        close = close_map.get(td)
+        if close and pd.notna(r.get("price")):
+            disc = round((float(r["price"]) - close) / close * 100, 2)
+            th = _BLOCK_INST_DISCOUNT_TH_PCT if seller_inst else _BLOCK_DISCOUNT_TH_PCT
+            if disc <= th:
+                discount_cnt += 1
+            max_disc = min(max_disc, disc)
+
+    pressure = discount_cnt >= 1
+    if pressure:
+        summary = f"{lookback_days}日内{discount_cnt}笔折价大宗（最大折价{max_disc:.1f}%" + \
+                  (f"，{inst_sell_cnt}笔机构专用卖出" if inst_sell_cnt else "") + "）"
+    else:
+        summary = f"{lookback_days}日内{n}笔大宗无明显折价（无派发压力）" if n else "无大宗交易"
+    return {
+        "n_blocks": n,
+        "discount_block_count": discount_cnt,
+        "inst_sell_block_count": inst_sell_cnt,
+        "max_discount_pct": round(max_disc, 2) if max_disc < 0 else 0.0,
+        "block_distribution_pressure": pressure,
+        "latest_block_date": latest_date,
+        "summary": summary,
     }
 
 

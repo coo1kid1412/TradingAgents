@@ -28,6 +28,7 @@ from tradingagents.dataflows.profile_calc import (
     compute_market_cap_tier,
     compute_liquidity_tier,
     compute_price_signals,
+    compute_short_term_structure,
     derive_style,
     detect_peak_signals,
     get_default_weights,
@@ -53,15 +54,35 @@ from tradingagents.dataflows.profile_calc import (
     parse_sys_net_growth_components,
     compute_deterministic_peg_inputs,
     compute_peg_band,
+    compute_peg_leg_target,
     compute_peer_anchored_pe_cap,
     compute_valuation_regime,
+    compute_ai_main_uptrend_signal,
     parse_growth_deceleration,
     parse_distribution_signals,
     parse_sys_cyclical,
+    parse_sys_paradigm,
+    parse_sys_main_business,
     cyclical_target_weights,
+    compute_cyclical_scenario_target,
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _format_short_term_structure_line(signal: dict) -> str:
+    """Serialize the deterministic structure signal in a stable field order."""
+    def number(name: str) -> str:
+        value = signal.get(name)
+        return "N/A" if value is None else f"{float(value):.2f}"
+
+    return (
+        f"SYS_SHORT_TERM_STRUCTURE: class={signal.get('structure_class') or 'insufficient_data'} | "
+        f"ma10_slope_5d_pct={number('ma10_slope_5d_pct')} | "
+        f"price_vs_ma10_pct={number('price_vs_ma10_pct')} | "
+        f"volume_ratio_5d_20d={number('volume_ratio_5d_20d')} | "
+        f"breakout_confirmed={str(bool(signal.get('breakout_confirmed'))).lower()}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -199,7 +220,8 @@ def _fetch_fundamentals_raw(ticker: str, trade_date: str) -> str:
 
 def _parse_capital_flow_signals(cf_yaml: str) -> dict:
     """从 capital_flow_yaml 抽 valuation_regime 需要的资金面信号（容错，缺失返回 None）。"""
-    out = {"regime": None, "streak": None, "lhb_inst_dir": None, "retail_signal": None, "score": None}
+    out = {"regime": None, "streak": None, "lhb_inst_dir": None, "retail_signal": None,
+           "score": None, "winner_rate": None}
     if not cf_yaml:
         return out
 
@@ -229,6 +251,11 @@ def _parse_capital_flow_signals(cf_yaml: str) -> dict:
         out["score"] = float(sc) if sc is not None else None
     except ValueError:
         out["score"] = None
+    wr = _grab("winner_rate_pct")
+    try:
+        out["winner_rate"] = float(wr) if wr is not None else None
+    except ValueError:
+        out["winner_rate"] = None
     return out
 
 
@@ -258,6 +285,15 @@ def _enforce_target_pe_cap(content: str, cap: float) -> str:
         return f"{m.group(1)}{new_low}, {new_high}{m.group(4)}  # ⚠️出口硬截断 high≤{cap:.1f}"
 
     return pat.sub(_repl, content)
+
+
+def _has_ai_order_evidence(text: str) -> bool:
+    """粗粒度硬证据代理：订单/核心客户/产能放量等词与 AI 链条词共现。"""
+    if not text:
+        return False
+    ai_terms = ("AI服务器", "AI芯片", "AI算力", "算力", "英伟达", "NVIDIA", "云厂商", "数据中心", "CPO", "光模块", "服务器", "PCB", "GPU", "800G", "1.6T")
+    evidence_terms = ("订单", "独家", "供应商", "认证", "量产", "放量", "绑定", "客户", "份额", "产能")
+    return any(t in text for t in ai_terms) and any(t in text for t in evidence_terms)
 
 
 # ---------------------------------------------------------------------------
@@ -292,6 +328,17 @@ def create_stock_profile_node(llm):
 
         # 3. 计算价格信号（RSI / 乖离率 / 量价背离 / 日均成交额）
         price_signals = compute_price_signals(price_df)
+        short_term_structure = compute_short_term_structure(
+            price_df,
+            rsi_percentile_1y=price_signals.get("rsi_percentile_1y"),
+            has_vol_divergence=bool(price_signals.get("has_vol_divergence")),
+        )
+        logger.info(
+            "SYS_SHORT_TERM_STRUCTURE: class=%s reasons=%s blockers=%s",
+            short_term_structure["structure_class"],
+            short_term_structure["reasons"][:3],
+            short_term_structure["blockers"][:3],
+        )
 
         # 4. 量化分数（来自 quant_score state）
         quant_yaml = _parse_quant_score_yaml(quant_score_md)
@@ -406,7 +453,8 @@ def create_stock_profile_node(llm):
         # 散文跑跑之间漂会让 regime 在 discipline/neutral 间翻（澜起 SELL↔HOLD 摆动根源）。
         growth_dir = parse_growth_deceleration(fundamentals_report + "\n" + fund_raw, strict=True)
         net_growth_strict = parse_net_profit_growth(fundamentals_report + "\n" + fund_raw, strict=True)
-        dist_sig = parse_distribution_signals(news_report, fundamentals_report, sentiment_report)
+        dist_sig = parse_distribution_signals(
+            news_report, fundamentals_report, sentiment_report, current_date=trade_date)
         gq = parse_growth_quality(fund_raw + "\n" + fundamentals_report)  # 扣非口径成长质量
         # 周期股机读行（vendor Python 发射 + fundamentals 转录兜底保证在场）
         cyc_info = parse_sys_cyclical(fundamentals_report + "\n" + fund_raw)
@@ -414,6 +462,20 @@ def create_stock_profile_node(llm):
             logger.info("SYS_CYCLICAL: class=%s position=%s roe_rank=%s normalized_eps=%s",
                         cyc_info["class"], cyc_info["position"],
                         cyc_info["roe_pct_rank"], cyc_info["normalized_eps"])
+        # 范式成长机读行（AI/算力硬科技 secular）——regime 加速期 ride-by-default
+        is_paradigm = parse_sys_paradigm(fundamentals_report + "\n" + fund_raw)
+        if is_paradigm:
+            logger.info("SYS_PARADIGM: 范式成长股识别命中 → regime 加速期走 ride-by-default")
+        # 主营构成（fina_mainbz 产品营收占比）——确定性转录到画像，PM 判热门概念归属% 直读
+        main_business_seg = parse_sys_main_business(fundamentals_report + "\n" + fund_raw)
+        # 盈利预期上修/下修（新闻 SUMMARY 粗代理）——喂 earnings 腿，让前瞻修正中和后视镜减速。
+        # 对标投研：revision 方向才是成长股"骑还是收"的真判据（report_rc 没权限前的零成本代理）。
+        from tradingagents.dataflows.news_catalyst import compute_earnings_revision
+        rev_info = compute_earnings_revision(news_report)
+        earnings_revision = rev_info["direction"] if rev_info else None
+        if rev_info and rev_info["direction"] != "停修":
+            logger.info("SYS_EARNINGS_REVISION: %s（up=%s down=%s 据=%s）",
+                        rev_info["direction"], rev_info["up"], rev_info["down"], rev_info["evidence"])
         regime_info = compute_valuation_regime(
             momentum_score=momentum_score,
             rsi_percentile_1y=price_signals.get("rsi_percentile_1y"),
@@ -431,11 +493,44 @@ def create_stock_profile_node(llm):
             recurring_loss=gq["recurring_loss"],
             cyclical_class=cyc_info["class"] if cyc_info else None,
             roe_pct_rank_10y=cyc_info["roe_pct_rank"] if cyc_info else None,
+            is_paradigm=is_paradigm,
+            earnings_revision=earnings_revision,
+            winner_rate_pct=cf_sig["winner_rate"],
         )
         valuation_regime = regime_info["valuation_regime"]
         if dist_sig["detected"]:
             logger.info("派发证据: %s", dist_sig["reasons"][:3])
+        if dist_sig.get("stale_skipped"):
+            logger.info("派发证据 recency 门：跳过 %d 条陈旧减持(>%d天)",
+                        dist_sig["stale_skipped"], 120)
         logger.info("valuation_regime: %s | %s", valuation_regime, regime_info["reasoning"])
+
+        ai_main_uptrend = compute_ai_main_uptrend_signal(
+            company_name=company_name,
+            industry=fund_raw,
+            main_business=main_business_seg,
+            is_paradigm=is_paradigm,
+            net_profit_growth=net_growth_strict,
+            revenue_growth=None,
+            earnings_revision=earnings_revision,
+            has_hard_order_evidence=_has_ai_order_evidence(news_report + "\n" + fundamentals_report),
+            momentum_score=momentum_score,
+            theme_stage_inferred=theme_inferred,
+            sector_rs_30d=sector_rs_30d,
+            valuation_regime=valuation_regime,
+            recurring_loss=gq["recurring_loss"],
+            has_peak_signal=peak_check["force_peak"],
+            retail_concentration_signal=cf_sig["retail_signal"],
+            rsi_percentile_1y=price_signals.get("rsi_percentile_1y"),
+            winner_rate_pct=cf_sig["winner_rate"],
+            capital_flow_regime=cf_sig["regime"],
+            main_force_streak_days=cf_sig["streak"],
+        )
+        logger.info(
+            "SYS_AI_MAIN_UPTREND: enabled=%s class=%s reasons=%s blockers=%s",
+            ai_main_uptrend["enabled"], ai_main_uptrend["class"],
+            ai_main_uptrend["reasons"][:3], ai_main_uptrend["blockers"][:3],
+        )
 
         # 主题溢价容忍度按 regime 闸门：ride 满/neutral 半/discipline 零（确定性，防澜起式阈值飘）
         premium_gated, premium_gate_note = gate_premium_by_regime(default_premium_pct, valuation_regime)
@@ -488,6 +583,13 @@ def create_stock_profile_node(llm):
             f"| valuation_regime | **{valuation_regime}**（ride骑趋势/neutral中性/discipline收纪律）| "
             f"六路合成(技术/资金/盈利/拥挤/主题/派发)：{regime_info['reasoning']}。"
             f"→ ride 放松估值 cap、骑趋势；discipline 收紧 cap、均值回归；下游 RM/PM 据此定姿态 |"
+        )
+        prog_lines.append(
+            f"| short_term_structure | **{short_term_structure['structure_class']}** | "
+            f"MA10斜率={short_term_structure.get('ma10_slope_5d_pct')}% / "
+            f"价格距MA10={short_term_structure.get('price_vs_ma10_pct')}% / "
+            f"5/20日量比={short_term_structure.get('volume_ratio_5d_20d')}；"
+            "仅决定入场时机，不改长期评级 |"
         )
 
         # peak 检测
@@ -984,8 +1086,31 @@ TRANSPARENCY:
             f"SYS_VALUATION_REGIME_NETSCORE: {regime_info.get('score')}\n"
             f"SYS_VALUATION_REGIME_LEGS: {regime_legs}\n"
             f"SYS_VALUATION_REGIME_REASON: {regime_info.get('reasoning', '')}\n"
+            + (f"SYS_EARNINGS_REVISION: {rev_info['direction']}（卖方盈利预期方向，新闻 SUMMARY 粗代理；up={rev_info['up']}/down={rev_info['down']}；已用于中和 earnings 腿后视镜减速，RM 勿重复计入）\n"
+               if rev_info and rev_info["direction"] != "停修" else "")
+            + (f"SYS_PARADIGM_CLASS: paradigm（AI/算力硬科技 secular；regime 加速期已走 ride-by-default，下游 RM 直读勿改）\n"
+               if is_paradigm else "")
+            + (f"SYS_MAIN_BUSINESS: {main_business_seg}（fina_mainbz 产品营收占比，Python 确定性转录；PM 判热门概念归属% 直读此行、禁自行推断）\n"
+               if main_business_seg else "")
+            + "<!-- ⚠️SYS_AI_MAIN_UPTREND｜Python 确定性AI主升兑现信号；仅在market_risk允许时给RM克制升档资格，不能绕过硬风险 -->\n"
+            + f"SYS_AI_MAIN_UPTREND_ENABLED: {str(ai_main_uptrend['enabled']).lower()}\n"
+            + f"SYS_AI_MAIN_UPTREND_CLASS: {ai_main_uptrend['class']}\n"
+            + f"SYS_AI_MAIN_UPTREND_REASONS: {'；'.join(ai_main_uptrend['reasons']) if ai_main_uptrend['reasons'] else '无'}\n"
+            + f"SYS_AI_MAIN_UPTREND_BLOCKERS: {'；'.join(ai_main_uptrend['blockers']) if ai_main_uptrend['blockers'] else '无'}\n"
+            + "<!-- ⚠️SYS_SHORT_TERM_STRUCTURE｜Python OHLCV确定性短线结构；下游只用于入场时机，禁止改长期评级 -->\n"
+            + _format_short_term_structure_line(short_term_structure) + "\n"
+            + f"SYS_SHORT_TERM_STRUCTURE_REASONS: {'；'.join(short_term_structure['reasons']) if short_term_structure['reasons'] else '无'}\n"
+            + f"SYS_SHORT_TERM_STRUCTURE_BLOCKERS: {'；'.join(short_term_structure['blockers']) if short_term_structure['blockers'] else '无'}\n"
+            + f"SYS_ENTRY_RECURRING_LOSS: {str(bool(gq['recurring_loss'])).lower()}\n"
+            + f"SYS_ENTRY_HAS_PEAK_SIGNAL: {str(bool(peak_check['force_peak'])).lower()}\n"
+            + f"SYS_ENTRY_RETAIL_CONCENTRATION: {cf_sig.get('retail_signal') or '中性'}\n"
+            + f"SYS_ENTRY_RSI_PERCENTILE_1Y: {price_signals.get('rsi_percentile_1y') if price_signals.get('rsi_percentile_1y') is not None else 'N/A'}\n"
+            + f"SYS_ENTRY_CAPITAL_FLOW_REGIME: {cf_sig.get('regime') or '数据不足'}\n"
+            + f"SYS_ENTRY_MAIN_FORCE_STREAK_DAYS: {cf_sig.get('streak') if cf_sig.get('streak') is not None else 'N/A'}\n"
         )
         logger.info("SYS_VALUATION_REGIME 已注入画像: %s", valuation_regime)
+        if main_business_seg:
+            logger.info("SYS_MAIN_BUSINESS 已转录画像: %s", main_business_seg[:60])
 
         # 主题溢价（regime 闸门后）—— 机器可读，RM Step6 动态阈值直读，禁止用 LLM 选的 theme_stage 重算
         content = content + (
@@ -1041,15 +1166,70 @@ TRANSPARENCY:
             )
             # 确定性 PEG 倍数带（regime 派生）——治 RM 自拍 PEG 倍数致目标价摆动（澜起 274↔189）。
             # RM Step4 PEG 腿必须用此带调 compute_peg_target_price，禁自选 0.8↔2.4 乱拍。
-            peg_low, peg_high = compute_peg_band(valuation_regime, peg_det['confidence'])
+            # 范式 ride 档（Phase2②）：范式股 + 确认 ride + earnings腿=+1 → 抬到 1.2-1.8（secular
+            # 多年跑道只由 PEG 这一通道表达，避免与多年 EPS 双重计入）。闸门里 confidence 由函数把关。
+            is_paradigm_ride = (
+                is_paradigm and valuation_regime == "ride"
+                and regime_info.get("legs", {}).get("earnings") == 1
+            )
+            peg_low, peg_high = compute_peg_band(
+                valuation_regime, peg_det['confidence'], is_paradigm_ride=is_paradigm_ride)
             content = content + (
                 f"SYS_PEG_BAND: low={peg_low} high={peg_high}"
-                f"（regime={valuation_regime} 派生；PEG 腿 target_peg_low/high 照此调"
-                f" compute_peg_target_price，禁自选倍数）\n"
+                + (f"（范式成长 ride 档：secular 龙头多年跑道，PEG 腿 target_peg_low/high 照此调"
+                   f" compute_peg_target_price，禁自选倍数）\n" if is_paradigm_ride else
+                   f"（regime={valuation_regime} 派生；PEG 腿 target_peg_low/high 照此调"
+                   f" compute_peg_target_price，禁自选倍数）\n")
             )
-            logger.info("SYS_PEG 已注入画像: growth=%s%% fwd_eps=%s conf=%s band=%s-%s",
+            if is_paradigm_ride:
+                logger.info("SYS_PEG_BAND 范式 ride 档生效: %s-%s (secular 龙头)", peg_low, peg_high)
+            # 确定性 PEG 腿目标价（Python 算死，RM Step4 直读）——根治成长股 PEG 腿摆动：
+            # 天孚同输入(EPS3.8/增速45/PEG0.9-1.2)三跑 194↔269↔342-456 乱跳，根因是 RM 调
+            # compute_peg_target_price 时无视 SYS 值自塞高一倍参数。钉死后无塞错入口。
+            peg_tgt = compute_peg_leg_target(
+                forward_eps=peg_det['forward_eps'],
+                growth_pct=peg_det['peg_growth_pct'],
+                peg_low=peg_low, peg_high=peg_high,
+            )
+            if peg_tgt is not None:
+                content = content + (
+                    f"<!-- ⚠️SYS_PEG_TARGET_PRICE｜Python 确定性 PEG 腿目标价(算死)，RM Step4 PEG 腿直读勿重算 -->\n"
+                    f"SYS_PEG_TARGET_PRICE: low={peg_tgt['low']} mid={peg_tgt['mid']} high={peg_tgt['high']}"
+                    f"（= SYS_FORWARD_EPS×(SYS_PEG_BAND×SYS_PEG_GROWTH_PCT)，隐含PE {peg_tgt['implied_pe_range'][0]}-{peg_tgt['implied_pe_range'][1]}；"
+                    f"**RM Step4 PEG 腿直读此三值，禁再调 compute_peg_target_price 重填参数**）\n"
+                )
+            logger.info("SYS_PEG 已注入画像: growth=%s%% fwd_eps=%s conf=%s band=%s-%s peg_tgt=%s",
                         peg_det['peg_growth_pct'], peg_det['forward_eps'], peg_det['confidence'],
-                        peg_low, peg_high)
+                        peg_low, peg_high, (peg_tgt or {}).get('mid'))
+
+            # 强周期股双轨情景目标价（确定性算死，RM Step4 直读，根治"硬平均两腿致摆动"）——
+            # bear=周期均值回归(正常化×mid-cycle PE) / bull=结构成长(前瞻PEG) / base=位置权重概率加权；
+            # 两腿离散≥2.5x 标低置信(双峰中间数不可信)。治兆易 SELL↔UW 残留摆动。
+            if cyc_info and cyc_info["class"] == "strong" and cyc_info["normalized_eps"] is not None:
+                cyc_tgt = compute_cyclical_scenario_target(
+                    normalized_eps=cyc_info["normalized_eps"],
+                    forward_eps=peg_det["forward_eps"],
+                    forward_growth_pct=peg_det["peg_growth_pct"],
+                    position=cyc_info["position"],
+                    peg_low=peg_low, peg_high=peg_high,
+                )
+                if cyc_tgt is not None:
+                    content = content + (
+                        f"\n<!-- ⚠️SYS_CYCLICAL_TARGET｜Python 双轨情景目标价(算死)，RM Step4 强周期目标价直读勿重算 -->\n"
+                        f"SYS_CYCLICAL_TARGET: bear={cyc_tgt['bear_low']}~{cyc_tgt['bear_high']}"
+                        f" | bull={cyc_tgt['bull_low']}~{cyc_tgt['bull_high']}"
+                        f" | base={cyc_tgt['base_low']}~{cyc_tgt['base_high']}"
+                        f"（normalize {cyc_tgt['weights']['normalize']:.0%}/growth {cyc_tgt['weights']['growth']:.0%}）"
+                        f" | 离散={cyc_tgt['dispersion']}x | 置信={cyc_tgt['confidence']}\n"
+                        f"SYS_CYCLICAL_TARGET_REASON: bear=周期均值回归(正常化EPS×mid-cycle PE {cyc_tgt['normalize_pe_band'][0]:.0f}-{cyc_tgt['normalize_pe_band'][1]:.0f}) "
+                        f"/ bull=结构成长(前瞻PEG) / base=位置权重概率加权；**RM Step4 综合目标价直读 base，禁现场重算两腿/重选PE倍数**。"
+                        + ("⚠️离散≥2.5x=双峰(周期崩vs结构成长分歧大)，base 是折中锚非真公允值，"
+                           "评级临近阈值时偏保守不下强方向单。" if cyc_tgt["confidence"] == "low" else "")
+                        + "\n"
+                    )
+                    logger.info("SYS_CYCLICAL_TARGET 已注入: base=%s~%s 离散=%sx 置信=%s",
+                                cyc_tgt["base_low"], cyc_tgt["base_high"],
+                                cyc_tgt["dispersion"], cyc_tgt["confidence"])
 
         return {"stock_profile": content}
 

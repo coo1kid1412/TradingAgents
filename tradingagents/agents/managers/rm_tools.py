@@ -782,20 +782,24 @@ def compute_step6_report_weighted_vote_adjustment(
 ) -> dict:
     """非估值方向票加权调整（改造 B）。
 
-    把 stock_profile.REPORT_WEIGHTS 真正接入评级——市场/新闻/情绪 三个非估值维度
-    的方向投票（LLM 给定 -1~+1）按权重加权，超过阈值则触发 ±1 档调整。
+    把 stock_profile.REPORT_WEIGHTS 真正接入评级——市场/新闻 两个非估值维度的方向
+    投票（LLM 给定 -1~+1）按权重加权，超过阈值则触发 ±1 档调整。
+
+    ⚠️ 舆情方向票已废（确定性置零）：舆情作"方向票"是反向指标——顶部狂热本该看空，
+    naive 方向票却会在狂热时投 +1 把评级抬高，正好抬反。对标投研：舆情不进趋势方向，
+    改喂"机构派发给散户"反向检测（见 capital_flow_utils.compute_distribution_into_retail）。
+    这里保留 sentiment_weight/sentiment_direction_vote 入参仅为兼容，方向票贡献恒为 0。
 
     设计动机：之前 REPORT_WEIGHTS 只影响 Bull/Bear 写论据来源，不影响评级生成。
-    现在题材股情绪权重 30%，能在情绪强烈看多时真正把评级抬一档。
 
     Args:
         rating_after_style_adj: Step 6 第六步 style 调整后的评级
         market_weight: stock_profile.REPORT_WEIGHTS.market（0-100 整数）
         news_weight: stock_profile.REPORT_WEIGHTS.news（0-100 整数）
-        sentiment_weight: stock_profile.REPORT_WEIGHTS.sentiment（0-100 整数）
+        sentiment_weight: 已废，仅兼容（不进方向票）
         market_direction_vote: LLM 读 market 报告后给的方向票（-1 全看空 ~ +1 全看多）
         news_direction_vote: 读 news 报告后给的方向票
-        sentiment_direction_vote: 读 sentiment 报告后给的方向票
+        sentiment_direction_vote: 已废，确定性置零（不进方向票）
 
     Returns:
         dict: {
@@ -809,21 +813,22 @@ def compute_step6_report_weighted_vote_adjustment(
     if rating_after_style_adj not in _RATINGS_ORDER:
         return {"error": f"未知评级: {rating_after_style_adj}"}
 
-    total_weight = market_weight + news_weight + sentiment_weight
+    # 舆情方向票确定性置零——只用市场+新闻两路方向（舆情改走派发检测，不进方向）
+    total_weight = market_weight + news_weight
     if total_weight <= 0:
         return {
             "adjustment": 0,
             "new_rating": rating_after_style_adj,
             "rule_applied": "skipped",
-            "skip_reason": f"非估值权重总和={total_weight} 无效",
+            "skip_reason": f"市场+新闻权重总和={total_weight} 无效（舆情不计方向票）",
         }
 
-    # 每个 vote clamp 到 [-1, +1]
+    # 每个 vote clamp 到 [-1, +1]；舆情票强制 0
     mv = max(-1.0, min(1.0, market_direction_vote))
     nv = max(-1.0, min(1.0, news_direction_vote))
-    sv = max(-1.0, min(1.0, sentiment_direction_vote))
+    sv = 0.0   # 舆情方向票废弃：顶部狂热是反向指标，不进趋势方向
 
-    weighted_vote = (market_weight * mv + news_weight * nv + sentiment_weight * sv) / total_weight
+    weighted_vote = (market_weight * mv + news_weight * nv) / total_weight
     weighted_vote = round(weighted_vote, 3)
 
     THRESHOLD = 0.3
@@ -1244,6 +1249,116 @@ _THRESHOLD_BASE_UP = 35.0
 _FADING_UP_LOCK = 30.0   # 主题退潮期上沿锁定（主题反噬保护，不再放宽）
 
 
+def derive_market_mode(market_risk_snapshot: dict | None) -> str:
+    """把 market_risk_daily 快照压成 AI 主升升档权限。
+
+    缺失快照按 risk_off 处理，避免在没有开盘前风险数据时默认乐观。
+    """
+    if not market_risk_snapshot:
+        return "risk_off"
+    gate = str(market_risk_snapshot.get("entry_gate") or "").upper()
+    risk = str(market_risk_snapshot.get("risk_level") or "")
+    bias = str(market_risk_snapshot.get("t_plus_1_bias") or "")
+    if gate == "OPEN" and risk == "低" and bias == "偏多":
+        return "risk_on"
+    if gate == "CONDITIONAL" or risk == "中":
+        return "conditional"
+    return "risk_off"
+
+
+_ENTRY_TIMING_BY_STRUCTURE = {
+    "trend_pullback": "分批介入",
+    "breakout_ready": "等放量突破",
+    "healthy_trend": "等回踩",
+    "exhaustion": "暂不介入",
+    "broken": "退出观察",
+    "neutral": "继续观察",
+    "insufficient_data": "数据不足",
+}
+
+
+def compute_entry_timing(
+    *,
+    structure_class: str,
+    market_mode: str,
+    recurring_loss: bool = False,
+    earnings_revision: Optional[str] = None,
+    valuation_regime: Optional[str] = None,
+    has_peak_signal: bool = False,
+    retail_concentration_signal: Optional[str] = None,
+    rsi_percentile_1y: Optional[float] = None,
+    capital_flow_regime: Optional[str] = None,
+    main_force_streak_days: Optional[int] = None,
+    long_term_rating: Optional[str] = None,
+) -> dict:
+    """Map deterministic structure to entry timing with hard risk gates.
+
+    This helper changes execution timing only. It never receives or mutates
+    the long-term five-level rating.
+    """
+    structure = (structure_class or "").strip().lower()
+    base_action = _ENTRY_TIMING_BY_STRUCTURE.get(structure, "数据不足")
+    normalized_mode = (market_mode or "risk_off").strip().lower()
+    if normalized_mode not in {"risk_on", "conditional", "risk_off"}:
+        normalized_mode = "risk_off"
+
+    blockers: list[str] = []
+    if recurring_loss:
+        blockers.append("扣非/主业持续亏损")
+    if (earnings_revision or "").strip() == "下修":
+        blockers.append("盈利预期下修")
+    if (valuation_regime or "").strip().lower() == "discipline":
+        blockers.append("valuation_regime=discipline")
+    if has_peak_signal:
+        blockers.append("peak 信号触发")
+    if (
+        (retail_concentration_signal or "").strip() == "散户高接盘"
+        and rsi_percentile_1y is not None
+        and rsi_percentile_1y >= 85
+    ):
+        blockers.append("散户高接盘叠加价格极端")
+
+    strong_outflow = (
+        (capital_flow_regime or "").strip() == "恶化"
+        or (main_force_streak_days is not None and main_force_streak_days <= -3)
+    )
+    if strong_outflow and (earnings_revision or "").strip() != "上修":
+        blockers.append("资金持续恶化且无盈利上修")
+
+    rating = (long_term_rating or "").strip().upper()
+    if rating in {"UNDERWEIGHT", "SELL"}:
+        blockers.append(f"长期评级={rating}，禁止积极入场")
+
+    effective_action = base_action
+    if blockers:
+        effective_action = "退出观察" if structure == "broken" else "暂不介入"
+    elif rating == "HOLD" and base_action == "分批介入":
+        effective_action = "等回踩"
+    elif normalized_mode == "risk_off":
+        if base_action in {"分批介入", "小仓试探", "等回踩", "等放量突破"}:
+            effective_action = "暂不介入"
+    elif normalized_mode == "conditional" and base_action == "分批介入":
+        effective_action = "小仓试探"
+
+    reasons = list(blockers)
+    if normalized_mode == "risk_off" and effective_action == "暂不介入":
+        reasons.append("market_risk_daily 总闸=risk_off")
+    elif normalized_mode == "conditional" and base_action == "分批介入":
+        reasons.append("market_risk_daily 总闸=conditional，积极动作降级")
+    if not reasons:
+        reasons.append(f"短线结构={structure or 'unknown'}")
+
+    return {
+        "structure_class": structure or "unknown",
+        "base_action": base_action,
+        "effective_action": effective_action,
+        "market_mode": normalized_mode,
+        "long_term_rating": rating or None,
+        "vetoed": bool(blockers),
+        "reasons": reasons,
+    }
+
+
 def _classify_inflection(inflection_stage: str) -> str:
     """把 inflection_stage 自由文本归一为单一类别 → accel / top / neutral。
 
@@ -1303,11 +1418,16 @@ def compute_step6_final_rating(
     northbound_flow_5d_direction: Optional[int] = None,
     kol_bullish_ratio_trend_pct: Optional[float] = None,
     news_catalyst_score: Optional[float] = None,
+    earnings_revision: Optional[str] = "",
     # ── 第七步 极端背离防御例外 ──
     inflection_confirmed_recent: Optional[bool] = False,
     # ── 周期股修正（画像 SYS_CYCLICAL_CLASS / SYS_CYCLICAL_POSITION 直读）──
     cyclical_class: Optional[str] = "",
     cycle_position: Optional[str] = "",
+    # ── AI 主升兑现信号（画像 SYS_AI_MAIN_UPTREND + market_risk_daily 总闸）──
+    ai_main_uptrend: Optional[bool] = False,
+    ai_main_uptrend_class: Optional[str] = "",
+    market_mode: Optional[str] = "",
 ) -> dict:
     """Step 6 评级终段一次合议：阈值→映射→拥挤→升降档→趋势叠加→极端防御 全链 Python。
 
@@ -1401,10 +1521,14 @@ def compute_step6_final_rating(
     decision_style = decision_style or ""
     cyclical_class = cyclical_class or ""
     cycle_position = cycle_position or ""
+    ai_main_uptrend_class = ai_main_uptrend_class or ""
+    market_mode = market_mode or "risk_off"
+    earnings_revision = earnings_revision or ""
     theme_premium_pct = float(theme_premium_pct or 0.0)
     consensus_crowded = bool(consensus_crowded)
     bear_anchor_strong = bool(bear_anchor_strong)
     inflection_confirmed_recent = bool(inflection_confirmed_recent)
+    ai_main_uptrend = bool(ai_main_uptrend)
     red_flags_count = int(red_flags_count or 0)
     market_weight = float(market_weight or 0.0)
     news_weight = float(news_weight or 0.0)
@@ -1569,6 +1693,55 @@ def compute_step6_final_rating(
     stages["symmetric"] = {"upgrade": upgrade, "downgrade": downgrade,
                            "rating_after": rating, "notes": sym_notes}
 
+    # ── 4b) AI 主升兑现信号（market_risk_daily 总闸 + 个股 SYS_AI_MAIN_UPTREND）──
+    ai_note = "未触发：SYS_AI_MAIN_UPTREND disabled"
+    ai_adjustment = 0
+    if ai_main_uptrend:
+        cls = (ai_main_uptrend_class or "").strip().lower()
+        mode = (market_mode or "risk_off").strip().lower()
+        if reg == "discipline":
+            ai_note = "valuation_regime=discipline：AI主升升档禁用"
+        elif mode == "risk_off":
+            ai_note = "risk_off：市场风险快照不允许进攻，AI主升仅作长期观察，不升档"
+        elif rating == "HOLD":
+            new_rating, cap_reason = _shift_rating(rating, +1, no_cross_hold=True)
+            new_rating, clamp_note = _clamp_to_bounds(new_rating)
+            ai_adjustment = 1 if new_rating != rating else 0
+            rating = new_rating
+            ai_note = (
+                f"{mode}+{cls or 'unknown'}：HOLD→{rating}"
+                + (f"（{cap_reason or clamp_note}）" if (cap_reason or clamp_note) else "")
+            )
+        elif rating == "OVERWEIGHT" and mode == "risk_on" and cls == "confirmed":
+            strong_confirm = (
+                (momentum_score is not None and momentum_score >= 80)
+                or (news_catalyst_score is not None and news_catalyst_score > 0)
+                or earnings_revision == "上修"
+            )
+            if strong_confirm:
+                new_rating, cap_reason = _shift_rating(rating, +1, no_cross_hold=True)
+                new_rating, clamp_note = _clamp_to_bounds(new_rating)
+                ai_adjustment = 1 if new_rating != rating else 0
+                rating = new_rating
+                ai_note = (
+                    f"risk_on+confirmed+强确认：OVERWEIGHT→{rating}"
+                    + (f"（{cap_reason or clamp_note}）" if (cap_reason or clamp_note) else "")
+                )
+            else:
+                ai_note = "risk_on+confirmed 但缺少强确认：OVERWEIGHT 不升 BUY"
+        elif rating == "OVERWEIGHT" and mode == "conditional":
+            ai_note = "conditional：只允许 HOLD→OVERWEIGHT，不允许 OVERWEIGHT→BUY"
+        else:
+            ai_note = f"{mode}+{cls or 'unknown'}：当前评级 {rating} 不在AI主升升档范围"
+    stages["ai_main_uptrend"] = {
+        "enabled": ai_main_uptrend,
+        "class": ai_main_uptrend_class or "none",
+        "market_mode": market_mode or "risk_off",
+        "adjustment": ai_adjustment,
+        "rating_after": rating,
+        "note": ai_note,
+    }
+
     # ── 5) 第六步 趋势叠加（复用既有工具，行为不变；结果受边界钳制——堵绕道）──
     overlay = compute_step6_trend_overlay.invoke({
         "rating_after_symmetric": rating,
@@ -1638,6 +1811,7 @@ def compute_step6_final_rating(
         f"阈值 ±{threshold_dn:.1f}/±{threshold_up:.1f} → 映射 {rating_raw}"
         f"（regime 闸门后 {mapping['rating']}）→ 拥挤 {stages['crowding']['rating_after']}"
         f" → 升降档 {stages['symmetric']['rating_after']}"
+        f" → AI主升 {stages['ai_main_uptrend']['rating_after']}"
         f" → 趋势叠加 {stages['overlay']['rating_after']}"
         f" → 极端防御 {stages['extreme_defense']['rating_after']}"
         f" → 不变量终检 {rating}"

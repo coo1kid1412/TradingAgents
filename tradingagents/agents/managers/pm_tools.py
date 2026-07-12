@@ -74,6 +74,42 @@ _STAR_POSITION = {
 
 
 @tool
+def apply_market_risk_gate(
+    entry_gate: str,
+    position_cap_pct: float,
+    proposed_action: str,
+    proposed_size_low_pct: float,
+    proposed_size_high_pct: float,
+) -> dict:
+    """应用 Market Risk Officer 的交易前硬闸门。
+
+    高风险快照给出的 WAIT 不改变长期评级，但会禁止 BUY_NOW；任何建议仓位
+    都不得超过快照给出的上限。中风险的 CONDITIONAL 同样把即时买入改为
+    条件等待，以避免追高。
+    """
+    cap = max(0.0, float(position_cap_pct))
+    low = max(0.0, min(float(proposed_size_low_pct), cap))
+    high = max(low, min(float(proposed_size_high_pct), cap))
+    action = (proposed_action or "WAIT").upper()
+    gate = (entry_gate or "WAIT").upper()
+    if gate == "WAIT":
+        effective_action = "WAIT"
+    elif gate == "CONDITIONAL" and action == "BUY_NOW":
+        effective_action = "CONDITIONAL"
+    else:
+        effective_action = action
+    return {
+        "entry_gate": gate,
+        "position_cap_pct": cap,
+        "effective_action": effective_action,
+        "effective_size_low_pct": low,
+        "effective_size_high_pct": high,
+        "overrode_action": effective_action != action,
+        "reason": f"市场闸门={gate}，仓位上限={cap:g}%",
+    }
+
+
+@tool
 def compute_conviction_position_map(rm_conviction: str, odds_r: Optional[float] = 1.0,
                                     abs_d: Optional[float] = 0.0,
                                     anchor_sensitive: Optional[bool] = False) -> dict:
@@ -206,6 +242,7 @@ PM_TOOLS = [
     compute_r_multiple_levels,
     compute_conviction_position_map,
     compute_pm_scenario_e,
+    apply_market_risk_gate,
 ]
 
 

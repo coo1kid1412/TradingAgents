@@ -52,58 +52,61 @@ _MIN_SAMPLE_SIZE = 5
 # ---------------------------------------------------------------------------
 # Step 1: cron 健康度
 # ---------------------------------------------------------------------------
-def check_cron_health() -> tuple[bool, str]:
-    """扫描 daily_update.log 最近 7 天，返回 (is_healthy, 健康描述/异常说明)。"""
-    if not _DAILY_LOG.exists():
-        return False, "daily_update.log 不存在，cron 可能从未跑过"
+def parse_cron_health(text: str, today: "_dt.date") -> tuple[bool, str]:
+    """从 daily_update.log 全文判 cron 健康度（纯函数，可单测）。
 
-    try:
-        text = _DAILY_LOG.read_text(encoding="utf-8", errors="replace")
-    except Exception as e:
-        return False, f"读 daily_update.log 失败：{e}"
-
-    # 取最后 500 行（够覆盖 7-10 天的运行）
-    tail_lines = text.splitlines()[-500:]
-    tail_text = "\n".join(tail_lines)
-
-    today = _dt.date.today()
+    ⚠️ 计数必须扫**全文的运行起始标记按日期去重**——**不能只取末尾固定行数**：
+    每次 daily_update 日志达 ~1300 行(DB init 刷屏+真值采集)，旧实现取末尾 500 行连一次
+    完整运行都覆盖不全，把"每天都准点跑"误报成"7 天仅 1 次"(2026-06-27 实测假警报)。
+    vendor 失败 / Traceback 只在最近 7 天窗口内查，避免历史旧错误一直误触发。
+    """
     cutoff = today - _dt.timedelta(days=7)
+    lines = text.splitlines()
 
-    # 1) 统计运行次数：每个运行片段以 "=== Harness Daily Update @ YYYY-MM-DD HH:MM:SS ===" 开始
-    run_dates: set = set()
-    for m in re.finditer(
-        r"=== Harness Daily Update @ (\d{4}-\d{2}-\d{2})", tail_text
-    ):
-        try:
-            d = _dt.date.fromisoformat(m.group(1))
-            if d >= cutoff:
-                run_dates.add(d)
-        except ValueError:
-            continue
-
+    # 1) 运行次数：扫全文运行起始标记，按日期去重，取最近 7 天
+    markers: list[tuple[int, "_dt.date"]] = []
+    for i, line in enumerate(lines):
+        m = re.search(r"=== Harness Daily Update @ (\d{4}-\d{2}-\d{2})", line)
+        if m:
+            try:
+                markers.append((i, _dt.date.fromisoformat(m.group(1))))
+            except ValueError:
+                continue
+    run_dates = {d for _, d in markers if d >= cutoff}
     n_runs = len(run_dates)
 
-    # 2) 检查 vendor 失败
-    vendor_fail_matches = re.findall(
-        r"vendor 链全部失败（cache 已落后 (\d+) 天）", tail_text
-    )
+    # 2/3) 真值采集失败 / Traceback：限定在最近 7 天窗口（从首个 ≥cutoff 的运行标记起）
+    recent_start = next((i for i, d in markers if d >= cutoff), len(lines))
+    recent_text = "\n".join(lines[recent_start:])
+    # 用 daily_update 自报的权威 'failed' 计数求和——**不数** price_cache 逐票 stale 警告
+    # （"vendor 链全部失败（cache 已落后 N 天）"对退市/不活跃/新票是常态噪音，9999=无缓存哨兵，
+    #   会把"采集其实全成功(failed:0)"误报成 vendor 失败 96 次。2026-06-27 实测）。
+    failed_counts = [int(x) for x in re.findall(r"'failed':\s*(\d+)", recent_text)]
+    total_failed = sum(failed_counts)
+    has_traceback = "Traceback (most recent call last):" in recent_text
 
-    # 3) 检查 Traceback
-    has_traceback = "Traceback (most recent call last):" in tail_text
-
-    # 综合判定
     issues = []
     if n_runs < 5:
         issues.append(f"7 天仅 {n_runs} 次运行（应 ≥5）")
-    if vendor_fail_matches:
-        worst_lag = max(int(x) for x in vendor_fail_matches)
-        issues.append(f"vendor 链失败 {len(vendor_fail_matches)} 次，最长落后 {worst_lag} 天")
+    if total_failed > 0:
+        issues.append(f"真值采集失败 {total_failed} 次（daily_update 自报 failed）")
     if has_traceback:
         issues.append("日志含未捕获 Python Traceback")
 
     if not issues:
         return True, f"7 天 {n_runs} 次运行正常，无异常"
     return False, " / ".join(issues)
+
+
+def check_cron_health() -> tuple[bool, str]:
+    """扫描 daily_update.log 最近 7 天，返回 (is_healthy, 健康描述/异常说明)。"""
+    if not _DAILY_LOG.exists():
+        return False, "daily_update.log 不存在，cron 可能从未跑过"
+    try:
+        text = _DAILY_LOG.read_text(encoding="utf-8", errors="replace")
+    except Exception as e:
+        return False, f"读 daily_update.log 失败：{e}"
+    return parse_cron_health(text, _dt.date.today())
 
 
 # ---------------------------------------------------------------------------

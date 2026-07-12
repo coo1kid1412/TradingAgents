@@ -76,6 +76,16 @@ def _to_yaml(metrics: dict) -> str:
                 for k, v in value.items():
                     lines.append(f"    {k}: \"{v}\"")
             continue
+        if field == "distribution_into_retail":
+            # 派发合成（嵌套 dict + drivers 列表）——扁平化便于下游解析
+            v = value if isinstance(value, dict) else {}
+            lines.append(f"  {field}:")
+            lines.append(f"    score: {v.get('score', 0)}")
+            lines.append(f"    confirmed: {str(bool(v.get('confirmed'))).lower()}")
+            lines.append(f"    strength: \"{v.get('strength', 'none')}\"")
+            lines.append(f"    retail_takeover: \"{v.get('retail_takeover', '中性')}\"")
+            lines.append(f"    drivers: \"{'; '.join(v.get('drivers', [])) or '无'}\"")
+            continue
         if value is None:
             lines.append(f"  {field}: null")
         elif isinstance(value, str):
@@ -108,6 +118,8 @@ _REPORT_FIELD_GROUPS: list[tuple[str, list[str]]] = [
         "retail_buy_amount_rate_5d_pct",
         "retail_net_inflow_rate_5d_pct",
         "retail_concentration_signal",
+        "block_distribution_pressure",
+        "block_trade_summary",
     ]),
     ("三、北向资金", [
         "northbound_5d_direction",
@@ -124,6 +136,8 @@ _REPORT_FIELD_GROUPS: list[tuple[str, list[str]]] = [
         "holder_num_latest_report_date",
         "holder_num_4q_trend",
         "chip_concentration_signal",
+        "insider_net_selling",
+        "insider_summary",
     ]),
     ("五、综合判定", [
         "circulating_market_value_yi",
@@ -178,6 +192,22 @@ def _build_markdown_report(
         lines.append(f"- 资金面综合状态：**{regime}**，capital_flow_score = **{score_str}** / 100")
         lines.append(f"- 解释：{reasoning}")
     lines.append("")
+
+    # 机构派发给散户合成（资金面三路：获利盘高位/户数增/主力流出；舆情狂热由 RM 拥挤门补入）
+    dist = metrics.get("distribution_into_retail")
+    if isinstance(dist, dict):
+        drivers_str = "; ".join(dist.get("drivers", [])) or "无"
+        lines.append(
+            f"SYS_DISTRIBUTION: strength={dist.get('strength', 'none')} | "
+            f"score={dist.get('score', 0)}/5 | "
+            f"retail_takeover={dist.get('retail_takeover', '中性')} | "
+            f"drivers={drivers_str}"
+        )
+        lines.append(
+            "> 注：此为资金面合成（获利盘高位/户数增/主力流出/折价大宗，舆情狂热未计入）；"
+            "RM 拥挤门会把舆情狂热作另一路补入。≥2 路共振=派发确认→拥挤硬确认门触发。"
+        )
+        lines.append("")
 
     # 投票明细
     votes = metrics.get("capital_flow_votes", {})
@@ -284,6 +314,21 @@ def create_capital_flow_node():
         except Exception as e:
             logger.info("capital_flow_node: get_ths_hot_rank 失败（不影响主流程）: %s", e)
 
+        # 6. 大宗交易派发压力（block_trade 折价；新档位解锁，派发合成第五路硬数据）
+        block_metrics = None
+        try:
+            from tradingagents.dataflows.tushare_vendor import get_block_trade_metrics
+            block_metrics = get_block_trade_metrics(symbol, trade_date)
+        except Exception as e:
+            logger.info("capital_flow_node: get_block_trade_metrics 失败（不影响主流程）: %s", e)
+
+        insider_metrics = None
+        try:
+            from tradingagents.dataflows.tushare_vendor import get_insider_distribution_metrics
+            insider_metrics = get_insider_distribution_metrics(symbol, trade_date)
+        except Exception as e:
+            logger.info("capital_flow_node: get_insider_distribution_metrics 失败（不影响主流程）: %s", e)
+
         # 装配
         if cap_data is None:
             cap_data = {
@@ -304,6 +349,8 @@ def create_capital_flow_node():
             latest_trade_date=cap_data.get("latest_trade_date"),
             chip_metrics=chip_metrics,
             ths_hot_rank=ths_hot_rank,
+            block_metrics=block_metrics,
+            insider_metrics=insider_metrics,
         )
 
         # 序列化

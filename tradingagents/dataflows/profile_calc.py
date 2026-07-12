@@ -205,6 +205,214 @@ def get_default_weights(style: Optional[str]) -> Optional[dict[str, int]]:
 # ---------------------------------------------------------------------------
 # 价格 / 估值数据提取（从 OHLCV / fundamentals 原始数据）
 # ---------------------------------------------------------------------------
+def compute_short_term_structure(
+    price_df,
+    *,
+    rsi_percentile_1y: Optional[float] = None,
+    has_vol_divergence: bool = False,
+) -> dict:
+    """Classify short-term price/volume structure from daily OHLCV.
+
+    The result is deterministic and uses only rows available through the
+    current bar. Risk states take precedence over constructive states.
+    """
+    import math
+    import pandas as pd
+
+    result = {
+        "as_of_date": None,
+        "structure_class": "insufficient_data",
+        "ma10": None,
+        "ma20": None,
+        "ma10_slope_5d_pct": None,
+        "price_vs_ma10_pct": None,
+        "price_vs_ma20_pct": None,
+        "volume_ratio_5d_20d": None,
+        "volume_ratio_1d_20d": None,
+        "atr14_pct": None,
+        "distance_from_prior_20d_high_pct": None,
+        "breakout_confirmed": False,
+        "reasons": [],
+        "blockers": [],
+    }
+    if price_df is None or len(price_df) == 0:
+        result["reasons"] = ["OHLCV 数据为空"]
+        return result
+
+    columns = {str(col).lower(): col for col in price_df.columns}
+    close_col = columns.get("close")
+    if close_col is None:
+        result["reasons"] = ["缺少 Close 列"]
+        return result
+
+    frame = pd.DataFrame(index=price_df.index)
+    frame["close"] = pd.to_numeric(price_df[close_col], errors="coerce")
+    for name in ("open", "high", "low", "volume"):
+        source = columns.get(name)
+        frame[name] = pd.to_numeric(price_df[source], errors="coerce") if source is not None else math.nan
+    frame = frame.replace([math.inf, -math.inf], math.nan).dropna(subset=["close"])
+    frame = frame[frame["close"] > 0].reset_index(drop=True)
+    if len(frame) < 20:
+        result["reasons"] = [f"有效收盘数据不足 20 日（{len(frame)} 日）"]
+        return result
+
+    date_col = columns.get("date")
+    if date_col is not None:
+        raw_date = price_df.loc[price_df[close_col].notna(), date_col]
+        if len(raw_date):
+            result["as_of_date"] = str(raw_date.iloc[-1])[:10]
+
+    close = frame["close"]
+    ma10_series = close.rolling(10).mean()
+    ma20_series = close.rolling(20).mean()
+    ma10 = float(ma10_series.iloc[-1])
+    ma20 = float(ma20_series.iloc[-1])
+    latest = float(close.iloc[-1])
+    ma10_slope = None
+    if len(frame) >= 15 and ma10_series.iloc[-6] > 0:
+        ma10_slope = float((ma10 / ma10_series.iloc[-6] - 1) * 100)
+
+    result.update({
+        "ma10": round(ma10, 4),
+        "ma20": round(ma20, 4),
+        "ma10_slope_5d_pct": round(ma10_slope, 4) if ma10_slope is not None else None,
+        "price_vs_ma10_pct": round((latest / ma10 - 1) * 100, 4),
+        "price_vs_ma20_pct": round((latest / ma20 - 1) * 100, 4),
+    })
+
+    high = frame["high"].where(frame["high"] > 0, close).fillna(close)
+    low = frame["low"].where(frame["low"] > 0, close).fillna(close)
+    prev_close = close.shift(1)
+    true_range = pd.concat([
+        high - low,
+        (high - prev_close).abs(),
+        (low - prev_close).abs(),
+    ], axis=1).max(axis=1)
+    atr14 = float(true_range.tail(14).mean())
+    atr14_pct = (atr14 / latest * 100) if latest > 0 and math.isfinite(atr14) else 2.0
+    if not math.isfinite(atr14_pct) or atr14_pct <= 0:
+        atr14_pct = 2.0
+        result["blockers"].append("ATR 无效，使用 2% 降级值")
+    result["atr14_pct"] = round(atr14_pct, 4)
+
+    near_band = min(max(0.75 * atr14_pct, 1.5), 4.0)
+    break_band = min(max(atr14_pct, 2.0), 5.0)
+    extended_band = min(max(2.0 * atr14_pct, 6.0), 12.0)
+
+    prior_20d_high = float(close.iloc[-21:-1].max()) if len(close) >= 21 else float(close.iloc[:-1].max())
+    distance_high = (latest / prior_20d_high - 1) * 100 if prior_20d_high > 0 else None
+    result["distance_from_prior_20d_high_pct"] = round(distance_high, 4) if distance_high is not None else None
+
+    volume = frame["volume"]
+    volume_valid = len(volume) >= 20 and volume.tail(5).notna().all() and (volume.tail(5) > 0).all()
+    volume_ratio_5d_20d = None
+    volume_ratio_1d_20d = None
+    if volume_valid:
+        volume_20d = float(volume.tail(20).mean())
+        if volume_20d > 0 and math.isfinite(volume_20d):
+            volume_ratio_5d_20d = float(volume.tail(5).mean() / volume_20d)
+            volume_ratio_1d_20d = float(volume.iloc[-1] / volume_20d)
+            result["volume_ratio_5d_20d"] = round(volume_ratio_5d_20d, 4)
+            result["volume_ratio_1d_20d"] = round(volume_ratio_1d_20d, 4)
+    else:
+        result["blockers"].append("近期成交量缺失或为零，关闭积极量价分类")
+
+    breakout = bool(distance_high is not None and distance_high > 0)
+    result["breakout_confirmed"] = bool(
+        breakout and volume_ratio_1d_20d is not None and volume_ratio_1d_20d >= 1.3
+    )
+
+    previous_ma20 = float(ma20_series.iloc[-2]) if len(ma20_series.dropna()) >= 2 else ma20
+    prior_above_ma20 = float(close.iloc[-2]) >= previous_ma20
+    broken = bool(
+        (latest < ma20 and ma10_slope is not None and ma10_slope <= -1.0)
+        or (
+            len(close) >= 2
+            and (close.tail(2) < ma10_series.tail(2)).all()
+            and result["price_vs_ma10_pct"] < -near_band
+            and ma10_slope is not None
+            and ma10_slope < 0
+        )
+        or (
+            prior_above_ma20
+            and latest < ma20
+            and volume_ratio_1d_20d is not None
+            and volume_ratio_1d_20d >= 1.5
+        )
+    )
+
+    five_day_return_pct = float((latest / close.iloc[-6] - 1) * 100) if len(close) >= 6 else 0.0
+    exhaustion = bool(
+        (
+            result["price_vs_ma10_pct"] > extended_band
+            and rsi_percentile_1y is not None
+            and rsi_percentile_1y >= 85
+        )
+        or (breakout and volume_ratio_1d_20d is not None and volume_ratio_1d_20d < 0.8)
+        or (
+            five_day_return_pct >= max(5.0, 2.0 * atr14_pct)
+            and ma10_slope is not None
+            and ma10_slope > 0
+            and bool(has_vol_divergence)
+        )
+    )
+
+    trend_pullback = bool(
+        volume_ratio_5d_20d is not None
+        and ma10_slope is not None
+        and ma10_slope >= 1.0
+        and ma10 > ma20
+        and abs(result["price_vs_ma10_pct"]) <= near_band
+        and latest >= ma20
+        and volume_ratio_5d_20d <= 0.85
+    )
+    ten_day_range_pct = float((close.tail(10).max() / close.tail(10).min() - 1) * 100)
+    breakout_ready = bool(
+        volume_ratio_5d_20d is not None
+        and distance_high is not None
+        and -break_band <= distance_high <= 0
+        and ten_day_range_pct <= max(8.0, 3.0 * atr14_pct)
+        and volume_ratio_5d_20d <= 0.85
+        and ma10_slope is not None
+        and ma10_slope >= 0
+        and latest >= ma20
+        and not result["breakout_confirmed"]
+    )
+    healthy_trend = bool(
+        ma10_slope is not None and ma10_slope > 0 and ma10 > ma20 and latest > ma10
+    )
+
+    if broken:
+        structure_class = "broken"
+        reasons = [f"短线破位：收盘/MA20={result['price_vs_ma20_pct']:+.2f}%"]
+    elif exhaustion:
+        structure_class = "exhaustion"
+        reasons = ["价格扩张与量能/拥挤不匹配"]
+    elif trend_pullback:
+        structure_class = "trend_pullback"
+        reasons = [
+            f"MA10 五日斜率={ma10_slope:+.2f}%",
+            f"价格/MA10={result['price_vs_ma10_pct']:+.2f}%",
+            f"5/20 日量比={volume_ratio_5d_20d:.2f}",
+        ]
+    elif breakout_ready:
+        structure_class = "breakout_ready"
+        reasons = [
+            f"距前20日高点={distance_high:+.2f}%",
+            f"5/20 日量比={volume_ratio_5d_20d:.2f}",
+        ]
+    elif healthy_trend:
+        structure_class = "healthy_trend"
+        reasons = [f"MA10 五日斜率={ma10_slope:+.2f}%，且 MA10>MA20"]
+    else:
+        structure_class = "neutral"
+        reasons = ["未形成明确的积极或风险短线结构"]
+
+    result["structure_class"] = structure_class
+    result["reasons"] = reasons
+    return result
+
+
 def compute_price_signals(price_df) -> dict:
     """从 OHLCV DataFrame 提取技术面信号：RSI / 乖离率 / 量价背离 / 60 日日均成交额。
 
@@ -382,6 +590,7 @@ def is_loss_making(eps_ttm: Optional[float]) -> bool:
 # 传统强周期：tushare stock_basic.industry 关键词匹配（行业粒度够细，安全）
 _CYCLICAL_STRONG_INDUSTRY_KW = (
     "钢", "煤", "焦炭", "有色", "铝", "铜", "锌", "铅", "镍", "锂矿",
+    "小金属", "稀有金属", "稀土", "黄金",   # 锗/铟/钨/钼/稀土/黄金等资源型，盈利随商品价周期波动
     "化工原料", "化纤", "石油开采", "炼油", "航运", "船舶",
     "水泥", "玻璃", "造纸", "养殖", "畜禽", "猪",
 )
@@ -418,6 +627,190 @@ def detect_cyclical(industry: Optional[str], company_name: Optional[str]) -> Opt
             if kw in ind:
                 return "strong"
     return None
+
+
+# ============================================================================
+# 范式成长（secular hardtech）识别 —— AI/算力硬科技结构性成长
+# ----------------------------------------------------------------------------
+# 对标投研：secular re-rating 期间倍数可多年不回归（NVDA/中际旭创式），不能用历史 PE band
+# 均值回归估。识别后让 regime 在"真加速期"走 ride-by-default（见 compute_valuation_regime
+# 范式反转），但 peak/派发/破位任一出现即回纪律（不骑顶）。
+# tushare industry 太粗（分不出 CPO/光刻胶/PCB），主用龙头名单（同周期股，零误伤优先）+
+# 少量干净行业关键词。维护：新龙头进名单。AI应用(软件)/固态电池暂不纳入。
+# ============================================================================
+_PARADIGM_INDUSTRY_KW = ("半导体",)   # tushare industry 里能干净映射的只有半导体；其余靠名单
+_PARADIGM_NAMES = (
+    # CPO / 光模块 / 光器件
+    "中际旭创", "新易盛", "天孚通信", "光迅科技", "华工科技", "剑桥科技", "太辰光", "仕佳光子",
+    # 算力 / AI 芯片 / GPU
+    "海光信息", "寒武纪", "景嘉微", "龙芯中科", "芯原股份", "瑞芯微", "澜起科技",
+    # 光刻胶 / 半导体材料
+    "晶瑞电材", "南大光电", "彤程新材", "华懋科技", "雅克科技", "鼎龙股份", "安集科技",
+    # PCB（AI 服务器 / 算力）
+    "沪电股份", "生益科技", "深南电路", "胜宏科技", "兴森科技", "广合科技",
+    # MLCC / 被动元件
+    "三环集团", "风华高科", "洁美科技",
+    # 算力租赁 / IDC
+    "润泽科技", "光环新网", "数据港", "云赛智联", "奥飞数据", "科华数据",
+    # 机器人（盈利兑现度较弱；regime 的盈利动能门控会自然过滤未兑现的）
+    "汇川技术", "绿的谐波", "埃斯顿", "拓斯达", "鸣志电器", "雷赛智能", "三花智控",
+)
+
+
+def detect_paradigm_growth(industry: Optional[str], company_name: Optional[str]) -> Optional[str]:
+    """范式成长确定性识别 → "paradigm" / None。
+
+    ⛔ 周期优先：已是周期股（detect_cyclical 命中，如存储/面板）→ 让位周期轨（返回 None）。
+    存储等结构性周期股的成长 β 已由周期轨的滑动权重（谷底偏成长前瞻）表达，不让它双轨打架。
+    Python 优先判（防 LLM 漂移）；LLM 只能对漏网者加注，不能摘帽（同周期股）。
+    """
+    if detect_cyclical(industry, company_name) is not None:
+        return None
+    name = (company_name or "").strip()
+    if name:
+        for kw in _PARADIGM_NAMES:
+            if kw in name:
+                return "paradigm"
+    ind = (industry or "").strip()
+    if ind:
+        for kw in _PARADIGM_INDUSTRY_KW:
+            if kw in ind:
+                return "paradigm"
+    return None
+
+
+_SYS_PARADIGM_RE = re.compile(r"【SYS_PARADIGM[^】]*】\s*class=(?P<cls>paradigm)")
+
+
+def parse_sys_paradigm(text: str) -> bool:
+    """从 fundamentals 报告解析 SYS_PARADIGM 机读行（Python 转录保证在场）。命中→True。"""
+    if not text:
+        return False
+    return bool(_SYS_PARADIGM_RE.search(text))
+
+
+_SYS_MAIN_BUSINESS_RE = re.compile(r"【SYS_MAIN_BUSINESS[^】]*】\s*(?P<seg>.+?)（按")
+
+
+def parse_sys_main_business(text: str) -> Optional[str]:
+    """从 fundamentals 原始数据解析 SYS_MAIN_BUSINESS 的产品营收占比段。
+
+    画像识别官据此把它确定性转录到画像末尾，PM 直读画像、不经基本面分析师改写——
+    防"分析师转写丢真值"（实测虽多数转录无误，但应去掉这道 LLM 转手）。
+    Returns: "芯片量产 47% / 芯片设计 28% / ..." 或 None。
+    """
+    if not text:
+        return None
+    m = _SYS_MAIN_BUSINESS_RE.search(text)
+    if not m:
+        return None
+    seg = m.group("seg").strip()
+    return seg or None
+
+
+_AI_MAIN_UPTREND_KEYWORDS = (
+    "AI服务器", "AI芯片", "AI算力", "算力", "CPO", "光模块", "光器件", "光通信", "800G", "1.6T", "数据中心",
+    "服务器", "交换机", "PCB", "高速互联", "液冷", "英伟达", "NVIDIA",
+    "GPU", "云厂商", "半导体", "芯片",
+)
+
+
+def compute_ai_main_uptrend_signal(
+    *,
+    company_name: Optional[str] = None,
+    industry: Optional[str] = None,
+    main_business: Optional[str] = None,
+    is_paradigm: bool = False,
+    net_profit_growth: Optional[float] = None,
+    revenue_growth: Optional[float] = None,
+    earnings_revision: Optional[str] = None,
+    has_hard_order_evidence: bool = False,
+    momentum_score: Optional[float] = None,
+    theme_stage_inferred: Optional[str] = None,
+    sector_rs_30d: Optional[float] = None,
+    valuation_regime: Optional[str] = None,
+    recurring_loss: Optional[bool] = None,
+    has_peak_signal: bool = False,
+    retail_concentration_signal: Optional[str] = None,
+    rsi_percentile_1y: Optional[float] = None,
+    winner_rate_pct: Optional[float] = None,
+    capital_flow_regime: Optional[str] = None,
+    main_force_streak_days: Optional[int] = None,
+) -> dict:
+    """识别 AI 算力链主升兑现票（纯确定性信号，不读外部状态）。
+
+    该信号只表达"是否有资格在市场 risk_on 时获得克制升档"，不是买入建议。
+    排除条件优先级最高：纪律 regime、扣非亏损、价格 blowoff、下修/资金恶化等都
+    会关闭信号，避免把纯叙事或会亏钱的票误抬。
+    """
+    text = " ".join([company_name or "", industry or "", main_business or ""])
+    upper_text = text.upper()
+    ai_chain = bool(is_paradigm) or any(kw.upper() in upper_text for kw in _AI_MAIN_UPTREND_KEYWORDS)
+
+    reasons: list[str] = []
+    blockers: list[str] = []
+
+    if ai_chain:
+        reasons.append("AI算力链/硬科技赛道命中")
+    else:
+        blockers.append("未命中AI算力链硬科技赛道")
+
+    if net_profit_growth is not None and net_profit_growth >= 0.40:
+        reasons.append(f"净利润兑现增长{net_profit_growth * 100:.0f}%")
+    if revenue_growth is not None and revenue_growth >= 0.30:
+        reasons.append(f"营收兑现增长{revenue_growth * 100:.0f}%")
+    if earnings_revision == "上修":
+        reasons.append("卖方盈利预期上修")
+    if has_hard_order_evidence:
+        reasons.append("订单/核心客户/产能放量硬证据")
+
+    has_confirmed_delivery = any(
+        marker in reason for reason in reasons
+        for marker in ("净利润兑现", "营收兑现", "上修")
+    )
+    has_delivery = has_confirmed_delivery or has_hard_order_evidence
+
+    trend_reasons: list[str] = []
+    if momentum_score is not None and momentum_score >= 65:
+        trend_reasons.append(f"momentum={momentum_score:.0f}>=65")
+    if theme_stage_inferred == "acceleration":
+        trend_reasons.append("theme_stage=acceleration")
+    if sector_rs_30d is not None and sector_rs_30d > 5:
+        trend_reasons.append(f"板块RS 30d={sector_rs_30d:+.1f}%")
+    reasons.extend(trend_reasons)
+
+    reg = (valuation_regime or "").strip().lower()
+    if reg == "discipline":
+        blockers.append("valuation_regime=discipline")
+    if recurring_loss is True:
+        blockers.append("扣非/主业亏损")
+    if has_peak_signal:
+        blockers.append("peak信号触发")
+    # 价格极端=纯价格行为(RSI≥85)，不含滞后的获利盘——见 _is_price_blowoff_extreme。
+    # winner_rate_pct 入参保留(向后兼容/未来扩展)，当前不参与 blowoff 判定。
+    price_extreme = _is_price_blowoff_extreme(rsi_percentile_1y)
+    if retail_concentration_signal == "散户高接盘" and price_extreme:
+        blockers.append("散户高接盘+价格极端 blowoff")
+    if earnings_revision == "下修":
+        blockers.append("卖方盈利预期下修")
+    strong_outflow = (
+        capital_flow_regime == "恶化"
+        or (main_force_streak_days is not None and main_force_streak_days <= -3)
+    )
+    if strong_outflow and earnings_revision != "上修":
+        blockers.append("资金面持续恶化且无卖方上修")
+
+    if not has_delivery:
+        blockers.append("缺少业绩/订单/上修兑现证据")
+    if not trend_reasons:
+        blockers.append("缺少趋势确认")
+
+    enabled = ai_chain and has_delivery and bool(trend_reasons) and not blockers
+    if not enabled:
+        return {"enabled": False, "class": "none", "reasons": reasons, "blockers": blockers}
+
+    signal_class = "confirmed" if has_confirmed_delivery else "early"
+    return {"enabled": True, "class": signal_class, "reasons": reasons, "blockers": []}
 
 
 # 强周期股目标价的「正常化 vs 成长前瞻」滑动权重，按周期位置确定（防 RM 自选权重致摆动）。
@@ -1107,14 +1500,112 @@ _PEG_BAND_BY_REGIME = {
     "discipline": (0.8, 1.0),   # 弱基本面（减速/派发/流出）：折价，不追
 }
 
+# 范式成长 ride 档（Phase 2 ②）：AI/算力硬科技 secular 龙头在确认 ride 时，比通用 ride
+# (1.0-1.5) 抬一档——对标卖方对 AI 龙头爬坡期常给 PEG 1.5-2.5，此处取**保守**上沿避免追顶。
+# 闸门严（见 compute_peg_band：is_paradigm_ride 须 paradigm+ride+earnings腿==1，且 confidence
+# 非 low 才享高沿）。⚠️ TODO(harness 超参)：上沿 1.8 待 T+30 回测校准，偏多则下调。
+_PARADIGM_RIDE_PEG_BAND = (1.2, 1.8)
+
 
 def compute_peg_band(valuation_regime: Optional[str],
-                     peg_confidence: Optional[str] = "") -> tuple[float, float]:
-    """regime → (PEG 下限, PEG 上限)。低置信前瞻时上沿压回（不为不确定的 EPS 付溢价）。"""
+                     peg_confidence: Optional[str] = "",
+                     is_paradigm_ride: bool = False) -> tuple[float, float]:
+    """regime → (PEG 下限, PEG 上限)。低置信前瞻时上沿压回（不为不确定的 EPS 付溢价）。
+
+    is_paradigm_ride=True（范式股 + 确认 ride + earnings腿=+1，由调用方判定）→ 用范式 ride 档
+    (1.2-1.8) 表达 secular 多年跑道；但**低置信前瞻(低基数尖峰)不享高沿**，退回通用 ride 再压。
+    """
+    conf_low = (peg_confidence or "").strip().lower() == "low"
+    if is_paradigm_ride and not conf_low:
+        return _PARADIGM_RIDE_PEG_BAND   # 范式 ride 档；多年 secular 跑道只由 PEG 这一通道表达
     low, high = _PEG_BAND_BY_REGIME.get((valuation_regime or "").strip().lower(), (0.9, 1.2))
-    if (peg_confidence or "").strip().lower() == "low":
+    if conf_low:
         high = min(high, 1.1)
     return (low, high)
+
+
+def compute_peg_leg_target(
+    forward_eps: Optional[float],
+    growth_pct: Optional[float],
+    peg_low: float,
+    peg_high: float,
+) -> Optional[dict]:
+    """确定性 PEG 腿目标价（= compute_peg_target_price 同公式），Python 算死供 RM Step4 直读。
+
+    根治成长股 PEG 腿被 LLM 现场乱填参数致目标价摆动：天孚同股同输入(前瞻EPS 3.8/增速45/
+    PEG 0.9-1.2)三跑 PEG 腿 194↔269↔342-456 乱跳，把 SELL 抬成 HOLD——根因是 RM 调
+    compute_peg_target_price 时无视 SYS_PEG_BAND/SYS_PEG_GROWTH_PCT，自塞高一倍的增速/PEG。
+    钉死后 RM 直读 SYS_PEG_TARGET_PRICE，不再有塞错参数的入口。
+
+    目标价 = forward_eps × (PEG × 增速%)，隐含 PE = PEG × 增速%（同 rm_tools.compute_peg_target_price）。
+
+    Returns: {low, mid, high, implied_pe_range} 或 None（缺前瞻 EPS/增速）。
+    """
+    if (forward_eps is None or growth_pct is None
+            or forward_eps <= 0 or growth_pct <= 0):
+        return None
+    low = round(forward_eps * peg_low * growth_pct, 2)
+    high = round(forward_eps * peg_high * growth_pct, 2)
+    mid = round((low + high) / 2, 2)
+    return {
+        "low": low, "mid": mid, "high": high,
+        "implied_pe_range": [round(peg_low * growth_pct, 1), round(peg_high * growth_pct, 1)],
+    }
+
+
+# 强周期股正常化腿的 mid-cycle PE 带（对标投研：周期股峰值盈利不可线性外推，给跨周期合理倍数）。
+# 存储/面板类 10-15x 是行业惯用 mid-cycle 区间。⚠️ TODO(harness 超参)：待回测校准。
+_CYCLICAL_NORMALIZE_PE_BAND = (10.0, 15.0)
+# 两腿离散度 ≥ 此倍数 = 双峰（周期崩 vs 结构成长分歧大）→ 综合目标低置信（中间数不可信）
+_CYCLICAL_DISPERSION_BIMODAL = 2.5
+
+
+def compute_cyclical_scenario_target(
+    normalized_eps: Optional[float],
+    forward_eps: Optional[float],
+    forward_growth_pct: Optional[float],
+    position: Optional[str],
+    peg_low: float,
+    peg_high: float,
+    normalize_pe_band: tuple = _CYCLICAL_NORMALIZE_PE_BAND,
+) -> Optional[dict]:
+    """强周期股双轨情景目标价（确定性，替代 RM 现场硬平均两条腿致摆动）。
+
+    两条腿是**互斥的未来**，不是同一估值的不同输入：
+      - 周期均值回归(bear)：normalized_eps × mid-cycle PE —— 峰值盈利不可持续、回归正常化；
+      - 结构成长(bull)：forward_eps × (PEG × 前瞻增速) —— AI 结构需求支撑前瞻溢价。
+    按周期位置滑动权重做概率加权出 base；两腿离散 ≥2.5x 时标低置信（双峰，中间数谁都不信）。
+    Python 算死、RM 直读 SYS_CYCLICAL_TARGET 不再现场算 → 根治残留摆动（兆易 SELL↔UW）。
+    对标投研：估值分歧 5 倍时不做算术平均，而是情景概率加权 + 显式标注双峰不确定性。
+
+    Returns: {bear_low/high, bull_low/high, base_low/high, weights, dispersion, confidence,
+              normalize_pe_band} 或 None（缺正常化/前瞻 EPS）。
+    """
+    if (normalized_eps is None or forward_eps is None or forward_growth_pct is None
+            or normalized_eps <= 0 or forward_eps <= 0 or forward_growth_pct <= 0):
+        return None
+    pe_lo, pe_hi = normalize_pe_band
+    bear_low = round(normalized_eps * pe_lo, 2)
+    bear_high = round(normalized_eps * pe_hi, 2)
+    # 成长腿：target_PE = PEG × 增速%；price = forward_eps × target_PE（同 compute_peg_target_price）
+    bull_low = round(forward_eps * peg_low * forward_growth_pct, 2)
+    bull_high = round(forward_eps * peg_high * forward_growth_pct, 2)
+    w_norm, w_growth = cyclical_target_weights(position)
+    base_low = round(w_norm * bear_low + w_growth * bull_low, 2)
+    base_high = round(w_norm * bear_high + w_growth * bull_high, 2)
+    bear_mid = (bear_low + bear_high) / 2
+    bull_mid = (bull_low + bull_high) / 2
+    dispersion = round(bull_mid / bear_mid, 2) if bear_mid > 0 else None
+    confidence = ("low" if dispersion is not None and dispersion >= _CYCLICAL_DISPERSION_BIMODAL
+                  else "normal")
+    return {
+        "bear_low": bear_low, "bear_high": bear_high,     # 周期均值回归视角（正常化）
+        "bull_low": bull_low, "bull_high": bull_high,     # 结构成长视角（前瞻 PEG）
+        "base_low": base_low, "base_high": base_high,     # 概率加权（位置滑动权重）
+        "weights": {"normalize": w_norm, "growth": w_growth},
+        "dispersion": dispersion, "confidence": confidence,
+        "normalize_pe_band": [pe_lo, pe_hi],
+    }
 
 
 def compute_peer_anchored_pe_cap(
@@ -1282,18 +1773,55 @@ _DISTRIBUTION_PATTERNS = (
 )
 _DISTRIBUTION_NEGATION = (r"未(?:发现|出现)[^。\n]{0,20}减持", r"无[^。\n]{0,10}减持")
 
+# 减持/派发证据的"陈旧"阈值：附近日期距分析日 >此天数 → 视为旧事，不投 distribution 腿。
+# 对标投研：内部人减持信号约 1 季度内有意义，半年前在 1/3 价位的减持对当前判断无增量。
+# 治范式龙头被陈旧减持敲出 ride（天孚 06-25：2026-01 高管@198-219 / 2025-03 大股东@98 误投）。
+_DISTRIBUTION_STALE_DAYS = 120
+# 匹配 YYYY-MM-DD / YYYY/MM/DD / YYYY.MM.DD / YYYY年MM月[DD日]（日可缺，缺则按当月1日）
+_EVENT_DATE_RE = re.compile(r"(20\d{2})\s*[-/.年]\s*(\d{1,2})(?:\s*[-/.月]\s*(\d{1,2}))?")
 
-def parse_distribution_signals(news_str: str, fund_str: str = "", sentiment_str: str = "") -> dict:
+
+def _nearest_event_date(text: str, pos: int, radius: int = 45):
+    """匹配位置 pos 附近窗口内、距 pos 最近的日期 → datetime.date 或 None。"""
+    import datetime
+    lo, hi = max(0, pos - radius), min(len(text), pos + radius)
+    window = text[lo:hi]
+    best, best_dist = None, 1 << 30
+    for m in _EVENT_DATE_RE.finditer(window):
+        try:
+            y, mo, d = int(m.group(1)), int(m.group(2)), int(m.group(3) or 1)
+            dt = datetime.date(y, mo, d)
+        except (ValueError, TypeError):
+            continue
+        center = lo + (m.start() + m.end()) // 2
+        dist = abs(center - pos)
+        if dist < best_dist:
+            best, best_dist = dt, dist
+    return best
+
+
+def parse_distribution_signals(news_str: str, fund_str: str = "", sentiment_str: str = "",
+                               current_date: Optional[str] = None) -> dict:
     """检测"大股东/机构派发"硬证据（减持/折价询价转让/机构减仓/筹码分散）。
 
     这是澜起式派发股最硬的看空信号，但散落在 news/fundamentals/sentiment，
-    之前没喂进 regime。返回 {detected: bool, reasons: [...]}（用于 regime 的 distribution 腿投负）。
+    之前没喂进 regime。返回 {detected, reasons, stale_skipped}（用于 regime 的 distribution 腿投负）。
+
+    recency 门（current_date 给定时生效）：每条减持/派发证据附近若有日期且 >120 天，视为陈旧、
+    不计入——治软口径把一年前低位减持当当前派发、把范式龙头敲出 ride。无日期的当期结构信号
+    （如"股东户数增加"）照常保留。缺 current_date 则不过滤（向后兼容）。
     """
-    import re
+    import datetime
     text = "\n".join([news_str or "", fund_str or "", sentiment_str or ""])
     if not text.strip():
-        return {"detected": False, "reasons": []}
-    reasons = []
+        return {"detected": False, "reasons": [], "stale_skipped": 0}
+    cd = None
+    if current_date:
+        try:
+            cd = datetime.date.fromisoformat(str(current_date)[:10])
+        except ValueError:
+            cd = None
+    reasons, stale_skipped = [], 0
     for pat in _DISTRIBUTION_PATTERNS:
         for m in re.finditer(pat, text):
             seg = m.group(0)
@@ -1301,10 +1829,35 @@ def parse_distribution_signals(news_str: str, fund_str: str = "", sentiment_str:
             ctx = text[max(0, m.start() - 8):m.start()]
             if any(re.search(neg, ctx + seg) for neg in _DISTRIBUTION_NEGATION):
                 continue
+            # recency 门：附近日期 >120 天 → 陈旧，跳过（无日期则保留，当期结构信号不丢）
+            if cd is not None:
+                ev = _nearest_event_date(text, m.start())
+                if ev is not None and (cd - ev).days > _DISTRIBUTION_STALE_DAYS:
+                    stale_skipped += 1
+                    continue
             reasons.append(seg.strip())
     # 去重
     reasons = list(dict.fromkeys(reasons))[:5]
-    return {"detected": len(reasons) > 0, "reasons": reasons}
+    return {"detected": len(reasons) > 0, "reasons": reasons, "stale_skipped": stale_skipped}
+
+
+# blowoff 护栏"价格极端"门槛：RSI 1年分位≥此值=真抛物线/超买顶（**纯价格行为**）。
+_BLOWOFF_RSI_PCTL = 85.0
+
+
+def _is_price_blowoff_extreme(rsi_percentile_1y: Optional[float]) -> bool:
+    """blowoff 护栏的"价格极端"判定——**纯价格行为**(RSI 1年分位≥85)，单一真值源。
+
+    ⚠️ 刻意**不含获利盘(winner_rate)**：获利盘是滞后筹码指标，个股冲高后回调仍多数浮盈
+    → 获利盘照样高，会把**已回调、RSI 中低位**的票误判成"价格见顶"，从而同时掐死范式
+    ride 档与 AI 主升升档（天孚 06-26 实测：RSI 45.69/35-40分位明显回调，却因获利盘 86%
+    误触 blowoff→压在 neutral→SELL，而同期花旗目标价 419）。获利盘的"派发"含义已在
+    compute_distribution_into_retail(散户高接盘合成,派发腿2)表达，不在此处再冒充价格信号。
+
+    compute_valuation_regime(regime blowoff) 与 compute_ai_main_uptrend_signal(AI主升 blocker)
+    共用此判定，保证两处"价格极端"定义一致、不分叉。
+    """
+    return rsi_percentile_1y is not None and rsi_percentile_1y >= _BLOWOFF_RSI_PCTL
 
 
 def compute_valuation_regime(
@@ -1325,6 +1878,9 @@ def compute_valuation_regime(
     recurring_loss: Optional[bool] = None,
     cyclical_class: Optional[str] = None,
     roe_pct_rank_10y: Optional[float] = None,
+    is_paradigm: bool = False,
+    earnings_revision: Optional[str] = None,
+    winner_rate_pct: Optional[float] = None,
 ) -> dict:
     """客观估值 regime（骑趋势 / 中性 / 收纪律）——六路分析师信号合成，纯 Python 确定性。
 
@@ -1409,6 +1965,20 @@ def compute_valuation_regime(
             legs["earnings"] = 0
             cyc_note = f"；强周期谷底(ROE分位{roe_pct_rank_10y:.2f})盈利差是周期常态，earnings腿抬0"
 
+    # 3c 前瞻盈利上修中和后视镜减速（对标投研：revision 方向才是"骑还是收"的真判据）——
+    #   主升浪里龙头单季高基数回落被 SYS_GROWTH 判 decelerating(-1)，但卖方此时在上修前瞻预期，
+    #   把 -1 中和到 0（前瞻方向优先于后视镜）；下修则把高增速 +1 削到 0（预期恶化预警）。
+    #   ⚠️ 范围克制：只动 earnings 腿，不碰 blowoff 护栏(硬派发仍生效)、不碰 PEG 带——避免把
+    #   澜起式顶部(卖方维持但目标价低于现价、非上修)重新放松。源自新闻粗代理(report_rc 没权限前)。
+    rev_note = ""
+    if earnings_revision and "earnings" in legs:
+        if earnings_revision == "上修" and legs["earnings"] == -1:
+            legs["earnings"] = 0
+            rev_note = "；卖方上修前瞻→earnings后视镜减速-1中和到0(revision方向优先)"
+        elif earnings_revision == "下修" and legs["earnings"] == 1:
+            legs["earnings"] = 0
+            rev_note = "；卖方下修前瞻→earnings高增速+1削到0(预期恶化预警)"
+
     # 4 舆情拥挤
     crowd_vote = 0
     if retail_concentration_signal == "散户高接盘" or (
@@ -1434,11 +2004,49 @@ def compute_valuation_regime(
     if distribution_detected and not strong_inflow:
         legs["distribution"] = -1
 
+    # 范式成长反转（镜像周期反转 3b）：确认范式股(secular hardtech) + 真加速(earnings=+1) +
+    # 无 blowoff 证据 → ride 门槛 +2 降到 +1，且"反拥挤致的 crowding -1"在主升浪属常态(非顶部
+    # 证据)抬 0。对标投研：secular re-rating 期间，拥挤/高位是加速特征不是该收的理由。
+    # 护栏(防骑顶)只认**硬证据**：peak信号 / 破位(tech=-1) / 散户高接盘(硬派发合成确认)。
+    # ⚠️ 不用 distribution_detected(软)做护栏——它是 parse_distribution_signals 读新闻散文的
+    # 旧减持口径，18倍股必有陈旧减持新闻(中际旭创实测：5个月前大股东减持 0.5% 触发软派发，
+    # 但硬数据股东户数 -15.78%=吸筹、大宗无折价=无派发，软信号误杀 ride)。硬派发由 peak/破位/
+    # 散户高接盘三路把关，陈旧减持新闻不该否决范式骑乘(内部人减持硬口径见待办 A)。
+    paradigm_note = ""
+    ride_threshold = 2
+    if is_paradigm and legs.get("earnings") == 1:
+        # blowoff 护栏（Option A）：peak信号 / 趋势破位 是**价格行为**硬证据，单独成立即否决 ride；
+        # 但"散户高接盘"是**筹码派发(流向)**信号、不等于价格 blowoff——必须叠加**价格极端**
+        # (RSI 1年分位≥85，纯价格行为) 才算真抛物线顶。价格极端判定收敛到 _is_price_blowoff_extreme
+        # 单一真值源（**已剔除滞后的获利盘**：天孚 06-26 RSI 35-40分位明显回调、获利盘 86% 误触，
+        # 把范式 ride 档+AI主升升档一锅端，而同期花旗目标价 419）。派发的看空已由 capital/crowding
+        # 两腿承担，不让同一信号第三次否决 ride。winner_rate_pct 入参保留但不再参与判定。
+        price_extreme = _is_price_blowoff_extreme(rsi_percentile_1y)
+        blowoff = (has_peak_signal
+                   or legs.get("tech") == -1
+                   or (retail_concentration_signal == "散户高接盘" and price_extreme))
+        # secular_phase 阶段判别（item3/Phase3）：secular 龙头也有"加速→派发顶"的阶段切换，
+        # 不能一路 ride 到顶。主题处 peak/fading(派发顶/退潮期)→不享 ride-by-default，即便
+        # earnings 仍正、未触发 has_peak_signal 硬标。acceleration / 中性/未知 → 仍可骑(不误伤)。
+        ts = (theme_stage_inferred or "").strip()
+        is_top_phase = ts in ("peak", "fading")
+        if blowoff:
+            paradigm_note = "；范式股但 blowoff硬证据(peak/破位/散户高接盘+价格极端)→反转失效，回纪律"
+        elif is_top_phase:
+            paradigm_note = f"；范式股但主题处 {ts}(派发顶/退潮期)→不享 ride-by-default，按标准+2阈值"
+        else:
+            ride_threshold = 1
+            if legs.get("crowding") == -1:   # 此时非散户高接盘(否则 blowoff)，纯反拥挤分 → 主升浪常态抬0
+                legs["crowding"] = 0
+                paradigm_note = "；范式成长加速期：拥挤属主升浪常态(crowding抬0)+ride门槛降至+1"
+            else:
+                paradigm_note = "；范式成长加速期：ride门槛降至+1（无blowoff证据）"
+
     score = sum(legs.values())
     # 有效路 < 3 → 数据不足，给 neutral（不轻易骑/收）
     if len(legs) < 3:
         regime = "neutral"
-    elif score >= 2:        # 对称阈值（无方向先验）：净 +2 → ride，-2 → discipline
+    elif score >= ride_threshold:   # 对称阈值；范式加速期门槛降至 +1（见上）
         regime = "ride"
     elif score <= -2:
         regime = "discipline"
@@ -1450,7 +2058,8 @@ def compute_valuation_regime(
         regime = "neutral"
 
     reasoning = (f"六路净分={score}（{legs}）→ {regime}"
-                 + ("；peak信号压制不骑" if has_peak_signal else "") + cyc_note)
+                 + ("；peak信号压制不骑" if has_peak_signal else "")
+                 + cyc_note + rev_note + paradigm_note)
     return {"valuation_regime": regime, "score": score, "legs": legs, "reasoning": reasoning}
 
 

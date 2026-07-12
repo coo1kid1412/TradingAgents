@@ -47,6 +47,9 @@ class AgentState(MessagesState):
     company_of_interest: Annotated[str, "Company that we are interested in trading"]
     company_name: Annotated[str, "Resolved human-readable company/fund name"]
     trade_date: Annotated[str, "What date we are trading at"]
+    market_risk_snapshot: Annotated[
+        dict, "Latest deterministic market-risk snapshot for this instrument market"
+    ]
 
     sender: Annotated[str, "Agent that sent this message"]
 

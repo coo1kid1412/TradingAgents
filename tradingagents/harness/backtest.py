@@ -23,6 +23,8 @@ _SLICE_DIMENSIONS = [
     ("style", "style"),
     ("theme_stage", "theme_stage"),
     ("conviction", "pm_conviction_stars"),
+    ("market_risk", "market_risk_level"),
+    ("short_term_trend", "short_term_trend"),
 ]
 # window 维度走 runs 表
 _RUN_SLICE_DIMENSIONS = [
@@ -42,6 +44,7 @@ def _query_fetched_outcomes(horizon: str, db_path=None) -> list[dict]:
                 o.tp1_hit, o.sl_hard_hit,
                 p.rm_rating, p.pm_rating, p.style, p.theme_stage,
                 p.pm_conviction_stars, p.composite_score, p.momentum_score,
+                p.market_risk_level, p.short_term_trend,
                 r.report_window, r.ticker, r.trade_date
                FROM outcomes o
                JOIN predictions p ON p.run_id = o.run_id

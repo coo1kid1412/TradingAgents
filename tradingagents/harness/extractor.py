@@ -82,6 +82,12 @@ def _find_yaml_block(text: str, key: str) -> dict | None:
     for block in reversed(blocks):
         if key not in block:
             continue
+        lines = block.splitlines()
+        while lines and lines[0].strip() == "---":
+            lines.pop(0)
+        while lines and lines[-1].strip() == "---":
+            lines.pop()
+        block = "\n".join(lines)
         try:
             parsed = yaml.safe_load(block)
         except yaml.YAMLError as e:

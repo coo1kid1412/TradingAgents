@@ -15,6 +15,11 @@ from tradingagents.dataflows.profile_calc import (
     parse_sys_net_growth_components,
     compute_deterministic_peg_inputs,
     compute_peg_band,
+    compute_peg_leg_target,
+    detect_paradigm_growth,
+    parse_sys_paradigm,
+    compute_cyclical_scenario_target,
+    compute_ai_main_uptrend_signal,
 )
 
 
@@ -26,11 +31,17 @@ def test_peg_band_by_regime():
     assert compute_peg_band(None) == (0.9, 1.2)          # 缺 regime → 中性档
     assert compute_peg_band("ride", "low") == (1.0, 1.1)  # 低置信前瞻压上沿
     assert compute_peg_band("neutral", "low") == (0.9, 1.1)
+    # 范式 ride 档（Phase2②）：paradigm+ride+earnings=+1 → 1.2-1.8
+    assert compute_peg_band("ride", "", is_paradigm_ride=True) == (1.2, 1.8)
+    # 低基数尖峰(confidence=low)不享范式高沿 → 退回通用 ride 再压
+    assert compute_peg_band("ride", "low", is_paradigm_ride=True) == (1.0, 1.1)
+    # 非 ride 不受 is_paradigm_ride 影响（调用方只在 ride+earnings=+1 时才传 True，双保险）
+    assert compute_peg_band("neutral", "", is_paradigm_ride=False) == (0.9, 1.2)
     # 下限 ≤ 上限恒成立
     for reg in ("ride", "neutral", "discipline", None):
         lo, hi = compute_peg_band(reg)
         assert lo <= hi
-    print("✓ PEG 带按 regime 派生，低置信压上沿，下限≤上限")
+    print("✓ PEG 带按 regime 派生（含范式 ride 档 1.2-1.8），低置信压上沿，下限≤上限")
 
 
 def test_deterministic_peg_inputs():
@@ -116,6 +127,250 @@ def test_neutral_mixed():
     assert r["valuation_regime"] == "neutral", r
 
 
+def test_detect_paradigm_growth():
+    """范式识别：硬科技 secular 命中；周期股(存储)让位；非赛道 None。"""
+    assert detect_paradigm_growth(None, "中际旭创") == "paradigm"      # CPO 龙头
+    assert detect_paradigm_growth("半导体", "某芯片股") == "paradigm"   # 行业关键词
+    assert detect_paradigm_growth(None, "沪电股份") == "paradigm"      # PCB
+    # 周期优先：兆易创新是 strong 周期(存储) → 让位周期轨，不抢范式
+    assert detect_paradigm_growth(None, "兆易创新") is None
+    assert detect_paradigm_growth("钢铁", "某钢铁股") is None          # 传统周期
+    assert detect_paradigm_growth("白酒", "贵州茅台") is None          # 非赛道
+    # SYS_PARADIGM 解析往返
+    assert parse_sys_paradigm("【SYS_PARADIGM｜tushare】 class=paradigm | sector=CPO") is True
+    assert parse_sys_paradigm("无此行") is False
+
+
+def test_ai_main_uptrend_confirmed_signal():
+    """AI 算力链 + 业绩兑现 + 强趋势 + 无硬排除 → confirmed。"""
+    r = compute_ai_main_uptrend_signal(
+        company_name="中际旭创",
+        industry="光模块",
+        main_business="高速光模块 85%",
+        is_paradigm=True,
+        net_profit_growth=0.9,
+        revenue_growth=0.66,
+        earnings_revision="上修",
+        momentum_score=82,
+        theme_stage_inferred="acceleration",
+        sector_rs_30d=18,
+        valuation_regime="ride",
+        recurring_loss=False,
+        has_peak_signal=False,
+        retail_concentration_signal="中性",
+        rsi_percentile_1y=70,
+        winner_rate_pct=72,
+    )
+    assert r["enabled"] is True, r
+    assert r["class"] == "confirmed", r
+    assert any("兑现" in x or "上修" in x for x in r["reasons"])
+    assert r["blockers"] == []
+
+
+def test_ai_main_uptrend_early_signal():
+    """链条地位明确 + 趋势强，但兑现证据较弱 → early。"""
+    r = compute_ai_main_uptrend_signal(
+        company_name="某AI服务器链",
+        industry="AI服务器",
+        main_business="AI 服务器代工 70%",
+        is_paradigm=False,
+        net_profit_growth=0.18,
+        revenue_growth=0.22,
+        earnings_revision="停修",
+        has_hard_order_evidence=True,
+        momentum_score=72,
+        theme_stage_inferred="none",
+        sector_rs_30d=12,
+        valuation_regime="neutral",
+    )
+    assert r["enabled"] is True, r
+    assert r["class"] == "early", r
+
+
+def test_ai_main_uptrend_rejects_non_ai_stock():
+    r = compute_ai_main_uptrend_signal(
+        company_name="贵州茅台",
+        industry="白酒",
+        main_business="白酒 99%",
+        net_profit_growth=0.5,
+        momentum_score=80,
+        theme_stage_inferred="acceleration",
+        valuation_regime="ride",
+    )
+    assert r["enabled"] is False
+    assert r["class"] == "none"
+    assert any("赛道" in x for x in r["blockers"])
+
+
+def test_ai_main_uptrend_blocked_by_discipline_and_losses():
+    r = compute_ai_main_uptrend_signal(
+        company_name="某AI概念",
+        industry="算力设备",
+        main_business="AI 设备 60%",
+        net_profit_growth=0.8,
+        momentum_score=90,
+        valuation_regime="discipline",
+        recurring_loss=True,
+    )
+    assert r["enabled"] is False
+    assert r["class"] == "none"
+    assert any("discipline" in x for x in r["blockers"])
+    assert any("扣非" in x or "亏损" in x for x in r["blockers"])
+
+
+def test_ai_main_uptrend_blocked_by_distribution_blowoff():
+    r = compute_ai_main_uptrend_signal(
+        company_name="天孚通信",
+        industry="光器件",
+        main_business="光器件 90%",
+        is_paradigm=True,
+        net_profit_growth=0.5,
+        momentum_score=88,
+        theme_stage_inferred="acceleration",
+        valuation_regime="ride",
+        retail_concentration_signal="散户高接盘",
+        rsi_percentile_1y=90,
+        winner_rate_pct=88,
+    )
+    assert r["enabled"] is False
+    assert any("blowoff" in x or "价格极端" in x for x in r["blockers"])
+
+
+def test_ai_main_uptrend_corrected_leader_not_blocked():
+    """天孚 06-26 修复：散户高接盘 + 获利盘 88% 但 RSI 35-40分位(已回调) →
+    价格极端不成立(纯 RSI 判定) → blowoff 不再 block AI 主升升档资格。"""
+    from tradingagents.dataflows.profile_calc import _is_price_blowoff_extreme
+    # 共享 helper：纯价格行为(RSI≥85)，获利盘不参与
+    assert _is_price_blowoff_extreme(90) is True
+    assert _is_price_blowoff_extreme(40) is False
+    assert _is_price_blowoff_extreme(None) is False
+    r = compute_ai_main_uptrend_signal(
+        company_name="天孚通信", industry="光器件", main_business="光器件 90%",
+        is_paradigm=True, net_profit_growth=0.5, momentum_score=86,
+        theme_stage_inferred="acceleration", valuation_regime="ride",
+        retail_concentration_signal="散户高接盘",
+        rsi_percentile_1y=38,    # 已回调，35-40 分位
+        winner_rate_pct=88,      # 获利盘高，但不再当价格极端
+    )
+    assert not any("blowoff" in x or "价格极端" in x for x in r["blockers"]), r
+
+
+def test_paradigm_ride_in_acceleration():
+    """范式股加速期：原本 neutral 的边际组合(拥挤拖累)，反转后 → ride。"""
+    base = dict(
+        momentum_score=70, rsi_percentile_1y=78, has_peak_signal=False,
+        capital_flow_regime="中性", main_force_streak_days=1, lhb_inst_direction=0,
+        net_profit_growth=0.5, retail_concentration_signal="中性",
+        theme_stage_inferred="acceleration", quant_anticrowding=25)  # 拥挤(anticrowding≤30)→crowding -1
+    # 非范式：earnings+1 / theme+1 / crowding-1 / tech+1(动量70未超买) → 净≈+2? 用拥挤压一下看 baseline
+    non_para = compute_valuation_regime(**base)
+    para = compute_valuation_regime(**base, is_paradigm=True)
+    # 范式反转：crowding -1 抬 0 + 门槛降 → ride；且不低于非范式
+    assert para["valuation_regime"] == "ride", para
+    assert para["legs"]["crowding"] == 0      # 拥挤腿被抬 0
+
+
+def test_paradigm_blowoff_guard_no_ride():
+    """范式股但 blowoff（peak/破位）→ 反转失效，不骑顶。"""
+    # 破位(动量弱) + peak → 价格行为硬证据，单独成立即否决 ride
+    r = compute_valuation_regime(
+        momentum_score=30, rsi_percentile_1y=30, has_peak_signal=True,
+        capital_flow_regime="中性", main_force_streak_days=-1, lhb_inst_direction=0,
+        net_profit_growth=0.5, retail_concentration_signal="中性",
+        theme_stage_inferred="peak", quant_anticrowding=50, is_paradigm=True)
+    assert r["valuation_regime"] != "ride", r   # 破位+peak → 护栏生效
+
+
+def test_paradigm_top_phase_no_ride_by_default():
+    """item3：范式股主题处 peak/fading(派发顶/退潮)→不享 ride-by-default(门槛不降)，
+    即便 earnings 正、未触发 has_peak_signal 硬标。acceleration 不受影响。"""
+    base = dict(
+        momentum_score=70, rsi_percentile_1y=55, has_peak_signal=False,
+        capital_flow_regime="中性", main_force_streak_days=1,
+        net_profit_growth=0.5, retail_concentration_signal="中性",
+        quant_anticrowding=25, is_paradigm=True)
+    # acceleration：享 ride-by-default → crowding 抬0 + ride
+    r_acc = compute_valuation_regime(**base, theme_stage_inferred="acceleration")
+    assert r_acc["legs"]["crowding"] == 0 and r_acc["valuation_regime"] == "ride", r_acc
+    # fading：不享 ride-by-default → crowding 仍 -1、门槛回 +2 → 不 ride
+    r_fad = compute_valuation_regime(**base, theme_stage_inferred="fading")
+    assert r_fad["legs"]["crowding"] == -1, r_fad
+    assert r_fad["valuation_regime"] != "ride", r_fad
+    assert "不享 ride-by-default" in r_fad["reasoning"]
+
+
+def test_paradigm_blowoff_needs_price_extreme():
+    """blowoff 的"价格极端"= 纯价格行为(RSI 1年分位≥85)，**不含滞后的获利盘**。
+    天孚式：散户高接盘 + 已回调(RSI 中低位)即便获利盘高 → 不再误判见顶，ride 反转生效。"""
+    # 边际组合(theme=none)：靠范式反转(crowding抬0+门槛降1)才骑得起来，便于看护栏是否生效
+    base = dict(
+        momentum_score=70, rsi_percentile_1y=55, has_peak_signal=False,
+        capital_flow_regime="中性", main_force_streak_days=1,
+        net_profit_growth=0.5, retail_concentration_signal="散户高接盘",
+        theme_stage_inferred="none", quant_anticrowding=25, is_paradigm=True)
+    # 无价格极端(RSI55)：散户高接盘不构成 blowoff → 反转生效(crowding 抬0+门槛降) → ride
+    r = compute_valuation_regime(**base)
+    assert r["legs"]["crowding"] == 0, r          # 反转生效，拥挤腿抬 0
+    assert r["valuation_regime"] == "ride", r
+    # 关键回归：获利盘 88%≥85 但 RSI 仅 55(已回调) → **不再**触发 blowoff → 仍骑（天孚 06-26 修复）
+    r_wr = compute_valuation_regime(**base, winner_rate_pct=88)
+    assert r_wr["legs"]["crowding"] == 0, r_wr
+    assert r_wr["valuation_regime"] == "ride", r_wr
+    # 仅当 RSI 1年分位≥85（真价格极端）→ blowoff 触发（且超买使 tech 腿落 0）→ 不骑
+    r_rsi = compute_valuation_regime(**{**base, "rsi_percentile_1y": 90})
+    assert r_rsi["legs"]["crowding"] == -1, r_rsi
+    assert r_rsi["valuation_regime"] != "ride", r_rsi
+
+
+def test_paradigm_stale_soft_distribution_not_blocks_ride():
+    """中际旭创实测回归：陈旧减持新闻(软派发 distribution_detected)不该否决范式 ride——
+    硬数据(retail=中性/户数减少吸筹/大宗无折价)说无派发时，5个月前的减持新闻不是 blowoff 证据。"""
+    r = compute_valuation_regime(
+        momentum_score=72, rsi_percentile_1y=75, has_peak_signal=False,
+        main_force_streak_days=2, net_profit_growth=0.9, growth_direction="accelerating",
+        retail_concentration_signal="中性",          # 硬：非散户高接盘
+        theme_stage_inferred="acceleration", quant_anticrowding=25,  # 拥挤
+        distribution_detected=True,                    # 软：陈旧减持新闻
+        is_paradigm=True)
+    assert r["valuation_regime"] == "ride", r          # 软派发不否决
+    assert r["legs"]["crowding"] == 0                   # 拥挤腿抬 0
+
+
+def test_cyclical_scenario_target():
+    """强周期双轨情景目标价（兆易实测复现）：bear/bull/base + 双峰低置信。"""
+    r = compute_cyclical_scenario_target(
+        normalized_eps=3.99, forward_eps=6.25, forward_growth_pct=45,
+        position="top", peg_low=0.8, peg_high=1.0)   # discipline PEG band
+    assert (r["bear_low"], r["bear_high"]) == (39.9, 59.85)        # 周期均值回归
+    assert (r["bull_low"], r["bull_high"]) == (225.0, 281.25)      # 结构成长
+    assert (r["base_low"], r["base_high"]) == (132.45, 170.55)     # 概率加权(top 50/50)
+    assert r["confidence"] == "low" and r["dispersion"] >= 2.5     # 5x 离散=双峰
+    # 谷底偏成长权重(0.3/0.7)→ base 更靠 bull
+    r2 = compute_cyclical_scenario_target(3.99, 6.25, 45, "trough", 0.9, 1.2)
+    assert r2["weights"] == {"normalize": 0.3, "growth": 0.7}
+    # 缺正常化 EPS → None（退回原路径）
+    assert compute_cyclical_scenario_target(None, 6.25, 45, "top", 0.8, 1.0) is None
+    # 两腿接近(非周期式)→ normal 置信
+    r3 = compute_cyclical_scenario_target(10.0, 11.0, 20, "mid", 0.9, 1.2)
+    assert r3["confidence"] == "normal"
+
+
+def test_peg_leg_target():
+    """确定性 PEG 腿目标价（天孚实测复现）：钉死后不再被 RM 现场塞错参数。"""
+    # 天孚 06-24：前瞻 EPS 3.8 / 增速 45 / neutral PEG 带 0.9-1.2
+    r = compute_peg_leg_target(forward_eps=3.8, growth_pct=45, peg_low=0.9, peg_high=1.2)
+    # 正确值 = 3.8×(0.9×45) ~ 3.8×(1.2×45) = 153.9 ~ 205.2，中位 179.55
+    assert (r["low"], r["mid"], r["high"]) == (153.9, 179.55, 205.2), r
+    # 隐含 PE = PEG×增速 = 40.5 ~ 54（绝非 RM 乱填出的 90-120）
+    assert r["implied_pe_range"] == [40.5, 54.0], r
+    # discipline 带 0.8-1.0 → 更低
+    r2 = compute_peg_leg_target(3.8, 45, 0.8, 1.0)
+    assert (r2["low"], r2["high"]) == (136.8, 171.0), r2
+    # 缺前瞻 EPS/增速 → None（退回原路径）
+    assert compute_peg_leg_target(None, 45, 0.9, 1.2) is None
+    assert compute_peg_leg_target(3.8, 0, 0.9, 1.2) is None
+
+
 def test_insufficient_data_neutral():
     r = compute_valuation_regime(momentum_score=80)  # 仅 1 路
     assert r["valuation_regime"] == "neutral", r
@@ -180,6 +435,36 @@ def test_earnings_accelerating_votes_positive():
         momentum_score=55, net_profit_growth=0.58, growth_direction="accelerating",
         capital_flow_regime="中性", theme_stage_inferred="none")
     assert r["legs"]["earnings"] == 1, r
+
+
+def test_earnings_revision_up_neutralizes_deceleration():
+    """A：卖方上修前瞻 → 后视镜减速 -1 中和到 0（主升浪龙头单季高基数回落不该判 discipline）。"""
+    base = dict(momentum_score=55, net_profit_growth=0.58, growth_direction="decelerating",
+                capital_flow_regime="中性", theme_stage_inferred="none")
+    r0 = compute_valuation_regime(**base)
+    assert r0["legs"]["earnings"] == -1                       # 无上修：减速 -1
+    r1 = compute_valuation_regime(**base, earnings_revision="上修")
+    assert r1["legs"]["earnings"] == 0, r1                    # 上修：中和到 0（非 +1，不过度）
+    assert "revision方向优先" in r1["reasoning"]
+    # 上修不凭空把非减速的腿抬高：earnings 已是 +1 时上修不动它
+    r2 = compute_valuation_regime(momentum_score=55, net_profit_growth=0.58,
+                                  growth_direction="accelerating", capital_flow_regime="中性",
+                                  theme_stage_inferred="none", earnings_revision="上修")
+    assert r2["legs"]["earnings"] == 1, r2
+
+
+def test_earnings_revision_down_cuts_high_growth():
+    """A：卖方下修 → 高增速 +1 削到 0（预期恶化预警，即便 TTM 增速仍高）。"""
+    r = compute_valuation_regime(
+        momentum_score=55, net_profit_growth=0.58, growth_direction="accelerating",
+        capital_flow_regime="中性", theme_stage_inferred="none", earnings_revision="下修")
+    assert r["legs"]["earnings"] == 0, r
+    assert "预期恶化预警" in r["reasoning"]
+    # 停修不动腿
+    r2 = compute_valuation_regime(
+        momentum_score=55, net_profit_growth=0.58, growth_direction="accelerating",
+        capital_flow_regime="中性", theme_stage_inferred="none", earnings_revision="停修")
+    assert r2["legs"]["earnings"] == 1, r2
 
 
 def test_distribution_leg():
@@ -367,6 +652,24 @@ def test_parse_distribution_signals():
     assert d["detected"] and len(d["reasons"]) >= 2, d
     # 否定语境不误报
     assert parse_distribution_signals("未发现明显治理红旗（无高管密集减持）")["detected"] is False
+
+
+def test_distribution_recency_gate():
+    """第6腿 recency 门：陈旧减持(>120天)不投，当期减持仍投；无 current_date 不过滤。"""
+    # 天孚式：一年前减持，现价已远高于减持价
+    stale = "2026-01-29 大股东减持39.5万股，均价218.97元；2025-03-21 大股东减持345万股"
+    # current_date=2026-06-25：两笔都 >120 天 → 全部跳过
+    r_stale = parse_distribution_signals(stale, current_date="2026-06-25")
+    assert r_stale["detected"] is False and r_stale["stale_skipped"] >= 1, r_stale
+    # 当期减持（30天前）→ 仍投
+    fresh = "2026-06-01 大股东减持39.5万股"
+    r_fresh = parse_distribution_signals(fresh, current_date="2026-06-25")
+    assert r_fresh["detected"] is True, r_fresh
+    # 无日期的当期结构信号（户数增）不受 recency 影响
+    r_struct = parse_distribution_signals("股东户数持续增加，筹码分散", current_date="2026-06-25")
+    assert r_struct["detected"] is True, r_struct
+    # 向后兼容：不传 current_date → 不过滤，陈旧减持照旧检出
+    assert parse_distribution_signals(stale)["detected"] is True
 
 
 if __name__ == "__main__":

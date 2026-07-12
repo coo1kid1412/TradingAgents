@@ -46,7 +46,9 @@ def _get_tool_description(ticker: str) -> str:
         "你拥有以下数据工具，请根据需要合理调用：\n"
         "1. **get_news(ticker, curr_date)** — 获取个股近 10 天相关新闻（东方财富/新浪财经等），日期范围 T-10 到 T 由系统自动计算，只需传入当前分析日期\n"
         "2. **get_global_news(curr_date, look_back_days, limit)** — 获取宏观经济及全球财经新闻\n"
-        "3. **get_insider_transactions(ticker)** — 获取董监高/大股东持股变动数据\n"
+        "3. **get_insider_transactions(ticker)** — 获取董监高/大股东持股变动数据。"
+        "⛔ **增减持方向必须以返回内容顶部的【SYS_INSIDER｜确定性增减持方向】为唯一真相**"
+        "（in_de: DE=减持/IN=增持），严禁自行判断或把减持说成增持——减持是看空信号、不是利好。\n"
         "7. **get_news_from_search(ticker, query_hint)** — 通过 Brave Search 搜索实时网络新闻（支持所有市场：A股/港股/美股），"
         "返回过去7天内的 top 10 新闻（已自动排除百科类页面）。公司名称已自动解析，query_hint 仅用于补充关键词（如行业、事件），"
         "**不要**在 query_hint 中填写公司名称或股票代码\n"
@@ -177,7 +179,25 @@ def create_news_analyst(llm):
             "- 多家机构同主题集中调研（如近 30 天 ≥3 次）→ 极强的机构关注度信号\n"
             "- 调研观点与卖方研报评级方向不一致 → 需特别警惕（可能机构内部认知分歧）\n\n"
             "若 news 报告中无调研类信号，明确填\"无渠道调研纪要识别到\"。**禁止**编造调研内容。\n\n"
-            + "## 输出格式\n"
+            + "## 信息时效与新鲜度（必输出，对标投研：陈旧信息边际驱动力衰减）\n\n"
+            "新闻的价值随时间衰减——一条三周前的'卖方上调'，市场多半已消化，对未来边际影响远小于今天的同类信号。\n\n"
+            "1. **每条事件标注见报日期 source_date**（从工具返回的新闻时间戳取），区别于 event_date（事件预期发生日）。\n"
+            "2. **对陈旧但尚未兑现的信号显式降权**：source_date 距当前分析日 >3 周的非财报类信号，在'对股价影响'里相应下调一档，并在备注说明'信息已偏旧'。\n"
+            f"3. **数据时效声明（报告必含一句）**：本分析基于截至 {current_date} 可获取的新闻/公告，"
+            "**当日盘中或最新实时事件可能尚未被数据源覆盖**；若处于快速行情（板块大幅异动日），"
+            "结论的时效性应相应打折，以最新行情和公告为准。\n\n"
+            "## 关键硬数据提取（驱动 thesis 的数字，必输出）\n\n"
+            "投研判一个 thesis 成不成立，最终落到**可验证的硬数字**，不是定性描述。从研报/公告/"
+            "调研里把驱动逻辑的**量化指标**抽出来单列（有则列，无则填'未识别到硬数据'，**禁止编造/估算**）：\n\n"
+            "**抽取目标**：在手订单金额 / 新增产能(及投产时间) / 良率 / 渗透率(及目标) / 关键产品价格(及趋势) / "
+            "核心客户份额或导入进度 / 关键预期数字(卖方 2026E/2027E 营收或 EPS，注明出处与日期)。\n\n"
+            "**输出格式**（每条硬数据必填来源与日期，便于后续跟踪验证）：\n\n"
+            "| 指标 | 数值 | 来源 | 日期 | 对 thesis 的含义（利好/利空/中性）|\n"
+            "|------|------|------|------|------|\n"
+            "| 例：1.6T 良率 | 95% | 某券商深度 | 2026-06-XX | 利好（行业领先，量产可见度高）|\n\n"
+            "**用途**：这些数字是 thesis 的可验证锚点，下游 PM 据此设监控/反向证伪触发器；卖方一致预期"
+            "数字（2026E/2027E）尤其关键（前瞻估值的源）。**多家数字分歧大时全部列出并注明，不取单一值当定论**。\n\n"
+            "## 输出格式\n"
             "请用中文撰写报告，按上述维度分节组织内容。在报告末尾附上一个 Markdown 汇总表格，包含以下列：\n"
             "| 信息来源 | 日期 | 分类 | 关键内容 | 可信度 | 对股价影响 | 时间窗 | 已定价概率 |\n"
             "股票代码、专有名词和评级关键词（BUY/SELL/HOLD）请保留英文原文。"
@@ -192,13 +212,22 @@ def create_news_analyst(llm):
             "  key_events:\n"
             "    - title: <≤30 字>\n"
             "      category: 公司 / 行业 / 宏观 / 机构\n"
+            "      event_date: <预期发生/验证日期：YYYY-MM-DD（精确）或 2026Q3（季度）或 未知>\n"
+            "      source_date: <该新闻的见报/发布日期：YYYY-MM-DD，从工具返回的新闻时间戳取；未知填 未知>\n"
             "      horizon: 短期(≤1周) / 中期(1-3月) / 长期(>3月)\n"
             "      priced_in_p: <0-100>\n"
             "      impact: +大 / +中 / +小 / 0 / -小 / -中 / -大\n"
             "      credibility: 高 / 中 / 低\n"
+            "      thesis_relevance: 核心 / 相关 / 边缘     # 该事件对投资逻辑(thesis)的相关度\n"
             "      second_order_chain: <≤50 字描述二阶传导链路，无则填 null>\n"
             "  cumulative_patterns:\n"
             "    - <识别到的累积模式，≤30 字>\n"
+            "  key_hard_numbers:                          # 驱动 thesis 的硬数据（无则空列表）\n"
+            "    - metric: <指标名，如 1.6T良率 / 2027E营收>\n"
+            "      value: <数值，如 95% / 280亿>\n"
+            "      source: <来源，如 某券商深度>\n"
+            "      date: <YYYY-MM-DD 或 未知>\n"
+            "      implication: 利好 / 利空 / 中性\n"
             "  research_consensus_rating: BUY / HOLD / SELL / null\n"
             "  research_consensus_target_price: <数值或 null>\n"
             "  data_implied_direction: 偏多 / 偏空 / 中性  # 数据真实隐含方向（穿透措辞）\n"
@@ -246,16 +275,41 @@ def create_news_analyst(llm):
         # 让"新闻催化"确定性进评级链（催化腿第5信号），不再靠 RM 当散文二次解读。
         if report:
             try:
-                from tradingagents.dataflows.news_catalyst import aggregate_news_catalyst
-                cat = aggregate_news_catalyst(report)
+                from tradingagents.dataflows.news_catalyst import (
+                    aggregate_news_catalyst, aggregate_catalyst_calendar,
+                    compute_narrative_shift,
+                )
+                cat = aggregate_news_catalyst(report, current_date=current_date)
                 if cat is not None:
                     report = report + (
                         f"\n\n<!-- ⚠️SYS_CATALYST｜Python 从 SUMMARY.key_events 确定性聚合，RM Step6 催化腿直读 -->\n"
                         f"SYS_CATALYST: direction={cat['direction']} | strength={cat['strength']}"
                         f" | score={cat['score']}"
-                        f"（净催化分{cat['net']}，{cat['n_events']}个事件按 impact×可信度×(1-已定价)×时间窗 聚合"
+                        f"（净催化分{cat['net']}，{cat['n_events']}个事件按 impact×可信度×(1-已定价)×时间窗×新鲜度 聚合"
                         + (f"；最近端：{cat['nearest']}" if cat['nearest'] else "")
                         + "）\n"
+                    )
+                # 催化日历（步骤1）：thesis 相关的有方向事件，按日期排——供 PM 时间止损/监控直读
+                cal = aggregate_catalyst_calendar(report)
+                if cal:
+                    lines = "\n".join(
+                        f"  - {c['date']} | {c['direction']} {c['impact']} | {c['thesis_relevance']}"
+                        f" | {c['title']}" + (f"（已定价{c['priced_in_p']}%）" if c['priced_in_p'] not in (None, "null") else "")
+                        for c in cal)
+                    report = report + (
+                        f"\n<!-- ⚠️SYS_CATALYST_CALENDAR｜Python 抽 thesis 相关催化事件按日期排，PM 时间止损/监控直读 -->\n"
+                        f"SYS_CATALYST_CALENDAR:\n{lines}\n"
+                    )
+                # 叙事切换早期预警（步骤3）：舆情水位 vs 7日动能/新闻论调背离——先于价格预警，
+                # 供 PM 监控段做领先观察项（不进确定性评级链）。社媒报告此时已在 state 里。
+                nar = compute_narrative_shift(
+                    state.get("sentiment_report", ""), report, state.get("market_report", ""))
+                if nar is not None and nar["status"] != "无明显切换":
+                    report = report + (
+                        f"\n<!-- ⚠️SYS_NARRATIVE｜舆情水位 vs 动能/新闻论调背离，PM 监控段早期预警（非评级信号） -->\n"
+                        f"SYS_NARRATIVE: status={nar['status']}"
+                        + (f" | trend_7d={nar['trend_7d']:.0f}" if nar['trend_7d'] is not None else "")
+                        + f"（{nar['note']}）\n"
                     )
             except Exception:
                 pass

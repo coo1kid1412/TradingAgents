@@ -67,6 +67,12 @@ def _migrate_schema(conn: sqlite3.Connection) -> None:
         ("overlay_style_adj", "INTEGER"),
         ("overlay_vote_adj", "INTEGER"),
         ("overlay_catalyst_adj", "INTEGER"),
+        ("market_risk_level", "TEXT"),
+        ("market_entry_gate", "TEXT"),
+        ("market_position_cap_pct", "REAL"),
+        ("short_term_trend", "TEXT"),
+        ("short_term_confidence", "TEXT"),
+        ("theme_outlook_12m", "TEXT"),
     ]:
         if col not in pred_cols:
             conn.execute(f"ALTER TABLE predictions ADD COLUMN {col} {typ}")
