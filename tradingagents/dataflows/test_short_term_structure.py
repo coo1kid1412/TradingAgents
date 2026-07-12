@@ -11,6 +11,7 @@ import sys
 import pandas as pd
 
 from tradingagents.dataflows.profile_calc import compute_short_term_structure
+from tradingagents.agents.utils.stock_profile_node import _format_short_term_structure_line
 
 
 def _frame(closes, volumes, *, high_pad=0.01, low_pad=0.01):
@@ -87,6 +88,21 @@ def test_output_is_finite_and_repeatable():
     assert first == second
     for key in ("ma10", "ma20", "ma10_slope_5d_pct", "price_vs_ma10_pct"):
         assert first[key] is None or math.isfinite(first[key]), (key, first)
+
+
+def test_truth_line_has_stable_fields_and_boolean_format():
+    line = _format_short_term_structure_line({
+        "structure_class": "trend_pullback",
+        "ma10_slope_5d_pct": 2.3456,
+        "price_vs_ma10_pct": None,
+        "volume_ratio_5d_20d": 0.7123,
+        "breakout_confirmed": False,
+    })
+    assert line == (
+        "SYS_SHORT_TERM_STRUCTURE: class=trend_pullback | "
+        "ma10_slope_5d_pct=2.35 | price_vs_ma10_pct=N/A | "
+        "volume_ratio_5d_20d=0.71 | breakout_confirmed=false"
+    ), line
 
 
 if __name__ == "__main__":

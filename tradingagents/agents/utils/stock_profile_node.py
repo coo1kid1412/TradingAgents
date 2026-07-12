@@ -28,6 +28,7 @@ from tradingagents.dataflows.profile_calc import (
     compute_market_cap_tier,
     compute_liquidity_tier,
     compute_price_signals,
+    compute_short_term_structure,
     derive_style,
     detect_peak_signals,
     get_default_weights,
@@ -67,6 +68,21 @@ from tradingagents.dataflows.profile_calc import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _format_short_term_structure_line(signal: dict) -> str:
+    """Serialize the deterministic structure signal in a stable field order."""
+    def number(name: str) -> str:
+        value = signal.get(name)
+        return "N/A" if value is None else f"{float(value):.2f}"
+
+    return (
+        f"SYS_SHORT_TERM_STRUCTURE: class={signal.get('structure_class') or 'insufficient_data'} | "
+        f"ma10_slope_5d_pct={number('ma10_slope_5d_pct')} | "
+        f"price_vs_ma10_pct={number('price_vs_ma10_pct')} | "
+        f"volume_ratio_5d_20d={number('volume_ratio_5d_20d')} | "
+        f"breakout_confirmed={str(bool(signal.get('breakout_confirmed'))).lower()}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -312,6 +328,17 @@ def create_stock_profile_node(llm):
 
         # 3. 计算价格信号（RSI / 乖离率 / 量价背离 / 日均成交额）
         price_signals = compute_price_signals(price_df)
+        short_term_structure = compute_short_term_structure(
+            price_df,
+            rsi_percentile_1y=price_signals.get("rsi_percentile_1y"),
+            has_vol_divergence=bool(price_signals.get("has_vol_divergence")),
+        )
+        logger.info(
+            "SYS_SHORT_TERM_STRUCTURE: class=%s reasons=%s blockers=%s",
+            short_term_structure["structure_class"],
+            short_term_structure["reasons"][:3],
+            short_term_structure["blockers"][:3],
+        )
 
         # 4. 量化分数（来自 quant_score state）
         quant_yaml = _parse_quant_score_yaml(quant_score_md)
@@ -556,6 +583,13 @@ def create_stock_profile_node(llm):
             f"| valuation_regime | **{valuation_regime}**（ride骑趋势/neutral中性/discipline收纪律）| "
             f"六路合成(技术/资金/盈利/拥挤/主题/派发)：{regime_info['reasoning']}。"
             f"→ ride 放松估值 cap、骑趋势；discipline 收紧 cap、均值回归；下游 RM/PM 据此定姿态 |"
+        )
+        prog_lines.append(
+            f"| short_term_structure | **{short_term_structure['structure_class']}** | "
+            f"MA10斜率={short_term_structure.get('ma10_slope_5d_pct')}% / "
+            f"价格距MA10={short_term_structure.get('price_vs_ma10_pct')}% / "
+            f"5/20日量比={short_term_structure.get('volume_ratio_5d_20d')}；"
+            "仅决定入场时机，不改长期评级 |"
         )
 
         # peak 检测
@@ -1063,6 +1097,10 @@ TRANSPARENCY:
             + f"SYS_AI_MAIN_UPTREND_CLASS: {ai_main_uptrend['class']}\n"
             + f"SYS_AI_MAIN_UPTREND_REASONS: {'；'.join(ai_main_uptrend['reasons']) if ai_main_uptrend['reasons'] else '无'}\n"
             + f"SYS_AI_MAIN_UPTREND_BLOCKERS: {'；'.join(ai_main_uptrend['blockers']) if ai_main_uptrend['blockers'] else '无'}\n"
+            + "<!-- ⚠️SYS_SHORT_TERM_STRUCTURE｜Python OHLCV确定性短线结构；下游只用于入场时机，禁止改长期评级 -->\n"
+            + _format_short_term_structure_line(short_term_structure) + "\n"
+            + f"SYS_SHORT_TERM_STRUCTURE_REASONS: {'；'.join(short_term_structure['reasons']) if short_term_structure['reasons'] else '无'}\n"
+            + f"SYS_SHORT_TERM_STRUCTURE_BLOCKERS: {'；'.join(short_term_structure['blockers']) if short_term_structure['blockers'] else '无'}\n"
         )
         logger.info("SYS_VALUATION_REGIME 已注入画像: %s", valuation_regime)
         if main_business_seg:
