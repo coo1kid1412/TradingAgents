@@ -2,6 +2,7 @@
 
 from tradingagents.harness.archive import _merge_pred_fields, resolve_trade_date
 from tradingagents.harness.extractor import ExtractResult, _find_yaml_block
+from tradingagents.agents.managers.portfolio_manager import _format_pm_decision
 
 
 def test_archive_prefers_pm_trade_date_over_report_generation_date():
@@ -33,6 +34,31 @@ PM_SUMMARY:
 ```"""
     parsed = _find_yaml_block(text, "PM_SUMMARY")
     assert parsed == {"pm_rating": "OVERWEIGHT", "entry_timing": "暂不介入"}
+
+
+def test_formatted_pm_decision_remains_archive_compatible():
+    content = """过程文字
+## Trade Ticket 交易票
+
+正文
+
+```yaml
+PM_SUMMARY:
+  pm_rating: OVERWEIGHT
+  pm_action_keyword: WAIT
+  pm_size_low_pct: 0
+  pm_size_high_pct: 0
+  short_term_structure: healthy_trend
+  entry_timing: 暂不介入
+```
+"""
+    formatted = _format_pm_decision(
+        content,
+        {"structure_class": "healthy_trend", "effective_action": "暂不介入"},
+    )
+    parsed = _find_yaml_block(formatted, "PM_SUMMARY")
+    assert parsed["pm_rating"] == "OVERWEIGHT"
+    assert parsed["entry_timing"] == "暂不介入"
 
 
 if __name__ == "__main__":

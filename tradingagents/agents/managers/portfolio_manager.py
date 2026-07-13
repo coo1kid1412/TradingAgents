@@ -18,6 +18,100 @@ logger = logging.getLogger(__name__)
 
 _MAX_TOOL_ITERATIONS = 6
 
+_ENTRY_PRESENTATION = {
+    "分批介入": (
+        "结构与风险门控允许分批进入，避免一次性追价",
+        "按计划分批执行，并持续检查资金与市场环境",
+    ),
+    "小仓试探": (
+        "条件尚未完全确认，只允许小仓验证",
+        "结构确认且风险条件改善后再评估扩大仓位",
+    ),
+    "等回踩": (
+        "趋势仍在，但当前位置不具备理想赔率",
+        "回踩企稳且资金未恶化后重新评估",
+    ),
+    "等放量突破": (
+        "突破条件尚未得到量价确认",
+        "放量突破关键位置并站稳后重新评估",
+    ),
+    "暂不介入": (
+        "当前风险条件未解除，不追高、不新开仓",
+        "资金转正、业绩兑现且价格结构企稳后重新评估",
+    ),
+    "退出观察": (
+        "短期结构已经破坏，当前不具备参与条件",
+        "结构修复并重新通过风险门控后再观察",
+    ),
+    "继续观察": (
+        "当前结构缺少明确方向，暂不执行交易",
+        "趋势或催化形成明确信号后重新评估",
+    ),
+    "数据不足": (
+        "关键数据不足，无法形成可靠的短期操作判断",
+        "补齐价格、资金和市场环境数据后重新评估",
+    ),
+}
+
+
+def _extract_pm_summary_value(content: str, key: str) -> str | None:
+    matches = re.findall(rf"(?m)^\s*{re.escape(key)}:\s*([^#\r\n]+?)\s*$", content or "")
+    return matches[-1].strip().strip('"\'') if matches else None
+
+
+def _format_position_size(low: str | None, high: str | None) -> str:
+    def clean(value: str | None) -> str | None:
+        if value is None or value.lower() == "null":
+            return None
+        try:
+            number = float(value)
+        except ValueError:
+            return value
+        return str(int(number)) if number.is_integer() else str(number)
+
+    low_value = clean(low)
+    high_value = clean(high)
+    if low_value is None and high_value is None:
+        return "数据不足"
+    if low_value == high_value or high_value is None:
+        return f"{low_value}%"
+    if low_value is None:
+        return f"0-{high_value}%"
+    return f"{low_value}-{high_value}%"
+
+
+def _format_pm_decision(content: str, timing: dict) -> str:
+    """Remove model working text and prepend a deterministic action summary."""
+    original = (content or "").strip()
+    trade_ticket = re.search(r"(?m)^#{1,2}\s+Trade Ticket\b.*$", original)
+    if trade_ticket:
+        report_body = original[trade_ticket.start():].strip()
+    else:
+        report_body = original
+        logger.warning("PM 输出未找到 Trade Ticket 标题，保留原文并仅添加操作摘要")
+
+    entry_timing = timing.get("effective_action") or "数据不足"
+    if entry_timing not in _ENTRY_PRESENTATION:
+        entry_timing = "数据不足"
+    reason, trigger = _ENTRY_PRESENTATION[entry_timing]
+    rating = _extract_pm_summary_value(original, "pm_rating") or "数据不足"
+    action = _extract_pm_summary_value(original, "pm_action_keyword") or "数据不足"
+    no_new_position_actions = {
+        "等回踩", "等放量突破", "暂不介入", "退出观察", "继续观察", "数据不足",
+    }
+    size = "0%" if entry_timing in no_new_position_actions else _format_position_size(
+        _extract_pm_summary_value(original, "pm_size_low_pct"),
+        _extract_pm_summary_value(original, "pm_size_high_pct"),
+    )
+
+    summary = (
+        f"# 短期操作结论：{entry_timing}\n\n"
+        f"> **当前动作：{action}｜新建仓位：{size}｜长期评级：{rating}**\n>\n"
+        f"> **核心原因：{reason}**\n>\n"
+        f"> **重新评估条件：{trigger}**\n\n---"
+    )
+    return f"{summary}\n\n{report_body}".rstrip() + "\n"
+
 
 def _pm_tool_loop(llm_with_tools, initial_messages):
     """PM 工具调用循环——复用 RM 的共享循环（含空输出/截断续写兜底）。
@@ -703,7 +797,8 @@ Be decisive and ground every conclusion in specific evidence from the analysts.{
         final_entry_timing = _derive_entry_timing_from_profile(
             stock_profile, market_mode, long_term_rating=final_rating,
         )
-        response = AIMessage(content=_enforce_entry_timing_truth(response.content, final_entry_timing))
+        enforced_content = _enforce_entry_timing_truth(response.content, final_entry_timing)
+        response = AIMessage(content=_format_pm_decision(enforced_content, final_entry_timing))
         logger.info("PM entry_timing 出口真值: %s", final_entry_timing)
 
         new_risk_debate_state = {
