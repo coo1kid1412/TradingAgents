@@ -14,7 +14,10 @@ from tradingagents.agents.managers.research_manager import (
     _enforce_entry_timing_truth,
     _extract_rm_rating,
 )
-from tradingagents.agents.managers.portfolio_manager import AIMessage as PortfolioAIMessage
+from tradingagents.agents.managers.portfolio_manager import (
+    AIMessage as PortfolioAIMessage,
+    _format_pm_decision,
+)
 
 
 def _timing(structure_class="trend_pullback", market_mode="risk_on", **kwargs):
@@ -164,6 +167,44 @@ RM_SUMMARY:
 
 def test_portfolio_manager_has_ai_message_available_for_output_enforcement():
     assert PortfolioAIMessage.__name__ == "AIMessage"
+
+
+def test_pm_decision_starts_with_salient_action_and_removes_working_preamble():
+    content = """我需要重新核算赔率并调用工具。
+现在正式撰写决策报告。
+
+## Trade Ticket 交易票
+
+| 结构时机 | 暂不介入；结构=healthy_trend |
+
+---
+PM_SUMMARY:
+  pm_rating: OVERWEIGHT
+  pm_action_keyword: WAIT
+  pm_size_low_pct: 2
+  pm_size_high_pct: 3
+  short_term_structure: healthy_trend
+  entry_timing: 暂不介入
+"""
+    result = _format_pm_decision(
+        content,
+        {"structure_class": "healthy_trend", "effective_action": "暂不介入"},
+    )
+    assert result.startswith("# 短期操作结论：暂不介入\n")
+    assert "**当前动作：WAIT｜新建仓位：0%｜长期评级：OVERWEIGHT**" in result
+    assert "## Trade Ticket 交易票" in result
+    assert "我需要重新核算" not in result
+    assert result.rstrip().endswith("entry_timing: 暂不介入")
+
+
+def test_pm_decision_without_trade_ticket_preserves_original_content():
+    content = "PM_SUMMARY:\n  pm_rating: HOLD\n  entry_timing: 继续观察\n"
+    result = _format_pm_decision(
+        content,
+        {"structure_class": "neutral", "effective_action": "继续观察"},
+    )
+    assert result.startswith("# 短期操作结论：继续观察\n")
+    assert content.strip() in result
 
 
 def test_rm_and_pm_prompt_contracts_keep_rating_and_timing_separate():
