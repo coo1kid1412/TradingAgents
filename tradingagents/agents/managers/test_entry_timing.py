@@ -14,6 +14,7 @@ from tradingagents.agents.managers.research_manager import (
     _enforce_entry_timing_truth,
     _extract_rm_rating,
 )
+from tradingagents.agents.managers.portfolio_manager import AIMessage as PortfolioAIMessage
 
 
 def _timing(structure_class="trend_pullback", market_mode="risk_on", **kwargs):
@@ -159,6 +160,10 @@ RM_SUMMARY:
     assert "entry_timing: 暂不介入" in fixed
     assert "| 结构时机 | 暂不介入；结构=healthy_trend |" in fixed
     assert "entry_timing: 等回踩" not in fixed
+
+
+def test_portfolio_manager_has_ai_message_available_for_output_enforcement():
+    assert PortfolioAIMessage.__name__ == "AIMessage"
 
 
 def test_rm_and_pm_prompt_contracts_keep_rating_and_timing_separate():
