@@ -1460,6 +1460,8 @@ def compute_deterministic_peg_inputs(
     eps_ttm: Optional[float],
     annual_net_growth: Optional[float],
     q_net_growth: Optional[float] = None,
+    recurring_loss: Optional[bool] = None,
+    deducted_yoy: Optional[float] = None,
 ) -> Optional[dict]:
     """确定性 PEG 输入：钉死「前瞻增速 + 前瞻 EPS + 低基数置信度」，杜绝 LLM 现场选增速/EPS
     致 PEG 目标价跑跑之间摆动（协创式 320↔180 → OW↔UW 翻转的根）。
@@ -1473,6 +1475,11 @@ def compute_deterministic_peg_inputs(
 
     缺确定性年度增速 / EPS_TTM / 年度增速≤0（PEG 不适用衰退）→ 返回 None（RM 走原 LLM 路径，至少不更差）。
     """
+    if recurring_loss is True:
+        return None
+    if (deducted_yoy is not None and annual_net_growth is not None
+            and annual_net_growth >= 0.50 and deducted_yoy < 0.15):
+        return None
     if eps_ttm is None or annual_net_growth is None or annual_net_growth <= 0:
         return None
     fwd_growth = _peg_forward_growth(annual_net_growth)

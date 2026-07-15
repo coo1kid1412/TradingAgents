@@ -18,6 +18,7 @@ from tradingagents.agents.managers.portfolio_manager import (
     AIMessage as PortfolioAIMessage,
     _format_pm_decision,
 )
+from tradingagents.agents.utils.agent_utils import RISK_DEBATE_PHRASING_RULES
 
 
 def _timing(structure_class="trend_pullback", market_mode="risk_on", **kwargs):
@@ -207,6 +208,62 @@ def test_pm_decision_without_trade_ticket_preserves_original_content():
     assert content.strip() in result
 
 
+def test_exit_observation_removes_entry_instructions_and_zeros_new_position():
+    content = """## Trade Ticket 交易票
+
+| **Size** 仓位规模 | 新建仓 2-3% |
+
+### 1.3 未来 3 个交易日趋势
+入场条件：等回踩 98 元企稳，分批试探单笔 1%。
+
+---
+PM_SUMMARY:
+  pm_rating: HOLD
+  pm_action_keyword: WAIT
+  pm_size_low_pct: 2
+  pm_size_high_pct: 3
+  pm_entry_low: 98
+  pm_entry_high: 100
+  entry_timing: 退出观察
+"""
+    result = _format_pm_decision(
+        content,
+        {"structure_class": "broken", "effective_action": "退出观察"},
+    )
+    assert "新建仓 0%" in result
+    assert "pm_size_low_pct: 0" in result
+    assert "pm_size_high_pct: 0" in result
+    assert "pm_entry_low: null" in result
+    assert "pm_entry_high: null" in result
+    assert "分批试探" not in result
+    assert "入场条件：等回踩" not in result
+    assert "重新评估条件：结构修复并重新通过风险门控" in result
+
+
+def test_stale_market_snapshot_forces_three_day_trend_to_data_insufficient():
+    content = """## Trade Ticket 交易票
+| 未来 3 个交易日趋势 | **下行**（置信度：低） |
+
+### 1.3 未来 3 个交易日趋势
+**下行**（置信度：低，数据陈旧）。
+
+PM_SUMMARY:
+  pm_rating: SELL
+  pm_action_keyword: WAIT
+  short_term_trend: 下跌
+  short_term_confidence: 低
+  entry_timing: 退出观察
+"""
+    result = _format_pm_decision(
+        content,
+        {"structure_class": "broken", "effective_action": "退出观察"},
+        market_risk_snapshot={"data_status": "stale", "required_checkpoint": "14:30"},
+    )
+    assert "| 未来 3 个交易日趋势 | **数据不足**（盘中风险快照陈旧，需 14:30 检查点） |" in result
+    assert "short_term_trend: 数据不足" in result
+    assert "**下行**（置信度：低，数据陈旧）" not in result
+
+
 def test_rm_and_pm_prompt_contracts_keep_rating_and_timing_separate():
     root = Path(__file__).resolve().parents[3]
     for relative in (
@@ -217,6 +274,11 @@ def test_rm_and_pm_prompt_contracts_keep_rating_and_timing_separate():
         assert "SYS_SHORT_TERM_STRUCTURE" in source, relative
         assert "entry_timing" in source, relative
         assert "短线结构不得改变长期评级" in source, relative
+
+
+def test_shared_agent_rules_reject_uncalibrated_precision_and_unsourced_facts():
+    assert "未经历史校准" in RISK_DEBATE_PHRASING_RULES
+    assert "事实性描述必须能追溯" in RISK_DEBATE_PHRASING_RULES
 
 
 if __name__ == "__main__":

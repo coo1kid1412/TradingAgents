@@ -1476,7 +1476,7 @@ def compute_step6_final_rating(
         theme_premium_pct: 画像末尾 SYS_THEME_PREMIUM_PCT（已按 regime 闸门）
         theme_stage: THEMATIC_PREMIUM.theme_stage（仅用于 fading 上沿锁）
         valuation_regime: 画像末尾 SYS_VALUATION_REGIME（ride/neutral/discipline）
-        peg_confidence: 画像末尾 SYS_PEG_CONFIDENCE（normal/low；无则 ""）
+        peg_confidence: 画像末尾 SYS_PEG_CONFIDENCE（normal/low/invalid；无则 ""）
         consensus_crowded / consensus_direction: 共识快照 crowded 与方向（偏多/偏空）
         quant_anticrowding: QUANT_SCORE.factor_scores.anticrowding（0-100，硬确认用）
         retail_concentration_signal: 资金流官散户接盘信号（散户高接盘/中性，硬确认用）
@@ -1794,6 +1794,20 @@ def compute_step6_final_rating(
             extreme_note = f"composite={composite_score:.0f} ≥80 且评级看空 → 强制 HOLD"
     stages["extreme_defense"] = {"rating_after": rating, "note": extreme_note}
 
+    # 盈利质量无效时，目标价即使有方向也缺少足够稳健的盈利锚，不给最高强度 BUY/SELL。
+    valuation_quality_note = "通过"
+    if (peg_confidence or "").strip().lower() == "invalid":
+        if rating == "BUY":
+            rating = "OVERWEIGHT"
+            valuation_quality_note = "盈利质量锚 invalid：BUY 收敛 OVERWEIGHT"
+        elif rating == "SELL":
+            rating = "UNDERWEIGHT"
+            valuation_quality_note = "盈利质量锚 invalid：SELL 收敛 UNDERWEIGHT"
+    stages["valuation_quality"] = {
+        "rating_after": rating,
+        "note": valuation_quality_note,
+    }
+
     # ── 7) 不变量 A 终检：评级方向必须与隐含收益同号 ──
     invariant_note = "通过（评级方向与目标价隐含收益同号）"
     if rating in ("BUY", "OVERWEIGHT") and deviation_pct >= 0:
@@ -1814,6 +1828,7 @@ def compute_step6_final_rating(
         f" → AI主升 {stages['ai_main_uptrend']['rating_after']}"
         f" → 趋势叠加 {stages['overlay']['rating_after']}"
         f" → 极端防御 {stages['extreme_defense']['rating_after']}"
+        f" → 估值质量 {stages['valuation_quality']['rating_after']}"
         f" → 不变量终检 {rating}"
     )
 

@@ -824,6 +824,9 @@ def compute_capital_flow_score(metrics: dict, regime: str) -> tuple[Optional[flo
     nb_dir = metrics.get("northbound_5d_direction")
     nb_status = metrics.get("northbound_data_status", "missing")
     lhb_inst_dir = metrics.get("lhb_inst_direction")
+    flow_5d = metrics.get("main_force_net_inflow_5d_yi")
+    flow_20d = metrics.get("main_force_net_inflow_20d_yi")
+    holder_qoq = metrics.get("holder_num_qoq_pct")
 
     parts: list[tuple[float, float]] = []  # (sub_score, weight)
     breakdown: dict = {}
@@ -832,15 +835,22 @@ def compute_capital_flow_score(metrics: dict, regime: str) -> tuple[Optional[flo
     def _dir_to_score(d: int) -> float:
         return 50.0 + 50.0 * float(d)
 
-    # 子分 1: ddx_like_5d_pct_1y（已是 0-100，权重 0.25；DDE 推断降权）
+    # 最近 5 日方向优先于历史 DDX 残留。
+    if flow_5d is not None:
+        sub = 100.0 if flow_5d > 0 else 0.0 if flow_5d < 0 else 50.0
+        parts.append((sub, 0.20))
+        breakdown["main_force_net_inflow_5d_yi"] = round(float(flow_5d), 3)
+        breakdown["recent_flow_sub_score"] = sub
+
+    # 子分 1: ddx_like_5d_pct_1y（历史分位降权，避免旧流入抬高当前分数）
     if ddx_pct is not None:
-        parts.append((float(ddx_pct), 0.25))
+        parts.append((float(ddx_pct), 0.15 if flow_5d is not None else 0.25))
         breakdown["ddx_like_5d_pct_1y"] = round(ddx_pct, 1)
 
     # 子分 2: ddz_like_20d_pct → 线性映射 [-3, +3] → [0, 100]，权重 0.20
     if ddz_20d is not None:
         sub = _linear_map(float(ddz_20d), -3.0, 3.0)
-        parts.append((sub, 0.20))
+        parts.append((sub, 0.10 if flow_5d is not None else 0.20))
         breakdown["ddz_like_20d_pct"] = round(ddz_20d, 2)
         breakdown["ddz_sub_score"] = round(sub, 1)
 
@@ -897,6 +907,13 @@ def compute_capital_flow_score(metrics: dict, regime: str) -> tuple[Optional[flo
     else:
         final_score = raw_score
         breakdown["regime_clamp"] = "无"
+
+    if (flow_5d is not None and flow_5d < 0
+            and holder_qoq is not None and holder_qoq >= 10):
+        final_score = min(final_score, 55.0)
+        breakdown["recent_contradiction_cap"] = "5d流出+股东户数扩散 → ≤55"
+        if flow_20d is not None:
+            breakdown["main_force_net_inflow_20d_yi"] = round(float(flow_20d), 3)
 
     final_score = _clip(final_score, 0.0, 100.0)
     return round(final_score, 1), breakdown

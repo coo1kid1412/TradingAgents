@@ -80,7 +80,11 @@ def _format_position_size(low: str | None, high: str | None) -> str:
     return f"{low_value}-{high_value}%"
 
 
-def _format_pm_decision(content: str, timing: dict) -> str:
+def _format_pm_decision(
+    content: str,
+    timing: dict,
+    market_risk_snapshot: dict | None = None,
+) -> str:
     """Remove model working text and prepend a deterministic action summary."""
     original = (content or "").strip()
     trade_ticket = re.search(r"(?m)^#{1,2}\s+Trade Ticket\b.*$", original)
@@ -99,6 +103,35 @@ def _format_pm_decision(content: str, timing: dict) -> str:
     no_new_position_actions = {
         "等回踩", "等放量突破", "暂不介入", "退出观察", "继续观察", "数据不足",
     }
+    if entry_timing in no_new_position_actions:
+        report_body = re.sub(
+            r"(?m)^(\|\s*\*\*Size\*\*\s*仓位规模\s*\|).*$",
+            r"\1 新建仓 0% |",
+            report_body,
+        )
+        report_body = re.sub(r"(?m)^(\s*pm_size_(?:low|high)_pct:\s*).*$", r"\g<1>0", report_body)
+        report_body = re.sub(r"(?m)^(\s*pm_entry_(?:low|high):\s*).*$", r"\g<1>null", report_body)
+        report_body = re.sub(
+            r"(?m)^入场条件：.*$",
+            "重新评估条件：结构修复并重新通过风险门控后再评估；当前不新开仓。",
+            report_body,
+        )
+    if (market_risk_snapshot or {}).get("data_status") == "stale":
+        checkpoint = (market_risk_snapshot or {}).get("required_checkpoint") or "最新盘中"
+        report_body = re.sub(
+            r"(?m)^\|\s*未来 3 个交易日趋势\s*\|.*$",
+            f"| 未来 3 个交易日趋势 | **数据不足**（盘中风险快照陈旧，需 {checkpoint} 检查点） |",
+            report_body,
+        )
+        report_body = re.sub(
+            r"(?ms)(^### 1\.3 未来 3 个交易日趋势\s*\n\s*)\*\*[^\n]+$",
+            rf"\g<1>**数据不足**（盘中风险快照陈旧，需 {checkpoint} 检查点；当前仅执行 WAIT、0%）。",
+            report_body,
+            count=1,
+        )
+        report_body = re.sub(
+            r"(?m)^(\s*short_term_trend:\s*).*$", r"\g<1>数据不足", report_body,
+        )
     size = "0%" if entry_timing in no_new_position_actions else _format_position_size(
         _extract_pm_summary_value(original, "pm_size_low_pct"),
         _extract_pm_summary_value(original, "pm_size_high_pct"),
@@ -169,7 +202,7 @@ def create_portfolio_manager(llm, memory):
         for i, rec in enumerate(past_memories, 1):
             past_memory_str += f"【适用场景】{rec['matched_situation']}\n【经验教训】{rec['recommendation']}\n\n"
 
-        prompt = f"""【语言要求】你必须使用中文撰写以下所有分析内容和回复。评级关键词（Buy/Overweight/Hold/Underweight/Sell）、股票代码、专业交易术语（Action/Size/R/TP/SL/Time Stop）可保留英文，但需带中文注释。
+        prompt = fr"""【语言要求】你必须使用中文撰写以下所有分析内容和回复。评级关键词（Buy/Overweight/Hold/Underweight/Sell）、股票代码、专业交易术语（Action/Size/R/TP/SL/Time Stop）可保留英文，但需带中文注释。
 
 你是**投资组合经理（Portfolio Manager）**，对标头部对冲基金 PM 角色，输出**专业交易票（Trade Ticket）**风格的决策。
 
@@ -453,6 +486,7 @@ PM 必须明确"thesis 兑现"的具体里程碑（如"Q2 营收增速 >25%"、"
 - 黑天鹅档**必须**显式引用尾部风险分析师的论据
 - 概率加权 E **必须**通过工具 `compute_pm_scenario_e` 计算（输入 4 档目标价 + 概率），禁止心算
 - 若工具计算结果与 RM 的 3 档 E 偏差超 8pct，需要说明黑天鹅档的贡献
+- 所有概率必须标注为“主观情景权重，未经历史校准”；不得引用无来源历史胜率、复合概率或精确事件概率增强权威感
 
 ### 第七步：Sell Trigger 对称详细（BUY/OVERWEIGHT 也必须有）
 
@@ -504,7 +538,7 @@ PM 必须明确"thesis 兑现"的具体里程碑（如"Q2 营收增速 >25%"、"
 | 入场判断 | <BUY NOW / WAIT / DON'T BUY>（含等待条件） |
 | 结构时机 | <逐字填写上方确定性 entry_timing.effective_action>；结构=<structure_class> |
 | Market Risk 市场风险 | <风险等级> / <T+1 偏向>，快照生效 <as_of_date as_of_time> |
-| 未来 5 日趋势 | <上涨 / 震荡 / 下跌>（置信度：高/中/低；失效条件：__） |
+| 未来 3 个交易日趋势 | <上行 / 横盘修复 / 下行>（置信度：高/中/低；领先风险信号：__；已触发信号：__；失效条件：__） |
 | 12 月主题判断 | <扩张 / 兑现 / 降速 / 破裂>（增长兑现/估值溢价/拥挤度：__） |
 
 ### 核心交易参数（Trade Parameters）
@@ -625,7 +659,7 @@ PM 必须明确"thesis 兑现"的具体里程碑（如"Q2 营收增速 >25%"、"
 2. **## 一、投资决策与入场时机**
    - **### 1.1 投资判断**（该不该投资？YES / NO / CONDITIONAL）—— 1 段推理 + 条件
    - **### 1.2 入场时机**（现阶段该不该买？BUY NOW / WAIT / DON'T BUY）—— 1 段推理 + 等待条件
-   - **### 1.3 未来 5 个交易日趋势** —— 上涨 / 震荡 / 下跌、置信度、关键支撑阻力、入场条件和失效条件；必须与市场风险快照一致
+   - **### 1.3 未来 3 个交易日趋势** —— 上行 / 横盘修复 / 下行、置信度、领先风险信号、已触发信号和失效条件；必须与最新盘中市场风险快照一致。快照 `data_status=stale` 时只能输出“数据不足、WAIT、0%”，不得用昨日收盘数据冒充盘中判断
    - **### 1.4 12 个月主题判断** —— 扩张 / 兑现 / 降速 / 破裂；解释增长兑现、估值溢价、拥挤度和主题风险。AI/科技股不得仅因静态 PE 高而降级
 
 3. **## 二、操作计划**
@@ -636,13 +670,13 @@ PM 必须明确"thesis 兑现"的具体里程碑（如"Q2 营收增速 >25%"、"
 
        **Scenario A：你当前空仓**（不建仓 / WAIT）—— 适用 CONDITIONAL / DON'T BUY；动作=[等反向证伪触发 + 重评 / WAIT]；⚠️**禁止**"清仓""减仓"指令（空仓无仓可减）
 
-       **Scenario B：你当前已持仓**（按 cost basis 三档分支）
+       **Scenario B：你当前已持仓**（按 thesis 与风险预算分支；成本价不得改变价值判断）
 
-       | 分支 | 触发条件（用户自查 cost basis）| 建议动作 |
-       |------|------------------------------|---------|
-       | **B.1 深度盈利者** | cost basis ≤ 当前价 × 0.80（盈利 ≥20%）| 锁利 30-50%；剩余持有至 thesis 破裂或硬止损 |
-       | **B.2 持平/微盈/微亏者** | cost basis 在当前价 ±10% 区间 | 按 SL_soft / SL_hard 节奏减仓：达 SL_soft 减 50%，跌破 SL_hard 全清 |
-       | **B.3 深度套牢者** | cost basis ≥ 当前价 × 1.10（套牢 ≥10%）| 不在当前价位清仓；等技术反弹至 cost basis 附近或基本面修复后再决定 |
+       | 分支 | 触发条件 | 建议动作 |
+       |------|----------|---------|
+       | **B.1 Thesis 完整且仓位合规** | 核心经营假设未证伪、仓位不超过风险上限 | 维持或按事件窗口降低风险，不因浮盈浮亏改变判断 |
+       | **B.2 Thesis 待验证或仓位超限** | 关键数据未兑现、仓位超过风险上限 | 趁流动性可用分批降至上限内 |
+       | **B.3 Thesis 破裂** | 主营、现金流、治理或价格结构触发硬证伪 | 不等待回到成本价，按流动性条件执行退出 |
 
        ⚠️ 本 section **禁止**"建仓""加仓"指令（持仓者不再讨论新建仓）
    - **### 2.2 执行细节** —— 流动性档位、单次冲击、分批节奏、事件窗口
@@ -676,7 +710,7 @@ PM 必须明确"thesis 兑现"的具体里程碑（如"Q2 营收增速 >25%"、"
 2. 反向证伪段是否给了具体价位区间？（如是改为触发条件）
 3. Scenario A（空仓者）是否混入"清仓/减仓"指令？（如是删除）
 4. Scenario B（持仓者）是否混入"建仓/加仓"指令？（如是删除）
-5. 三档 cost basis 分支是否相互独立？
+5. 持仓分支是否只按 thesis 状态与风险预算划分，并明确禁止等待回到成本价再处理？
 
 ⚠️ 没有这个自检，过往报告反复出现"230 元清仓 + 230 元建仓"的逻辑矛盾。
 
@@ -798,7 +832,9 @@ Be decisive and ground every conclusion in specific evidence from the analysts.{
             stock_profile, market_mode, long_term_rating=final_rating,
         )
         enforced_content = _enforce_entry_timing_truth(response.content, final_entry_timing)
-        response = AIMessage(content=_format_pm_decision(enforced_content, final_entry_timing))
+        response = AIMessage(content=_format_pm_decision(
+            enforced_content, final_entry_timing, market_risk_snapshot=market_risk_snapshot,
+        ))
         logger.info("PM entry_timing 出口真值: %s", final_entry_timing)
 
         new_risk_debate_state = {

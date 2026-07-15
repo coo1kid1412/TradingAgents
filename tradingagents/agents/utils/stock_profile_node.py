@@ -738,7 +738,8 @@ def create_stock_profile_node(llm):
             # 不再靠禁发防 RM 误用（禁发治不住 LLM 自填的 primary_method=peg）。
             sys_g = parse_sys_net_growth_components(fund_raw + "\n" + fundamentals_report)
             peg_det = compute_deterministic_peg_inputs(
-                eps_ttm_val, sys_g["annual"], sys_g["quarter"])
+                eps_ttm_val, sys_g["annual"], sys_g["quarter"],
+                recurring_loss=gq["recurring_loss"], deducted_yoy=gq["deducted_yoy"])
             if peg_det is not None:
                 conf_note = ("⚠️**低基数尖峰，前瞻高度不确定**" if peg_det["confidence"] == "low"
                              else "正常")
@@ -1230,6 +1231,16 @@ TRANSPARENCY:
                     logger.info("SYS_CYCLICAL_TARGET 已注入: base=%s~%s 离散=%sx 置信=%s",
                                 cyc_tgt["base_low"], cyc_tgt["base_high"],
                                 cyc_tgt["dispersion"], cyc_tgt["confidence"])
+
+        elif gq["recurring_loss"] is True or (
+                gq["deducted_yoy"] is not None and net_growth_strict is not None
+                and net_growth_strict >= 0.50 and gq["deducted_yoy"] < 0.15):
+            content = content + (
+                "\n<!-- ⚠️SYS_PEG_QUALITY_GATE｜扣非盈利质量不足，禁止生成 PEG 目标价 -->\n"
+                "SYS_PEG_ELIGIBLE: false\n"
+                "SYS_PEG_CONFIDENCE: invalid\n"
+                "SYS_PEG_REASON: 扣非亏损或扣非增速显著弱于归母增速，归母增长受非经常性损益/低基数污染；禁止使用 PEG 腿\n"
+            )
 
         return {"stock_profile": content}
 
