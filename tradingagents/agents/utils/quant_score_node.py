@@ -133,6 +133,8 @@ def _parse_fundamentals(fund_str: str) -> dict:
         "net_margin_pct": None,
         "revenue_yoy_pct": None,
         "net_profit_yoy_pct": None,
+        "deducted_profit_yoy_pct": None,
+        "recurring_loss": None,
         "industry": None,
     }
     if not fund_str:
@@ -157,6 +159,13 @@ def _parse_fundamentals(fund_str: str) -> dict:
     out["net_margin_pct"] = _parse_table_row(fund_str, "销售净利率")
     out["revenue_yoy_pct"] = _parse_table_row(fund_str, "营业收入同比增长率")
     out["net_profit_yoy_pct"] = _parse_table_row(fund_str, "净利润同比增长率")
+    quality = re.search(
+        r"SYS_GROWTH_QUALITY.*?recurring_loss\s*=\s*(yes|no).*?扣非净利YoY年度\s*=\s*([+-]?[0-9.]+)%",
+        fund_str, re.S,
+    )
+    if quality:
+        out["recurring_loss"] = quality.group(1) == "yes"
+        out["deducted_profit_yoy_pct"] = _safe_float(quality.group(2))
 
     return out
 
@@ -395,6 +404,10 @@ def create_quant_score_node():
             net_margin_pct=fund_inputs["net_margin_pct"],
             revenue_yoy_pct=fund_inputs["revenue_yoy_pct"],
             net_profit_yoy_pct=fund_inputs["net_profit_yoy_pct"],
+            recurring_loss=fund_inputs["recurring_loss"],
+            deducted_profit_yoy_pct=fund_inputs["deducted_profit_yoy_pct"],
+            holder_num_qoq_pct=cf_metrics.get("holder_num_qoq_pct"),
+            winner_rate_pct=cf_metrics.get("winner_rate_pct"),
             capital_flow_score_input=capital_flow_score_input,
         )
 

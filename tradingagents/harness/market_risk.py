@@ -16,6 +16,7 @@ from tradingagents.harness import db as _db
 
 SNAPSHOT_VERSION = "v1"
 _POSITION_CAP = {"低": 20, "中": 6, "高": 3, "极高": 0, "数据不足": 0}
+_A_SHARE_CHECKPOINTS = ((9, 35, "09:35"), (11, 15, "11:15"), (14, 30, "14:30"))
 
 
 def infer_market(ticker: str) -> str:
@@ -162,6 +163,55 @@ def load_latest_market_risk_snapshot(market: str, as_of_date: str | None = None,
     return out
 
 
-def load_market_risk_for_ticker(ticker: str, trade_date: str, db_path=None) -> dict[str, Any] | None:
+def enforce_snapshot_freshness(
+    snapshot: dict[str, Any] | None,
+    trade_date: str,
+    analysis_time: str | None = None,
+) -> dict[str, Any] | None:
+    """Fail the A-share entry gate closed when an expected intraday checkpoint is missing."""
+    if not snapshot or snapshot.get("market") != "a_share":
+        return snapshot
+    now = _dt.datetime.fromisoformat(analysis_time) if analysis_time else _dt.datetime.now().astimezone()
+    if str(trade_date) != now.date().isoformat():
+        return snapshot
+
+    required = None
+    for hour, minute, label in _A_SHARE_CHECKPOINTS:
+        if (now.hour, now.minute) >= (hour, minute):
+            required = (hour, minute, label)
+    if required is None:
+        return snapshot
+
+    try:
+        captured = _dt.datetime.fromisoformat(str(snapshot.get("as_of_time")))
+    except (TypeError, ValueError):
+        captured = None
+    hour, minute, label = required
+    is_current = (
+        captured is not None
+        and captured.date() == now.date()
+        and (captured.hour, captured.minute) >= (hour, minute)
+    )
+    if is_current:
+        return snapshot
+
+    stale = dict(snapshot)
+    stale["data_status"] = "stale"
+    stale["entry_gate"] = "WAIT"
+    stale["position_cap_pct"] = 0
+    stale["required_checkpoint"] = label
+    stale["reasons"] = list(snapshot.get("reasons") or []) + [
+        f"盘中风险快照陈旧：当前应至少使用 {label} 检查点，短期动作强制 WAIT"
+    ]
+    return stale
+
+
+def load_market_risk_for_ticker(
+    ticker: str,
+    trade_date: str,
+    db_path=None,
+    analysis_time: str | None = None,
+) -> dict[str, Any] | None:
     """供个股图读取：按 ticker 市场取分析日及之前最近有效快照。"""
-    return load_latest_market_risk_snapshot(infer_market(ticker), trade_date, db_path)
+    snapshot = load_latest_market_risk_snapshot(infer_market(ticker), trade_date, db_path)
+    return enforce_snapshot_freshness(snapshot, trade_date, analysis_time=analysis_time)

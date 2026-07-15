@@ -646,6 +646,21 @@ def test_parse_growth_quality():
     assert parse_growth_quality("无相关")["recurring_loss"] is None
 
 
+def test_recurring_loss_and_weak_deducted_growth_disable_peg_inputs():
+    """Headline profit growth must not create a PEG leg when core earnings are poor."""
+    assert compute_deterministic_peg_inputs(
+        1.46, 2.259, q_net_growth=1.1178, recurring_loss=True,
+    ) is None
+    assert compute_deterministic_peg_inputs(
+        2.0, 0.80, q_net_growth=0.90, recurring_loss=False, deducted_yoy=0.05,
+    ) is None
+
+    healthy = compute_deterministic_peg_inputs(
+        2.0, 0.48, q_net_growth=0.52, recurring_loss=False, deducted_yoy=0.45,
+    )
+    assert healthy is not None and healthy["confidence"] == "normal"
+
+
 def test_parse_distribution_signals():
     news = '第五大股东通过询价转让方式"折价8%"出让，套现约30.58亿元；170余家机构在Q1已披露减持'
     d = parse_distribution_signals(news)

@@ -219,8 +219,10 @@ def quality_score(
 def growth_score(
     revenue_yoy_pct: Optional[float],
     net_profit_yoy_pct: Optional[float],
+    recurring_loss: Optional[bool] = None,
+    deducted_profit_yoy_pct: Optional[float] = None,
 ) -> tuple[Optional[float], dict]:
-    """成长因子：营收 YoY + 净利 YoY。"""
+    """成长因子：优先使用扣非盈利，主业亏损时限制头条归母增速。"""
     breakdown: dict = {}
     parts: list[tuple[float, float]] = []
 
@@ -234,9 +236,16 @@ def growth_score(
         breakdown["revenue_yoy_score"] = round(s, 1)
         parts.append((s, 0.35))
 
-    if net_profit_yoy_pct is not None:
-        s = _score_yoy(net_profit_yoy_pct)
-        breakdown["net_profit_yoy_pct"] = round(net_profit_yoy_pct, 2)
+    profit_yoy = deducted_profit_yoy_pct if deducted_profit_yoy_pct is not None else net_profit_yoy_pct
+    if profit_yoy is not None:
+        s = _score_yoy(profit_yoy)
+        if recurring_loss is True:
+            s = min(s, 20.0)
+            breakdown["quality_gate"] = "recurring_loss"
+        if net_profit_yoy_pct is not None:
+            breakdown["net_profit_yoy_pct"] = round(net_profit_yoy_pct, 2)
+        if deducted_profit_yoy_pct is not None:
+            breakdown["deducted_profit_yoy_pct"] = round(deducted_profit_yoy_pct, 2)
         breakdown["net_profit_yoy_score"] = round(s, 1)
         parts.append((s, 0.65))
 
@@ -269,6 +278,8 @@ def lowvol_score(realized_vol_annualized_pct: Optional[float]) -> tuple[Optional
 def anticrowding_score(
     r60d_pct: Optional[float],
     turnover_ratio_30d_to_90d: Optional[float],
+    holder_num_qoq_pct: Optional[float] = None,
+    winner_rate_pct: Optional[float] = None,
 ) -> tuple[Optional[float], dict]:
     """反拥挤因子：近 60 日累计收益 + 换手率加速度（30d 均值/90d 均值）。
 
@@ -296,6 +307,15 @@ def anticrowding_score(
 
     total_w = sum(w for _, w in parts)
     composite = sum(s * w for s, w in parts) / total_w
+    distributed = holder_num_qoq_pct is not None and holder_num_qoq_pct >= 10
+    trapped = winner_rate_pct is not None and winner_rate_pct <= 30
+    if distributed and trapped:
+        composite = min(composite, 40.0)
+        breakdown["distribution_penalty"] = True
+        breakdown["holder_num_qoq_pct"] = round(holder_num_qoq_pct, 2)
+        breakdown["winner_rate_pct"] = round(winner_rate_pct, 2)
+    else:
+        breakdown["distribution_penalty"] = False
     return round(composite, 1), breakdown
 
 
@@ -354,11 +374,15 @@ def compute_quant_score(
     # Growth inputs
     revenue_yoy_pct: Optional[float] = None,
     net_profit_yoy_pct: Optional[float] = None,
+    recurring_loss: Optional[bool] = None,
+    deducted_profit_yoy_pct: Optional[float] = None,
     # LowVol input
     realized_vol_annualized_pct: Optional[float] = None,
     # AntiCrowding inputs
     r60d_pct: Optional[float] = None,
     turnover_ratio_30d_to_90d: Optional[float] = None,
+    holder_num_qoq_pct: Optional[float] = None,
+    winner_rate_pct: Optional[float] = None,
     # Capital Flow (第 7 因子，由 Capital Flow Officer 预计算，直接传入 0-100 分)
     capital_flow_score_input: Optional[float] = None,
     # Optional weight override
@@ -385,7 +409,11 @@ def compute_quant_score(
     factor_scores["quality"] = s
     factor_breakdowns["quality"] = bd
 
-    s, bd = growth_score(revenue_yoy_pct, net_profit_yoy_pct)
+    s, bd = growth_score(
+        revenue_yoy_pct, net_profit_yoy_pct,
+        recurring_loss=recurring_loss,
+        deducted_profit_yoy_pct=deducted_profit_yoy_pct,
+    )
     factor_scores["growth"] = s
     factor_breakdowns["growth"] = bd
 
@@ -393,7 +421,10 @@ def compute_quant_score(
     factor_scores["lowvol"] = s
     factor_breakdowns["lowvol"] = bd
 
-    s, bd = anticrowding_score(r60d_pct, turnover_ratio_30d_to_90d)
+    s, bd = anticrowding_score(
+        r60d_pct, turnover_ratio_30d_to_90d,
+        holder_num_qoq_pct=holder_num_qoq_pct, winner_rate_pct=winner_rate_pct,
+    )
     factor_scores["anticrowding"] = s
     factor_breakdowns["anticrowding"] = bd
 

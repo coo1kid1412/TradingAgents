@@ -445,6 +445,24 @@ def test_ai_main_uptrend_respects_crowded_buy_ceiling():
     print("✓ AI主升不越过拥挤多头 BUY 天花板")
 
 
+def test_invalid_peg_quality_blocks_extreme_directional_rating():
+    """No robust recurring-earnings anchor means BUY/SELL conviction is not defensible."""
+    bearish = F.invoke(_base(
+        current_price=109.04, target_price_mid=66.54,
+        style="high_beta_growth", peg_confidence="invalid",
+        composite_score=33.5, red_flags_count=4,
+        bear_anchor_strong=True, earnings_sustainability="待验证",
+    ))
+    assert bearish["final_rating"] == "UNDERWEIGHT", bearish["explanation"]
+    assert bearish["stages"]["valuation_quality"]["rating_after"] == "UNDERWEIGHT"
+
+    bullish = F.invoke(_base(
+        current_price=60, target_price_mid=100,
+        style="high_beta_growth", peg_confidence="invalid",
+    ))
+    assert bullish["final_rating"] == "OVERWEIGHT", bullish["explanation"]
+
+
 def test_mapping_error_propagates():
     """target_price_mid ≤ 0 时返回错误而非崩溃。"""
     r = F.invoke(_base(target_price_mid=0.0))
@@ -479,5 +497,6 @@ if __name__ == "__main__":
     test_ai_main_uptrend_risk_off_no_upgrade()
     test_ai_main_uptrend_respects_discipline_ceiling()
     test_ai_main_uptrend_respects_crowded_buy_ceiling()
+    test_invalid_peg_quality_blocks_extreme_directional_rating()
     test_mapping_error_propagates()
-    print("\n全部 27 项通过 ✅")
+    print("\n全部 28 项通过 ✅")

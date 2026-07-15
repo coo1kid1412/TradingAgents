@@ -19,6 +19,7 @@ from tradingagents.harness.market_risk import (
     save_market_risk_snapshot,
     load_latest_market_risk_snapshot,
     load_market_risk_for_ticker,
+    enforce_snapshot_freshness,
 )
 from tradingagents.harness import market_risk_daily
 from tradingagents.harness.market_risk_daily import is_market_trading_day, run_market_risk_daily, _send_feishu_message
@@ -108,6 +109,32 @@ def test_snapshot_storage_is_unique_per_market_and_date():
         assert infer_market("NVDA") == "us"
         assert infer_market("300308") == "a_share"
         assert load_market_risk_for_ticker("300308", "2026-06-25", db_path)["market"] == "a_share"
+
+
+def test_same_day_premarket_snapshot_fails_closed_after_intraday_checkpoint():
+    snapshot = compute_market_risk_snapshot(
+        "a_share", _prices([100 + i for i in range(60)]), 70, 10,
+        as_of_date="2026-07-15", as_of_time="2026-07-15T08:30:00+08:00",
+    )
+    checked = enforce_snapshot_freshness(
+        snapshot, "2026-07-15", analysis_time="2026-07-15T14:18:00+08:00",
+    )
+    assert checked["data_status"] == "stale"
+    assert checked["entry_gate"] == "WAIT"
+    assert checked["position_cap_pct"] == 0
+    assert checked["required_checkpoint"] == "11:15"
+
+
+def test_current_intraday_checkpoint_remains_usable():
+    snapshot = compute_market_risk_snapshot(
+        "a_share", _prices([100 + i for i in range(60)]), 70, 10,
+        as_of_date="2026-07-15", as_of_time="2026-07-15T11:16:00+08:00",
+    )
+    checked = enforce_snapshot_freshness(
+        snapshot, "2026-07-15", analysis_time="2026-07-15T14:18:00+08:00",
+    )
+    assert checked["data_status"] == "fresh"
+    assert checked["entry_gate"] == "OPEN"
 
 
 def test_daily_runner_skips_closed_market_and_does_not_push():
