@@ -1,4 +1,5 @@
 import logging
+import re
 import uuid
 from datetime import datetime, timedelta
 
@@ -13,8 +14,60 @@ from tradingagents.agents.utils.agent_utils import (
     get_stock_data,
 )
 from tradingagents.dataflows.config import get_config
+from tradingagents.dataflows.intraday_quote import parse_price_metadata
 
 logger = logging.getLogger(__name__)
+
+
+def _extract_price_metadata(messages: list) -> dict:
+    for message in reversed(messages):
+        if getattr(message, "name", None) != "get_stock_data":
+            continue
+        content = str(getattr(message, "content", ""))
+        if "# Actual date range:" in content:
+            return parse_price_metadata(content)
+    return {"status": "unknown", "date": None, "time": None, "source": "unknown"}
+
+
+def _enforce_price_metadata(report: str, meta: dict) -> str:
+    if not report or not meta:
+        return report
+    labels = {
+        "intraday_provisional": "盘中临时K线",
+        "official_daily": "正式日线",
+        "t_minus_1": "T-1（实时行情不可用）",
+        "unknown": "未知",
+    }
+    status = meta.get("status") or "unknown"
+    date = meta.get("date") or "未知"
+    quote_time = meta.get("time") or "无"
+    source = meta.get("source") or "unknown"
+    banner = (
+        f"> **价格数据状态：{labels.get(status, status)}**｜"
+        f"数据日期：{date}｜报价时间：{quote_time}｜来源：{source}\n\n"
+    )
+
+    summary_match = re.search(r"(^SUMMARY:\s*$)", report, re.M)
+    if summary_match:
+        fields = {
+            "price_data_status": status,
+            "price_data_date": meta.get("date"),
+            "price_data_time": meta.get("time"),
+            "price_data_source": source,
+        }
+        additions = []
+        for key, value in fields.items():
+            rendered = f'"{value}"' if value is not None else "null"
+            pattern = rf"^\s{{2}}{key}:.*$"
+            replacement = f"  {key}: {rendered}"
+            if re.search(pattern, report, re.M):
+                report = re.sub(pattern, replacement, report, flags=re.M)
+            else:
+                additions.append(replacement)
+        if additions:
+            insertion = summary_match.end()
+            report = report[:insertion] + "\n" + "\n".join(additions) + report[insertion:]
+    return banner + report.lstrip()
 
 # ── 技术指标目录（供 system prompt 使用） ──────────────────────────────
 _INDICATOR_CATALOG = """
@@ -140,13 +193,16 @@ def create_market_analyst(llm):
         )
         if prefetch_msgs:
             messages = messages + prefetch_msgs
+        price_meta = _extract_price_metadata(messages)
 
         # ── 根据数据是否已就绪，切换 prompt 指令 ─────────────────
         if stock_data_available:
             data_instruction = (
                 "行情数据（OHLCV）已在上方对话中获取。你无需再次调用 "
                 "get_stock_data。请直接选择最相关的技术指标（通过 get_indicators），"
-                "然后撰写分析报告。"
+                "然后撰写分析报告。必须读取行情头中的 Price data status、"
+                "Latest bar source 和 Latest quote time；intraday_provisional 是盘中临时K线，"
+                "t_minus_1 表示当日实时行情不可用，禁止将其描述为今日价格。"
             )
         else:
             data_instruction = (
@@ -267,6 +323,10 @@ def create_market_analyst(llm):
             "  volume_price_pattern: 放量上涨 / 放量下跌 / 缩量整理 / 无量背离 / 量价齐升 / 正常   # 量价配合诊断\n"
             "  capital_flow_regime: 强势 / 分化 / 恶化 / 中性 / 数据不足 / 非A股不适用    # 直接引用上游 Capital Flow Officer 的 capital_flow_regime\n"
             "  capital_flow_score: <0-100 或 null>      # 直接引用上游 capital_flow_score（数据不足时为 null）\n"
+            "  price_data_status: intraday_provisional / official_daily / t_minus_1 / unknown\n"
+            "  price_data_date: <YYYY-MM-DD 或 null>\n"
+            "  price_data_time: <YYYY-MM-DD HH:MM:SS 或 null>\n"
+            "  price_data_source: <tushare_rt_k / sina_realtime / tushare_daily / unknown>\n"
             "  northbound_5d_direction: 净流入 / 净流出 / 平衡 / 数据停滞 / 不适用      # 引用 northbound_5d_direction\n"
             "  margin_change: 增加 / 减少 / 平稳 / 不适用\n"
             "  rating: BUY / HOLD / SELL                # 措辞评级（保守表达）\n"
@@ -317,7 +377,7 @@ def create_market_analyst(llm):
 
         report = ""
         if len(result.tool_calls) == 0:
-            report = result.content
+            report = _enforce_price_metadata(str(result.content), price_meta)
 
         result_dict = {
             "messages": prefetch_msgs + [result],

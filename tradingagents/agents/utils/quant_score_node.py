@@ -28,6 +28,7 @@ from tradingagents.dataflows.factor_calc import (
 )
 from tradingagents.dataflows.interface import route_to_vendor
 from tradingagents.dataflows.akshare_vendor import get_industry_pe_table
+from tradingagents.dataflows.intraday_quote import parse_price_metadata
 
 logger = logging.getLogger(__name__)
 
@@ -54,6 +55,8 @@ def _fetch_price_df(ticker: str, trade_date: str) -> Optional[pd.DataFrame]:
     if not csv_str or "未找到" in csv_str[:200]:
         return None
 
+    price_meta = parse_price_metadata(csv_str)
+
     # 跳过以 # 开头的 header 行
     lines = [ln for ln in csv_str.splitlines() if not ln.startswith("#") and ln.strip()]
     if not lines:
@@ -63,6 +66,7 @@ def _fetch_price_df(ticker: str, trade_date: str) -> Optional[pd.DataFrame]:
     except Exception as e:
         logger.warning("quant_score 解析价格 CSV 失败: %s", e)
         return None
+    df.attrs["price_metadata"] = price_meta
     return df
 
 
@@ -250,6 +254,7 @@ def _format_report(
     trade_date: str,
     result,
     raw_inputs: dict,
+    price_meta: Optional[dict] = None,
 ) -> str:
     composite = result.composite
     interp = result.interpretation
@@ -258,6 +263,12 @@ def _format_report(
     lines.append(f"# {ticker} {company_name} 量化因子打分报告")
     lines.append("")
     lines.append(f"**分析日期**：{trade_date}")
+    if price_meta:
+        lines.append(
+            f"**价格数据状态**：{price_meta.get('status', 'unknown')} | "
+            f"截止 {price_meta.get('date') or '未知'} | "
+            f"来源 {price_meta.get('source') or 'unknown'}"
+        )
     lines.append("")
     lines.append("---")
     lines.append("")
@@ -339,6 +350,11 @@ def _format_report(
     lines.append("")
     lines.append("```yaml")
     lines.append("QUANT_SCORE:")
+    price_meta = price_meta or {}
+    for key in ("status", "date", "time", "source"):
+        value = price_meta.get(key)
+        rendered = f'"{value}"' if value is not None else "null"
+        lines.append(f"  price_data_{key}: {rendered}")
     lines.append(f"  composite: {composite if composite is not None else 'null'}")
     lines.append(f'  interpretation: "{interp}"')
     lines.append("  factor_scores:")
@@ -373,6 +389,9 @@ def create_quant_score_node():
 
         # 1. 拉取原始数据
         price_df = _fetch_price_df(ticker, trade_date)
+        price_meta = (
+            price_df.attrs.get("price_metadata", {}) if price_df is not None else {}
+        )
         fund_str = _fetch_fundamentals_raw(ticker, trade_date)
 
         # 2. 计算价格因子（动量 / 低波 / 反拥挤）
@@ -420,7 +439,10 @@ def create_quant_score_node():
         }
 
         # 7. 格式化 markdown 报告
-        report = _format_report(ticker, company_name, trade_date, result, raw_inputs)
+        report = _format_report(
+            ticker, company_name, trade_date, result, raw_inputs,
+            price_meta=price_meta,
+        )
 
         return {"quant_score": report}
 
