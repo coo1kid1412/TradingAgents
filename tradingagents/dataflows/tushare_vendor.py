@@ -17,6 +17,7 @@ import pandas as pd
 from tradingagents.dataflows.valuation_utils import compute_ttm_eps, compute_ttm_revenue_per_share
 
 from .ticker_utils import to_tushare_format, to_akshare_date, to_standard_date, is_etf_or_lof
+from .intraday_quote import fetch_intraday_quote, merge_intraday_quote
 from .vendor_errors import TushareRateLimitError, TushareUnavailableError
 from .financial_field_maps import (
     extract_and_format,
@@ -328,6 +329,8 @@ def get_stock(
     if df is None or df.empty:
         return f"未找到股票 '{symbol}' 在 {start_date} 至 {end_date} 期间的数据"
 
+    quote = fetch_intraday_quote(symbol, end_date, tushare_api=pro)
+    df, price_meta = merge_intraday_quote(df, quote, end_date)
     df = df.sort_values("trade_date")
     result = pd.DataFrame({
         "Date": df["trade_date"].apply(lambda x: to_standard_date(str(x))),
@@ -344,11 +347,17 @@ def get_stock(
     actual_start = result["Date"].iloc[0]
     actual_end = result["Date"].iloc[-1]
 
+    quote_time_header = (
+        f"# Latest quote time: {price_meta['time']}\n" if price_meta["time"] else ""
+    )
     header = (
         f"# Stock data for {symbol}\n"
         f"# Actual date range: {actual_start} to {actual_end} "
         f"(requested: {start_date} to {end_date})\n"
         f"# Source: {data_source}\n"
+        f"# Price data status: {price_meta['status']}\n"
+        f"# Latest bar source: {price_meta['source']}\n"
+        f"{quote_time_header}"
         f"# Total records: {len(result)}\n"
         f"# Data retrieved on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
     )
@@ -385,6 +394,8 @@ def get_indicator(
     if df is None or df.empty:
         return f"未找到股票 '{symbol}' 的历史行情数据，无法计算指标"
 
+    quote = fetch_intraday_quote(symbol, curr_date, tushare_api=pro)
+    df, price_meta = merge_intraday_quote(df, quote, curr_date)
     df = df.sort_values("trade_date")
     ohlcv = pd.DataFrame({
         "Date": df["trade_date"].apply(lambda x: to_standard_date(str(x))),
@@ -417,6 +428,10 @@ def get_indicator(
     return (
         f"## {indicator} values from {before.strftime('%Y-%m-%d')} to {curr_date}:\n"
         f"## Source: Tushare Pro + stockstats\n\n"
+        f"## Price data status: {price_meta['status']}\n"
+        f"## Latest bar source: {price_meta['source']}\n"
+        + (f"## Latest quote time: {price_meta['time']}\n" if price_meta["time"] else "")
+        + "\n"
         + "\n".join(lines)
         + "\n"
     )
