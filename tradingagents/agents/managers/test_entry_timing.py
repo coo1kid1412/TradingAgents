@@ -365,6 +365,10 @@ def test_no_buy_structure_explanation_matches_the_actual_timing_state():
 | Conviction 信心 | ⭐⭐⭐ Medium |
 | 结构时机 | 等回踩 |
 
+---
+
+---
+
 ## 系统归档数据（供程序读取）
 
 ```yaml
@@ -383,6 +387,7 @@ PM_SUMMARY:
     assert "短线结构已破坏" not in result
     assert "长期评级保持正面" not in result
     assert "系统归档数据" not in result
+    assert "---\n\n---" not in result
 
 
 def test_pm_decision_hides_internal_audit_and_surfaces_position_specific_actions():

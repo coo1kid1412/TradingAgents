@@ -287,6 +287,12 @@ def _strip_internal_pm_content(content: str) -> str:
     lines = [line for line in cleaned.splitlines() if not _INTERNAL_PM_LINE.search(line)]
     cleaned = "\n".join(lines)
     cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    cleaned = re.sub(
+        r"(?m)(?:^---[ \t]*\n(?:[ \t]*\n)?){2,}",
+        "---\n\n",
+        cleaned,
+    )
+    cleaned = re.sub(r"(?:\n[ \t]*---[ \t]*[\r\n]*)+\Z", "", cleaned)
     return cleaned.strip()
 
 
