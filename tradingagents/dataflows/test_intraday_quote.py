@@ -14,8 +14,11 @@ import pandas as pd
 
 import tradingagents.dataflows.tushare_vendor as tushare_vendor
 import tradingagents.dataflows.intraday_quote as intraday_quote_module
+import tradingagents.agents.analysts.fundamentals_analyst as fundamentals_analyst_module
 import tradingagents.agents.analysts.market_analyst as market_analyst_module
+import tradingagents.agents.utils.macro_context_node as macro_context_module
 import tradingagents.agents.utils.quant_score_node as quant_score_module
+from tradingagents.dataflows.profile_calc import parse_market_cap_from_fundamentals
 
 try:
     from tradingagents.dataflows.intraday_quote import (
@@ -67,6 +70,60 @@ def _quote(
         amount=13_800_000_000.0,
         source=source,
     )
+
+
+def _fundamentals_quote() -> "IntradayQuote":
+    return IntradayQuote(
+        symbol="301217",
+        name="铜冠铜箔",
+        trade_date="2026-07-20",
+        quote_time=datetime(2026, 7, 20, 14, 19, 15, tzinfo=SHANGHAI),
+        open=119.0,
+        high=119.0,
+        low=103.24,
+        last=103.24,
+        pre_close=129.05,
+        volume=24_760_000,
+        amount=2_750_000_000.0,
+        source="sina_realtime",
+    )
+
+
+def _fundamentals_output(
+    quote,
+    daily_trade_date: str = "20260717",
+    daily_close: float = 129.05,
+) -> str:
+    stock_basic = pd.DataFrame([{
+        "ts_code": "301217.SZ", "symbol": "301217", "name": "铜冠铜箔",
+        "area": "安徽", "industry": "元件", "market": "创业板", "list_date": "20220127",
+    }])
+    fina = pd.DataFrame([
+        {"end_date": "20251231", "eps": 0.2, "tob_operate_income": 2.0},
+        {"end_date": "20241231", "eps": -0.1, "tob_operate_income": 1.0},
+    ])
+    daily_basic = pd.DataFrame([{
+        "trade_date": daily_trade_date, "close": daily_close, "pe_ttm": 651.37,
+        "ps_ttm": 55.0, "pb": 19.45, "total_mv": 10_698_400.0,
+        "circ_mv": 2_955_000.0, "total_share": 82_900.0,
+    }])
+    pro = SimpleNamespace(stock_basic=lambda **kwargs: stock_basic)
+
+    with (
+        patch.object(tushare_vendor, "_get_tushare_api", return_value=pro),
+        patch.object(tushare_vendor, "_safe_call", return_value=stock_basic),
+        patch.object(tushare_vendor, "_fetch_fina_indicator_cached", return_value=fina),
+        patch.object(tushare_vendor, "_fetch_cached", return_value=daily_basic),
+        patch.object(tushare_vendor, "fetch_intraday_quote", return_value=quote, create=True),
+        patch.object(tushare_vendor, "_compute_ttm_eps", return_value=0.2),
+        patch.object(tushare_vendor, "_compute_ttm_revenue_per_share_fina", return_value=2.0),
+        patch.object(tushare_vendor, "_format_growth_indicators", return_value=""),
+        patch.object(tushare_vendor, "_format_landmine_line", return_value=""),
+        patch.object(tushare_vendor, "_format_cyclical_line", return_value=""),
+        patch.object(tushare_vendor, "_format_paradigm_line", return_value=""),
+        patch.object(tushare_vendor, "_format_main_business_line", return_value=""),
+    ):
+        return tushare_vendor.get_fundamentals("301217", "2026-07-20")
 
 
 def _sina_payload(date: str = "2026-07-17", time: str = "11:29:58") -> str:
@@ -305,6 +362,129 @@ def test_market_prompt_requires_price_freshness_summary_contract():
         "price_data_status", "price_data_date", "price_data_time", "price_data_source",
     ):
         assert field in source, field
+
+
+def test_fundamentals_valuation_uses_intraday_price_for_all_price_sensitive_metrics():
+    output = _fundamentals_output(_fundamentals_quote())
+    assert "价格数据状态: intraday_provisional" in output
+    assert "估值基准价(元): 103.24" in output
+    assert "估值基准时间: 2026-07-20 14:19:15" in output
+    assert "估值基准来源: sina_realtime" in output
+    assert "前收参考价(元,非当前价): 129.05" in output
+    assert "动态PE(系统计算): 516.2倍" in output
+    assert "静态PE(系统计算): 516.2倍" in output
+    assert "PS(TTM/系统计算): 51.62" in output
+    assert "PB: 15.56 (按估值基准价调整)" in output
+    assert "总市值(亿元): 855.87 (按估值基准价调整)" in output
+    assert parse_market_cap_from_fundamentals(output) == 855.87
+
+
+def test_fundamentals_valuation_labels_t_minus_one_when_intraday_quote_is_missing():
+    output = _fundamentals_output(None)
+    assert "价格数据状态: t_minus_1" in output
+    assert "估值基准价(元): 129.05" in output
+    assert "估值基准日期: 2026-07-17" in output
+    assert "估值基准来源: tushare_daily_basic" in output
+    assert "动态PE(系统计算): 645.25倍" in output
+    assert "静态PE(系统计算): 645.25倍" in output
+    assert "PB: 19.45 (按估值基准价调整)" in output
+    assert "总市值(亿元): 1069.84 (按估值基准价调整)" in output
+    assert parse_market_cap_from_fundamentals(output) == 1069.84
+
+
+def test_fundamentals_report_has_deterministic_intraday_price_banner():
+    enforce = getattr(fundamentals_analyst_module, "_enforce_price_context", None)
+    assert callable(enforce), "fundamentals price context enforcement is missing"
+    vendor_text = """## 估值价格口径
+价格数据状态: intraday_provisional
+估值基准价(元): 103.24
+估值基准日期: 2026-07-20
+估值基准时间: 2026-07-20 14:19:15
+估值基准来源: sina_realtime
+前收参考价(元,非当前价): 129.05
+前收日期: 2026-07-17
+"""
+    output = enforce("# 基本面分析\n\n正文", vendor_text)
+    assert output.startswith("> **估值价格口径：盘中临时价 103.24 元**")
+    assert "前收参考：129.05 元（非当前价）" in output
+
+
+def test_fundamentals_same_day_official_close_beats_realtime_quote():
+    daily_basic = pd.DataFrame([{
+        "trade_date": "20260722",
+        "close": 118.34,
+    }])
+    quote = IntradayQuote(
+        symbol="603629",
+        name="利通电子",
+        trade_date="2026-07-22",
+        quote_time=datetime(2026, 7, 22, 15, 34, 59, tzinfo=SHANGHAI),
+        open=114.0,
+        high=118.34,
+        low=112.8,
+        last=118.34,
+        pre_close=107.58,
+        volume=12_825_794,
+        amount=1_500_000_000.0,
+        source="sina_realtime",
+    )
+
+    with patch.object(tushare_vendor, "fetch_intraday_quote", return_value=quote):
+        context = tushare_vendor._resolve_fundamentals_price_context(
+            "603629", "2026-07-22", SimpleNamespace(), daily_basic,
+        )
+
+    assert context["status"] == "official_daily"
+    assert context["price"] == 118.34
+    assert context["date"] == "2026-07-22"
+    assert context["time"] is None
+    assert context["source"] == "tushare_daily_basic"
+
+    vendor_text = """## 估值价格口径
+价格数据状态: official_daily
+估值基准价(元): 118.34
+估值基准日期: 2026-07-22
+估值基准时间: N/A
+估值基准来源: tushare_daily_basic
+前收参考价(元,非当前价): 118.34
+前收日期: 2026-07-22
+"""
+    report = fundamentals_analyst_module._enforce_price_context("# 基本面分析", vendor_text)
+    assert report.startswith("> **估值价格口径：正式收盘价 118.34 元**")
+    assert "盘中临时价" not in report
+    assert "前收参考" not in report
+
+
+def test_fundamentals_official_daily_output_omits_previous_close_fields():
+    output = _fundamentals_output(
+        _fundamentals_quote(), daily_trade_date="20260720", daily_close=103.24,
+    )
+    assert "价格数据状态: official_daily" in output
+    assert "估值基准价(元): 103.24" in output
+    assert "估值基准时间: N/A" in output
+    assert "前收参考价(元,非当前价)" not in output
+    assert "前收日期:" not in output
+
+
+def test_macro_prompt_prioritizes_intraday_price_over_previous_close():
+    class CaptureLLM:
+        def __init__(self):
+            self.prompt = ""
+
+        def invoke(self, prompt):
+            self.prompt = prompt
+            return SimpleNamespace(content="ok")
+
+    llm = CaptureLLM()
+    node = macro_context_module.create_macro_context_node(llm)
+    node({
+        "company_of_interest": "301217", "company_name": "铜冠铜箔",
+        "trade_date": "2026-07-20", "news_report": "", "sentiment_report": "",
+        "fundamentals_report": "前收参考价(元,非当前价): 129.05",
+        "market_report": "最新价：103.24 元（盘中）",
+    })
+    assert "盘中临时价是唯一当前价" in llm.prompt
+    assert "前收参考价不得写成当前价" in llm.prompt
 
 
 if __name__ == "__main__":

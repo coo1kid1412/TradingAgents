@@ -1,5 +1,6 @@
 import json
 import logging
+import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
@@ -103,6 +104,48 @@ def _format_structured_data(raw_data: dict, ticker: str, current_date: str) -> s
 # 修法与 stock_profile_node 同款：Python 原样转录追加在报告末尾，不靠 LLM 自觉。
 _SYS_LINE_PREFIXES = ("【SYS_GROWTH_YOY", "【SYS_LANDMINE", "【SYS_CYCLICAL", "EPS(TTM):")
 
+_PRICE_STATUS_LABELS = {
+    "intraday_provisional": "盘中临时价",
+    "official_daily": "正式收盘价",
+    "t_minus_1": "最近正式收盘价（T-1）",
+}
+
+
+def _extract_price_field(vendor_text: str, label: str):
+    match = re.search(rf"^{re.escape(label)}:\s*(.+?)\s*$", vendor_text or "", re.M)
+    if not match:
+        return None
+    value = match.group(1).strip()
+    return None if value in {"", "N/A", "None"} else value
+
+
+def _enforce_price_context(report: str, vendor_text: str) -> str:
+    """Prepend the vendor's deterministic valuation-price context to the report."""
+    status = _extract_price_field(vendor_text, "价格数据状态")
+    price = _extract_price_field(vendor_text, "估值基准价(元)")
+    if not status or not price:
+        return report
+
+    label = _PRICE_STATUS_LABELS.get(status, status)
+    date = _extract_price_field(vendor_text, "估值基准日期")
+    quote_time = _extract_price_field(vendor_text, "估值基准时间")
+    source = _extract_price_field(vendor_text, "估值基准来源")
+    official_close = _extract_price_field(vendor_text, "前收参考价(元,非当前价)")
+    official_date = _extract_price_field(vendor_text, "前收日期")
+
+    parts = [f"> **估值价格口径：{label} {price} 元**"]
+    if date:
+        parts.append(f"日期：{date}")
+    if quote_time:
+        parts.append(f"报价时间：{quote_time}")
+    if source:
+        parts.append(f"来源：{source}")
+    if official_close and status != "official_daily" and official_date != date:
+        parts.append(f"前收参考：{official_close} 元（非当前价）")
+        if official_date:
+            parts.append(f"前收日期：{official_date}")
+    return "｜".join(parts) + "\n\n" + report.lstrip()
+
 
 def _extract_sys_lines(vendor_text: str) -> list[str]:
     """从源数据文本里抽出机读行（防御式：空文本返回空列表）。"""
@@ -145,6 +188,14 @@ def create_fundamentals_analyst(llm):
         system_message = f"""【语言要求】你必须使用中文撰写所有分析报告和回复内容。股票代码、财务指标英文缩写（如 EPS、P/E、ROE 等）以及评级关键词（BUY/SELL/HOLD）请保留英文原文。
 
 你是一名专业的基本面分析师，负责分析公司的基本面信息并撰写全面的研究报告。
+
+## ⚠️ 价格口径（强制约束）
+
+- 「估值基准价(元)」是本报告唯一允许使用的当前价格；PE、PB、PS、总市值必须采用标有「按估值基准价调整」的数值
+- `价格数据状态=intraday_provisional` 时，必须写作「盘中价/盘中临时价」，严禁称为「收盘价」
+- `价格数据状态=official_daily` 时，同日正式日线是唯一当前价；严禁被收盘后实时回报价降级成「盘中临时价」
+- 「前收参考价(元,非当前价)」仅用于比较涨跌，严禁写成当前价、现价或估值计算基准
+- 报告标题、公司概况、估值分析、关键指标表中的价格和市值口径必须一致；不得混用盘中价与前收价
 
 ## ⚠️ 数值计算必须调用工具（强制约束）
 
@@ -353,7 +404,7 @@ SUMMARY:
 ## ⚠️ 数值类指标使用规范（PE/EPS/PB 等）
 - **PE(TTM)、动态PE、静态PE、EPS 等有标准计算公式的指标**：必须优先使用数据中「## PE估值（系统计算）」段落的「系统计算」值
 - **仅在「系统计算」值不可用时**，才可使用「API参考」值或自行计算
-- **如需自行计算**：必须写明公式并验证结果（示例: PE = 收盘价/年度EPS = 210.27/1.97 = 106.7），不允许凭记忆估算
+- **如需自行计算**：必须写明公式并验证结果（示例: PE = 估值基准价/年度EPS = 210.27/1.97 = 106.7），不允许凭记忆估算
 - **数据校验警告**：如果数据前方出现「⚠️ 数据质量校验警告」段落，请优先处理其建议
 
 当前日期：{current_date}。{instrument_context}{lang_instruction}"""
@@ -396,6 +447,7 @@ SUMMARY:
             result = llm_with_tools.invoke(messages)
 
         report = result.content if hasattr(result, "content") else str(result)
+        report = _enforce_price_context(report, raw_data.get("fundamentals", ""))
         # 机读行确定性传递（Python 兜底，不靠 LLM 转抄）
         report = _append_sys_lines(report, raw_data.get("fundamentals", ""))
 

@@ -1,6 +1,7 @@
 """测试 tushare_vendor.py 中系统计算 PS(TTM) 的功能。"""
 
 import pandas as pd
+import tradingagents.dataflows.tushare_vendor as tushare_vendor
 from tradingagents.dataflows.tushare_vendor import _compute_ttm_revenue_per_share_fina
 
 
@@ -108,6 +109,13 @@ def test_601138_scenario():
     print(f"✓ 工业富联场景测试通过: TTM每股营业收入 ≈ {result:.2f} 元")
 
 
+def test_daily_basic_total_share_converts_ten_thousand_shares_to_shares():
+    extract = getattr(tushare_vendor, "_extract_total_shares", None)
+    assert callable(extract), "daily_basic total_share unit converter is missing"
+    daily_basic = pd.DataFrame([{"total_share": 82_900.0}])
+    assert extract(daily_basic) == 829_000_000.0
+
+
 def run_all_tests():
     """运行所有测试。"""
     print("=" * 60)
@@ -120,6 +128,7 @@ def run_all_tests():
     test_invalid_shares()
     test_negative_revenue()
     test_601138_scenario()
+    test_daily_basic_total_share_converts_ten_thousand_shares_to_shares()
 
     print("\n" + "=" * 60)
     print("所有测试通过！✓")

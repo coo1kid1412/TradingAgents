@@ -35,6 +35,13 @@ def create_macro_context_node(llm):
 
 **重要**：你的判断会影响下游 stock_profile_node 对主题溢价（THEMATIC_PREMIUM）的判断 + RM Step 1 的行业景气度判断。**精准、可证伪、有依据**。
 
+**价格口径优先级（强制）**：
+- `official_daily`（同日正式日线）> `intraday_provisional`（同日盘中临时价）> `t_minus_1`（最近正式收盘价）
+- market 或 fundamentals 已标记 `official_daily` 时，正式收盘价是唯一当前价；不得被收盘后实时回报价改写成盘中临时价
+- market report 标记 `intraday_provisional` 时，盘中临时价是唯一当前价；fundamentals 中同日「估值基准价」用于其估值指标
+- 「前收参考价」只用于涨跌比较，前收参考价不得写成当前价、现价或今日收盘价
+- 若 market 与 fundamentals 的盘中报价时间略有不同，价格描述采用报价时间更晚者；不得退回 T-1 价格
+
 {instrument_context}
 
 当前日期：{trade_date}

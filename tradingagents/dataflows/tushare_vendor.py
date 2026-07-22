@@ -128,6 +128,85 @@ def _fetch_cached(prefix: str, ts_code: str, fetch_fn) -> Optional[pd.DataFrame]
     return _read_api_cache(prefix, ts_code, require_fresh=False)
 
 
+def _optional_float(value) -> Optional[float]:
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return None
+    return result if pd.notna(result) else None
+
+
+def _resolve_fundamentals_price_context(
+    ticker: str,
+    curr_date: Optional[str],
+    pro,
+    daily_basic: Optional[pd.DataFrame],
+) -> dict:
+    """Resolve the one price basis used by all price-sensitive valuations."""
+    context = {
+        "status": "unknown",
+        "price": None,
+        "date": None,
+        "time": None,
+        "source": "unknown",
+        "official_close": None,
+        "official_close_date": None,
+    }
+
+    if daily_basic is not None and not daily_basic.empty:
+        row = daily_basic.iloc[0]
+        official_close = _optional_float(row.get("close"))
+        raw_date_value = row.get("trade_date")
+        raw_date = str(raw_date_value).strip() if pd.notna(raw_date_value) else ""
+        official_date = to_standard_date(raw_date) if len(raw_date.replace("-", "")) >= 8 else None
+        context.update({
+            "status": "official_daily" if official_date and official_date == curr_date else "t_minus_1",
+            "price": official_close,
+            "date": official_date,
+            "source": "tushare_daily_basic",
+            "official_close": official_close,
+            "official_close_date": official_date,
+        })
+
+        # A completed same-day bar is authoritative. Some realtime providers
+        # keep returning the closing auction after 15:00; treating that replay
+        # as provisional would downgrade an already-final price.
+        if official_close is not None and official_date == curr_date:
+            return context
+
+    if curr_date:
+        try:
+            quote = fetch_intraday_quote(ticker, curr_date, tushare_api=pro)
+        except Exception as exc:
+            logger.warning("基本面盘中报价获取失败 %s: %s", ticker, exc)
+            quote = None
+        if quote is not None:
+            context.update({
+                "status": "intraday_provisional",
+                "price": quote.last,
+                "date": quote.trade_date,
+                "time": quote.quote_time.strftime("%Y-%m-%d %H:%M:%S"),
+                "source": quote.source,
+            })
+
+    return context
+
+
+def _adjust_snapshot_metric(value, price_ratio: Optional[float]) -> Optional[float]:
+    metric = _optional_float(value)
+    if metric is None:
+        return None
+    return metric * price_ratio if price_ratio is not None else metric
+
+
+def _extract_total_shares(daily_basic: Optional[pd.DataFrame]) -> Optional[float]:
+    """Return total shares in shares; Tushare daily_basic reports 万股."""
+    if daily_basic is None or daily_basic.empty:
+        return None
+    total_share_wan = _optional_float(daily_basic.iloc[0].get("total_share"))
+    return total_share_wan * 10_000 if total_share_wan is not None else None
+
+
 # fina 拉 40 期（≈10 年季度）：一次 API 成本与 5 期相同，但解锁周期股正常化估值
 # （ROE 十年中位 × BPS = normalized EPS、ROE 分位 = 周期位置）
 _FINA_FETCH_LIMIT = 40
@@ -840,8 +919,12 @@ def get_fundamentals(
     except Exception as e:
         logger.debug("获取利润表出错，PS(TTM) 可能无法计算: %s", e)
 
-    # 估值指标（PE / PB 等）—— 系统计算 PE，不依赖 API 的 pe_ttm
-    close_price = None
+    # 估值指标（PE / PB 等）—— daily_basic 提供正式快照，盘中报价提供统一估值基准价
+    valuation_price = None
+    price_context = {
+        "status": "unknown", "price": None, "date": None, "time": None,
+        "source": "unknown", "official_close": None, "official_close_date": None,
+    }
     api_pe_ttm = None
     daily_basic = None
     try:
@@ -865,32 +948,53 @@ def get_fundamentals(
         if daily_basic is not None and not daily_basic.empty:
             has_data = True
             r = daily_basic.iloc[0]
-            close_price = float(r["close"]) if pd.notna(r.get("close")) else None
             api_pe_ttm = float(r["pe_ttm"]) if pd.notna(r.get("pe_ttm")) else None
-            sections.append(f"收盘价(元): {r.get('close', 'N/A')}")
     except (TushareUnavailableError, TushareRateLimitError) as e:
         logger.warning("获取估值指标失败（接口限流或不可用），跳过: %s", e)
     except Exception as e:
         sections.append(f"# 获取估值指标出错：{e}\n")
 
+    price_context = _resolve_fundamentals_price_context(ticker, curr_date, pro, daily_basic)
+    valuation_price = price_context["price"]
+    official_close = price_context["official_close"]
+    price_ratio = (
+        valuation_price / official_close
+        if valuation_price is not None and official_close not in (None, 0)
+        else None
+    )
+    sections.append("## 估值价格口径")
+    sections.append(f"价格数据状态: {price_context['status']}")
+    sections.append(f"估值基准价(元): {valuation_price if valuation_price is not None else 'N/A'}")
+    sections.append(f"估值基准日期: {price_context['date'] or 'N/A'}")
+    sections.append(f"估值基准时间: {price_context['time'] or 'N/A'}")
+    sections.append(f"估值基准来源: {price_context['source']}")
+    if (
+        official_close is not None
+        and price_context["status"] != "official_daily"
+        and price_context["official_close_date"] != price_context["date"]
+    ):
+        sections.append(f"前收参考价(元,非当前价): {official_close}")
+        sections.append(f"前收日期: {price_context['official_close_date'] or 'N/A'}")
+    sections.append("")
+
     # 系统计算 PE（核心修复：不再依赖 Tushare pe_ttm，自行计算确保准确性）
     try:
         sections.append("## PE估值（系统计算）")
 
-        # 动态 PE(TTM)：收盘价 / TTM_EPS
+        # 动态 PE(TTM)：统一估值基准价 / TTM_EPS
         ttm_eps = _compute_ttm_eps(fina)
         # TTM_EPS 单独输出成可解析行——只要 fina 在(缓存即够)就有，不受收盘价/daily_basic 限流影响。
         # 下游 parse_eps_ttm 直读，确定性 PEG(SYS_FORWARD_EPS = EPS_TTM×(1+增速)) 才能稳定激活。
         if ttm_eps is not None:
             sections.append(f"EPS(TTM): {ttm_eps:.4f} 元（系统按 fina_indicator 滚动 4 季计算，下游直读）")
-        if close_price and ttm_eps:
-            dynamic_pe = round(close_price / ttm_eps, 2)
-            sections.append(f"动态PE(系统计算): {dynamic_pe}倍 (公式: 收盘价/TTM_EPS)")
+        if valuation_price and ttm_eps:
+            dynamic_pe = round(valuation_price / ttm_eps, 2)
+            sections.append(f"动态PE(系统计算): {dynamic_pe}倍 (公式: 估值基准价/TTM_EPS)")
         else:
-            sections.append("动态PE(系统计算): N/A (缺少收盘价或TTM_EPS)")
+            sections.append("动态PE(系统计算): N/A (缺少估值基准价或TTM_EPS)")
 
         # 周期股正常化估值机读行（非周期股返回空串不发射）——下游画像路由 + RM Step4 直读
-        cyclical_line = _format_cyclical_line(stock_industry, stock_name, fina, close_price)
+        cyclical_line = _format_cyclical_line(stock_industry, stock_name, fina, valuation_price)
         if cyclical_line:
             sections.append(cyclical_line)
 
@@ -904,27 +1008,31 @@ def get_fundamentals(
         if main_business_line:
             sections.append(main_business_line)
 
-        # 静态 PE：收盘价 / 年度 EPS
-        if fina is not None and not fina.empty and close_price:
+        # 静态 PE：统一估值基准价 / 年度 EPS
+        if fina is not None and not fina.empty and valuation_price:
             annual_mask = fina["end_date"].astype(str).str.endswith("1231")
-            annual_rows = fina[annual_mask]
+            annual_rows = fina[annual_mask].sort_values("end_date")
             if not annual_rows.empty:
                 annual_eps = float(annual_rows.iloc[-1].get("eps", 0))
                 if annual_eps > 0:
-                    static_pe = round(close_price / annual_eps, 2)
-                    sections.append(f"静态PE(系统计算): {static_pe}倍 (公式: 收盘价/年度EPS)")
+                    static_pe = round(valuation_price / annual_eps, 2)
+                    sections.append(f"静态PE(系统计算): {static_pe}倍 (公式: 估值基准价/年度EPS)")
                 else:
                     sections.append("静态PE(系统计算): N/A (年度EPS<=0)")
 
         # API 参考值（仅供对比，不作为主要依据）
-        if api_pe_ttm is not None:
-            sections.append(f"PE(TTM/API参考): {round(api_pe_ttm, 4)}倍 (Tushare daily_basic 直接返回，仅供参考)")
+        adjusted_api_pe = _adjust_snapshot_metric(api_pe_ttm, price_ratio)
+        if adjusted_api_pe is not None:
+            sections.append(
+                f"PE(TTM/API参考-按估值基准价调整): {round(adjusted_api_pe, 4)}倍 "
+                "(daily_basic 快照按价格比例调整，仅供参考)"
+            )
 
         # 偏差警告
-        if close_price and ttm_eps and api_pe_ttm is not None:
-            calc_pe = close_price / ttm_eps
-            if calc_pe > 0 and abs(api_pe_ttm - calc_pe) / calc_pe > 0.15:
-                deviation = round(abs(api_pe_ttm - calc_pe) / calc_pe * 100)
+        if valuation_price and ttm_eps and adjusted_api_pe is not None:
+            calc_pe = valuation_price / ttm_eps
+            if calc_pe > 0 and abs(adjusted_api_pe - calc_pe) / calc_pe > 0.15:
+                deviation = round(abs(adjusted_api_pe - calc_pe) / calc_pe * 100)
                 sections.append(f"⚠️ PE偏差警告: API值与系统计算值偏差 {deviation}%，以系统计算值为准")
 
         sections.append("")
@@ -936,12 +1044,8 @@ def get_fundamentals(
     try:
         sections.append("## PS(TTM)估值（系统计算）")
 
-        # 从 daily_basic 获取总股本（单位：股）
-        total_shares = None
-        if daily_basic is not None and not daily_basic.empty:
-            r = daily_basic.iloc[0]
-            # Tushare daily_basic 返回的 total_share 单位为股
-            total_shares = float(r["total_share"]) if pd.notna(r.get("total_share")) else None
+        # 从 daily_basic 获取总股本；接口单位为万股，统一换算为股再参与 PS 计算
+        total_shares = _extract_total_shares(daily_basic)
 
         # 系统计算 PS(TTM)：优先用 fina_indicator.tob_operate_income，fallback 到 income.revenue
         ttm_rev_ps = _compute_ttm_revenue_per_share_fina(fina, total_shares)
@@ -966,35 +1070,52 @@ def get_fundamentals(
                 )
                 revenue_source = "income.OPERATE_INCOME(fallback)"
 
-        if close_price and ttm_rev_ps:
-            calc_ps = round(close_price / ttm_rev_ps, 2)
-            sections.append(f"PS(TTM/系统计算): {calc_ps} (公式: 收盘价/TTM_每股营业收入, 数据源: {revenue_source})")
+        if valuation_price and ttm_rev_ps:
+            calc_ps = round(valuation_price / ttm_rev_ps, 2)
+            sections.append(f"PS(TTM/系统计算): {calc_ps} (公式: 估值基准价/TTM_每股营业收入, 数据源: {revenue_source})")
         else:
-            sections.append(f"PS(TTM/系统计算): N/A (缺少收盘价、总股本或营业收入数据)")
+            sections.append(f"PS(TTM/系统计算): N/A (缺少估值基准价、总股本或营业收入数据)")
 
         # API 参考值（仅供对比，不作为主要依据）
         if daily_basic is not None and not daily_basic.empty:
             r = daily_basic.iloc[0]
             api_ps_ttm = float(r["ps_ttm"]) if pd.notna(r.get("ps_ttm")) else None
-            if api_ps_ttm is not None:
-                sections.append(f"PS(TTM/API参考): {round(api_ps_ttm, 4)} (Tushare daily_basic 直接返回，仅供参考)")
+            adjusted_api_ps = _adjust_snapshot_metric(api_ps_ttm, price_ratio)
+            if adjusted_api_ps is not None:
+                sections.append(
+                    f"PS(TTM/API参考-按估值基准价调整): {round(adjusted_api_ps, 4)} "
+                    "(daily_basic 快照按价格比例调整，仅供参考)"
+                )
+        else:
+            api_ps_ttm = None
+            adjusted_api_ps = None
 
         # 偏差警告
-        if close_price and ttm_rev_ps and api_ps_ttm is not None:
-            calc_ps = close_price / ttm_rev_ps
-            if calc_ps > 0 and abs(api_ps_ttm - calc_ps) / calc_ps > 0.15:
-                deviation = round(abs(api_ps_ttm - calc_ps) / calc_ps * 100)
+        if valuation_price and ttm_rev_ps and adjusted_api_ps is not None:
+            calc_ps = valuation_price / ttm_rev_ps
+            if calc_ps > 0 and abs(adjusted_api_ps - calc_ps) / calc_ps > 0.15:
+                deviation = round(abs(adjusted_api_ps - calc_ps) / calc_ps * 100)
                 sections.append(f"⚠️ PS偏差警告: API值与系统计算值偏差 {deviation}%，以系统计算值为准")
 
         # PB / 市值（从 daily_basic 获取）
         if daily_basic is not None and not daily_basic.empty:
             r = daily_basic.iloc[0]
-            sections.append(f"PB: {r.get('pb', 'N/A')}")
-            total_mv = r.get('total_mv', None)
-            sections.append(f"总市值(万元): {total_mv if total_mv is not None else 'N/A'}")
-            if total_mv is not None and pd.notna(total_mv):
-                sections.append(f"总市值(亿元): {round(float(total_mv) / 10000, 2)}")
-            sections.append(f"流通市值(万元): {r.get('circ_mv', 'N/A')}")
+            adjusted_pb = _adjust_snapshot_metric(r.get("pb"), price_ratio)
+            adjusted_total_mv = _adjust_snapshot_metric(r.get("total_mv"), price_ratio)
+            adjusted_circ_mv = _adjust_snapshot_metric(r.get("circ_mv"), price_ratio)
+            sections.append(
+                f"PB: {round(adjusted_pb, 4) if adjusted_pb is not None else 'N/A'} (按估值基准价调整)"
+            )
+            sections.append(
+                "总市值(万元): "
+                f"{round(adjusted_total_mv, 2) if adjusted_total_mv is not None else 'N/A'} (按估值基准价调整)"
+            )
+            if adjusted_total_mv is not None:
+                sections.append(f"总市值(亿元): {round(adjusted_total_mv / 10000, 2)} (按估值基准价调整)")
+            sections.append(
+                "流通市值(万元): "
+                f"{round(adjusted_circ_mv, 2) if adjusted_circ_mv is not None else 'N/A'} (按估值基准价调整)"
+            )
         sections.append("")
     except Exception as e:
         logger.warning("系统计算 PS(TTM) 出错: %s", e)

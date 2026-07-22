@@ -132,11 +132,14 @@ def validate_fundamentals_data(raw_fundamentals_text: str) -> str:
 
     # 2. 用正则提取系统计算的 PE 和 EPS 做公式校验
     pe_match = re.search(r"动态PE\(系统计算\):\s*([\d.]+)\s*倍", raw_fundamentals_text)
-    close_match = re.search(r"收盘价\(元\):\s*([\d.]+)", raw_fundamentals_text)
-    if pe_match and close_match:
+    price_match = (
+        re.search(r"估值基准价\(元\):\s*([\d.]+)", raw_fundamentals_text)
+        or re.search(r"收盘价\(元\):\s*([\d.]+)", raw_fundamentals_text)
+    )
+    if pe_match and price_match:
         calc_pe = float(pe_match.group(1))
-        close_price = float(close_match.group(1))
-        implied_eps = close_price / calc_pe
+        valuation_price = float(price_match.group(1))
+        implied_eps = valuation_price / calc_pe
 
         # 检查 EPS 一致性
         eps_patterns = [
