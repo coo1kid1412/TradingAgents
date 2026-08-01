@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from statistics import pstdev
 import sys
 from unittest import TestCase, main
 
@@ -225,8 +226,51 @@ class CommonFeatureTests(TestCase):
 
         result = AShareFeatureStrategy().build(raw, history)
 
-        self.assertIsNotNone(result.features["volatility_ratio_5d_20d"])
-        self.assertNotEqual(result.features["ma20_slope"], 0.0)
+        returns = [closes[index] / closes[index - 1] - 1 for index in range(1, len(closes))]
+        expected_ratio = pstdev(returns[-5:]) / pstdev(returns[-20:])
+        expected_slope = (sum(closes[-20:]) / 20) / (sum(closes[-21:-1]) / 20) - 1
+        self.assertAlmostEqual(result.features["volatility_ratio_5d_20d"], expected_ratio)
+        self.assertAlmostEqual(result.features["ma20_slope"], expected_slope)
+
+    def test_prior_close_is_valid_only_for_premarket_not_intraday(self):
+        market = Market.US
+        as_of = datetime(2026, 9, 1, 14, 0, tzinfo=UTC)
+        prior_close = as_of - timedelta(days=1)
+        points = (
+            point("index_price", 100.0, prior_close, market=market, symbol="SPX"),
+            point("index_change_pct", 0.0, prior_close, market=market, symbol="SPX"),
+            point("open", 99.0, prior_close, market=market, symbol="SPX"),
+            point("high", 101.0, prior_close, market=market, symbol="SPX"),
+            point("low", 98.0, prior_close, market=market, symbol="SPX"),
+        )
+        premarket = snapshot(*points, market=market, at=as_of, session_slot="premarket")
+        intraday = snapshot(*points, market=market, at=as_of, session_slot="intraday")
+
+        self.assertAlmostEqual(USFeatureStrategy().build(premarket, ()).features["range_pct"], 3 / 99)
+        self.assertIsNone(USFeatureStrategy().build(intraday, ()).features["range_pct"])
+
+    def test_window_outside_gaps_do_not_invalidate_current_five_or_twenty_day_returns(self):
+        market = Market.US
+        history = tuple(
+            snapshot(
+                point("index_price", 100.0, AS_OF - timedelta(days=days), market=market, symbol="SPX"),
+                market=market,
+                at=AS_OF - timedelta(days=days),
+            )
+            for days in range(1, 23)
+        )
+        old_gap = snapshot(market=market, at=AS_OF - timedelta(days=22))
+        raw = snapshot(
+            point("index_price", 110.0, AS_OF, market=market, symbol="SPX"),
+            point("index_change_pct", 10.0, AS_OF, market=market, symbol="SPX"),
+            market=market,
+            session_slot="intraday",
+        )
+
+        result = USFeatureStrategy().build(raw, (old_gap, *history))
+
+        self.assertAlmostEqual(result.features["return_5d"], 0.1)
+        self.assertAlmostEqual(result.features["return_20d"], 0.1)
 
 
 class AShareFeatureTests(TestCase):
@@ -288,13 +332,13 @@ class USFeatureTests(TestCase):
             *history_from_series("vix", [20.0] * 20, market=market, symbol="VIX"),
         )
         raw = snapshot(
-            point("index_price", 100.0, AS_OF, market=market, symbol="SPX"),
-            point("index_change_pct", -1.0, AS_OF, market=market, symbol="SPX"),
+            point("index_price", 102.0, AS_OF, market=market, symbol="SPX"),
+            point("index_change_pct", 2.0, AS_OF, market=market, symbol="SPX"),
             point("index_price", 98.0, AS_OF, market=market, symbol="HYG"),
-            point("index_price", 100.0, AS_OF, market=market, symbol="LQD"),
-            point("index_price", 95.0, AS_OF, market=market, symbol="RUT"),
-            point("index_price", 97.0, AS_OF, market=market, symbol="NDX"),
-            point("index_price", 96.0, AS_OF, market=market, symbol="SOXX"),
+            point("index_price", 101.0, AS_OF, market=market, symbol="LQD"),
+            point("index_price", 99.0, AS_OF, market=market, symbol="RUT"),
+            point("index_price", 103.0, AS_OF, market=market, symbol="NDX"),
+            point("index_price", 97.0, AS_OF, market=market, symbol="SOXX"),
             point("vix", 25.0, AS_OF, market=market, symbol="VIX", source="vix_source"),
             point("vix3m", 24.0, AS_OF, market=market, symbol="VIX3M"),
             market=market,
@@ -303,12 +347,12 @@ class USFeatureTests(TestCase):
 
         result = USFeatureStrategy().build(raw, history)
 
-        self.assertAlmostEqual(result.features["hyg_lqd_relative_return_5d"], -0.02)
+        self.assertAlmostEqual(result.features["hyg_lqd_relative_return_5d"], -0.03)
         self.assertAlmostEqual(result.features["vix_vix3m_ratio"], 25 / 24)
         self.assertAlmostEqual(result.features["vix_change_5d"], 0.25)
-        self.assertAlmostEqual(result.features["russell_spx_relative_return_5d"], -0.05)
-        self.assertAlmostEqual(result.features["nasdaq_spx_relative_return_5d"], -0.03)
-        self.assertAlmostEqual(result.features["soxx_spx_relative_return_5d"], -0.04)
+        self.assertAlmostEqual(result.features["russell_spx_relative_return_5d"], -0.03)
+        self.assertAlmostEqual(result.features["nasdaq_spx_relative_return_5d"], 0.01)
+        self.assertAlmostEqual(result.features["soxx_spx_relative_return_5d"], -0.05)
         self.assertTrue(result.features["credit_volatility_transition"])
         self.assertEqual(result.reliability_grade, "C")
         vix_evidence = next(item for item in result.evidence if item.evidence_id.split(":")[2] == "vix")
@@ -375,6 +419,69 @@ class USFeatureTests(TestCase):
         self.assertEqual(relative_evidence.as_of_time, AS_OF)
         self.assertEqual(result.source_times["spx_history:first"], old)
         self.assertEqual(result.source_times["spx_history:last"], old)
+
+    def test_return_evidence_excludes_remote_history_and_credit_lists_four_legs(self):
+        market = Market.US
+        history = tuple(
+            snapshot(
+                point("index_price", 100.0, AS_OF - timedelta(days=days), market=market, symbol="SPX", source=f"remote_{days}"),
+                market=market,
+                at=AS_OF - timedelta(days=days),
+            )
+            for days in range(2, 9)
+        ) + (
+            snapshot(point("index_price", 100.0, AS_OF - timedelta(days=1), market=market, symbol="SPX", source="near"), market=market, at=AS_OF - timedelta(days=1)),
+        )
+        raw = snapshot(
+            point("index_price", 101.0, AS_OF, market=market, symbol="SPX", source="now"),
+            point("index_change_pct", 1.0, AS_OF, market=market, symbol="SPX"),
+            point("index_price", 98.0, AS_OF, market=market, symbol="HYG", source="hyg"),
+            point("index_price", 100.0, AS_OF, market=market, symbol="LQD", source="lqd"),
+            point("vix", 25.0, AS_OF, market=market, symbol="VIX", source="vix"),
+            point("vix3m", 24.0, AS_OF, market=market, symbol="VIX3M", source="vix3m"),
+            market=market,
+            session_slot="intraday",
+        )
+
+        result = USFeatureStrategy().build(raw, history)
+
+        return_evidence = next(item for item in result.evidence if item.evidence_id.split(":")[2] == "return_1d")
+        credit_evidence = next(item for item in result.evidence if item.evidence_id.split(":")[2] == "credit_volatility_transition")
+        self.assertEqual(return_evidence.source, "near+now")
+        self.assertEqual(credit_evidence.source, "hyg+lqd+vix+vix3m")
+
+    def test_intraday_alignment_accepts_120_seconds_and_rejects_121(self):
+        market = Market.US
+        def build(skew: int):
+            return snapshot(
+                point("index_price", 100.0, AS_OF, market=market, symbol="SPX"),
+                point("index_change_pct", 0.0, AS_OF, market=market, symbol="SPX"),
+                point("vix", 24.0, AS_OF, market=market, symbol="VIX"),
+                point("vix3m", 23.0, AS_OF - timedelta(seconds=skew), market=market, symbol="VIX3M"),
+                market=market,
+                session_slot="intraday",
+            )
+
+        self.assertAlmostEqual(USFeatureStrategy().build(build(120), ()).features["vix_vix3m_ratio"], 24 / 23)
+        self.assertIsNone(USFeatureStrategy().build(build(121), ()).features["vix_vix3m_ratio"])
+
+    def test_source_times_excludes_visible_but_unused_raw_metadata(self):
+        raw = RawMarketSnapshot(
+            market=Market.US,
+            as_of_time=AS_OF,
+            session_slot="intraday",
+            points=(
+                point("index_price", 100.0, AS_OF, market=Market.US, symbol="SPX", source="used"),
+                point("index_change_pct", 0.0, AS_OF, market=Market.US, symbol="SPX", source="quality_only"),
+            ),
+            source_times={"unused_adapter": AS_OF},
+        )
+
+        result = USFeatureStrategy().build(raw, ())
+
+        self.assertNotIn("unused_adapter:first", result.source_times)
+        self.assertNotIn("quality_only:first", result.source_times)
+        self.assertEqual(result.source_times["used:first"], AS_OF)
 
 
 if __name__ == "__main__":

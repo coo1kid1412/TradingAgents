@@ -81,7 +81,7 @@ _US_METADATA = {
     "russell_spx_relative_return_5d": _metadata("Russell 2000 and S&P 500 closes", "6 aligned observations visible by as_of", "more negative is risk-off", "ratio"),
     "nasdaq_spx_relative_return_5d": _metadata("Nasdaq and S&P 500 closes", "6 aligned observations visible by as_of", "more negative is risk-off", "ratio"),
     "soxx_spx_relative_return_5d": _metadata("SOXX and S&P 500 closes", "6 aligned observations visible by as_of", "more negative is risk-off", "ratio"),
-    "credit_volatility_transition": _metadata("HYG LQD VIX VIX3M", "credit and volatility inputs visible by as_of", "true is risk-off", "boolean"),
+    "credit_volatility_transition": _metadata("HYG LQD VIX VIX3M", "6 aligned HYG/LQD/VIX observations plus current aligned VIX3M visible by as_of", "true is risk-off", "boolean"),
 }
 
 FEATURE_METADATA = {**_COMMON_METADATA, **_A_SHARE_METADATA, **_US_METADATA}
@@ -153,7 +153,8 @@ def _visible_history(raw: RawMarketSnapshot, prior_history: Iterable[RawMarketSn
     merged.append(raw)
     latest_by_day: dict[object, RawMarketSnapshot] = {}
     for item in merged:
-        latest_by_day[_market_day(item.as_of_time, raw.market)] = item
+        observation_date = _observation_date(item, raw.market) or _market_day(item.as_of_time, raw.market)
+        latest_by_day[observation_date] = item
     return tuple(sorted(latest_by_day.values(), key=lambda item: item.as_of_time))
 
 
@@ -167,12 +168,41 @@ def _is_intraday_slot(session_slot: str) -> bool:
     return normalized in {"intraday", "open", "regular", "session"} or "intraday" in normalized
 
 
-def _aligned(points: Iterable[MarketDataPoint | None], market: Market, session_slot: str) -> bool:
+def _is_premarket_slot(session_slot: str) -> bool:
+    normalized = session_slot.strip().lower()
+    return normalized in {"premarket", "pre-market", "before_open"} or "premarket" in normalized
+
+
+def _benchmark_point(points: Iterable[MarketDataPoint], market: Market) -> MarketDataPoint | None:
+    symbols = A_SHARE_BROAD_BENCHMARKS if market == Market.A_SHARE else US_BROAD_BENCHMARKS
+    return next((_point_for(points, "index_price", symbol) for symbol in symbols if _point_for(points, "index_price", symbol)), None)
+
+
+def _observation_date(snapshot: RawMarketSnapshot, market: Market) -> object | None:
+    points = _points_at(snapshot)
+    benchmark = _benchmark_point(points, market)
+    if benchmark is not None:
+        return _market_day(benchmark.data_time, market)
+    if not points:
+        return None
+    return max((_market_day(point.data_time, market) for point in points), default=None)
+
+
+def _current_observation_is_usable(raw: RawMarketSnapshot) -> bool:
+    observation_date = _observation_date(raw, raw.market)
+    if observation_date is None:
+        return False
+    return _is_premarket_slot(raw.session_slot) or observation_date == _market_day(raw.as_of_time, raw.market)
+
+
+def _aligned(
+    points: Iterable[MarketDataPoint | None], market: Market, session_slot: str, observation_date: object | None
+) -> bool:
     candidates = tuple(points)
     values = tuple(point for point in candidates if point is not None)
     if not values or len(values) != len(candidates):
         return False
-    if len({_market_day(point.data_time, market) for point in values}) != 1:
+    if observation_date is None or any(_market_day(point.data_time, market) != observation_date for point in values):
         return False
     return not _is_intraday_slot(session_slot) or (
         max(point.data_time for point in values) - min(point.data_time for point in values)
@@ -188,6 +218,7 @@ def _history_aligned(
             tuple(_point_for(_points_at(item), field, symbol) for field, symbol in inputs),
             market,
             item.session_slot,
+            _observation_date(item, market),
         )
         for item in history
     )
@@ -268,11 +299,9 @@ def _percentile(current: float | None, history: pd.Series, horizon: int) -> floa
 
 def _source_times(raw: RawMarketSnapshot, points: Iterable[MarketDataPoint]) -> dict[str, datetime]:
     by_source: dict[str, list[datetime]] = {}
-    for source, timestamp in raw.source_times.items():
-        if timestamp <= raw.as_of_time:
-            by_source.setdefault(source, []).append(timestamp)
     for point in points:
-        by_source.setdefault(point.source, []).append(point.data_time)
+        if point.data_time <= raw.as_of_time:
+            by_source.setdefault(point.source, []).append(point.data_time)
     if not by_source:
         return {"snapshot:first": raw.as_of_time, "snapshot:last": raw.as_of_time}
     return {
@@ -318,6 +347,8 @@ class _FeatureStrategy:
     def _common_features(self, history: tuple[RawMarketSnapshot, ...], selected: tuple[MarketDataPoint, ...]) -> dict[str, Any]:
         symbol = self._main_symbol(selected)
         close = _series(history, "index_price", symbol) if symbol is not None else pd.Series([float("nan")] * len(history))
+        if not _current_observation_is_usable(history[-1]):
+            close.iloc[-1] = float("nan")
         current = _last(close)
         volumes = _series(history, "volume", symbol) if symbol is not None else pd.Series([float("nan")] * len(history))
         high_point = _point_for(selected, "high", symbol) if symbol is not None else None
@@ -334,7 +365,12 @@ class _FeatureStrategy:
         range_pct = None if high is None or low is None or open_value in (None, 0) else (high - low) / open_value
         close_location = None if high is None or low is None or current is None or high == low else (current - low) / (high - low)
         phase = derive_market_phase(_drawdown(close, 20))
-        ohlc_aligned = _aligned((open_point, high_point, low_point, _point_for(selected, "index_price", symbol)), self.market, history[-1].session_slot)
+        ohlc_aligned = _current_observation_is_usable(history[-1]) and _aligned(
+            (open_point, high_point, low_point, _point_for(selected, "index_price", symbol)),
+            self.market,
+            history[-1].session_slot,
+            _observation_date(history[-1], self.market),
+        )
         return {
             "return_1d": _return(close, 1), "return_5d": _return(close, 5), "return_20d": _return(close, 20),
             "return_60d": _return(close, 60), "return_120d": _return(close, 120), "return_252d": _return(close, 252),
@@ -376,8 +412,10 @@ class _FeatureStrategy:
         elif name in _A_SHARE_METADATA:
             field, field_symbol = _EVIDENCE_INPUTS[name]
             inputs = [(field, field_symbol)]
-        elif name in {"hyg_lqd_relative_return_5d", "hyg_lqd_relative_return_20d", "credit_volatility_transition"}:
+        elif name in {"hyg_lqd_relative_return_5d", "hyg_lqd_relative_return_20d"}:
             inputs = [("index_price", "HYG"), ("index_price", "LQD")]
+        elif name == "credit_volatility_transition":
+            inputs = [("index_price", "HYG"), ("index_price", "LQD"), ("vix", "VIX"), ("vix3m", "VIX3M")]
         elif name == "vix_vix3m_ratio":
             inputs = [("vix", "VIX"), ("vix3m", "VIX3M")]
         elif name in {"vix", "vix_change_5d"}:
@@ -385,12 +423,36 @@ class _FeatureStrategy:
         elif name.endswith("spx_relative_return_5d"):
             leg = {"russell_spx_relative_return_5d": "RUT", "nasdaq_spx_relative_return_5d": "NDX", "soxx_spx_relative_return_5d": "SOXX"}[name]
             inputs = [("index_price", leg), ("index_price", "SPX")]
+        windows = {
+            "return_1d": 2, "return_5d": 6, "return_20d": 21, "return_60d": 61,
+            "return_120d": 121, "return_252d": 253, "drawdown_20d": 20, "drawdown_60d": 60,
+            "drawdown_252d": 252, "market_phase": 20, "ma20_distance": 20, "ma50_distance": 50,
+            "ma200_distance": 200, "ma20_slope": 21, "ma50_slope": 51, "ma200_slope": 201,
+            "realized_volatility_5d": 6, "realized_volatility_20d": 21, "realized_volatility_60d": 61,
+            "volatility_ratio_5d_20d": 21, "volatility_ratio_20d_60d": 61, "volume_zscore_20d": 20,
+            "margin_balance_growth_20d": 21, "margin_balance_contracting_from_high": 21,
+            "valuation_percentile_20d": 21, "turnover_percentile_20d": 21, "shibor_3m_change_20d": 21,
+            "hyg_lqd_relative_return_5d": 6, "hyg_lqd_relative_return_20d": 21, "vix_change_5d": 6,
+            "russell_spx_relative_return_5d": 6, "nasdaq_spx_relative_return_5d": 6,
+            "soxx_spx_relative_return_5d": 6, "credit_volatility_transition": 6,
+        }
         current_only = {
             "breadth_up_pct", "breadth_above_ma20_pct", "new_low_20d_pct", "industry_decline_pct",
-            "margin_buying", "limit_down_pct", "shibor_3m", "vix",
+            "margin_buying", "limit_down_pct", "shibor_3m", "vix", "vix_vix3m_ratio", "range_pct", "close_location",
         }
+        if name == "credit_volatility_transition":
+            result = []
+            for item in history[-6:]:
+                visible = _points_at(item)
+                for field, input_symbol in (("index_price", "HYG"), ("index_price", "LQD"), ("vix", "VIX")):
+                    point = _point_for(visible, field, input_symbol)
+                    if point is not None:
+                        result.append(point)
+            vix3m = _point_for(_points_at(history[-1]), "vix3m", "VIX3M")
+            return tuple(result + ([vix3m] if vix3m is not None else []))
         result = []
-        for item in history[-1:] if name in current_only else history:
+        window = 1 if name in current_only else windows.get(name, 1)
+        for item in history[-window:]:
             visible = _points_at(item)
             for field, input_symbol in inputs:
                 point = _point_for(visible, field, input_symbol)
@@ -449,17 +511,28 @@ class USFeatureStrategy(_FeatureStrategy):
         vix3m_point = _point_for(selected, "vix3m", "VIX3M")
         hyg5, lqd5 = _return(hyg, 5), _return(lqd, 5)
         hyg20, lqd20 = _return(hyg, 20), _return(lqd, 20)
-        credit_aligned = _aligned((hyg_point, lqd_point), self.market, history[-1].session_slot) and _history_aligned(
-            history, self.market, (("index_price", "HYG"), ("index_price", "LQD"))
+        credit_current_aligned = _current_observation_is_usable(history[-1]) and _aligned(
+            (hyg_point, lqd_point), self.market, history[-1].session_slot, _observation_date(history[-1], self.market)
         )
-        relative5 = hyg5 - lqd5 if credit_aligned and hyg5 is not None and lqd5 is not None else None
-        relative20 = hyg20 - lqd20 if credit_aligned and hyg20 is not None and lqd20 is not None else None
+        credit5_aligned = credit_current_aligned and _history_aligned(
+            history[-6:], self.market, (("index_price", "HYG"), ("index_price", "LQD"))
+        )
+        credit20_aligned = credit_current_aligned and _history_aligned(
+            history[-21:], self.market, (("index_price", "HYG"), ("index_price", "LQD"))
+        )
+        relative5 = hyg5 - lqd5 if credit5_aligned and hyg5 is not None and lqd5 is not None else None
+        relative20 = hyg20 - lqd20 if credit20_aligned and hyg20 is not None and lqd20 is not None else None
         vix_change = _return(vix, 5)
-        vix_ratio = _ratio(_last(vix), _last(vix3m)) if _aligned((vix_point, vix3m_point), self.market, history[-1].session_slot) else None
+        vix_ratio = _ratio(_last(vix), _last(vix3m)) if _current_observation_is_usable(history[-1]) and _aligned(
+            (vix_point, vix3m_point), self.market, history[-1].session_slot, _observation_date(history[-1], self.market)
+        ) else None
         relative = lambda symbol: self._relative_return(
             _series(history, "index_price", symbol), spx, 5,
-            _aligned((_point_for(selected, "index_price", symbol), spx_point), self.market, history[-1].session_slot)
-            and _history_aligned(history, self.market, (("index_price", symbol), ("index_price", "SPX"))),
+            _current_observation_is_usable(history[-1]) and _aligned(
+                (_point_for(selected, "index_price", symbol), spx_point), self.market, history[-1].session_slot,
+                _observation_date(history[-1], self.market),
+            )
+            and _history_aligned(history[-6:], self.market, (("index_price", symbol), ("index_price", "SPX"))),
         )
         return {
             "hyg_lqd_relative_return_5d": relative5,
