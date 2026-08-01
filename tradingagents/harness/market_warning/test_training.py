@@ -7,14 +7,15 @@ import json
 import subprocess
 import sys
 import tempfile
-import tomllib
 from datetime import datetime, timezone
 from pathlib import Path
 from unittest import TestCase, main
 
+import exchange_calendars
 import joblib
 import numpy as np
 import pandas as pd
+import sklearn
 from sklearn.impute import SimpleImputer
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import average_precision_score, brier_score_loss
@@ -388,6 +389,26 @@ class ModelTrainingTests(TestCase):
         self.assertGreaterEqual(report.constant_base_rate_brier, 0)
         self.assertGreaterEqual(report.expected_calibration_error, 0)
 
+    def test_evaluate_model_requires_explicit_point_in_time_validation_marker(self):
+        train = _dated_frame("2007-01-01", 120)
+        calibration = _dated_frame("2014-01-01", 60)
+        test = _dated_frame("2020-01-02", 80)
+        bundle = fit_model(train, calibration, Market.US, "1d")
+        test.attrs.clear()
+
+        with self.assertRaisesRegex(ValueError, "point-in-time validated"):
+            evaluate_model(bundle, test)
+
+    def test_evaluate_model_rejects_future_feature_availability(self):
+        train = _dated_frame("2007-01-01", 120)
+        calibration = _dated_frame("2014-01-01", 60)
+        test = _dated_frame("2020-01-02", 80)
+        bundle = fit_model(train, calibration, Market.US, "1d")
+        test.loc[3, "feature_available_at"] = test.loc[3, "as_of_time"] + pd.Timedelta(seconds=1)
+
+        with self.assertRaisesRegex(ValueError, "feature_available_at"):
+            evaluate_model(bundle, test)
+
 
 class TrainingCommandTests(TestCase):
     def _run(self, *arguments):
@@ -428,6 +449,19 @@ class TrainingCommandTests(TestCase):
             )
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("Task 12", result.stderr)
+
+    def test_cli_rejects_unsafe_model_versions_before_dispatch(self):
+        for version in (".", "..", "../escape", "nested/version", r"nested\version", "/absolute"):
+            with self.subTest(version=version):
+                result = self._run(
+                    "train",
+                    "--start", "2000-01-01",
+                    "--test-end", "2026-07-31",
+                    "--version", version,
+                )
+
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("--version", result.stderr)
 
     def test_train_and_evaluate_execute_with_validated_local_dataset(self):
         with tempfile.TemporaryDirectory(prefix="warning_cli_") as directory:
@@ -471,17 +505,14 @@ class TrainingCommandTests(TestCase):
             self.assertEqual(evaluated.returncode, 0, evaluated.stderr)
             self.assertEqual(json.loads(evaluated.stdout)["horizon"], "1d")
 
-    def test_lock_contains_declared_task6_dependencies(self):
-        with (PROJECT_ROOT / "uv.lock").open("rb") as stream:
-            lock = tomllib.load(stream)
-        project = next(package for package in lock["package"] if package["name"] == "tradingagents")
-        dependency_names = {dependency["name"] for dependency in project["dependencies"]}
-        requirements = {requirement["name"]: requirement.get("specifier") for requirement in project["metadata"]["requires-dist"]}
+    def test_task6_dependencies_import_with_supported_versions(self):
+        sklearn_version = tuple(int(part) for part in sklearn.__version__.split(".")[:2])
+        calendars_version = tuple(int(part) for part in exchange_calendars.__version__.split(".")[:2])
 
-        self.assertIn("scikit-learn", dependency_names)
-        self.assertIn("exchange-calendars", dependency_names)
-        self.assertEqual(requirements["scikit-learn"], ">=1.7,<2")
-        self.assertEqual(requirements["exchange-calendars"], ">=4.11,<5")
+        self.assertGreaterEqual(sklearn_version, (1, 7))
+        self.assertLess(sklearn_version, (2, 0))
+        self.assertGreaterEqual(calendars_version, (4, 11))
+        self.assertLess(calendars_version, (5, 0))
 
 
 if __name__ == "__main__":

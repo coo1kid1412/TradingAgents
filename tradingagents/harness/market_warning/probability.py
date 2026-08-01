@@ -13,7 +13,7 @@ from typing import Any, Callable, Mapping, Protocol
 import joblib
 
 from .domain import DataStatus, FeatureSnapshot, Market, MarketPhase, QuantRiskAssessment
-from .training import ModelBundle
+from .training import ModelBundle, validate_model_version
 
 
 class ModelRegistry(Protocol):
@@ -31,8 +31,11 @@ def save_model_bundle(
 ) -> dict[str, Any]:
     """Persist one immutable joblib artifact and register its checksum metadata."""
 
+    model_version = validate_model_version(bundle.model_version)
     root = Path(artifact_root).resolve()
-    target_dir = root / bundle.model_version
+    target_dir = (root / model_version).resolve()
+    if target_dir.parent != root:
+        raise ValueError("resolved model artifact directory must remain below artifact_root")
     target_dir.mkdir(parents=True, exist_ok=True)
     target = target_dir / f"{bundle.market.value}-{bundle.horizon}.joblib"
     descriptor, temporary_name = tempfile.mkstemp(prefix=f".{target.name}.", suffix=".tmp", dir=target_dir)

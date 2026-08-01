@@ -145,6 +145,41 @@ class ProbabilityArtifactTests(TestCase):
             self.assertEqual(record["horizon"], horizon)
             self.assertTrue(record["active"])
 
+    def test_save_model_bundle_rejects_unsafe_model_version_components(self):
+        model_root = self.directory / "models"
+        absolute_version = str(self.directory / "absolute-target")
+        unsafe_versions = (
+            "",
+            ".",
+            "..",
+            "../escape",
+            "nested/version",
+            r"nested\version",
+            absolute_version,
+            "x" * 65,
+        )
+        for version in unsafe_versions:
+            with self.subTest(version=version):
+                bundle = replace(self.bundles["1d"], model_version=version)
+
+                with self.assertRaisesRegex(ValueError, "model_version"):
+                    save_model_bundle(bundle, model_root, self.repository)
+
+        self.assertFalse(model_root.exists())
+
+    def test_save_model_bundle_rejects_resolved_directory_outside_artifact_root(self):
+        model_root = self.directory / "models"
+        model_root.mkdir()
+        outside = self.directory / "outside"
+        outside.mkdir()
+        (model_root / "safe-version").symlink_to(outside, target_is_directory=True)
+        bundle = replace(self.bundles["1d"], model_version="safe-version")
+
+        with self.assertRaisesRegex(ValueError, "artifact_root"):
+            save_model_bundle(bundle, model_root, self.repository)
+
+        self.assertEqual(list(outside.iterdir()), [])
+
     def test_predict_loads_two_independent_horizons_and_maps_contributors_to_evidence(self):
         self._register_both()
 

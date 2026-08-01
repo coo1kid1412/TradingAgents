@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 from dataclasses import dataclass
 from datetime import datetime
@@ -29,6 +30,9 @@ MODEL_VERSION = "market-warning-logistic-v1"
 CALIBRATION_VERSION = "platt-v1"
 EMBARGO_TRADING_DAYS = 3
 TEST_END = pd.Timestamp("2026-07-31", tz="UTC")
+_MODEL_VERSION_PATTERN = re.compile(
+    r"[A-Za-z0-9](?:[A-Za-z0-9._-]{0,62}[A-Za-z0-9])?\Z"
+)
 
 _LABEL_THRESHOLDS = {
     Market.A_SHARE: {"1d": -0.04, "3d": -0.06},
@@ -237,8 +241,8 @@ def fit_model(
     missing_calibration = set(feature_names).difference(calibration.columns)
     if missing_calibration:
         raise ValueError(f"calibration is missing features: {sorted(missing_calibration)}")
-    _validate_training_frame(train, feature_names)
-    _validate_training_frame(calibration, feature_names)
+    _validate_model_frame(train, feature_names, "training")
+    _validate_model_frame(calibration, feature_names, "calibration")
 
     x_train, y_train = _labeled_rows(train, feature_names, target)
     x_calibration, y_calibration = _labeled_rows(calibration, feature_names, target)
@@ -284,6 +288,7 @@ def fit_model(
 def evaluate_model(bundle: ModelBundle, test: pd.DataFrame) -> EvaluationReport:
     """Evaluate one frozen bundle without tuning it on the supplied rows."""
 
+    _validate_model_frame(test, bundle.feature_names, "test")
     target = _target_column(bundle.horizon)
     labeled = test.loc[test[target].notna()].copy()
     if labeled.empty:
@@ -344,14 +349,29 @@ def _target_column(horizon: str) -> str:
     return f"label_{horizon}"
 
 
-def _validate_training_frame(frame: pd.DataFrame, feature_names: Sequence[str]) -> None:
+def _validate_model_frame(
+    frame: pd.DataFrame,
+    feature_names: Sequence[str],
+    frame_name: str,
+) -> None:
     if frame.attrs.get("point_in_time_validated") is not True:
-        raise ValueError("training frame must carry an explicit point-in-time validated marker")
+        raise ValueError(f"{frame_name} frame must carry an explicit point-in-time validated marker")
     proof = frame.attrs.get("availability_proof")
     if not isinstance(proof, Mapping):
-        raise ValueError("training frame must document availability proof")
+        raise ValueError(f"{frame_name} frame must document availability proof")
     label_source = "close" if "close" in proof else "label_source"
     _validate_availability_proof(frame, tuple(feature_names) + (label_source,))
+
+
+def validate_model_version(model_version: str) -> str:
+    """Return a filesystem-safe model version component."""
+
+    if not isinstance(model_version, str) or not _MODEL_VERSION_PATTERN.fullmatch(model_version):
+        raise ValueError(
+            "model_version must be 1-64 ASCII letters, digits, dots, underscores, or hyphens "
+            "and must begin and end with a letter or digit"
+        )
+    return model_version
 
 
 def _validate_availability_proof(frame: pd.DataFrame, source_names: Sequence[str]) -> None:
@@ -545,6 +565,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         _validate_cli_window(args.start, args.test_end)
+        try:
+            validate_model_version(args.version)
+        except ValueError as exc:
+            raise ValueError(f"--version is invalid: {exc}") from exc
         if args.command == "backfill":
             raise ValueError(
                 "Task 12 input is not ready: backfill requires production data-source orchestration and cache auditing"
