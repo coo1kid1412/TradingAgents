@@ -314,7 +314,11 @@ class TushareDataAdapterTests(unittest.TestCase):
             ]
         )
 
-        by_date = _results_by_date(_FetchResult(frame, complete=False), "trade_date")
+        with patch(
+            "pandas.Series.eq",
+            side_effect=AssertionError("date splitting must not rescan the full frame per date"),
+        ):
+            by_date = _results_by_date(_FetchResult(frame, complete=False), "trade_date")
 
         self.assertTrue(by_date[date(2026, 7, 17)].complete)
         self.assertTrue(by_date[date(2026, 7, 20)].complete)

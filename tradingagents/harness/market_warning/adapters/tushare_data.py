@@ -61,13 +61,12 @@ def _results_by_date(
 ) -> dict[date, _FetchResult]:
     if result.frame.empty or date_column not in result.frame:
         return {}
-    parsed = result.frame[date_column].map(_row_date)
+    dated = result.frame.copy()
+    dated["_cache_date"] = dated[date_column].map(_row_date)
+    dated = dated.dropna(subset=["_cache_date"])
     return {
-        current: _FetchResult(
-            result.frame.loc[parsed.eq(current)].copy(),
-            True,
-        )
-        for current in sorted(set(parsed.dropna()))
+        current: _FetchResult(rows.drop(columns=["_cache_date"]).copy(), True)
+        for current, rows in dated.groupby("_cache_date", sort=True)
     }
 
 
