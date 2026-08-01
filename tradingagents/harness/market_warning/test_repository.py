@@ -25,6 +25,7 @@ from tradingagents.harness.market_warning.domain import (
     QuantRiskAssessment,
 )
 from tradingagents.harness.market_warning.adapters.sqlite_repository import SQLiteWarningRepository
+from tradingagents.harness.market_warning.policy import build_final_decision
 
 
 AS_OF = datetime(2026, 8, 1, 9, 35, tzinfo=timezone.utc)
@@ -130,6 +131,31 @@ def save_complete_decision(
 
 
 class SQLiteWarningRepositoryTests(TestCase):
+    def test_init_db_closes_its_schema_connection(self):
+        with temporary_database() as db_path:
+            opened = []
+            original_connect = _db.sqlite3.connect
+
+            def tracking_connect(*args, **kwargs):
+                connection = original_connect(*args, **kwargs)
+                opened.append(connection)
+                return connection
+
+            _db.sqlite3.connect = tracking_connect
+            try:
+                _db.init_db(db_path)
+            finally:
+                _db.sqlite3.connect = original_connect
+
+            self.assertEqual(len(opened), 1)
+            try:
+                opened[0].execute("SELECT 1")
+            except sqlite3.ProgrammingError:
+                pass
+            else:
+                opened[0].close()
+                self.fail("init_db left its schema connection open")
+
     def test_connect_initializes_all_six_warning_tables(self):
         with temporary_database() as db_path:
             with _db.connect(db_path) as connection:
@@ -144,6 +170,10 @@ class SQLiteWarningRepositoryTests(TestCase):
                     for row in connection.execute("PRAGMA table_info(market_warning_feature_snapshots)")
                     if row["name"] == "reliability_grade"
                 )
+                decision_columns = {
+                    row["name"]: row
+                    for row in connection.execute("PRAGMA table_info(market_warning_decisions)")
+                }
 
         self.assertTrue(
             {
@@ -156,6 +186,33 @@ class SQLiteWarningRepositoryTests(TestCase):
             }.issubset(tables)
         )
         self.assertEqual(reliability_not_null, 1)
+        self.assertEqual(decision_columns["valid_snapshot_count"]["notnull"], 1)
+        self.assertEqual(decision_columns["valid_snapshot_count"]["dflt_value"], "0")
+        self.assertIn("retained_risk_level", decision_columns)
+
+    def test_existing_decision_table_migration_is_idempotent(self):
+        with temporary_database() as db_path:
+            with sqlite3.connect(db_path) as connection:
+                connection.execute(
+                    "CREATE TABLE market_warning_decisions ("
+                    "id INTEGER PRIMARY KEY AUTOINCREMENT, feature_snapshot_id INTEGER NOT NULL UNIQUE, "
+                    "prediction_ids_json TEXT NOT NULL, reasoning_id INTEGER, baseline_level TEXT NOT NULL, "
+                    "final_level TEXT NOT NULL, transition TEXT NOT NULL, entry_gate TEXT NOT NULL, "
+                    "new_position_cap_pct REAL NOT NULL, holding_action TEXT NOT NULL, "
+                    "push_required INTEGER NOT NULL, data_status TEXT NOT NULL, reasons_json TEXT NOT NULL, "
+                    "model_version TEXT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)"
+                )
+
+            _db.init_db(db_path)
+            _db.init_db(db_path)
+
+            with sqlite3.connect(db_path) as connection:
+                columns = {
+                    row[1]: row for row in connection.execute("PRAGMA table_info(market_warning_decisions)")
+                }
+            self.assertEqual(columns["valid_snapshot_count"][3], 1)
+            self.assertEqual(columns["valid_snapshot_count"][4], "0")
+            self.assertIn("retained_risk_level", columns)
 
     def test_round_trip_persists_snapshot_two_horizons_reasoning_and_decision(self):
         with temporary_database() as db_path:
@@ -202,6 +259,102 @@ class SQLiteWarningRepositoryTests(TestCase):
                 repository.load_previous_decision(Market.A_SHARE, AS_OF + timedelta(minutes=1)),
                 make_decision(),
             )
+
+    def test_recovery_state_survives_repository_reloads_and_unknown_interruption(self):
+        with temporary_database() as db_path:
+            def persist(at, data_status, decision):
+                repository = SQLiteWarningRepository(db_path)
+                feature_snapshot_id = repository.save_feature_snapshot(
+                    make_snapshot(
+                        as_of_time=at,
+                        data_quality=data_status,
+                        reliability_grade="UNAVAILABLE" if data_status != "fresh" else "A",
+                        source_times={"exchange": at},
+                    )
+                )
+                prediction_ids = repository.save_predictions(feature_snapshot_id, make_quant())
+                repository.save_decision(feature_snapshot_id, prediction_ids, None, decision)
+                return SQLiteWarningRepository(db_path).load_latest_decision(Market.A_SHARE)
+
+            red_snapshot = make_snapshot(
+                as_of_time=AS_OF,
+                data_quality="fresh",
+                reliability_grade="A",
+                source_times={"exchange": AS_OF},
+            )
+            red = build_final_decision(
+                baseline="RED",
+                candidate="RED",
+                snapshot=red_snapshot,
+                previous=None,
+                valid_snapshot_count=0,
+            )
+            loaded = persist(AS_OF, "fresh", red)
+            self.assertEqual(loaded.final_level.value, "RED")
+            self.assertEqual(loaded.retained_risk_level.value, "RED")
+
+            for minutes in (5, 10):
+                at = AS_OF + timedelta(minutes=minutes)
+                stale_snapshot = make_snapshot(
+                    as_of_time=at,
+                    data_quality="stale",
+                    reliability_grade="UNAVAILABLE",
+                    source_times={"exchange": at},
+                )
+                unknown = build_final_decision(
+                    baseline="UNKNOWN",
+                    candidate="UNKNOWN",
+                    snapshot=stale_snapshot,
+                    previous=loaded.final_level,
+                    valid_snapshot_count=loaded.valid_snapshot_count,
+                    retained_risk_level=loaded.retained_risk_level,
+                )
+                loaded = persist(at, "stale", unknown)
+                self.assertEqual(loaded.final_level.value, "UNKNOWN")
+                self.assertEqual(loaded.valid_snapshot_count, 0)
+                self.assertEqual(loaded.retained_risk_level.value, "RED")
+
+            first_green_at = AS_OF + timedelta(minutes=15)
+            first_green_snapshot = make_snapshot(
+                as_of_time=first_green_at,
+                data_quality="fresh",
+                reliability_grade="A",
+                source_times={"exchange": first_green_at},
+            )
+            first_green = build_final_decision(
+                baseline="GREEN",
+                candidate="GREEN",
+                snapshot=first_green_snapshot,
+                previous=loaded.final_level,
+                valid_snapshot_count=loaded.valid_snapshot_count + 1,
+                retained_risk_level=loaded.retained_risk_level,
+            )
+            loaded = persist(first_green_at, "fresh", first_green)
+            self.assertEqual(loaded.final_level.value, "RED")
+            self.assertEqual(loaded.state_transition, "RECOVERY_PENDING")
+            self.assertEqual(loaded.valid_snapshot_count, 1)
+            self.assertEqual(loaded.retained_risk_level.value, "RED")
+
+            second_green_at = AS_OF + timedelta(minutes=20)
+            second_green_snapshot = make_snapshot(
+                as_of_time=second_green_at,
+                data_quality="fresh",
+                reliability_grade="A",
+                source_times={"exchange": second_green_at},
+            )
+            second_green = build_final_decision(
+                baseline="GREEN",
+                candidate="GREEN",
+                snapshot=second_green_snapshot,
+                previous=loaded.final_level,
+                valid_snapshot_count=loaded.valid_snapshot_count + 1,
+                retained_risk_level=loaded.retained_risk_level,
+            )
+            loaded = persist(second_green_at, "fresh", second_green)
+            self.assertEqual(loaded.final_level.value, "GREEN")
+            self.assertEqual(loaded.state_transition, "RECOVERY_RED_TO_GREEN")
+            self.assertEqual(loaded.valid_snapshot_count, 0)
+            self.assertIsNone(loaded.retained_risk_level)
 
     def test_alert_claim_is_atomic_across_repository_instances(self):
         with temporary_database() as db_path:

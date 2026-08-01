@@ -177,8 +177,8 @@ class SQLiteWarningRepository:
                 "INSERT INTO market_warning_decisions "
                 "(feature_snapshot_id, prediction_ids_json, reasoning_id, baseline_level, final_level, "
                 "transition, entry_gate, new_position_cap_pct, holding_action, push_required, "
-                "data_status, reasons_json, model_version) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "data_status, reasons_json, valid_snapshot_count, retained_risk_level, model_version) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     feature_snapshot_id,
                     _json_dump(list(prediction_ids)),
@@ -192,6 +192,8 @@ class SQLiteWarningRepository:
                     int(decision.push_required),
                     decision.data_status.value,
                     _json_dump(list(decision.decision_reasons)),
+                    decision.valid_snapshot_count,
+                    decision.retained_risk_level.value if decision.retained_risk_level is not None else None,
                     model_version,
                 ),
             )
@@ -204,7 +206,8 @@ class SQLiteWarningRepository:
         with _db.connect(self._db_path) as connection:
             row = connection.execute(
                 "SELECT d.baseline_level, d.final_level, d.transition, d.entry_gate, "
-                "d.new_position_cap_pct, d.holding_action, d.push_required, d.data_status, d.reasons_json "
+                "d.new_position_cap_pct, d.holding_action, d.push_required, d.data_status, d.reasons_json, "
+                "d.valid_snapshot_count, d.retained_risk_level "
                 "FROM market_warning_decisions AS d "
                 "INNER JOIN market_warning_feature_snapshots AS s ON s.id = d.feature_snapshot_id "
                 "WHERE s.market = ? AND (? IS NULL OR s.as_of_time <= ?) "
@@ -217,7 +220,8 @@ class SQLiteWarningRepository:
         with _db.connect(self._db_path) as connection:
             row = connection.execute(
                 "SELECT d.baseline_level, d.final_level, d.transition, d.entry_gate, "
-                "d.new_position_cap_pct, d.holding_action, d.push_required, d.data_status, d.reasons_json "
+                "d.new_position_cap_pct, d.holding_action, d.push_required, d.data_status, d.reasons_json, "
+                "d.valid_snapshot_count, d.retained_risk_level "
                 "FROM market_warning_decisions AS d "
                 "INNER JOIN market_warning_feature_snapshots AS s ON s.id = d.feature_snapshot_id "
                 "WHERE s.market = ? AND s.as_of_time < ? "
@@ -325,4 +329,6 @@ class SQLiteWarningRepository:
             push_required=bool(row["push_required"]),
             decision_reasons=tuple(json.loads(row["reasons_json"])),
             data_status=row["data_status"],
+            valid_snapshot_count=row["valid_snapshot_count"],
+            retained_risk_level=row["retained_risk_level"],
         )

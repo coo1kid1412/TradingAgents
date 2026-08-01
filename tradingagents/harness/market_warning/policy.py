@@ -24,12 +24,14 @@ HARD_TRIGGER_VERSION = "market-warning-hard-triggers-v1"
 _UNUSABLE_DATA = frozenset({DataStatus.CONFLICTED, DataStatus.STALE, DataStatus.INSUFFICIENT})
 _ORDERED_LEVELS = (RiskLevel.GREEN, RiskLevel.YELLOW, RiskLevel.ORANGE, RiskLevel.RED)
 _LEVEL_INDEX = {level: index for index, level in enumerate(_ORDERED_LEVELS)}
+_RELIABILITY_GRADES = frozenset({"A", "B", "C", "UNAVAILABLE"})
 _TRANSITION_SIGNAL_FIELDS = (
     "pressure_transition_signal",
     "volatility_acceleration_transition",
     "abnormal_range_weak_close_transition",
     "breadth_deterioration_transition",
     "credit_volatility_transition",
+    "equity_dispersion_transition",
 )
 
 
@@ -63,6 +65,10 @@ def _probability_ratio(probability: object, base_rate: object) -> float | None:
     ):
         return None
     return probability_value / base_rate_value
+
+
+def _valid_reliability_grade(value: object) -> bool:
+    return isinstance(value, str) and value in _RELIABILITY_GRADES
 
 
 def _feature(snapshot: FeatureSnapshot, name: str) -> float | None:
@@ -138,9 +144,11 @@ def baseline_level(quant: QuantRiskAssessment, snapshot: FeatureSnapshot) -> Ris
         return RiskLevel.UNKNOWN
     if snapshot.data_quality in _UNUSABLE_DATA:
         return RiskLevel.UNKNOWN
-    if str(getattr(quant, "reliability_grade", "UNAVAILABLE")).strip().upper() == "UNAVAILABLE":
+    quant_reliability = getattr(quant, "reliability_grade", None)
+    snapshot_reliability = snapshot.reliability_grade
+    if not _valid_reliability_grade(quant_reliability) or quant_reliability == "UNAVAILABLE":
         return RiskLevel.UNKNOWN
-    if snapshot.reliability_grade.strip().upper() == "UNAVAILABLE":
+    if not _valid_reliability_grade(snapshot_reliability) or snapshot_reliability == "UNAVAILABLE":
         return RiskLevel.UNKNOWN
 
     ratio_1d = _probability_ratio(
@@ -179,20 +187,43 @@ def apply_llm_adjustment(
         return RiskLevel.UNKNOWN
     if baseline_level_value == RiskLevel.UNKNOWN or not isinstance(context, LLMContextAssessment):
         return baseline_level_value
-    if context.reasoning_status.strip().lower() != "validated":
+    if not isinstance(context.reasoning_status, str) or context.reasoning_status != "validated":
+        return baseline_level_value
+    if not isinstance(context.market_scenario, str) or not context.market_scenario.strip():
+        return baseline_level_value
+    if not isinstance(context.action_reason, str) or not context.action_reason.strip():
+        return baseline_level_value
+    if (
+        not isinstance(context.causal_chain, tuple)
+        or not context.causal_chain
+        or any(not isinstance(item, str) or not item.strip() for item in context.causal_chain)
+    ):
+        return baseline_level_value
+    if (
+        not isinstance(context.overlooked_risks, tuple)
+        or any(not isinstance(item, str) for item in context.overlooked_risks)
+    ):
         return baseline_level_value
     confidence = _number(context.confidence)
     if confidence is None or confidence < 0.70:
         return baseline_level_value
 
-    supporting_ids = tuple(context.supporting_evidence_ids)
-    referenced_ids = supporting_ids + tuple(context.conflicting_evidence_ids)
-    valid_ids = frozenset(snapshot.evidence_ids)
+    if not isinstance(context.supporting_evidence_ids, tuple) or not isinstance(
+        context.conflicting_evidence_ids, tuple
+    ):
+        return baseline_level_value
+    supporting_ids = context.supporting_evidence_ids
+    conflicting_ids = context.conflicting_evidence_ids
+    referenced_ids = supporting_ids + conflicting_ids
+    valid_snapshot_ids = tuple(snapshot.evidence_ids)
+    if any(not isinstance(item, str) or not item for item in referenced_ids + valid_snapshot_ids):
+        return baseline_level_value
+    valid_ids = frozenset(valid_snapshot_ids)
     if len(set(supporting_ids)) < 2 or any(item not in valid_ids for item in referenced_ids):
         return baseline_level_value
 
     recommended = context.recommended_risk_level
-    if recommended == RiskLevel.UNKNOWN:
+    if not isinstance(recommended, RiskLevel) or recommended == RiskLevel.UNKNOWN:
         return baseline_level_value
     baseline_index = _LEVEL_INDEX[baseline_level_value]
     recommended_index = _LEVEL_INDEX[recommended]
@@ -327,10 +358,25 @@ def build_final_decision(
 ) -> FinalWarningDecision:
     """Build the persisted decision from explicit policy and state inputs."""
 
+    if not isinstance(snapshot, FeatureSnapshot):
+        raise ValueError("snapshot must be a FeatureSnapshot")
     baseline_value = _coerce_level(baseline)
+    candidate_value = _coerce_level(candidate)
+    unusable = snapshot.data_quality in _UNUSABLE_DATA
+    snapshot_reliability = snapshot.reliability_grade
+    if unusable or not _valid_reliability_grade(snapshot_reliability) or snapshot_reliability == "UNAVAILABLE":
+        baseline_value = RiskLevel.UNKNOWN
+        candidate_value = RiskLevel.UNKNOWN
+    elif baseline_value == RiskLevel.UNKNOWN:
+        candidate_value = RiskLevel.UNKNOWN
+    else:
+        baseline_index = _LEVEL_INDEX[baseline_value]
+        candidate_index = _LEVEL_INDEX.get(candidate_value)
+        if candidate_index not in {baseline_index, baseline_index + 1}:
+            candidate_value = RiskLevel.UNKNOWN
     result = transition(
         previous,
-        candidate,
+        candidate_value,
         valid_snapshot_count,
         retained_risk_level=retained_risk_level,
     )
@@ -350,4 +396,6 @@ def build_final_decision(
         push_required=result.push_required,
         decision_reasons=reasons,
         data_status=snapshot.data_quality,
+        valid_snapshot_count=result.next_valid_snapshot_count,
+        retained_risk_level=result.retained_risk_level,
     )

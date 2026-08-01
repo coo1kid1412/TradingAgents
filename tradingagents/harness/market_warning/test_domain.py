@@ -11,10 +11,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 from tradingagents.harness.market_warning.domain import (
     Evidence,
     FeatureSnapshot,
+    FinalWarningDecision,
     LLMContextAssessment,
     Market,
     QuantRiskAssessment,
     RawMarketSnapshot,
+    RiskLevel,
 )
 
 
@@ -54,6 +56,69 @@ def make_context(**changes):
 
 
 class DomainValidationTests(TestCase):
+    def test_final_decision_recovery_state_has_safe_validated_defaults(self):
+        decision = FinalWarningDecision(
+            baseline_level="GREEN",
+            final_level="GREEN",
+            state_transition="UNCHANGED",
+            entry_gate="OPEN",
+            new_position_cap_pct=100.0,
+            holding_action="HOLD",
+            push_required=False,
+            decision_reasons=(),
+            data_status="fresh",
+        )
+
+        self.assertEqual(decision.valid_snapshot_count, 0)
+        self.assertIsNone(decision.retained_risk_level)
+
+    def test_final_decision_validates_persisted_recovery_state(self):
+        valid = FinalWarningDecision(
+            baseline_level="UNKNOWN",
+            final_level="UNKNOWN",
+            state_transition="TO_UNKNOWN",
+            entry_gate="WAIT",
+            new_position_cap_pct=0.0,
+            holding_action="HOLD",
+            push_required=False,
+            decision_reasons=(),
+            data_status="stale",
+            valid_snapshot_count=1,
+            retained_risk_level="RED",
+        )
+        self.assertEqual(valid.retained_risk_level, RiskLevel.RED)
+
+        for count in (True, -1, 1.0, "1", None):
+            with self.subTest(count=count):
+                with self.assertRaises(ValueError):
+                    FinalWarningDecision(
+                        baseline_level="GREEN",
+                        final_level="GREEN",
+                        state_transition="UNCHANGED",
+                        entry_gate="OPEN",
+                        new_position_cap_pct=100.0,
+                        holding_action="HOLD",
+                        push_required=False,
+                        decision_reasons=(),
+                        data_status="fresh",
+                        valid_snapshot_count=count,
+                    )
+        for retained in ("GREEN", "YELLOW", "UNKNOWN", "BLUE"):
+            with self.subTest(retained=retained):
+                with self.assertRaises(ValueError):
+                    FinalWarningDecision(
+                        baseline_level="GREEN",
+                        final_level="GREEN",
+                        state_transition="UNCHANGED",
+                        entry_gate="OPEN",
+                        new_position_cap_pct=100.0,
+                        holding_action="HOLD",
+                        push_required=False,
+                        decision_reasons=(),
+                        data_status="fresh",
+                        retained_risk_level=retained,
+                    )
+
     def test_quant_assessment_rejects_probability_outside_unit_interval(self):
         with self.assertRaises(ValueError):
             make_quant(crash_1d_probability=1.01)

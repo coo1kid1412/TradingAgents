@@ -10,7 +10,15 @@ from unittest import TestCase, main
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 
-from tradingagents.harness.market_warning.domain import DataStatus, Market, MarketDataPoint, MarketPhase, RawMarketSnapshot
+from tradingagents.harness.market_warning.domain import (
+    DataStatus,
+    Market,
+    MarketDataPoint,
+    MarketPhase,
+    QuantRiskAssessment,
+    RawMarketSnapshot,
+    RiskLevel,
+)
 from tradingagents.harness.market_warning.features import (
     AShareFeatureStrategy,
     FEATURE_METADATA,
@@ -18,6 +26,7 @@ from tradingagents.harness.market_warning.features import (
     USFeatureStrategy,
     derive_market_phase,
 )
+from tradingagents.harness.market_warning.policy import baseline_level
 
 
 UTC = timezone.utc
@@ -72,6 +81,40 @@ def history_from_series(
 
 
 class CommonFeatureTests(TestCase):
+    def test_range_zscore_and_transition_metadata_have_auditable_missing_contracts(self):
+        names = (
+            "range_zscore_20d",
+            "abnormal_range_weak_close_transition",
+            "breadth_deterioration_transition",
+            "equity_dispersion_transition",
+        )
+        for name in names:
+            with self.subTest(name=name):
+                self.assertIn(name, FEATURE_METADATA)
+                self.assertEqual(
+                    FEATURE_METADATA[name]["missing"],
+                    "preserve as None; emit unavailable evidence",
+                )
+
+    def test_missing_inputs_preserve_new_transition_features_as_none(self):
+        a_result = AShareFeatureStrategy().build(
+            snapshot(point("index_price", 100.0, AS_OF), point("index_change_pct", 0.0, AS_OF)),
+            (),
+        )
+        us_result = USFeatureStrategy().build(
+            snapshot(
+                point("index_price", 100.0, AS_OF, market=Market.US, symbol="SPX"),
+                point("index_change_pct", 0.0, AS_OF, market=Market.US, symbol="SPX"),
+                market=Market.US,
+            ),
+            (),
+        )
+
+        self.assertIsNone(a_result.features["range_zscore_20d"])
+        self.assertIsNone(a_result.features["abnormal_range_weak_close_transition"])
+        self.assertIsNone(a_result.features["breadth_deterioration_transition"])
+        self.assertIsNone(us_result.features["equity_dispersion_transition"])
+
     def test_common_price_features_use_declared_rolling_horizons(self):
         closes = [100.0] * 19 + [110.0, 100.0]
         history = history_from_series("index_price", closes[:-1])
@@ -578,6 +621,121 @@ class USFeatureTests(TestCase):
         self.assertNotIn("unused_adapter:first", result.source_times)
         self.assertNotIn("quality_only:first", result.source_times)
         self.assertEqual(result.source_times["used:first"], AS_OF)
+
+
+class PolicyReachabilityIntegrationTests(TestCase):
+    @staticmethod
+    def quant(probability: float) -> QuantRiskAssessment:
+        return QuantRiskAssessment(
+            crash_1d_probability=probability,
+            crash_3d_probability=0.01,
+            market_phase=MarketPhase.FIRST_SHOCK,
+            base_rate_1d=0.01,
+            base_rate_3d=0.01,
+            reliability_grade="A",
+            model_version="integration-model",
+            calibration_version="integration-calibration",
+            top_contributors=(),
+        )
+
+    def test_a_share_strategy_emits_reachable_orange_pressure_transition(self):
+        old = AS_OF - timedelta(days=1)
+        history = (
+            snapshot(
+                point("index_price", 100.0, old, source="index_history"),
+                market=Market.A_SHARE,
+                at=old,
+            ),
+        )
+        raw = snapshot(
+            point("index_price", 99.0, AS_OF, source="index_now"),
+            point("index_change_pct", -1.0, AS_OF, source="index_now"),
+            point("breadth_up_pct", 25.0, AS_OF, source="breadth_now"),
+            point("industry_decline_pct", 80.0, AS_OF, source="industry_now"),
+            point("limit_down_pct", 0.5, AS_OF, source="limit_now"),
+        )
+
+        result = AShareFeatureStrategy().build(raw, history)
+
+        self.assertTrue(result.features["breadth_deterioration_transition"])
+        self.assertEqual(baseline_level(self.quant(0.04), result), RiskLevel.ORANGE)
+        evidence = next(
+            item for item in result.evidence
+            if item.evidence_id.split(":")[2] == "breadth_deterioration_transition"
+        )
+        self.assertEqual(evidence.source, "breadth_now+index_history+index_now+industry_now")
+        self.assertEqual(evidence.as_of_time, AS_OF)
+        self.assertIn("breadth_now:last", result.source_times)
+        self.assertIn("index_history:first", result.source_times)
+
+    def test_us_strategy_emits_non_credit_orange_transition(self):
+        market = Market.US
+        history = tuple(
+            snapshot(
+                *(
+                    point("index_price", 100.0, AS_OF - timedelta(days=days), market=market, symbol=symbol, source=f"{symbol}_history")
+                    for symbol in ("SPX", "RUT", "NDX", "SOXX")
+                ),
+                market=market,
+                at=AS_OF - timedelta(days=days),
+            )
+            for days in range(5, 0, -1)
+        )
+        raw = snapshot(
+            point("index_price", 99.0, AS_OF, market=market, symbol="SPX", source="SPX_now"),
+            point("index_change_pct", -1.0, AS_OF, market=market, symbol="SPX", source="SPX_now"),
+            point("index_price", 97.0, AS_OF, market=market, symbol="RUT", source="RUT_now"),
+            point("index_price", 97.5, AS_OF, market=market, symbol="NDX", source="NDX_now"),
+            point("index_price", 98.5, AS_OF, market=market, symbol="SOXX", source="SOXX_now"),
+            market=market,
+            session_slot="intraday",
+        )
+
+        result = USFeatureStrategy().build(raw, history)
+
+        self.assertTrue(result.features["equity_dispersion_transition"])
+        self.assertIsNone(result.features["credit_volatility_transition"])
+        self.assertEqual(baseline_level(self.quant(0.04), result), RiskLevel.ORANGE)
+        evidence = next(
+            item for item in result.evidence
+            if item.evidence_id.split(":")[2] == "equity_dispersion_transition"
+        )
+        self.assertNotEqual(evidence.source, "unavailable")
+        self.assertEqual(evidence.as_of_time, AS_OF)
+
+    def test_strategy_emitted_abnormal_range_reaches_hard_red(self):
+        ranges = [0.02] * 19 + [0.20]
+        history = tuple(
+            snapshot(
+                point("index_price", 100.0, AS_OF - timedelta(days=days), source="close_history"),
+                point("open", 100.0, AS_OF - timedelta(days=days), source="ohlc_history"),
+                point("high", 101.0, AS_OF - timedelta(days=days), source="ohlc_history"),
+                point("low", 99.0, AS_OF - timedelta(days=days), source="ohlc_history"),
+                at=AS_OF - timedelta(days=days),
+            )
+            for days in range(19, 0, -1)
+        )
+        raw = snapshot(
+            point("index_price", 92.0, AS_OF, source="close_now"),
+            point("index_change_pct", -8.0, AS_OF, source="close_now"),
+            point("open", 100.0, AS_OF, source="ohlc_now"),
+            point("high", 110.0, AS_OF, source="ohlc_now"),
+            point("low", 90.0, AS_OF, source="ohlc_now"),
+        )
+
+        result = AShareFeatureStrategy().build(raw, history)
+
+        expected_zscore = (ranges[-1] - sum(ranges) / len(ranges)) / pstdev(ranges)
+        self.assertAlmostEqual(result.features["range_zscore_20d"], expected_zscore)
+        self.assertTrue(result.features["abnormal_range_weak_close_transition"])
+        self.assertEqual(baseline_level(self.quant(0.01), result), RiskLevel.RED)
+        evidence = next(
+            item for item in result.evidence if item.evidence_id.split(":")[2] == "range_zscore_20d"
+        )
+        self.assertEqual(evidence.source, "ohlc_history+ohlc_now")
+        self.assertEqual(evidence.as_of_time, AS_OF)
+        self.assertIn("ohlc_history:first", result.source_times)
+        self.assertIn("ohlc_now:last", result.source_times)
 
 
 if __name__ == "__main__":

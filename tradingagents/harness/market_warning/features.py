@@ -53,8 +53,10 @@ _COMMON_METADATA = {
     "volatility_ratio_5d_20d": _metadata("broad index close", "21 observations visible by as_of", "higher is risk-off", "ratio"),
     "volatility_ratio_20d_60d": _metadata("broad index close", "61 observations visible by as_of", "higher is risk-off", "ratio"),
     "range_pct": _metadata("index high low open", "same-session OHLC visible by as_of", "higher is risk-off", "ratio"),
+    "range_zscore_20d": _metadata("index high low open", "20 aligned OHLC observations visible by as_of", "higher is stress", "z-score"),
     "close_location": _metadata("index high low close", "same-session OHLC visible by as_of", "lower is risk-off", "ratio"),
     "volume_zscore_20d": _metadata("broad index volume", "20 observations visible by as_of", "higher is stress", "z-score"),
+    "abnormal_range_weak_close_transition": _metadata("index OHLC and close history", "range z-score, close location, and 1-day return available", "true is risk-off", "boolean"),
 }
 
 _A_SHARE_METADATA = {
@@ -70,6 +72,7 @@ _A_SHARE_METADATA = {
     "limit_down_pct": _metadata("limit-down cross section", "point-in-time stock universe available", "higher is risk-off", "percent"),
     "shibor_3m": _metadata("Shibor", "disclosed observation visible by as_of", "higher is funding stress", "percent"),
     "shibor_3m_change_20d": _metadata("Shibor", "21 disclosed observations visible by as_of", "higher is funding stress", "percentage points"),
+    "breadth_deterioration_transition": _metadata("stock and industry breadth plus broad index", "current breadth and industry decline with 1-day broad-index return", "true is risk-off", "boolean"),
 }
 
 _US_METADATA = {
@@ -82,6 +85,7 @@ _US_METADATA = {
     "nasdaq_spx_relative_return_5d": _metadata("Nasdaq and S&P 500 closes", "6 aligned observations visible by as_of", "more negative is risk-off", "ratio"),
     "soxx_spx_relative_return_5d": _metadata("SOXX and S&P 500 closes", "6 aligned observations visible by as_of", "more negative is risk-off", "ratio"),
     "credit_volatility_transition": _metadata("HYG LQD VIX VIX3M", "aligned HYG/LQD credit weakness AND (aligned 5-day VIX change OR current aligned VIX/VIX3M ratio)", "true is risk-off", "boolean"),
+    "equity_dispersion_transition": _metadata("Russell Nasdaq SOXX and S&P closes", "6 aligned observations for all four equity legs", "true is risk-off", "boolean"),
 }
 
 FEATURE_METADATA = {**_COMMON_METADATA, **_A_SHARE_METADATA, **_US_METADATA}
@@ -257,6 +261,27 @@ def _observation_series(history: tuple[RawMarketSnapshot, ...], field: str, symb
     return pd.Series(values, dtype="float64")
 
 
+def _range_series(history: tuple[RawMarketSnapshot, ...], symbol: str) -> pd.Series:
+    values: list[float] = []
+    for item in history:
+        visible = _points_at(item)
+        open_point = _point_for(visible, "open", symbol)
+        high_point = _point_for(visible, "high", symbol)
+        low_point = _point_for(visible, "low", symbol)
+        aligned = _aligned(
+            (open_point, high_point, low_point),
+            item.market,
+            item.session_slot,
+            _observation_date(item, item.market),
+        )
+        open_value = _number(open_point.value) if open_point is not None else None
+        high = _number(high_point.value) if high_point is not None else None
+        low = _number(low_point.value) if low_point is not None else None
+        value = None if not aligned or open_value in (None, 0) or high is None or low is None else (high - low) / open_value
+        values.append(float("nan") if value is None else value)
+    return pd.Series(values, dtype="float64")
+
+
 def _last(series: pd.Series) -> float | None:
     if series.empty or pd.isna(series.iloc[-1]):
         return None
@@ -360,6 +385,7 @@ class _FeatureStrategy:
             close.iloc[-1] = float("nan")
         current = _last(close)
         volumes = _series(history, "volume", symbol) if symbol is not None else pd.Series([float("nan")] * len(history))
+        ranges = _range_series(history, symbol) if symbol is not None else pd.Series([float("nan")] * len(history))
         high_point = _point_for(selected, "high", symbol) if symbol is not None else None
         low_point = _point_for(selected, "low", symbol) if symbol is not None else None
         open_point = _point_for(selected, "open", symbol) if symbol is not None else None
@@ -371,6 +397,8 @@ class _FeatureStrategy:
         vol60 = _realized_volatility(close, 60)
         volume_mean = _rolling_mean(volumes, 20)
         volume_std = _last(volumes.rolling(20, min_periods=20).std(ddof=0))
+        range_mean = _rolling_mean(ranges, 20)
+        range_std = _last(ranges.rolling(20, min_periods=20).std(ddof=0))
         range_pct = None if high is None or low is None or open_value in (None, 0) else (high - low) / open_value
         close_location = None if high is None or low is None or current is None or high == low else (current - low) / (high - low)
         phase = derive_market_phase(_drawdown(close, 20))
@@ -380,8 +408,19 @@ class _FeatureStrategy:
             history[-1].session_slot,
             _observation_date(history[-1], self.market),
         )
+        return_1d = _return(close, 1)
+        range_zscore = (
+            None
+            if range_mean is None or range_std in (None, 0) or _last(ranges) is None
+            else (_last(ranges) - range_mean) / range_std
+        )
+        abnormal_range_transition = (
+            None
+            if range_zscore is None or close_location is None or return_1d is None
+            else range_zscore >= 2.0 and close_location <= 0.25 and return_1d < 0.0
+        )
         return {
-            "return_1d": _return(close, 1), "return_5d": _return(close, 5), "return_20d": _return(close, 20),
+            "return_1d": return_1d, "return_5d": _return(close, 5), "return_20d": _return(close, 20),
             "return_60d": _return(close, 60), "return_120d": _return(close, 120), "return_252d": _return(close, 252),
             "drawdown_20d": _drawdown(close, 20), "drawdown_60d": _drawdown(close, 60), "drawdown_252d": _drawdown(close, 252),
             "market_phase": phase.value if phase is not None else None,
@@ -389,8 +428,11 @@ class _FeatureStrategy:
             "ma20_slope": _ma_slope(close, 20), "ma50_slope": _ma_slope(close, 50), "ma200_slope": _ma_slope(close, 200),
             "realized_volatility_5d": vol5, "realized_volatility_20d": vol20, "realized_volatility_60d": vol60,
             "volatility_ratio_5d_20d": _ratio(vol5, vol20), "volatility_ratio_20d_60d": _ratio(vol20, vol60),
-            "range_pct": range_pct if ohlc_aligned else None, "close_location": close_location if ohlc_aligned else None,
+            "range_pct": range_pct if ohlc_aligned else None,
+            "range_zscore_20d": range_zscore if ohlc_aligned else None,
+            "close_location": close_location if ohlc_aligned else None,
             "volume_zscore_20d": None if volume_mean is None or volume_std in (None, 0) or _last(volumes) is None else (_last(volumes) - volume_mean) / volume_std,
+            "abnormal_range_weak_close_transition": abnormal_range_transition if ohlc_aligned else None,
         }
 
     def _evidence(self, name: str, value: Any, points: tuple[MarketDataPoint, ...], as_of_time: datetime) -> Evidence:
@@ -420,8 +462,14 @@ class _FeatureStrategy:
         inputs = [("index_price", symbol)]
         if name in {"range_pct", "close_location"}:
             inputs = [("index_price", symbol), ("open", symbol), ("high", symbol), ("low", symbol)]
+        elif name == "range_zscore_20d":
+            inputs = [("open", symbol), ("high", symbol), ("low", symbol)]
+        elif name == "abnormal_range_weak_close_transition":
+            inputs = [("index_price", symbol), ("open", symbol), ("high", symbol), ("low", symbol)]
         elif name == "volume_zscore_20d":
             inputs = [("volume", symbol)]
+        elif name == "breadth_deterioration_transition":
+            inputs = [("index_price", symbol), ("breadth_up_pct", None), ("industry_decline_pct", None)]
         elif name in _A_SHARE_METADATA:
             field, field_symbol = _EVIDENCE_INPUTS[name]
             inputs = [(field, field_symbol)]
@@ -436,6 +484,13 @@ class _FeatureStrategy:
         elif name.endswith("spx_relative_return_5d"):
             leg = {"russell_spx_relative_return_5d": "RUT", "nasdaq_spx_relative_return_5d": "NDX", "soxx_spx_relative_return_5d": "SOXX"}[name]
             inputs = [("index_price", leg), ("index_price", "SPX")]
+        elif name == "equity_dispersion_transition":
+            inputs = [
+                ("index_price", "SPX"),
+                ("index_price", "RUT"),
+                ("index_price", "NDX"),
+                ("index_price", "SOXX"),
+            ]
         windows = {
             "return_1d": 2, "return_5d": 6, "return_20d": 21, "return_60d": 61,
             "return_120d": 121, "return_252d": 253, "drawdown_20d": 20, "drawdown_60d": 60,
@@ -443,11 +498,13 @@ class _FeatureStrategy:
             "ma200_distance": 200, "ma20_slope": 21, "ma50_slope": 51, "ma200_slope": 201,
             "realized_volatility_5d": 6, "realized_volatility_20d": 21, "realized_volatility_60d": 61,
             "volatility_ratio_5d_20d": 21, "volatility_ratio_20d_60d": 61, "volume_zscore_20d": 20,
+            "range_zscore_20d": 20, "abnormal_range_weak_close_transition": 20,
             "margin_balance_growth_20d": 21, "margin_balance_contracting_from_high": 21,
             "valuation_percentile_20d": 21, "turnover_percentile_20d": 21, "shibor_3m_change_20d": 21,
             "hyg_lqd_relative_return_5d": 6, "hyg_lqd_relative_return_20d": 21, "vix_change_5d": 6,
             "russell_spx_relative_return_5d": 6, "nasdaq_spx_relative_return_5d": 6,
             "soxx_spx_relative_return_5d": 6, "credit_volatility_transition": 6,
+            "breadth_deterioration_transition": 2, "equity_dispersion_transition": 6,
         }
         current_only = {
             "breadth_up_pct", "breadth_above_ma20_pct", "new_low_20d_pct", "industry_decline_pct",
@@ -507,11 +564,20 @@ class AShareFeatureStrategy(_FeatureStrategy):
         margin_high = _last(margin.iloc[-21:-1].rolling(20, min_periods=20).max())
         current_valuation = _last(valuation)
         current_turnover = _last(turnover)
+        breadth_up = _last(_series(history, "breadth_up_pct"))
+        industry_decline = _last(_series(history, "industry_decline_pct"))
+        symbol = self._main_symbol(selected)
+        broad_return = _return(_series(history, "index_price", symbol), 1) if symbol is not None else None
+        breadth_transition = (
+            None
+            if breadth_up is None or industry_decline is None or broad_return is None
+            else breadth_up <= 30.0 and industry_decline >= 70.0 and broad_return < 0.0
+        )
         return {
-            "breadth_up_pct": _last(_series(history, "breadth_up_pct")),
+            "breadth_up_pct": breadth_up,
             "breadth_above_ma20_pct": _last(_series(history, "breadth_above_ma20_pct")),
             "new_low_20d_pct": _last(_series(history, "new_low_20d_pct")),
-            "industry_decline_pct": _last(_series(history, "industry_decline_pct")),
+            "industry_decline_pct": industry_decline,
             "margin_balance_growth_20d": None if margin_current is None or prior_margin in (None, 0) else margin_current / float(prior_margin) - 1.0,
             "margin_buying": _last(_series(history, "margin_buying")),
             "margin_balance_contracting_from_high": None if margin_current is None or margin_high is None else margin_current < margin_high,
@@ -520,6 +586,7 @@ class AShareFeatureStrategy(_FeatureStrategy):
             "limit_down_pct": _last(_series(history, "limit_down_pct")),
             "shibor_3m": _last(shibor),
             "shibor_3m_change_20d": None if _last(shibor) is None or len(shibor) < 21 or pd.isna(shibor.iloc[-21]) else _last(shibor) - float(shibor.iloc[-21]),
+            "breadth_deterioration_transition": breadth_transition,
         }
 
 
@@ -563,16 +630,27 @@ class USFeatureStrategy(_FeatureStrategy):
             )
             and _history_aligned(history[-6:], self.market, (("index_price", symbol), ("index_price", "SPX"))),
         )
+        relative_russell = relative("RUT")
+        relative_nasdaq = relative("NDX")
+        relative_soxx = relative("SOXX")
+        broad_return = _return(spx, 1)
+        equity_relative_returns = (relative_russell, relative_nasdaq, relative_soxx)
+        equity_dispersion_transition = (
+            None
+            if broad_return is None or any(value is None for value in equity_relative_returns)
+            else broad_return < 0.0 and sum(value <= -0.01 for value in equity_relative_returns) >= 2
+        )
         return {
             "hyg_lqd_relative_return_5d": relative5,
             "hyg_lqd_relative_return_20d": relative20,
             "vix": _last(vix),
             "vix_change_5d": vix_change,
             "vix_vix3m_ratio": vix_ratio,
-            "russell_spx_relative_return_5d": relative("RUT"),
-            "nasdaq_spx_relative_return_5d": relative("NDX"),
-            "soxx_spx_relative_return_5d": relative("SOXX"),
+            "russell_spx_relative_return_5d": relative_russell,
+            "nasdaq_spx_relative_return_5d": relative_nasdaq,
+            "soxx_spx_relative_return_5d": relative_soxx,
             "credit_volatility_transition": None if relative5 is None or (vix_change is None and vix_ratio is None) else relative5 <= -0.015 and (vix_change is not None and vix_change >= 0.20 or vix_ratio is not None and vix_ratio >= 1.0),
+            "equity_dispersion_transition": equity_dispersion_transition,
         }
 
     @staticmethod

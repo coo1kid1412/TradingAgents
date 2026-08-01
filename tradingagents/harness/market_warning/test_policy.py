@@ -128,6 +128,23 @@ class BaselinePolicyTests(TestCase):
             RiskLevel.UNKNOWN,
         )
 
+    def test_reliability_grade_whitelist_is_exact_for_snapshot_and_quant(self):
+        for grade in ("A", "B", "C"):
+            with self.subTest(valid_grade=grade):
+                self.assertEqual(
+                    baseline_level(make_quant(reliability=grade), make_snapshot(reliability=grade)),
+                    RiskLevel.GREEN,
+                )
+        for grade in ("D", "a", "", None, 1, True):
+            with self.subTest(snapshot_grade=grade):
+                snapshot = make_snapshot()
+                object.__setattr__(snapshot, "reliability_grade", grade)
+                self.assertEqual(baseline_level(make_quant(), snapshot), RiskLevel.UNKNOWN)
+            with self.subTest(quant_grade=grade):
+                quant = make_quant()
+                object.__setattr__(quant, "reliability_grade", grade)
+                self.assertEqual(baseline_level(quant, make_snapshot()), RiskLevel.UNKNOWN)
+
     def test_zero_or_invalid_base_rates_fail_closed_as_unknown(self):
         values = (0.0, -0.01, float("nan"), float("inf"), True, "0.01", None)
         for value in values:
@@ -236,6 +253,32 @@ class LLMAdjustmentTests(TestCase):
         context = make_context(supporting=("e1", "e1"))
         self.assertEqual(apply_llm_adjustment(RiskLevel.GREEN, context, make_snapshot()), RiskLevel.GREEN)
 
+    def test_malformed_context_fields_never_raise_or_adjust(self):
+        mutations = (
+            ("reasoning_status", None),
+            ("reasoning_status", 1),
+            ("supporting_evidence_ids", ("e1", ["e2"])),
+            ("supporting_evidence_ids", ("e1", 2)),
+            ("supporting_evidence_ids", None),
+            ("conflicting_evidence_ids", ({"nested": "e3"},)),
+            ("conflicting_evidence_ids", 1),
+            ("recommended_risk_level", "BLUE"),
+            ("recommended_risk_level", None),
+            ("confidence", "0.9"),
+            ("causal_chain", ("valid", ["nested"])),
+            ("market_scenario", None),
+            ("action_reason", {"nested": "reason"}),
+            ("overlooked_risks", (["nested"],)),
+        )
+        for field, value in mutations:
+            with self.subTest(field=field, value=value):
+                context = make_context()
+                object.__setattr__(context, field, value)
+                self.assertEqual(
+                    apply_llm_adjustment(RiskLevel.GREEN, context, make_snapshot()),
+                    RiskLevel.GREEN,
+                )
+
 
 class StateMachineTests(TestCase):
     def test_upgrades_are_immediate_and_actionable_upgrades_push(self):
@@ -302,6 +345,52 @@ class StateMachineTests(TestCase):
 
 
 class FinalDecisionTests(TestCase):
+    def test_unusable_snapshot_forces_unknown_wait_even_with_green_inputs(self):
+        for status in (DataStatus.CONFLICTED, DataStatus.STALE, DataStatus.INSUFFICIENT):
+            with self.subTest(status=status):
+                decision = build_final_decision(
+                    baseline=RiskLevel.GREEN,
+                    candidate=RiskLevel.GREEN,
+                    snapshot=make_snapshot(data_quality=status),
+                    previous=RiskLevel.GREEN,
+                    valid_snapshot_count=0,
+                )
+                self.assertEqual(decision.final_level, RiskLevel.UNKNOWN)
+                self.assertEqual(decision.entry_gate, "WAIT")
+                self.assertEqual(decision.new_position_cap_pct, 0.0)
+
+    def test_candidate_mismatch_fails_closed_without_lowering_or_jumping(self):
+        cases = (
+            (RiskLevel.RED, RiskLevel.GREEN),
+            (RiskLevel.ORANGE, RiskLevel.YELLOW),
+            (RiskLevel.GREEN, RiskLevel.ORANGE),
+            (RiskLevel.GREEN, RiskLevel.RED),
+        )
+        for baseline, candidate in cases:
+            with self.subTest(baseline=baseline, candidate=candidate):
+                decision = build_final_decision(
+                    baseline=baseline,
+                    candidate=candidate,
+                    snapshot=make_snapshot(),
+                    previous=RiskLevel.GREEN,
+                    valid_snapshot_count=0,
+                )
+                self.assertEqual(decision.final_level, RiskLevel.UNKNOWN)
+                self.assertEqual(decision.entry_gate, "WAIT")
+
+    def test_build_decision_copies_recovery_state(self):
+        decision = build_final_decision(
+            baseline=RiskLevel.GREEN,
+            candidate=RiskLevel.GREEN,
+            snapshot=make_snapshot(),
+            previous=RiskLevel.UNKNOWN,
+            valid_snapshot_count=1,
+            retained_risk_level=RiskLevel.RED,
+        )
+        self.assertEqual(decision.final_level, RiskLevel.RED)
+        self.assertEqual(decision.valid_snapshot_count, 1)
+        self.assertEqual(decision.retained_risk_level, RiskLevel.RED)
+
     def test_action_mapping_is_exact(self):
         cases = (
             (RiskLevel.GREEN, "OPEN", 100.0, "HOLD"),

@@ -257,6 +257,8 @@ CREATE TABLE IF NOT EXISTS market_warning_decisions (
     push_required INTEGER NOT NULL,
     data_status TEXT NOT NULL,
     reasons_json TEXT NOT NULL,
+    valid_snapshot_count INTEGER NOT NULL DEFAULT 0,
+    retained_risk_level TEXT,
     model_version TEXT,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (feature_snapshot_id) REFERENCES market_warning_feature_snapshots(id),

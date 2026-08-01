@@ -217,12 +217,25 @@ class FinalWarningDecision:
     push_required: bool
     decision_reasons: tuple[str, ...]
     data_status: DataStatus
+    valid_snapshot_count: int = 0
+    retained_risk_level: RiskLevel | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "baseline_level", _coerce_enum(self.baseline_level, RiskLevel, "baseline_level"))
         object.__setattr__(self, "final_level", _coerce_enum(self.final_level, RiskLevel, "final_level"))
         object.__setattr__(self, "data_status", _coerce_enum(self.data_status, DataStatus, "data_status"))
         _require_percentage(self.new_position_cap_pct, "new_position_cap_pct")
+        if (
+            isinstance(self.valid_snapshot_count, bool)
+            or not isinstance(self.valid_snapshot_count, int)
+            or self.valid_snapshot_count < 0
+        ):
+            raise ValueError("valid_snapshot_count must be a non-negative integer")
+        if self.retained_risk_level is not None:
+            retained = _coerce_enum(self.retained_risk_level, RiskLevel, "retained_risk_level")
+            if retained not in {RiskLevel.ORANGE, RiskLevel.RED}:
+                raise ValueError("retained_risk_level must be ORANGE, RED, or None")
+            object.__setattr__(self, "retained_risk_level", retained)
         object.__setattr__(self, "decision_reasons", tuple(self.decision_reasons))
 
 
