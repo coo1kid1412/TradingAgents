@@ -11,6 +11,7 @@ from datetime import date, datetime
 from enum import Enum
 from pathlib import Path
 from typing import Any, Iterable, Mapping
+from zoneinfo import ZoneInfo
 
 from tradingagents.harness.market_warning.domain import DataStatus, Market, MarketDataPoint, RawMarketSnapshot
 
@@ -273,6 +274,49 @@ class RawDataCache:
             )
         except (AttributeError, KeyError, TypeError, ValueError):
             return None
+
+    def list_snapshots(
+        self,
+        market: Market,
+        dataset: str,
+        start_date: date,
+        end_date: date,
+    ) -> tuple[RawMarketSnapshot, ...]:
+        """Return valid cached snapshots without making a vendor request."""
+
+        market = Market(market)
+        if end_date < start_date:
+            raise ValueError("end_date must not be before start_date")
+        zone = ZoneInfo("Asia/Shanghai" if market == Market.A_SHARE else "America/New_York")
+        root = self.root / market.value / dataset
+        snapshots: dict[tuple[datetime, str], RawMarketSnapshot] = {}
+        if not root.is_dir():
+            return ()
+        for manifest_path in sorted(root.glob("*/*.manifest.json")):
+            try:
+                year = int(manifest_path.parent.name)
+                cache_key = manifest_path.name.removesuffix(".manifest.json")
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                query = manifest.get("query")
+                metadata = manifest.get("snapshot")
+                if not isinstance(query, Mapping) or not isinstance(metadata, Mapping):
+                    continue
+                as_of_time = datetime.fromisoformat(str(metadata["as_of_time"]))
+                local_date = as_of_time.astimezone(zone).date()
+                if not start_date <= local_date <= end_date:
+                    continue
+            except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError):
+                continue
+            snapshot = self.read_snapshot(
+                market=market,
+                dataset=dataset,
+                year=year,
+                cache_key=cache_key,
+                query=query,
+            )
+            if snapshot is not None:
+                snapshots[(snapshot.as_of_time, snapshot.session_slot)] = snapshot
+        return tuple(snapshot for _, snapshot in sorted(snapshots.items()))
 
     @staticmethod
     def _atomic_write(path: Path, content: bytes) -> None:

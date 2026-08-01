@@ -12,6 +12,7 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 
 from tradingagents.harness.market_warning.adapters.data_cache import RawDataCache
+from tradingagents.harness.market_warning.calendars import calendar_for_range
 from tradingagents.harness.market_warning.domain import Market, MarketDataPoint, RawMarketSnapshot
 from tradingagents.harness.market_warning.quality import QUALITY_POLICY_V1, evaluate_data_quality
 
@@ -32,6 +33,7 @@ YAHOO_TICKERS = {
     "TREASURY": "TLT",
     "USD": "DX-Y.NYB",
 }
+YAHOO_CORE_SYMBOLS = frozenset({"SPX", "NDX", "RUT", "VIX"})
 
 
 def _default_download(**kwargs: Any) -> pd.DataFrame:
@@ -152,7 +154,12 @@ class YahooUSDataAdapter:
         if frame.empty:
             return False
         minimum_rows = 2 if daily else 1
-        for ticker in self.ticker_map.values():
+        required_tickers = tuple(
+            ticker
+            for symbol, ticker in self.ticker_map.items()
+            if symbol in YAHOO_CORE_SYMBOLS
+        ) or tuple(self.ticker_map.values())
+        for ticker in required_tickers:
             visible = self._visible_close(frame, ticker, as_of_time, daily=daily)
             if len(visible) < minimum_rows:
                 return False
@@ -250,13 +257,24 @@ class YahooUSDataAdapter:
         )
 
     def _load_snapshot_result(
-        self, market: Market, as_of_time: datetime, session_slot: str
+        self,
+        market: Market,
+        as_of_time: datetime,
+        session_slot: str,
+        *,
+        daily_override: pd.DataFrame | None = None,
+        fetched_at_override: datetime | None = None,
     ) -> _LoadResult:
         if Market(market) != Market.US:
             raise ValueError("YahooUSDataAdapter only supports us")
-        fetched_at = self.clock() if self.clock is not None else datetime.now(_NEW_YORK)
+        fetched_at = fetched_at_override or (
+            self.clock() if self.clock is not None else datetime.now(_NEW_YORK)
+        )
         expected_daily_date = self._expected_observation_date(as_of_time, session_slot)
-        daily_frame, daily_complete = self._download_frame(self._query(as_of_time, "1d"))
+        if daily_override is None:
+            daily_frame, daily_complete = self._download_frame(self._query(as_of_time, "1d"))
+        else:
+            daily_frame, daily_complete = daily_override.copy(), True
         if not daily_complete:
             return _LoadResult(self._snapshot(as_of_time, session_slot, ()), False, fetched_at)
         complete = self._has_complete_batch(
@@ -315,28 +333,84 @@ class YahooUSDataAdapter:
     def backfill(self, start_date: date, end_date: date) -> Iterator[RawMarketSnapshot]:
         if end_date < start_date:
             raise ValueError("end_date must not be before start_date")
-        current = start_date
-        while current <= end_date:
+        calendar = calendar_for_range(
+            Market.US,
+            start_date - timedelta(days=10),
+            end_date,
+        )
+        start_stamp = pd.Timestamp(start_date)
+        end_stamp = pd.Timestamp(end_date)
+        if start_stamp >= calendar.first_session and end_stamp <= calendar.last_session:
+            target_dates = tuple(
+                stamp.date() for stamp in calendar.sessions_in_range(start_stamp, end_stamp)
+            )
+        else:
+            target_dates = tuple(stamp.date() for stamp in pd.bdate_range(start_date, end_date))
+
+        cached: dict[date, RawMarketSnapshot] = {}
+        queries: dict[date, dict[str, Any]] = {}
+        for current in target_dates:
             cache_key = current.isoformat()
             as_of_time = datetime.combine(current, time(16, 0), tzinfo=_NEW_YORK)
             expected_observation_date = self._expected_observation_date(as_of_time, "close")
             query = self._cache_query(current, as_of_time, expected_observation_date)
+            queries[current] = query
             snapshot = self._read_cached(current, cache_key, query)
-            if snapshot is None:
-                result = self._load_snapshot_result(Market.US, as_of_time, "close")
-                snapshot = result.snapshot
-                if self.cache is not None and result.complete:
-                    self.cache.write_snapshot(
-                        dataset="daily_snapshot",
-                        cache_key=cache_key,
-                        snapshot=snapshot,
-                        query=query,
-                        source="yahoo_finance",
-                        fetched_at=result.fetched_at,
+            if snapshot is not None:
+                cached[current] = snapshot
+        missing_dates = tuple(current for current in target_dates if current not in cached)
+
+        generated: dict[date, RawMarketSnapshot] = {}
+        if missing_dates:
+            batch_query = {
+                "tickers": " ".join(self.ticker_map.values()),
+                "start": (min(missing_dates) - timedelta(days=10)).isoformat(),
+                "end": (max(missing_dates) + timedelta(days=1)).isoformat(),
+                "interval": "1d",
+                "auto_adjust": False,
+                "progress": False,
+                "threads": False,
+            }
+            daily_frame, downloaded = self._download_frame(batch_query)
+            fetched_at = self.clock() if self.clock is not None else datetime.now(_NEW_YORK)
+            if downloaded:
+                daily_frame = daily_frame.sort_index(kind="stable")
+                daily_times = tuple(
+                    self._timestamp(index, daily=True) for index in daily_frame.index
+                )
+                visible_end = 0
+                for current in missing_dates:
+                    as_of_time = datetime.combine(current, time(16, 0), tzinfo=_NEW_YORK)
+                    while (
+                        visible_end < len(daily_times)
+                        and daily_times[visible_end] <= as_of_time
+                    ):
+                        visible_end += 1
+                    daily_window = daily_frame.iloc[max(0, visible_end - 15):visible_end]
+                    result = self._load_snapshot_result(
+                        Market.US,
+                        as_of_time,
+                        "close",
+                        daily_override=daily_window,
+                        fetched_at_override=fetched_at,
                     )
+                    generated[current] = result.snapshot
+                    if self.cache is not None and result.complete:
+                        self.cache.write_snapshot(
+                            dataset="daily_snapshot",
+                            cache_key=current.isoformat(),
+                            snapshot=result.snapshot,
+                            query=queries[current],
+                            source="yahoo_finance",
+                            fetched_at=result.fetched_at,
+                        )
+
+        for current in target_dates:
+            snapshot = cached.get(current) or generated.get(current)
+            if snapshot is None:
+                continue
             if snapshot.points and all(
                 point.data_time <= (point.available_at or point.fetched_at) <= snapshot.as_of_time
                 for point in snapshot.points
             ):
                 yield snapshot
-            current += timedelta(days=1)

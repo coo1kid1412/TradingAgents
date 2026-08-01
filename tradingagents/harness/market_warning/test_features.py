@@ -7,6 +7,7 @@ from pathlib import Path
 from statistics import pstdev
 import sys
 from unittest import TestCase, main
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 
@@ -27,6 +28,7 @@ from tradingagents.harness.market_warning.features import (
     derive_market_phase,
 )
 from tradingagents.harness.market_warning.policy import baseline_level
+import tradingagents.harness.market_warning.features as feature_module
 
 
 UTC = timezone.utc
@@ -83,6 +85,34 @@ def history_from_series(
 
 
 class CommonFeatureTests(TestCase):
+    def test_one_feature_build_selects_each_history_snapshot_at_most_once(self):
+        market = Market.US
+        history = history_from_series(
+            "index_price",
+            [100.0 + index for index in range(30)],
+            market=market,
+            symbol="SPX",
+        )
+        raw = snapshot(
+            point("index_price", 131.0, AS_OF, market=market, symbol="SPX"),
+            point("index_change_pct", 1.0, AS_OF, market=market, symbol="SPX"),
+            market=market,
+        )
+
+        with patch.object(
+            feature_module,
+            "select_point_in_time",
+            wraps=feature_module.select_point_in_time,
+        ) as selector, patch.object(
+            feature_module,
+            "_point_for",
+            wraps=feature_module._point_for,
+        ) as linear_lookup:
+            USFeatureStrategy().build(raw, history)
+
+        self.assertLessEqual(selector.call_count, len(history) + 1)
+        self.assertLessEqual(linear_lookup.call_count, 100)
+
     def test_range_zscore_and_transition_metadata_have_auditable_missing_contracts(self):
         names = (
             "audited_ohlc_return_1d",

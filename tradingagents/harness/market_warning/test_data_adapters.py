@@ -17,8 +17,15 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 from tradingagents.dataflows import intraday_quote
 from tradingagents.dataflows.intraday_quote import IntradayQuote
 from tradingagents.harness.market_warning.adapters.data_cache import RawDataCache
+from tradingagents.harness.market_warning.adapters import tushare_data
 from tradingagents.harness.market_warning.adapters.realtime_quote import RealtimeAShareDataAdapter
-from tradingagents.harness.market_warning.adapters.tushare_data import TushareAShareDataAdapter
+from tradingagents.harness.market_warning.adapters.tushare_data import (
+    TushareAShareDataAdapter,
+    _FetchResult,
+    _date_chunks,
+    _results_by_date,
+    _resume_warmup_start,
+)
 from tradingagents.harness.market_warning.adapters.us_market_data import YAHOO_TICKERS, YahooUSDataAdapter
 from tradingagents.harness.market_warning.domain import DataStatus, Market, MarketDataPoint, RawMarketSnapshot
 from tradingagents.harness.market_warning.quality import evaluate_data_quality
@@ -256,6 +263,71 @@ def _snapshot_for_cache(*, as_of: datetime, data_time: datetime, value: float = 
 
 
 class TushareDataAdapterTests(unittest.TestCase):
+    def test_configured_vendor_throttle_and_retry_apply_at_the_fetch_boundary(self):
+        class FlakyPro:
+            def __init__(self):
+                self.calls = 0
+
+            def daily(self, **kwargs):
+                self.calls += 1
+                if self.calls == 1:
+                    raise RuntimeError("temporary rate limit")
+                return pd.DataFrame([{"trade_date": kwargs["trade_date"], "close": 1.0}])
+
+        elapsed = [0.0]
+        sleeps = []
+
+        def sleep(seconds):
+            sleeps.append(seconds)
+            elapsed[0] += seconds
+
+        pro = FlakyPro()
+        adapter = TushareAShareDataAdapter(
+            pro=pro,
+            minimum_request_interval=0.125,
+            max_fetch_attempts=2,
+            monotonic_clock=lambda: elapsed[0],
+            sleep=sleep,
+        )
+
+        result = adapter._fetch("daily", trade_date="20260720")
+
+        self.assertTrue(result.complete)
+        self.assertEqual(pro.calls, 2)
+        self.assertEqual(sleeps, [0.125])
+
+    def test_long_vendor_ranges_are_split_into_bounded_complete_chunks(self):
+        chunks = _date_chunks(date(2000, 1, 1), date(2002, 1, 10), max_days=366)
+
+        self.assertEqual(chunks[0][0], date(2000, 1, 1))
+        self.assertEqual(chunks[-1][1], date(2002, 1, 10))
+        self.assertTrue(all((end - start).days < 366 for start, end in chunks))
+        self.assertTrue(
+            all(previous_end + timedelta(days=1) == next_start for (_, previous_end), (next_start, _) in zip(chunks, chunks[1:]))
+        )
+
+    def test_successful_dates_remain_cacheable_when_another_range_chunk_failed(self):
+        frame = pd.DataFrame(
+            [
+                {"trade_date": "20260717", "value": 1.0},
+                {"trade_date": "20260720", "value": 2.0},
+            ]
+        )
+
+        by_date = _results_by_date(_FetchResult(frame, complete=False), "trade_date")
+
+        self.assertTrue(by_date[date(2026, 7, 17)].complete)
+        self.assertTrue(by_date[date(2026, 7, 20)].complete)
+
+    def test_resume_warmup_starts_before_the_first_missing_session_only(self):
+        targets = (date(2000, 1, 4), date(2026, 7, 17), date(2026, 7, 20))
+
+        self.assertEqual(
+            _resume_warmup_start(targets, {targets[0], targets[1]}),
+            date(2026, 7, 20) - timedelta(days=45),
+        )
+        self.assertIsNone(_resume_warmup_start(targets, set(targets)))
+
     def test_normalizes_realistic_responses_with_per_dataset_availability_and_daily_loops(self):
         pro = MockTusharePro()
         fetched_at = datetime(2026, 7, 21, 9, 5, tzinfo=SHANGHAI)
@@ -301,6 +373,70 @@ class TushareDataAdapterTests(unittest.TestCase):
         self.assertTrue(all(point.fetched_at == fetched_at for point in snapshot.points))
         self.assertEqual(next(point.value for point in snapshot.points if point.field == "breadth_up_pct"), 50.0)
         self.assertEqual(next(point.value for point in snapshot.points if point.field == "industry_decline_pct"), 50.0)
+
+    def test_rolling_breadth_uses_vectorized_cross_sectional_aggregation(self):
+        dates = pd.bdate_range("2026-06-22", periods=20)
+        rows = []
+        for offset, current in enumerate(dates, start=1):
+            trade_date = current.strftime("%Y%m%d")
+            rows.extend(
+                [
+                    {"ts_code": "000001.SZ", "trade_date": trade_date, "close": float(offset), "pct_chg": 1.0},
+                    {"ts_code": "600000.SH", "trade_date": trade_date, "close": float(21 - offset), "pct_chg": -1.0},
+                ]
+            )
+        frame = pd.DataFrame(rows)
+        expected = dates[-1].date()
+        adapter = TushareAShareDataAdapter(pro=MockTusharePro())
+
+        with patch(
+            "pandas.core.groupby.generic.DataFrameGroupBy.__iter__",
+            side_effect=AssertionError("per-symbol Python iteration is too slow for full backfill"),
+        ):
+            points = tuple(
+                adapter._breadth_points(
+                    frame,
+                    pd.DataFrame(),
+                    datetime(2026, 7, 18, tzinfo=SHANGHAI),
+                    datetime(2026, 7, 18, tzinfo=SHANGHAI),
+                    expected,
+                )
+            )
+
+        values = {point.field: point.value for point in points}
+        self.assertEqual(values["breadth_above_ma20_pct"], 50.0)
+        self.assertEqual(values["new_low_20d_pct"], 50.0)
+
+    def test_incremental_backfill_breadth_matches_twenty_observation_definition(self):
+        state = tushare_data._RollingBreadthState()
+        values = {}
+        dates = pd.bdate_range("2026-06-22", periods=20)
+        for offset, current in enumerate(dates, start=1):
+            trade_date = current.strftime("%Y%m%d")
+            frame = pd.DataFrame(
+                [
+                    {"ts_code": "000001.SZ", "trade_date": trade_date, "close": float(offset), "pct_chg": 1.0},
+                    {"ts_code": "600000.SH", "trade_date": trade_date, "close": float(21 - offset), "pct_chg": -1.0},
+                ]
+            )
+            values = state.update(frame, complete=True)
+
+        self.assertEqual(values["breadth_up_pct"], 50.0)
+        self.assertEqual(values["breadth_above_ma20_pct"], 50.0)
+        self.assertEqual(values["new_low_20d_pct"], 50.0)
+
+    def test_backfill_uses_incremental_breadth_instead_of_rebuilding_rolling_frames(self):
+        adapter = TushareAShareDataAdapter(pro=MockTusharePro())
+
+        with patch.object(
+            adapter,
+            "_breadth_points",
+            side_effect=AssertionError("historical backfill must use incremental breadth"),
+        ):
+            result = tuple(adapter.backfill(date(2026, 7, 20), date(2026, 7, 20)))
+
+        self.assertEqual(len(result), 1)
+        self.assertIn("breadth_up_pct", {point.field for point in result[0].points})
 
     def test_margin_is_hidden_monday_0830_and_visible_monday_0900_after_friday(self):
         pro = MockTusharePro(latest_trade_date="20260717")
@@ -366,6 +502,23 @@ class TushareDataAdapterTests(unittest.TestCase):
         self.assertEqual(first[0].as_of_time, datetime(2026, 7, 21, 9, 0, tzinfo=SHANGHAI))
         self.assertTrue(all(point.available_at <= first[0].as_of_time for point in first[0].points))
 
+    def test_backfill_uses_trading_sessions_and_reuses_overlapping_vendor_history(self):
+        pro = MockTusharePro(latest_trade_date="20260720")
+        adapter = TushareAShareDataAdapter(pro=pro)
+
+        result = tuple(adapter.backfill(date(2026, 7, 17), date(2026, 7, 20)))
+
+        daily_dates = [kwargs["trade_date"] for name, kwargs in pro.calls if name == "daily"]
+        index_calls = [kwargs for name, kwargs in pro.calls if name == "index_daily"]
+        self.assertEqual(len(result), 2)
+        self.assertEqual(len(daily_dates), len(set(daily_dates)))
+        self.assertEqual(len(index_calls), 6)
+        self.assertEqual(sum(name == "shibor" for name, _ in pro.calls), 1)
+        self.assertEqual(sum(name == "margin" for name, _ in pro.calls), 1)
+        self.assertEqual(sum(name == "limit_list_d" for name, _ in pro.calls), 0)
+        self.assertEqual(sum(name == "moneyflow" for name, _ in pro.calls), 0)
+        self.assertNotIn("20260619", daily_dates)
+
     def test_tushare_exception_is_not_cached_and_next_backfill_retries(self):
         pro = MockTusharePro(fail_index_once=True)
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -375,6 +528,24 @@ class TushareDataAdapterTests(unittest.TestCase):
             tuple(adapter.backfill(date(2026, 7, 20), date(2026, 7, 20)))
 
         self.assertGreater(len(pro.calls), first_count)
+
+    def test_optional_tushare_failure_does_not_block_core_snapshot_cache(self):
+        class OptionalFailurePro(MockTusharePro):
+            def daily_basic(self, **kwargs):
+                self._record("daily_basic", kwargs)
+                raise RuntimeError("optional history is temporarily unavailable")
+
+        pro = OptionalFailurePro()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            adapter = TushareAShareDataAdapter(pro=pro, cache=RawDataCache(root))
+            first = tuple(adapter.backfill(date(2026, 7, 20), date(2026, 7, 20)))
+            first_count = len(pro.calls)
+            second = tuple(adapter.backfill(date(2026, 7, 20), date(2026, 7, 20)))
+
+        self.assertEqual(first, second)
+        self.assertEqual(len(pro.calls), first_count)
+        self.assertNotIn("valuation", {point.field for point in first[0].points})
 
     def test_empty_core_tushare_result_is_not_cached_and_retries(self):
         pro = MockTusharePro(all_empty=True)
@@ -737,6 +908,94 @@ class YahooDataAdapterTests(unittest.TestCase):
 
         self.assertEqual(manifest["fetched_at"], fetched_at.isoformat())
 
+    def test_yahoo_backfill_batches_missing_exchange_sessions_and_skips_weekend(self):
+        calls = []
+        dates = pd.DatetimeIndex(
+            ["2026-07-29", "2026-07-30", "2026-07-31", "2026-08-03"]
+        )
+        frame = _yahoo_frame(interval="1d").reindex(dates)
+        for ticker_offset, ticker in enumerate(YAHOO_TICKERS.values()):
+            closes = [98.0 + ticker_offset + day_offset for day_offset in range(len(dates))]
+            for field, values in {
+                "Open": [value - 1 for value in closes],
+                "High": [value + 1 for value in closes],
+                "Low": [value - 2 for value in closes],
+                "Close": closes,
+                "Volume": [1000.0 * (ticker_offset + 1) + day for day in range(len(dates))],
+            }.items():
+                frame[(field, ticker)] = values
+
+        def download(**kwargs):
+            calls.append(kwargs)
+            return frame
+
+        snapshots = tuple(
+            YahooUSDataAdapter(download=download).backfill(
+                date(2026, 7, 30), date(2026, 8, 3)
+            )
+        )
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(
+            [snapshot.as_of_time.date() for snapshot in snapshots],
+            [date(2026, 7, 30), date(2026, 7, 31), date(2026, 8, 3)],
+        )
+        self.assertEqual(
+            [max(point.data_time for point in snapshot.points).date() for snapshot in snapshots],
+            [date(2026, 7, 30), date(2026, 7, 31), date(2026, 8, 3)],
+        )
+
+    def test_yahoo_batch_limits_each_snapshot_to_a_small_visible_history_window(self):
+        dates = pd.bdate_range(end="2026-07-31", periods=100)
+        template = _yahoo_frame(interval="1d")
+        frame = template.reindex(dates)
+        for ticker_offset, ticker in enumerate(YAHOO_TICKERS.values()):
+            closes = [80.0 + ticker_offset + day_offset / 10 for day_offset in range(len(dates))]
+            for field, values in {
+                "Open": [value - 1 for value in closes],
+                "High": [value + 1 for value in closes],
+                "Low": [value - 2 for value in closes],
+                "Close": closes,
+                "Volume": [1000.0 * (ticker_offset + 1) + day for day in range(len(dates))],
+            }.items():
+                frame[(field, ticker)] = values
+
+        class InspectingAdapter(YahooUSDataAdapter):
+            windows = []
+
+            def _load_snapshot_result(self, *args, daily_override=None, **kwargs):
+                self.windows.append(len(daily_override))
+                return super()._load_snapshot_result(
+                    *args, daily_override=daily_override, **kwargs
+                )
+
+        adapter = InspectingAdapter(download=lambda **_: frame)
+        snapshots = tuple(adapter.backfill(date(2026, 7, 1), date(2026, 7, 31)))
+
+        self.assertGreater(len(snapshots), 0)
+        self.assertLessEqual(max(adapter.windows), 15)
+
+    def test_yahoo_backfill_treats_later_inception_proxies_as_optional_for_cache(self):
+        calls = []
+        optional_ticker = YAHOO_TICKERS["VIX3M"]
+        frame = _yahoo_frame(interval="1d").drop(
+            columns=[(field, optional_ticker) for field in ("Open", "High", "Low", "Close", "Volume")]
+        )
+
+        def download(**kwargs):
+            calls.append(kwargs)
+            return frame
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            adapter = YahooUSDataAdapter(download=download, cache=RawDataCache(Path(temp_dir)))
+            first = tuple(adapter.backfill(date(2026, 7, 31), date(2026, 7, 31)))
+            second = tuple(adapter.backfill(date(2026, 7, 31), date(2026, 7, 31)))
+
+        self.assertEqual(len(first), 1)
+        self.assertEqual(first, second)
+        self.assertEqual(len(calls), 1)
+        self.assertNotIn("VIX3M", {point.symbol for point in first[0].points})
+
     def test_cache_query_records_policy_calendar_asof_and_expected_date_and_version_change_misses(self):
         first_download, first_calls = self._download()
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -770,6 +1029,38 @@ class YahooDataAdapterTests(unittest.TestCase):
 
 
 class RawDataCacheTests(unittest.TestCase):
+    def test_list_snapshots_reads_only_valid_complete_cache_entries_in_time_order(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            cache = RawDataCache(Path(temp_dir))
+            first = _snapshot_for_cache(
+                as_of=datetime(2026, 7, 30, 16, 0, tzinfo=NEW_YORK),
+                data_time=datetime(2026, 7, 30, 16, 0, tzinfo=NEW_YORK),
+            )
+            second = _snapshot_for_cache(
+                as_of=datetime(2026, 7, 31, 16, 0, tzinfo=NEW_YORK),
+                data_time=datetime(2026, 7, 31, 16, 0, tzinfo=NEW_YORK),
+            )
+            for snapshot in (second, first):
+                cache.write_snapshot(
+                    dataset="daily_snapshot",
+                    cache_key=snapshot.as_of_time.date().isoformat(),
+                    snapshot=snapshot,
+                    query={"as_of_time": snapshot.as_of_time.isoformat()},
+                    source="fixture",
+                    fetched_at=snapshot.as_of_time,
+                )
+            damaged = next(Path(temp_dir).rglob("2026-07-31.jsonl"))
+            damaged.write_text("damaged", encoding="utf-8")
+
+            snapshots = cache.list_snapshots(
+                Market.US,
+                "daily_snapshot",
+                date(2026, 7, 1),
+                date(2026, 7, 31),
+            )
+
+        self.assertEqual(tuple(item.as_of_time for item in snapshots), (first.as_of_time,))
+
     def test_manifest_contains_generation_hash_and_canonical_query(self):
         query = {
             "tickers": ["^GSPC"],

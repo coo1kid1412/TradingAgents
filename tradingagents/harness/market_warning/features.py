@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import OrderedDict
 from collections.abc import Iterable
 from datetime import datetime
 from math import isfinite
@@ -170,6 +171,9 @@ def _visible_history(raw: RawMarketSnapshot, prior_history: Iterable[RawMarketSn
         grouped.setdefault(item.as_of_time, []).append(item)
     merged = []
     for as_of_time, snapshots in sorted(grouped.items()):
+        if len(snapshots) == 1:
+            merged.append(snapshots[0])
+            continue
         points = tuple(point for item in snapshots for point in item.points)
         source_times = {source: timestamp for item in snapshots for source, timestamp in item.source_times.items()}
         merged.append(
@@ -211,7 +215,15 @@ def _benchmark_point(points: Iterable[MarketDataPoint], market: Market) -> Marke
 
 def _observation_date(snapshot: RawMarketSnapshot, market: Market) -> object | None:
     points = _points_at(snapshot)
-    benchmark = _benchmark_point(points, market)
+    symbols = A_SHARE_BROAD_BENCHMARKS if market == Market.A_SHARE else US_BROAD_BENCHMARKS
+    benchmark = next(
+        (
+            point
+            for symbol in symbols
+            if (point := _point_at(snapshot, "index_price", symbol)) is not None
+        ),
+        None,
+    )
     if benchmark is not None:
         return _market_day(benchmark.data_time, market)
     if not points:
@@ -246,7 +258,7 @@ def _history_aligned(
 ) -> bool:
     return all(
         _aligned(
-            tuple(_point_for(_points_at(item), field, symbol) for field, symbol in inputs),
+            tuple(_point_at(item, field, symbol) for field, symbol in inputs),
             market,
             item.session_slot,
             _observation_date(item, market),
@@ -255,8 +267,67 @@ def _history_aligned(
     )
 
 
+_POINTS_AT_CACHE_LIMIT = 8192
+_POINTS_AT_CACHE: OrderedDict[
+    int, tuple[RawMarketSnapshot, tuple[MarketDataPoint, ...]]
+] = OrderedDict()
+_POINT_INDEX_CACHE: OrderedDict[
+    int,
+    tuple[
+        RawMarketSnapshot,
+        dict[tuple[str, str | None], MarketDataPoint],
+    ],
+] = OrderedDict()
+
+
 def _points_at(snapshot: RawMarketSnapshot) -> tuple[MarketDataPoint, ...]:
-    return select_point_in_time(snapshot.points, snapshot.as_of_time)
+    key = id(snapshot)
+    cached = _POINTS_AT_CACHE.get(key)
+    if cached is not None and cached[0] is snapshot:
+        _POINTS_AT_CACHE.move_to_end(key)
+        return cached[1]
+    points = select_point_in_time(snapshot.points, snapshot.as_of_time)
+    _POINTS_AT_CACHE[key] = (snapshot, points)
+    _POINTS_AT_CACHE.move_to_end(key)
+    while len(_POINTS_AT_CACHE) > _POINTS_AT_CACHE_LIMIT:
+        _POINTS_AT_CACHE.popitem(last=False)
+    return points
+
+
+def _point_index(
+    snapshot: RawMarketSnapshot,
+) -> dict[tuple[str, str | None], MarketDataPoint]:
+    key = id(snapshot)
+    cached = _POINT_INDEX_CACHE.get(key)
+    if cached is not None and cached[0] is snapshot:
+        _POINT_INDEX_CACHE.move_to_end(key)
+        return cached[1]
+    index: dict[tuple[str, str | None], MarketDataPoint] = {}
+    ranks: dict[tuple[str, str | None], tuple[datetime, datetime, str, str]] = {}
+    for point in _points_at(snapshot):
+        if _number(point.value) is None or point.quality_status not in _USABLE_POINT_STATUSES:
+            continue
+        field = _canonical_field(point.field)
+        rank = (point.data_time, point.fetched_at, point.source, point.symbol)
+        for item_key in ((field, point.symbol.upper()), (field, None)):
+            if item_key not in ranks or rank > ranks[item_key]:
+                index[item_key] = point
+                ranks[item_key] = rank
+    _POINT_INDEX_CACHE[key] = (snapshot, index)
+    _POINT_INDEX_CACHE.move_to_end(key)
+    while len(_POINT_INDEX_CACHE) > _POINTS_AT_CACHE_LIMIT:
+        _POINT_INDEX_CACHE.popitem(last=False)
+    return index
+
+
+def _point_at(
+    snapshot: RawMarketSnapshot,
+    field: str,
+    symbol: str | None = None,
+) -> MarketDataPoint | None:
+    return _point_index(snapshot).get(
+        (_canonical_field(field), symbol.upper() if symbol is not None else None)
+    )
 
 
 def _ohlc_at(snapshot: RawMarketSnapshot, symbol: str):
@@ -286,7 +357,7 @@ def _point_for(points: Iterable[MarketDataPoint], field: str, symbol: str | None
 def _series(history: tuple[RawMarketSnapshot, ...], field: str, symbol: str | None = None) -> pd.Series:
     values: list[float] = []
     for item in history:
-        point = _point_for(_points_at(item), field, symbol)
+        point = _point_at(item, field, symbol)
         values.append(float("nan") if point is None else float(point.value))
     return pd.Series(values, dtype="float64")
 
@@ -294,7 +365,7 @@ def _series(history: tuple[RawMarketSnapshot, ...], field: str, symbol: str | No
 def _observation_series(history: tuple[RawMarketSnapshot, ...], field: str, symbol: str) -> pd.Series:
     values: list[float] = []
     for item in history:
-        point = _point_for(_points_at(item), field, symbol)
+        point = _point_at(item, field, symbol)
         aligned = point is not None and _market_day(point.data_time, item.market) == _observation_date(item, item.market)
         values.append(float(point.value) if aligned else float("nan"))
     return pd.Series(values, dtype="float64")
@@ -637,35 +708,33 @@ class _FeatureStrategy:
         if name == "vix_change_5d":
             result = []
             for item in (history[-6], history[-1]) if len(history) >= 6 else ():
-                point = _point_for(_points_at(item), "vix", "VIX")
+                point = _point_at(item, "vix", "VIX")
                 if point is not None and _market_day(point.data_time, item.market) == _observation_date(item, item.market):
                     result.append(point)
             return tuple(result)
         if name == "credit_volatility_transition":
             result = []
             for item in history[-6:]:
-                visible = _points_at(item)
                 for field, input_symbol in (("index_price", "HYG"), ("index_price", "LQD")):
-                    point = _point_for(visible, field, input_symbol)
+                    point = _point_at(item, field, input_symbol)
                     if point is not None:
                         result.append(point)
             if features["vix_change_5d"] is not None and features["vix_change_5d"] >= 0.20:
                 for item in (history[-6], history[-1]):
-                    point = _point_for(_points_at(item), "vix", "VIX")
+                    point = _point_at(item, "vix", "VIX")
                     if point is not None:
                         result.append(point)
             elif features["vix_vix3m_ratio"] is not None and features["vix_vix3m_ratio"] >= 1.0:
                 for field, input_symbol in (("vix", "VIX"), ("vix3m", "VIX3M")):
-                    point = _point_for(_points_at(history[-1]), field, input_symbol)
+                    point = _point_at(history[-1], field, input_symbol)
                     if point is not None:
                         result.append(point)
             return tuple(result)
         result = []
         window = 1 if name in current_only else windows.get(name, 1)
         for item in history[-window:]:
-            visible = _points_at(item)
             for field, input_symbol in inputs:
-                point = _point_for(visible, field, input_symbol)
+                point = _point_at(item, field, input_symbol)
                 if point is not None:
                     result.append(point)
         return tuple(result)

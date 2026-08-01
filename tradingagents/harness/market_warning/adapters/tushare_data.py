@@ -2,16 +2,19 @@
 
 from __future__ import annotations
 
+from collections import deque
 from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, replace
 from datetime import date, datetime, time, timedelta
 from math import isfinite
+import time as clock_time
 from typing import Any
 from zoneinfo import ZoneInfo
 
 import pandas as pd
 
 from tradingagents.harness.market_warning.adapters.data_cache import RawDataCache
+from tradingagents.harness.market_warning.calendars import calendar_for_range
 from tradingagents.harness.market_warning.domain import Market, MarketDataPoint, RawMarketSnapshot
 from tradingagents.harness.market_warning.quality import QUALITY_POLICY_V1, evaluate_data_quality
 
@@ -21,6 +24,51 @@ _BENCHMARKS = ("000001.SH", "399001.SZ", "000300.SH", "000905.SH", "399006.SZ", 
 _DAILY_ROW_LIMIT = 6000
 FALLBACK_CALENDAR_VERSION = "weekday-fallback-v1"
 TUSHARE_DISCLOSURE_POLICY_VERSION = "tushare-disclosure-v2"
+
+
+def _date_chunks(
+    start_date: date,
+    end_date: date,
+    *,
+    max_days: int = 366,
+) -> tuple[tuple[date, date], ...]:
+    if end_date < start_date:
+        raise ValueError("end_date must not be before start_date")
+    if isinstance(max_days, bool) or not isinstance(max_days, int) or max_days < 1:
+        raise ValueError("max_days must be a positive integer")
+    chunks = []
+    current = start_date
+    while current <= end_date:
+        chunk_end = min(end_date, current + timedelta(days=max_days - 1))
+        chunks.append((current, chunk_end))
+        current = chunk_end + timedelta(days=1)
+    return tuple(chunks)
+
+
+def _resume_warmup_start(
+    target_dates: tuple[date, ...],
+    cached_dates: set[date],
+    *,
+    warmup_days: int = 45,
+) -> date | None:
+    missing = tuple(current for current in target_dates if current not in cached_dates)
+    return None if not missing else min(missing) - timedelta(days=warmup_days)
+
+
+def _results_by_date(
+    result: _FetchResult,
+    date_column: str,
+) -> dict[date, _FetchResult]:
+    if result.frame.empty or date_column not in result.frame:
+        return {}
+    parsed = result.frame[date_column].map(_row_date)
+    return {
+        current: _FetchResult(
+            result.frame.loc[parsed.eq(current)].copy(),
+            True,
+        )
+        for current in sorted(set(parsed.dropna()))
+    }
 
 
 def _number(value: Any) -> float | None:
@@ -105,6 +153,47 @@ class _LoadResult:
     fetched_at: datetime
 
 
+class _RollingBreadthState:
+    def __init__(self) -> None:
+        self._closes: dict[str, deque[float]] = {}
+
+    def update(self, frame: pd.DataFrame, *, complete: bool) -> dict[str, float]:
+        if (
+            not complete
+            or frame.empty
+            or not {"ts_code", "close", "pct_chg"}.issubset(frame.columns)
+        ):
+            return {}
+        current = frame[["ts_code", "close", "pct_chg"]].copy()
+        current["close"] = pd.to_numeric(current["close"], errors="coerce")
+        current["pct_chg"] = pd.to_numeric(current["pct_chg"], errors="coerce")
+        current = current.dropna(subset=["ts_code", "close"]).drop_duplicates(
+            "ts_code", keep="last"
+        )
+        if current.empty:
+            return {}
+        values = {
+            "breadth_up_pct": float(current["pct_chg"].gt(0).mean() * 100.0)
+        }
+        current_symbols = []
+        for row in current.itertuples(index=False):
+            symbol = str(row.ts_code)
+            history = self._closes.setdefault(symbol, deque(maxlen=20))
+            history.append(float(row.close))
+            current_symbols.append(symbol)
+        eligible = [
+            self._closes[symbol]
+            for symbol in current_symbols
+            if len(self._closes[symbol]) == 20
+        ]
+        if eligible:
+            above = sum(history[-1] > sum(history) / 20.0 for history in eligible)
+            new_low = sum(history[-1] <= min(history) for history in eligible)
+            values["breadth_above_ma20_pct"] = float(above / len(eligible) * 100.0)
+            values["new_low_20d_pct"] = float(new_low / len(eligible) * 100.0)
+        return values
+
+
 class TushareAShareDataAdapter:
     def __init__(
         self,
@@ -116,7 +205,19 @@ class TushareAShareDataAdapter:
         previous_session: Callable[[date], date] = _previous_weekday,
         calendar_version: str = FALLBACK_CALENDAR_VERSION,
         disclosure_policy_version: str = TUSHARE_DISCLOSURE_POLICY_VERSION,
+        minimum_request_interval: float = 0.0,
+        max_fetch_attempts: int = 1,
+        monotonic_clock: Callable[[], float] = clock_time.monotonic,
+        sleep: Callable[[float], None] = clock_time.sleep,
     ) -> None:
+        if minimum_request_interval < 0:
+            raise ValueError("minimum_request_interval must not be negative")
+        if (
+            isinstance(max_fetch_attempts, bool)
+            or not isinstance(max_fetch_attempts, int)
+            or max_fetch_attempts < 1
+        ):
+            raise ValueError("max_fetch_attempts must be a positive integer")
         self.pro = pro
         self.cache = cache
         self.clock = clock
@@ -124,6 +225,20 @@ class TushareAShareDataAdapter:
         self.previous_session = previous_session
         self.calendar_version = calendar_version
         self.disclosure_policy_version = disclosure_policy_version
+        self.minimum_request_interval = float(minimum_request_interval)
+        self.max_fetch_attempts = max_fetch_attempts
+        self.monotonic_clock = monotonic_clock
+        self.sleep = sleep
+        self._last_request_at: float | None = None
+
+    def _throttle(self) -> None:
+        now = float(self.monotonic_clock())
+        if self._last_request_at is not None:
+            remaining = self.minimum_request_interval - (now - self._last_request_at)
+            if remaining > 0:
+                self.sleep(remaining)
+                now = float(self.monotonic_clock())
+        self._last_request_at = now
 
     def _fetch(self, method_name: str, **kwargs: Any) -> _FetchResult:
         method = getattr(self.pro, method_name, None)
@@ -131,13 +246,44 @@ class TushareAShareDataAdapter:
             method = getattr(self.pro, "limit_list", None)
         if method is None:
             return _FetchResult(pd.DataFrame(), False)
-        try:
-            result = method(**kwargs)
-        except Exception:
-            return _FetchResult(pd.DataFrame(), False)
+        result = None
+        for attempt in range(self.max_fetch_attempts):
+            self._throttle()
+            try:
+                result = method(**kwargs)
+                break
+            except Exception:
+                if attempt + 1 == self.max_fetch_attempts:
+                    return _FetchResult(pd.DataFrame(), False)
         if not isinstance(result, pd.DataFrame):
             return _FetchResult(pd.DataFrame(), False)
         return _FetchResult(result.copy(), True)
+
+    def _fetch_date_range(
+        self,
+        method_name: str,
+        start_date: date,
+        end_date: date,
+        **fixed: Any,
+    ) -> _FetchResult:
+        frames = []
+        complete = True
+        for chunk_start, chunk_end in _date_chunks(start_date, end_date):
+            result = self._fetch(
+                method_name,
+                **fixed,
+                start_date=chunk_start.strftime("%Y%m%d"),
+                end_date=chunk_end.strftime("%Y%m%d"),
+            )
+            complete = complete and result.complete
+            if not result.frame.empty:
+                frames.append(result.frame)
+        frame = (
+            pd.concat(frames, ignore_index=True).drop_duplicates(ignore_index=True)
+            if frames
+            else pd.DataFrame()
+        )
+        return _FetchResult(frame, complete)
 
     def _daily_history(self, start_date: date, end_date: date) -> tuple[pd.DataFrame, bool]:
         frames: list[pd.DataFrame] = []
@@ -211,6 +357,10 @@ class TushareAShareDataAdapter:
         session_slot: str,
         *,
         allow_current_industry: bool = True,
+        daily_override: tuple[pd.DataFrame, bool] | None = None,
+        index_overrides: list[_FetchResult] | None = None,
+        auxiliary_overrides: Mapping[str, _FetchResult] | None = None,
+        breadth_override: Mapping[str, float] | None = None,
     ) -> _LoadResult:
         if Market(market) != Market.A_SHARE:
             raise ValueError("TushareAShareDataAdapter only supports a_share")
@@ -221,8 +371,14 @@ class TushareAShareDataAdapter:
         start_date = end_date - timedelta(days=45)
         range_query = {"start_date": start_date.strftime("%Y%m%d"), "end_date": end_date.strftime("%Y%m%d")}
 
-        index_results = [self._fetch("index_daily", ts_code=symbol, **range_query) for symbol in _BENCHMARKS]
-        daily, daily_complete = self._daily_history(start_date, end_date)
+        index_results = index_overrides or [
+            self._fetch("index_daily", ts_code=symbol, **range_query)
+            for symbol in _BENCHMARKS
+        ]
+        if daily_override is None:
+            daily, daily_complete = self._daily_history(start_date, end_date)
+        else:
+            daily, daily_complete = daily_override
         use_current_industry = (
             allow_current_industry
             and fetched_at.astimezone(_SHANGHAI).date() == local_as_of.date()
@@ -257,14 +413,17 @@ class TushareAShareDataAdapter:
                 market_dates.append(selected[1])
         latest_market_date = max(market_dates, default=end_date)
         trade_date_query = latest_market_date.strftime("%Y%m%d")
-        auxiliary = {
-            "daily_basic": self._fetch("daily_basic", trade_date=trade_date_query),
-            "margin": self._fetch("margin", trade_date=trade_date_query),
-            "shibor": self._fetch("shibor", **range_query),
-            "limit": self._fetch("limit_list_d", trade_date=trade_date_query),
-            "moneyflow": self._fetch("moneyflow", trade_date=trade_date_query),
+        auxiliary = dict(auxiliary_overrides or {})
+        fetches = {
+            "daily_basic": ("daily_basic", {"trade_date": trade_date_query}),
+            "margin": ("margin", {"trade_date": trade_date_query}),
+            "shibor": ("shibor", range_query),
+            "limit": ("limit_list_d", {"trade_date": trade_date_query}),
+            "moneyflow": ("moneyflow", {"trade_date": trade_date_query}),
         }
-        complete = complete and all(result.complete for result in auxiliary.values())
+        for key, (method_name, kwargs) in fetches.items():
+            if key not in auxiliary:
+                auxiliary[key] = self._fetch(method_name, **kwargs)
 
         points = list(
             self._index_points(
@@ -274,7 +433,19 @@ class TushareAShareDataAdapter:
                 expected_observation_date,
             )
         )
-        if daily_complete:
+        if breadth_override is not None:
+            points.extend(
+                self._point(
+                    "MARKET",
+                    field,
+                    value,
+                    expected_observation_date,
+                    fetched_at,
+                    "tushare_daily",
+                )
+                for field, value in sorted(breadth_override.items())
+            )
+        elif daily_complete:
             points.extend(
                 self._breadth_points(
                     daily,
@@ -352,17 +523,25 @@ class TushareAShareDataAdapter:
         history = history[
             history["_date"].notna() & history["close"].notna() & (history["_date"] <= trade_date)
         ]
-        above: list[bool] = []
-        new_low: list[bool] = []
         if "ts_code" in history:
-            for _, rows in history.sort_values("_date").groupby("ts_code"):
-                closes = rows["close"].tail(20)
-                if len(closes) == 20:
-                    above.append(bool(closes.iloc[-1] > closes.mean()))
-                    new_low.append(bool(closes.iloc[-1] <= closes.min()))
-        if above:
-            values["breadth_above_ma20_pct"] = float(sum(above) / len(above) * 100.0)
-            values["new_low_20d_pct"] = float(sum(new_low) / len(new_low) * 100.0)
+            ordered = history.sort_values(["ts_code", "_date"], kind="stable").drop_duplicates(
+                ["ts_code", "_date"], keep="last"
+            )
+            recent = ordered.groupby("ts_code", sort=False).tail(20)
+            rolling = recent.groupby("ts_code", sort=False)["close"].agg(
+                observations="size",
+                mean="mean",
+                minimum="min",
+                latest="last",
+            )
+            rolling = rolling.loc[rolling["observations"].eq(20)]
+            if not rolling.empty:
+                values["breadth_above_ma20_pct"] = float(
+                    rolling["latest"].gt(rolling["mean"]).mean() * 100.0
+                )
+                values["new_low_20d_pct"] = float(
+                    rolling["latest"].le(rolling["minimum"]).mean() * 100.0
+                )
         if {"ts_code", "industry"}.issubset(stock_basic.columns):
             industries = stock_basic[["ts_code", "industry"]].dropna().drop_duplicates("ts_code")
             industry_rows = current.merge(industries, on="ts_code", how="left").dropna(subset=["industry"])
@@ -493,33 +672,140 @@ class TushareAShareDataAdapter:
     def backfill(self, start_date: date, end_date: date) -> Iterator[RawMarketSnapshot]:
         if end_date < start_date:
             raise ValueError("end_date must not be before start_date")
-        current = start_date
-        while current <= end_date:
+        calendar_start = start_date - timedelta(days=45)
+        try:
+            calendar = calendar_for_range(
+                Market.A_SHARE,
+                calendar_start,
+                end_date,
+            )
+        except ValueError:
+            calendar = None
+        start_stamp = pd.Timestamp(start_date)
+        end_stamp = pd.Timestamp(end_date)
+        if (
+            calendar is not None
+            and start_stamp >= calendar.first_session
+            and end_stamp <= calendar.last_session
+        ):
+            target_dates = tuple(
+                stamp.date() for stamp in calendar.sessions_in_range(start_stamp, end_stamp)
+            )
+        else:
+            target_dates = tuple(stamp.date() for stamp in pd.bdate_range(start_date, end_date))
+
+        cached: dict[date, RawMarketSnapshot] = {}
+        for current in target_dates:
             cache_key = current.isoformat()
             as_of_time = datetime.combine(self.next_trading_day(current), time(9), tzinfo=_SHANGHAI)
             expected_observation_date = self._expected_observation_date(as_of_time, "premarket")
             query = self._cache_query(current, as_of_time, expected_observation_date)
             snapshot = self._read_cached(current, cache_key, query)
-            if snapshot is None:
-                result = self._load_snapshot_result(
-                    Market.A_SHARE,
-                    as_of_time,
-                    "premarket",
-                    allow_current_industry=False,
+            if snapshot is not None:
+                cached[current] = snapshot
+        if len(cached) == len(target_dates):
+            yield from (cached[current] for current in target_dates)
+            return
+
+        warmup_start = _resume_warmup_start(target_dates, set(cached))
+        if warmup_start is None:
+            return
+        for current in target_dates:
+            if current >= warmup_start:
+                break
+            if current in cached:
+                yield cached[current]
+
+        index_results = [
+            self._fetch_date_range(
+                "index_daily", warmup_start, end_date, ts_code=symbol
+            )
+            for symbol in _BENCHMARKS
+        ]
+        shibor_result = self._fetch_date_range("shibor", warmup_start, end_date)
+        margin_result = self._fetch_date_range("margin", warmup_start, end_date)
+        index_by_date = [
+            _results_by_date(result, "trade_date") for result in index_results
+        ]
+        shibor_by_date = _results_by_date(shibor_result, "date")
+        margin_by_date = _results_by_date(margin_result, "trade_date")
+        if calendar is not None:
+            all_dates = tuple(
+                stamp.date()
+                for stamp in calendar.sessions_in_range(
+                    pd.Timestamp(warmup_start), pd.Timestamp(end_date)
                 )
-                snapshot = result.snapshot
-                if self.cache is not None and result.complete:
-                    self.cache.write_snapshot(
-                        dataset="daily_snapshot",
-                        cache_key=cache_key,
-                        snapshot=snapshot,
-                        query=query,
-                        source="tushare",
-                        fetched_at=result.fetched_at,
+            )
+        else:
+            all_dates = tuple(
+                stamp.date() for stamp in pd.bdate_range(warmup_start, end_date)
+            )
+        breadth_state = _RollingBreadthState()
+        target_set = set(target_dates)
+        for current in all_dates:
+            daily_result = self._fetch("daily", trade_date=current.strftime("%Y%m%d"))
+            daily_complete = daily_result.complete and len(daily_result.frame) < _DAILY_ROW_LIMIT
+            breadth_values = breadth_state.update(
+                daily_result.frame,
+                complete=daily_complete,
+            )
+            if current not in target_set:
+                continue
+            if current in cached:
+                yield cached[current]
+                continue
+            current_rows = daily_result.frame.copy()
+            if daily_complete and not current_rows.empty and "pct_chg" in current_rows:
+                pct_change = pd.to_numeric(current_rows["pct_chg"], errors="coerce")
+                limit_rows = current_rows.loc[pct_change <= -9.5, ["trade_date"]].copy()
+                limit_rows["limit"] = "D"
+            else:
+                limit_rows = pd.DataFrame(columns=("trade_date", "limit"))
+            trade_date_query = current.strftime("%Y%m%d")
+            auxiliary = {
+                "daily_basic": self._fetch("daily_basic", trade_date=trade_date_query),
+                "margin": margin_by_date.get(
+                    current, _FetchResult(pd.DataFrame(), margin_result.complete)
+                ),
+                "shibor": shibor_by_date.get(
+                    current, _FetchResult(pd.DataFrame(), shibor_result.complete)
+                ),
+                "limit": _FetchResult(limit_rows, True),
+                "moneyflow": _FetchResult(pd.DataFrame(), True),
+            }
+            as_of_time = datetime.combine(
+                self.next_trading_day(current), time(9), tzinfo=_SHANGHAI
+            )
+            expected_observation_date = self._expected_observation_date(as_of_time, "premarket")
+            query = self._cache_query(current, as_of_time, expected_observation_date)
+            result = self._load_snapshot_result(
+                Market.A_SHARE,
+                as_of_time,
+                "premarket",
+                allow_current_industry=False,
+                daily_override=(current_rows, daily_complete),
+                index_overrides=[
+                    by_date.get(
+                        current,
+                        _FetchResult(pd.DataFrame(), index_results[index].complete),
                     )
+                    for index, by_date in enumerate(index_by_date)
+                ],
+                auxiliary_overrides=auxiliary,
+                breadth_override=breadth_values,
+            )
+            snapshot = result.snapshot
+            if self.cache is not None and result.complete:
+                self.cache.write_snapshot(
+                    dataset="daily_snapshot",
+                    cache_key=current.isoformat(),
+                    snapshot=snapshot,
+                    query=query,
+                    source="tushare",
+                    fetched_at=result.fetched_at,
+                )
             if snapshot.points and all(
                 point.data_time <= (point.available_at or point.fetched_at) <= snapshot.as_of_time
                 for point in snapshot.points
             ):
                 yield snapshot
-            current += timedelta(days=1)
