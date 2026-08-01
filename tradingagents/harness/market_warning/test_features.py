@@ -41,6 +41,7 @@ def point(
     market: Market = Market.A_SHARE,
     symbol: str = "INDEX",
     source: str = "fixture",
+    quality_status: DataStatus = DataStatus.FRESH,
 ) -> MarketDataPoint:
     return MarketDataPoint(
         market=market,
@@ -50,6 +51,7 @@ def point(
         data_time=at,
         fetched_at=at,
         source=source,
+        quality_status=quality_status,
     )
 
 
@@ -707,20 +709,20 @@ class PolicyReachabilityIntegrationTests(TestCase):
         ranges = [0.02] * 19 + [0.20]
         history = tuple(
             snapshot(
-                point("index_price", 100.0, AS_OF - timedelta(days=days), source="close_history"),
-                point("open", 100.0, AS_OF - timedelta(days=days), source="ohlc_history"),
-                point("high", 101.0, AS_OF - timedelta(days=days), source="ohlc_history"),
-                point("low", 99.0, AS_OF - timedelta(days=days), source="ohlc_history"),
+                point("index_price", 100.0, AS_OF - timedelta(days=days), source="candle_history"),
+                point("open", 100.0, AS_OF - timedelta(days=days), source="candle_history"),
+                point("high", 101.0, AS_OF - timedelta(days=days), source="candle_history"),
+                point("low", 99.0, AS_OF - timedelta(days=days), source="candle_history"),
                 at=AS_OF - timedelta(days=days),
             )
             for days in range(19, 0, -1)
         )
         raw = snapshot(
-            point("index_price", 92.0, AS_OF, source="close_now"),
-            point("index_change_pct", -8.0, AS_OF, source="close_now"),
-            point("open", 100.0, AS_OF, source="ohlc_now"),
-            point("high", 110.0, AS_OF, source="ohlc_now"),
-            point("low", 90.0, AS_OF, source="ohlc_now"),
+            point("index_price", 92.0, AS_OF, source="candle_now"),
+            point("index_change_pct", -8.0, AS_OF, source="candle_now"),
+            point("open", 100.0, AS_OF, source="candle_now"),
+            point("high", 110.0, AS_OF, source="candle_now"),
+            point("low", 90.0, AS_OF, source="candle_now"),
         )
 
         result = AShareFeatureStrategy().build(raw, history)
@@ -732,28 +734,28 @@ class PolicyReachabilityIntegrationTests(TestCase):
         evidence = next(
             item for item in result.evidence if item.evidence_id.split(":")[2] == "range_zscore_20d"
         )
-        self.assertEqual(evidence.source, "close_history+close_now+ohlc_history+ohlc_now")
+        self.assertEqual(evidence.source, "candle_history+candle_now")
         self.assertEqual(evidence.as_of_time, AS_OF)
-        self.assertIn("ohlc_history:first", result.source_times)
-        self.assertIn("ohlc_now:last", result.source_times)
+        self.assertIn("candle_history:first", result.source_times)
+        self.assertIn("candle_now:last", result.source_times)
 
     def test_reviewer_invalid_close_regression_is_unknown_not_red(self):
         history = tuple(
             snapshot(
-                point("index_price", 100.0, AS_OF - timedelta(days=days), source="close_history"),
-                point("open", 100.0, AS_OF - timedelta(days=days), source="ohlc_history"),
-                point("high", 101.0, AS_OF - timedelta(days=days), source="ohlc_history"),
-                point("low", 99.0, AS_OF - timedelta(days=days), source="ohlc_history"),
+                point("index_price", 100.0, AS_OF - timedelta(days=days), source="candle_history"),
+                point("open", 100.0, AS_OF - timedelta(days=days), source="candle_history"),
+                point("high", 101.0, AS_OF - timedelta(days=days), source="candle_history"),
+                point("low", 99.0, AS_OF - timedelta(days=days), source="candle_history"),
                 at=AS_OF - timedelta(days=days),
             )
             for days in range(19, 0, -1)
         )
         raw = snapshot(
-            point("index_price", 80.0, AS_OF, source="close_now"),
-            point("index_change_pct", -20.0, AS_OF, source="close_now"),
-            point("open", 100.0, AS_OF, source="ohlc_now"),
-            point("high", 110.0, AS_OF, source="ohlc_now"),
-            point("low", 90.0, AS_OF, source="ohlc_now"),
+            point("index_price", 80.0, AS_OF, source="candle_now"),
+            point("index_change_pct", -20.0, AS_OF, source="candle_now"),
+            point("open", 100.0, AS_OF, source="candle_now"),
+            point("high", 110.0, AS_OF, source="candle_now"),
+            point("low", 90.0, AS_OF, source="candle_now"),
         )
 
         result = AShareFeatureStrategy().build(raw, history)
@@ -794,6 +796,184 @@ class PolicyReachabilityIntegrationTests(TestCase):
         self.assertIsNone(result.features["abnormal_range_weak_close_transition"])
         self.assertNotEqual(result.data_quality, DataStatus.CONFLICTED)
         self.assertEqual(baseline_level(self.quant(0.01), result), RiskLevel.GREEN)
+
+    def test_stale_current_ohlc_is_unknown_and_cannot_trigger_red(self):
+        history = tuple(
+            snapshot(
+                point("index_price", 100.0, AS_OF - timedelta(days=days), source="candle_history"),
+                point("open", 100.0, AS_OF - timedelta(days=days), source="candle_history"),
+                point("high", 101.0, AS_OF - timedelta(days=days), source="candle_history"),
+                point("low", 99.0, AS_OF - timedelta(days=days), source="candle_history"),
+                at=AS_OF - timedelta(days=days),
+            )
+            for days in range(19, 0, -1)
+        )
+        raw = snapshot(
+            point("index_price", 92.0, AS_OF, source="candle_now"),
+            point("index_change_pct", -8.0, AS_OF, source="candle_now"),
+            point("open", 100.0, AS_OF, source="candle_now", quality_status=DataStatus.STALE),
+            point("high", 110.0, AS_OF, source="candle_now", quality_status=DataStatus.STALE),
+            point("low", 90.0, AS_OF, source="candle_now", quality_status=DataStatus.STALE),
+        )
+
+        result = AShareFeatureStrategy().build(raw, history)
+
+        self.assertEqual(result.data_quality, DataStatus.STALE)
+        self.assertEqual(result.reliability_grade, "UNAVAILABLE")
+        for name in (
+            "range_pct",
+            "range_zscore_20d",
+            "close_location",
+            "abnormal_range_weak_close_transition",
+        ):
+            self.assertIsNone(result.features[name], name)
+        self.assertEqual(baseline_level(self.quant(0.01), result), RiskLevel.UNKNOWN)
+
+    def test_insufficient_current_ohlc_is_unknown_and_has_no_range_features(self):
+        raw = snapshot(
+            point("index_price", 100.0, AS_OF, source="candle"),
+            point("index_change_pct", 0.0, AS_OF, source="candle"),
+            point(
+                "open",
+                100.0,
+                AS_OF,
+                source="candle",
+                quality_status=DataStatus.INSUFFICIENT,
+            ),
+            point("high", 101.0, AS_OF, source="candle"),
+            point("low", 99.0, AS_OF, source="candle"),
+        )
+
+        result = AShareFeatureStrategy().build(raw, ())
+
+        self.assertEqual(result.data_quality, DataStatus.INSUFFICIENT)
+        self.assertEqual(result.reliability_grade, "UNAVAILABLE")
+        for name in (
+            "range_pct",
+            "range_zscore_20d",
+            "close_location",
+            "abnormal_range_weak_close_transition",
+        ):
+            self.assertIsNone(result.features[name], name)
+        self.assertEqual(baseline_level(self.quant(0.01), result), RiskLevel.UNKNOWN)
+
+    def test_historical_stale_or_conflicted_ohlc_is_nan_without_fill(self):
+        for status in (DataStatus.STALE, DataStatus.CONFLICTED):
+            with self.subTest(status=status):
+                history = tuple(
+                    snapshot(
+                        point("index_price", 100.0, AS_OF - timedelta(days=days), source="history"),
+                        point(
+                            "open",
+                            100.0,
+                            AS_OF - timedelta(days=days),
+                            source="history",
+                            quality_status=status if days == 10 else DataStatus.FRESH,
+                        ),
+                        point("high", 101.0, AS_OF - timedelta(days=days), source="history"),
+                        point("low", 99.0, AS_OF - timedelta(days=days), source="history"),
+                        at=AS_OF - timedelta(days=days),
+                    )
+                    for days in range(19, 0, -1)
+                )
+                raw = snapshot(
+                    point("index_price", 92.0, AS_OF, source="current"),
+                    point("index_change_pct", -8.0, AS_OF, source="current"),
+                    point("open", 100.0, AS_OF, source="current"),
+                    point("high", 110.0, AS_OF, source="current"),
+                    point("low", 90.0, AS_OF, source="current"),
+                )
+
+                result = AShareFeatureStrategy().build(raw, history)
+
+                self.assertIsNone(result.features["range_zscore_20d"])
+                self.assertIsNone(result.features["abnormal_range_weak_close_transition"])
+                self.assertEqual(baseline_level(self.quant(0.01), result), RiskLevel.GREEN)
+
+    def test_two_valid_sources_do_not_mix_and_remain_usable(self):
+        observation_time = AS_OF + timedelta(hours=1)
+        points = []
+        source_values = {
+            "alpha": {"open": 100.0, "high": 110.0, "low": 90.0, "index_price": 100.0},
+            "beta": {"open": 100.4, "high": 110.4, "low": 90.4, "index_price": 100.4},
+        }
+        skews = {
+            "alpha": {"open": 20, "high": 0, "low": 20, "index_price": 0},
+            "beta": {"open": 0, "high": 20, "low": 0, "index_price": 20},
+        }
+        for source, values in source_values.items():
+            for field, value in values.items():
+                points.append(
+                    point(
+                        field,
+                        value,
+                        observation_time - timedelta(seconds=skews[source][field]),
+                        source=source,
+                    )
+                )
+        points.append(point("index_change_pct", 0.0, observation_time, source="alpha"))
+
+        history = (
+            snapshot(
+                point("index_price", 100.0, observation_time - timedelta(days=1), source="history"),
+                at=observation_time - timedelta(days=1),
+            ),
+        )
+        result = AShareFeatureStrategy().build(
+            snapshot(*points, at=observation_time, session_slot="intraday"),
+            history,
+        )
+
+        self.assertEqual(result.data_quality, DataStatus.FRESH)
+        expected_ranges = {(110.0 - 90.0) / 100.0, (110.4 - 90.4) / 100.4}
+        self.assertIn(result.features["range_pct"], expected_ranges)
+        self.assertAlmostEqual(result.features["return_1d"], 100.4 / 100.0 - 1.0)
+        evidence = next(item for item in result.evidence if item.evidence_id.split(":")[2] == "range_pct")
+        self.assertEqual(len(evidence.source.split("+")), 1)
+
+    def test_mixed_incomplete_sources_cannot_create_range_features(self):
+        raw = snapshot(
+            point("index_price", 100.0, AS_OF, source="close_source"),
+            point("index_change_pct", 0.0, AS_OF, source="close_source"),
+            point("open", 100.0, AS_OF, source="close_source"),
+            point("high", 110.0, AS_OF, source="range_source"),
+            point("low", 90.0, AS_OF, source="range_source"),
+        )
+
+        result = AShareFeatureStrategy().build(raw, ())
+
+        self.assertNotEqual(result.data_quality, DataStatus.CONFLICTED)
+        for name in (
+            "range_pct",
+            "range_zscore_20d",
+            "close_location",
+            "abnormal_range_weak_close_transition",
+        ):
+            self.assertIsNone(result.features[name], name)
+
+    def test_materially_divergent_complete_sources_fail_closed(self):
+        raw = snapshot(
+            *(
+                point(field, value, AS_OF, source="alpha")
+                for field, value in (
+                    ("index_price", 100.0), ("open", 100.0), ("high", 101.0), ("low", 99.0)
+                )
+            ),
+            *(
+                point(field, value, AS_OF, source="beta")
+                for field, value in (
+                    ("index_price", 110.0), ("open", 110.0), ("high", 111.0), ("low", 109.0)
+                )
+            ),
+            point("index_change_pct", 0.0, AS_OF, source="alpha"),
+        )
+
+        result = AShareFeatureStrategy().build(raw, ())
+
+        self.assertEqual(result.data_quality, DataStatus.CONFLICTED)
+        self.assertEqual(result.reliability_grade, "UNAVAILABLE")
+        self.assertIsNone(result.features["range_pct"])
+        self.assertEqual(baseline_level(self.quant(0.01), result), RiskLevel.UNKNOWN)
 
     def test_valid_close_at_low_and_incomplete_ohlc_keep_exact_missing_semantics(self):
         old = AS_OF - timedelta(days=1)

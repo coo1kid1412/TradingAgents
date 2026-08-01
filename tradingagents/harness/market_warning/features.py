@@ -236,6 +236,17 @@ def _points_at(snapshot: RawMarketSnapshot) -> tuple[MarketDataPoint, ...]:
     return select_point_in_time(snapshot.points, snapshot.as_of_time)
 
 
+def _ohlc_at(snapshot: RawMarketSnapshot, symbol: str):
+    return assess_ohlc_invariants(
+        _points_at(snapshot),
+        snapshot.market,
+        snapshot.session_slot,
+        timestamp_skew=QUALITY_POLICY_V1.cross_source_timestamp_skew,
+        price_tolerance=QUALITY_POLICY_V1.cross_source_price_tolerance,
+        benchmark_symbol=symbol,
+    )
+
+
 def _point_for(points: Iterable[MarketDataPoint], field: str, symbol: str | None = None) -> MarketDataPoint | None:
     candidates = [
         point
@@ -268,13 +279,7 @@ def _observation_series(history: tuple[RawMarketSnapshot, ...], field: str, symb
 def _range_series(history: tuple[RawMarketSnapshot, ...], symbol: str) -> pd.Series:
     values: list[float] = []
     for item in history:
-        ohlc = assess_ohlc_invariants(
-            _points_at(item),
-            item.market,
-            item.session_slot,
-            timestamp_skew=QUALITY_POLICY_V1.cross_source_timestamp_skew,
-            benchmark_symbol=symbol,
-        )
+        ohlc = _ohlc_at(item, symbol)
         open_value = _number(ohlc.open_point.value) if ohlc.open_point is not None else None
         high = _number(ohlc.high_point.value) if ohlc.high_point is not None else None
         low = _number(ohlc.low_point.value) if ohlc.low_point is not None else None
@@ -383,7 +388,6 @@ class _FeatureStrategy:
         close = _series(history, "index_price", symbol) if symbol is not None else pd.Series([float("nan")] * len(history))
         if not _current_observation_is_usable(history[-1]):
             close.iloc[-1] = float("nan")
-        current = _last(close)
         volumes = _series(history, "volume", symbol) if symbol is not None else pd.Series([float("nan")] * len(history))
         ranges = _range_series(history, symbol) if symbol is not None else pd.Series([float("nan")] * len(history))
         ohlc = (
@@ -392,6 +396,7 @@ class _FeatureStrategy:
                 self.market,
                 history[-1].session_slot,
                 timestamp_skew=QUALITY_POLICY_V1.cross_source_timestamp_skew,
+                price_tolerance=QUALITY_POLICY_V1.cross_source_price_tolerance,
                 benchmark_symbol=symbol,
             )
             if symbol is not None
@@ -403,6 +408,19 @@ class _FeatureStrategy:
         high = _number(high_point.value) if high_point is not None else None
         low = _number(low_point.value) if low_point is not None else None
         open_value = _number(open_point.value) if open_point is not None else None
+        candle_close = (
+            _number(ohlc.close_point.value)
+            if ohlc is not None and ohlc.close_point is not None
+            else None
+        )
+        if (
+            ohlc is not None
+            and ohlc.valid
+            and candle_close is not None
+            and _current_observation_is_usable(history[-1])
+        ):
+            close.iloc[-1] = candle_close
+        current = _last(close)
         vol5 = _realized_volatility(close, 5)
         vol20 = _realized_volatility(close, 20)
         vol60 = _realized_volatility(close, 60)
@@ -411,7 +429,11 @@ class _FeatureStrategy:
         range_mean = _rolling_mean(ranges, 20)
         range_std = _last(ranges.rolling(20, min_periods=20).std(ddof=0))
         range_pct = None if high is None or low is None or open_value in (None, 0) else (high - low) / open_value
-        close_location = None if high is None or low is None or current is None or high == low else (current - low) / (high - low)
+        close_location = (
+            None
+            if high is None or low is None or candle_close is None or high == low
+            else (candle_close - low) / (high - low)
+        )
         phase = derive_market_phase(_drawdown(close, 20))
         ohlc_valid = (
             _current_observation_is_usable(history[-1])
@@ -469,6 +491,18 @@ class _FeatureStrategy:
         symbol = self._main_symbol(selected)
         if name in _COMMON_METADATA and symbol is None:
             return ()
+        if name in {
+            "range_pct",
+            "range_zscore_20d",
+            "close_location",
+            "abnormal_range_weak_close_transition",
+        }:
+            window = 1 if name in {"range_pct", "close_location"} else 20
+            return tuple(
+                point
+                for item in history[-window:]
+                for point in _ohlc_at(item, symbol).points
+            )
         inputs = [("index_price", symbol)]
         if name in {"range_pct", "close_location"}:
             inputs = [("index_price", symbol), ("open", symbol), ("high", symbol), ("low", symbol)]

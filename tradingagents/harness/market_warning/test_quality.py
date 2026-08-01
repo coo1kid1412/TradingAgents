@@ -163,6 +163,69 @@ class SourceCombinationTests(TestCase):
 
 
 class QualityEvaluationTests(TestCase):
+    def test_complete_current_stale_ohlc_group_is_stale_and_unavailable(self):
+        assessment = evaluate_data_quality(
+            snapshot(
+                point("index_price", 100.0, source="candle"),
+                point("index_change_pct", 0.0, source="candle"),
+                point("open", 100.0, source="candle", quality_status=DataStatus.STALE),
+                point("high", 101.0, source="candle", quality_status=DataStatus.STALE),
+                point("low", 99.0, source="candle", quality_status=DataStatus.STALE),
+            ),
+            QUALITY_POLICY_V1,
+            NOW,
+        )
+
+        self.assertEqual(assessment.status, DataStatus.STALE)
+        self.assertEqual(assessment.reliability_grade, "UNAVAILABLE")
+        self.assertTrue(any("OHLC" in reason for reason in assessment.reasons))
+
+    def test_complete_current_insufficient_ohlc_group_is_unavailable(self):
+        assessment = evaluate_data_quality(
+            snapshot(
+                point("index_price", 100.0, source="candle"),
+                point("index_change_pct", 0.0, source="candle"),
+                point("open", 100.0, source="candle", quality_status=DataStatus.INSUFFICIENT),
+                point("high", 101.0, source="candle"),
+                point("low", 99.0, source="candle"),
+            ),
+            QUALITY_POLICY_V1,
+            NOW,
+        )
+
+        self.assertEqual(assessment.status, DataStatus.INSUFFICIENT)
+        self.assertEqual(assessment.reliability_grade, "UNAVAILABLE")
+
+    def test_material_source_divergence_precedes_stale_ohlc(self):
+        assessment = evaluate_data_quality(
+            snapshot(
+                *(
+                    point(field, value, source="stale", quality_status=DataStatus.STALE)
+                    for field, value in (
+                        ("index_price", 100.0),
+                        ("open", 100.0),
+                        ("high", 101.0),
+                        ("low", 99.0),
+                    )
+                ),
+                *(
+                    point(field, value, source="fresh")
+                    for field, value in (
+                        ("index_price", 110.0),
+                        ("open", 110.0),
+                        ("high", 111.0),
+                        ("low", 109.0),
+                    )
+                ),
+                point("index_change_pct", 0.0, source="fresh"),
+            ),
+            QUALITY_POLICY_V1,
+            NOW,
+        )
+
+        self.assertEqual(assessment.status, DataStatus.CONFLICTED)
+        self.assertEqual(assessment.reliability_grade, "UNAVAILABLE")
+
     def test_complete_aligned_invalid_ohlc_is_conflicted_and_unavailable(self):
         cases = (
             ("close_below_low", 100.0, 110.0, 90.0, 80.0),

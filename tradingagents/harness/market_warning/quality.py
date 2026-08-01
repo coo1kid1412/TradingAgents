@@ -334,6 +334,7 @@ def evaluate_data_quality(
         snapshot.market,
         snapshot.session_slot,
         timestamp_skew=policy.cross_source_timestamp_skew,
+        price_tolerance=policy.cross_source_price_tolerance,
     )
     source_conflicted = _source_conflict(points, policy) or any(
         point.quality_status == DataStatus.CONFLICTED for point in points
@@ -351,7 +352,7 @@ def evaluate_data_quality(
         if ohlc.conflicted:
             reasons.append("selected benchmark OHLC violates finite positive price or range invariants")
     else:
-        stale = point_stale
+        stale = point_stale or ohlc.stale
         if covered_core:
             core_values = tuple(
                 point for point in points if _canonical_field(point.field) in covered_core
@@ -389,7 +390,13 @@ def evaluate_data_quality(
                 )
         if stale:
             status = DataStatus.STALE
-            reasons.append("core fields are older than the actual data-time policy")
+            if point_stale:
+                reasons.append("core fields are older than the actual data-time policy")
+            if ohlc.stale:
+                reasons.append("selected benchmark OHLC contains stale source observations")
+        elif ohlc.insufficient:
+            status = DataStatus.INSUFFICIENT
+            reasons.append("selected benchmark OHLC contains insufficient source observations")
         elif not covered_core:
             status = DataStatus.INSUFFICIENT
             reasons.append("no required core field is available at the point in time")
