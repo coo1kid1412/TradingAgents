@@ -6,14 +6,17 @@ from collections.abc import Iterable
 from datetime import datetime
 from math import isfinite
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 
 from .domain import Evidence, FeatureSnapshot, Market, MarketDataPoint, MarketPhase, RawMarketSnapshot
-from .quality import evaluate_data_quality, select_point_in_time
+from .quality import QUALITY_POLICY_V1, evaluate_data_quality, select_point_in_time
 
 
 FEATURE_VERSION = "market-warning-v1"
+A_SHARE_BROAD_BENCHMARKS = ("INDEX", "000001.SH", "399001.SZ", "000300.SH", "000905.SH", "399006.SZ", "000688.SH")
+US_BROAD_BENCHMARKS = ("SPX", "^GSPC", "INDEX")
 
 
 def _metadata(source: str, availability: str, direction: str, unit: str) -> dict[str, str]:
@@ -28,12 +31,12 @@ def _metadata(source: str, availability: str, direction: str, unit: str) -> dict
 
 
 _COMMON_METADATA = {
-    "return_1d": _metadata("broad index close", "close visible by as_of", "negative is risk-off", "ratio"),
-    "return_5d": _metadata("broad index close", "five completed observations visible by as_of", "negative is risk-off", "ratio"),
-    "return_20d": _metadata("broad index close", "twenty completed observations visible by as_of", "negative is risk-off", "ratio"),
-    "return_60d": _metadata("broad index close", "sixty completed observations visible by as_of", "negative is risk-off", "ratio"),
-    "return_120d": _metadata("broad index close", "120 completed observations visible by as_of", "negative is risk-off", "ratio"),
-    "return_252d": _metadata("broad index close", "252 completed observations visible by as_of", "negative is risk-off", "ratio"),
+    "return_1d": _metadata("broad index close", "2 observations visible by as_of", "negative is risk-off", "ratio"),
+    "return_5d": _metadata("broad index close", "6 observations visible by as_of", "negative is risk-off", "ratio"),
+    "return_20d": _metadata("broad index close", "21 observations visible by as_of", "negative is risk-off", "ratio"),
+    "return_60d": _metadata("broad index close", "61 observations visible by as_of", "negative is risk-off", "ratio"),
+    "return_120d": _metadata("broad index close", "121 observations visible by as_of", "negative is risk-off", "ratio"),
+    "return_252d": _metadata("broad index close", "253 observations visible by as_of", "negative is risk-off", "ratio"),
     "drawdown_20d": _metadata("broad index close", "20 observations visible by as_of", "more negative is risk-off", "ratio"),
     "drawdown_60d": _metadata("broad index close", "60 observations visible by as_of", "more negative is risk-off", "ratio"),
     "drawdown_252d": _metadata("broad index close", "252 observations visible by as_of", "more negative is risk-off", "ratio"),
@@ -44,11 +47,11 @@ _COMMON_METADATA = {
     "ma20_slope": _metadata("broad index close", "21 observations visible by as_of", "negative is risk-off", "ratio"),
     "ma50_slope": _metadata("broad index close", "51 observations visible by as_of", "negative is risk-off", "ratio"),
     "ma200_slope": _metadata("broad index close", "201 observations visible by as_of", "negative is risk-off", "ratio"),
-    "realized_volatility_5d": _metadata("broad index close", "5 return observations visible by as_of", "higher is risk-off", "ratio"),
-    "realized_volatility_20d": _metadata("broad index close", "20 return observations visible by as_of", "higher is risk-off", "ratio"),
-    "realized_volatility_60d": _metadata("broad index close", "60 return observations visible by as_of", "higher is risk-off", "ratio"),
-    "volatility_ratio_5d_20d": _metadata("broad index close", "20 return observations visible by as_of", "higher is risk-off", "ratio"),
-    "volatility_ratio_20d_60d": _metadata("broad index close", "60 return observations visible by as_of", "higher is risk-off", "ratio"),
+    "realized_volatility_5d": _metadata("broad index close", "6 observations visible by as_of", "higher is risk-off", "ratio"),
+    "realized_volatility_20d": _metadata("broad index close", "21 observations visible by as_of", "higher is risk-off", "ratio"),
+    "realized_volatility_60d": _metadata("broad index close", "61 observations visible by as_of", "higher is risk-off", "ratio"),
+    "volatility_ratio_5d_20d": _metadata("broad index close", "21 observations visible by as_of", "higher is risk-off", "ratio"),
+    "volatility_ratio_20d_60d": _metadata("broad index close", "61 observations visible by as_of", "higher is risk-off", "ratio"),
     "range_pct": _metadata("index high low open", "same-session OHLC visible by as_of", "higher is risk-off", "ratio"),
     "close_location": _metadata("index high low close", "same-session OHLC visible by as_of", "lower is risk-off", "ratio"),
     "volume_zscore_20d": _metadata("broad index volume", "20 observations visible by as_of", "higher is stress", "z-score"),
@@ -59,25 +62,25 @@ _A_SHARE_METADATA = {
     "breadth_above_ma20_pct": _metadata("stock cross section", "point-in-time stock history available", "lower is risk-off", "percent"),
     "new_low_20d_pct": _metadata("stock cross section", "point-in-time stock history available", "higher is risk-off", "percent"),
     "industry_decline_pct": _metadata("industry cross section", "point-in-time industry returns available", "higher is risk-off", "percent"),
-    "margin_balance_growth_20d": _metadata("margin balance", "20 disclosed observations visible by as_of", "higher is crowded risk", "ratio"),
+    "margin_balance_growth_20d": _metadata("margin balance", "21 disclosed observations visible by as_of", "higher is crowded risk", "ratio"),
     "margin_buying": _metadata("margin purchases", "disclosed observation visible by as_of", "higher is crowded risk", "native"),
-    "margin_balance_contracting_from_high": _metadata("margin balance", "20 disclosed observations visible by as_of", "true is risk-off", "boolean"),
-    "valuation_percentile_20d": _metadata("index valuation", "20 disclosed observations visible by as_of", "higher is valuation risk", "percentile"),
-    "turnover_percentile_20d": _metadata("index turnover", "20 disclosed observations visible by as_of", "higher is crowding risk", "percentile"),
+    "margin_balance_contracting_from_high": _metadata("margin balance", "21 disclosed observations visible by as_of", "true is risk-off", "boolean"),
+    "valuation_percentile_20d": _metadata("index valuation", "21 disclosed observations visible by as_of", "higher is valuation risk", "percentile"),
+    "turnover_percentile_20d": _metadata("index turnover", "21 disclosed observations visible by as_of", "higher is crowding risk", "percentile"),
     "limit_down_pct": _metadata("limit-down cross section", "point-in-time stock universe available", "higher is risk-off", "percent"),
     "shibor_3m": _metadata("Shibor", "disclosed observation visible by as_of", "higher is funding stress", "percent"),
-    "shibor_3m_change_20d": _metadata("Shibor", "20 disclosed observations visible by as_of", "higher is funding stress", "percentage points"),
+    "shibor_3m_change_20d": _metadata("Shibor", "21 disclosed observations visible by as_of", "higher is funding stress", "percentage points"),
 }
 
 _US_METADATA = {
-    "hyg_lqd_relative_return_5d": _metadata("HYG and LQD closes", "five completed observations visible by as_of", "more negative is risk-off", "ratio"),
-    "hyg_lqd_relative_return_20d": _metadata("HYG and LQD closes", "twenty completed observations visible by as_of", "more negative is risk-off", "ratio"),
+    "hyg_lqd_relative_return_5d": _metadata("HYG and LQD closes", "6 aligned observations visible by as_of", "more negative is risk-off", "ratio"),
+    "hyg_lqd_relative_return_20d": _metadata("HYG and LQD closes", "21 aligned observations visible by as_of", "more negative is risk-off", "ratio"),
     "vix": _metadata("VIX", "observation visible by as_of", "higher is risk-off", "index"),
-    "vix_change_5d": _metadata("VIX", "five completed observations visible by as_of", "higher is risk-off", "ratio"),
-    "vix_vix3m_ratio": _metadata("VIX and VIX3M", "same-time observations visible by as_of", "higher is risk-off", "ratio"),
-    "russell_spx_relative_return_5d": _metadata("Russell 2000 and S&P 500 closes", "five completed observations visible by as_of", "more negative is risk-off", "ratio"),
-    "nasdaq_spx_relative_return_5d": _metadata("Nasdaq and S&P 500 closes", "five completed observations visible by as_of", "more negative is risk-off", "ratio"),
-    "soxx_spx_relative_return_5d": _metadata("SOXX and S&P 500 closes", "five completed observations visible by as_of", "more negative is risk-off", "ratio"),
+    "vix_change_5d": _metadata("VIX", "6 observations visible by as_of", "higher is risk-off", "ratio"),
+    "vix_vix3m_ratio": _metadata("VIX and VIX3M", "aligned observations visible by as_of", "higher is risk-off", "ratio"),
+    "russell_spx_relative_return_5d": _metadata("Russell 2000 and S&P 500 closes", "6 aligned observations visible by as_of", "more negative is risk-off", "ratio"),
+    "nasdaq_spx_relative_return_5d": _metadata("Nasdaq and S&P 500 closes", "6 aligned observations visible by as_of", "more negative is risk-off", "ratio"),
+    "soxx_spx_relative_return_5d": _metadata("SOXX and S&P 500 closes", "6 aligned observations visible by as_of", "more negative is risk-off", "ratio"),
     "credit_volatility_transition": _metadata("HYG LQD VIX VIX3M", "credit and volatility inputs visible by as_of", "true is risk-off", "boolean"),
 }
 
@@ -105,10 +108,12 @@ _EVIDENCE_INPUTS: dict[str, tuple[str, str | None]] = {
 }
 
 
-def derive_market_phase(drawdown_20d: float | None) -> MarketPhase:
+def derive_market_phase(drawdown_20d: float | None) -> MarketPhase | None:
     """Classify a shallow drawdown as first shock; -5% is continuation."""
 
-    return MarketPhase.FIRST_SHOCK if drawdown_20d is None or drawdown_20d > -0.05 else MarketPhase.CONTINUATION
+    if drawdown_20d is None:
+        return None
+    return MarketPhase.FIRST_SHOCK if drawdown_20d > -0.05 else MarketPhase.CONTINUATION
 
 
 def _number(value: Any) -> float | None:
@@ -145,7 +150,47 @@ def _visible_history(raw: RawMarketSnapshot, prior_history: Iterable[RawMarketSn
                 source_times=source_times,
             )
         )
-    return tuple(merged) + (raw,)
+    merged.append(raw)
+    latest_by_day: dict[object, RawMarketSnapshot] = {}
+    for item in merged:
+        latest_by_day[_market_day(item.as_of_time, raw.market)] = item
+    return tuple(sorted(latest_by_day.values(), key=lambda item: item.as_of_time))
+
+
+def _market_day(value: datetime, market: Market) -> object:
+    zone = ZoneInfo("Asia/Shanghai") if market == Market.A_SHARE else ZoneInfo("America/New_York")
+    return value.astimezone(zone).date()
+
+
+def _is_intraday_slot(session_slot: str) -> bool:
+    normalized = session_slot.strip().lower()
+    return normalized in {"intraday", "open", "regular", "session"} or "intraday" in normalized
+
+
+def _aligned(points: Iterable[MarketDataPoint | None], market: Market, session_slot: str) -> bool:
+    candidates = tuple(points)
+    values = tuple(point for point in candidates if point is not None)
+    if not values or len(values) != len(candidates):
+        return False
+    if len({_market_day(point.data_time, market) for point in values}) != 1:
+        return False
+    return not _is_intraday_slot(session_slot) or (
+        max(point.data_time for point in values) - min(point.data_time for point in values)
+        <= QUALITY_POLICY_V1.cross_source_timestamp_skew
+    )
+
+
+def _history_aligned(
+    history: tuple[RawMarketSnapshot, ...], market: Market, inputs: tuple[tuple[str, str], ...]
+) -> bool:
+    return all(
+        _aligned(
+            tuple(_point_for(_points_at(item), field, symbol) for field, symbol in inputs),
+            market,
+            item.session_slot,
+        )
+        for item in history
+    )
 
 
 def _points_at(snapshot: RawMarketSnapshot) -> tuple[MarketDataPoint, ...]:
@@ -221,13 +266,20 @@ def _percentile(current: float | None, history: pd.Series, horizon: int) -> floa
     return float((window <= current).mean())
 
 
-def _source_times(raw: RawMarketSnapshot, points: tuple[MarketDataPoint, ...]) -> dict[str, datetime]:
-    times = {source: timestamp for source, timestamp in raw.source_times.items() if timestamp <= raw.as_of_time}
+def _source_times(raw: RawMarketSnapshot, points: Iterable[MarketDataPoint]) -> dict[str, datetime]:
+    by_source: dict[str, list[datetime]] = {}
+    for source, timestamp in raw.source_times.items():
+        if timestamp <= raw.as_of_time:
+            by_source.setdefault(source, []).append(timestamp)
     for point in points:
-        current = times.get(point.source)
-        if current is None or point.data_time > current:
-            times[point.source] = point.data_time
-    return dict(sorted(times.items())) or {"snapshot": raw.as_of_time}
+        by_source.setdefault(point.source, []).append(point.data_time)
+    if not by_source:
+        return {"snapshot:first": raw.as_of_time, "snapshot:last": raw.as_of_time}
+    return {
+        key: value
+        for source, times in sorted(by_source.items())
+        for key, value in ((f"{source}:first", min(times)), (f"{source}:last", max(times)))
+    }
 
 
 class _FeatureStrategy:
@@ -242,8 +294,9 @@ class _FeatureStrategy:
         history = _visible_history(raw, prior_history)
         features = self._common_features(history, selected)
         features.update(self._market_features(history, selected))
+        provenance = {name: self._provenance_points(name, history, selected) for name in features}
         evidence = tuple(
-            self._evidence(name, features[name], selected, raw.as_of_time)
+            self._evidence(name, features[name], provenance[name], raw.as_of_time)
             for name in sorted(features)
         )
         return FeatureSnapshot(
@@ -255,24 +308,21 @@ class _FeatureStrategy:
             evidence=evidence,
             data_quality=quality.status,
             reliability_grade=quality.reliability_grade,
-            source_times=_source_times(raw, selected),
+            source_times=_source_times(raw, (point for points in provenance.values() for point in points)),
         )
 
     def _main_symbol(self, selected: tuple[MarketDataPoint, ...]) -> str | None:
-        preferred = "SPX" if self.market == Market.US else "INDEX"
-        if _point_for(selected, "index_price", preferred) is not None:
-            return preferred
-        point = _point_for(selected, "index_price")
-        return point.symbol if point is not None else None
+        allowed = A_SHARE_BROAD_BENCHMARKS if self.market == Market.A_SHARE else US_BROAD_BENCHMARKS
+        return next((symbol for symbol in allowed if _point_for(selected, "index_price", symbol) is not None), None)
 
     def _common_features(self, history: tuple[RawMarketSnapshot, ...], selected: tuple[MarketDataPoint, ...]) -> dict[str, Any]:
         symbol = self._main_symbol(selected)
-        close = _series(history, "index_price", symbol)
+        close = _series(history, "index_price", symbol) if symbol is not None else pd.Series([float("nan")] * len(history))
         current = _last(close)
-        volumes = _series(history, "volume", symbol)
-        high_point = _point_for(selected, "high", symbol)
-        low_point = _point_for(selected, "low", symbol)
-        open_point = _point_for(selected, "open", symbol)
+        volumes = _series(history, "volume", symbol) if symbol is not None else pd.Series([float("nan")] * len(history))
+        high_point = _point_for(selected, "high", symbol) if symbol is not None else None
+        low_point = _point_for(selected, "low", symbol) if symbol is not None else None
+        open_point = _point_for(selected, "open", symbol) if symbol is not None else None
         high = _number(high_point.value) if high_point is not None else None
         low = _number(low_point.value) if low_point is not None else None
         open_value = _number(open_point.value) if open_point is not None else None
@@ -283,25 +333,25 @@ class _FeatureStrategy:
         volume_std = _last(volumes.rolling(20, min_periods=20).std(ddof=0))
         range_pct = None if high is None or low is None or open_value in (None, 0) else (high - low) / open_value
         close_location = None if high is None or low is None or current is None or high == low else (current - low) / (high - low)
+        phase = derive_market_phase(_drawdown(close, 20))
+        ohlc_aligned = _aligned((open_point, high_point, low_point, _point_for(selected, "index_price", symbol)), self.market, history[-1].session_slot)
         return {
             "return_1d": _return(close, 1), "return_5d": _return(close, 5), "return_20d": _return(close, 20),
             "return_60d": _return(close, 60), "return_120d": _return(close, 120), "return_252d": _return(close, 252),
             "drawdown_20d": _drawdown(close, 20), "drawdown_60d": _drawdown(close, 60), "drawdown_252d": _drawdown(close, 252),
-            "market_phase": derive_market_phase(_drawdown(close, 20)).value,
+            "market_phase": phase.value if phase is not None else None,
             "ma20_distance": _ma_distance(close, 20), "ma50_distance": _ma_distance(close, 50), "ma200_distance": _ma_distance(close, 200),
             "ma20_slope": _ma_slope(close, 20), "ma50_slope": _ma_slope(close, 50), "ma200_slope": _ma_slope(close, 200),
             "realized_volatility_5d": vol5, "realized_volatility_20d": vol20, "realized_volatility_60d": vol60,
             "volatility_ratio_5d_20d": _ratio(vol5, vol20), "volatility_ratio_20d_60d": _ratio(vol20, vol60),
-            "range_pct": range_pct, "close_location": close_location,
+            "range_pct": range_pct if ohlc_aligned else None, "close_location": close_location if ohlc_aligned else None,
             "volume_zscore_20d": None if volume_mean is None or volume_std in (None, 0) or _last(volumes) is None else (_last(volumes) - volume_mean) / volume_std,
         }
 
-    def _evidence(self, name: str, value: Any, selected: tuple[MarketDataPoint, ...], as_of_time: datetime) -> Evidence:
-        field, symbol = _EVIDENCE_INPUTS[name]
-        source_point = _point_for(selected, field, symbol)
+    def _evidence(self, name: str, value: Any, points: tuple[MarketDataPoint, ...], as_of_time: datetime) -> Evidence:
         metadata = self.metadata[name]
-        source_time = source_point.data_time if source_point is not None else as_of_time
-        source = source_point.source if source_point is not None else "unavailable"
+        source_time = max((point.data_time for point in points), default=as_of_time)
+        source = "+".join(sorted({point.source for point in points})) or "unavailable"
         state = "unavailable" if value is None else f"value={value}"
         return Evidence(
             evidence_id=f"{self.market.value}:{FEATURE_VERSION}:{name}:{as_of_time.isoformat()}",
@@ -311,6 +361,42 @@ class _FeatureStrategy:
             source=source,
             as_of_time=source_time,
         )
+
+    def _provenance_points(
+        self, name: str, history: tuple[RawMarketSnapshot, ...], selected: tuple[MarketDataPoint, ...]
+    ) -> tuple[MarketDataPoint, ...]:
+        symbol = self._main_symbol(selected)
+        if name in _COMMON_METADATA and symbol is None:
+            return ()
+        inputs = [("index_price", symbol)]
+        if name in {"range_pct", "close_location"}:
+            inputs = [("index_price", symbol), ("open", symbol), ("high", symbol), ("low", symbol)]
+        elif name == "volume_zscore_20d":
+            inputs = [("volume", symbol)]
+        elif name in _A_SHARE_METADATA:
+            field, field_symbol = _EVIDENCE_INPUTS[name]
+            inputs = [(field, field_symbol)]
+        elif name in {"hyg_lqd_relative_return_5d", "hyg_lqd_relative_return_20d", "credit_volatility_transition"}:
+            inputs = [("index_price", "HYG"), ("index_price", "LQD")]
+        elif name == "vix_vix3m_ratio":
+            inputs = [("vix", "VIX"), ("vix3m", "VIX3M")]
+        elif name in {"vix", "vix_change_5d"}:
+            inputs = [("vix", "VIX")]
+        elif name.endswith("spx_relative_return_5d"):
+            leg = {"russell_spx_relative_return_5d": "RUT", "nasdaq_spx_relative_return_5d": "NDX", "soxx_spx_relative_return_5d": "SOXX"}[name]
+            inputs = [("index_price", leg), ("index_price", "SPX")]
+        current_only = {
+            "breadth_up_pct", "breadth_above_ma20_pct", "new_low_20d_pct", "industry_decline_pct",
+            "margin_buying", "limit_down_pct", "shibor_3m", "vix",
+        }
+        result = []
+        for item in history[-1:] if name in current_only else history:
+            visible = _points_at(item)
+            for field, input_symbol in inputs:
+                point = _point_for(visible, field, input_symbol)
+                if point is not None:
+                    result.append(point)
+        return tuple(result)
 
     def _market_features(self, history: tuple[RawMarketSnapshot, ...], selected: tuple[MarketDataPoint, ...]) -> dict[str, Any]:
         raise NotImplementedError
@@ -356,13 +442,25 @@ class USFeatureStrategy(_FeatureStrategy):
         spx = _series(history, "index_price", "SPX")
         vix = _series(history, "vix", "VIX")
         vix3m = _series(history, "vix3m", "VIX3M")
+        hyg_point = _point_for(selected, "index_price", "HYG")
+        lqd_point = _point_for(selected, "index_price", "LQD")
+        spx_point = _point_for(selected, "index_price", "SPX")
+        vix_point = _point_for(selected, "vix", "VIX")
+        vix3m_point = _point_for(selected, "vix3m", "VIX3M")
         hyg5, lqd5 = _return(hyg, 5), _return(lqd, 5)
         hyg20, lqd20 = _return(hyg, 20), _return(lqd, 20)
-        relative5 = None if hyg5 is None or lqd5 is None else hyg5 - lqd5
-        relative20 = None if hyg20 is None or lqd20 is None else hyg20 - lqd20
+        credit_aligned = _aligned((hyg_point, lqd_point), self.market, history[-1].session_slot) and _history_aligned(
+            history, self.market, (("index_price", "HYG"), ("index_price", "LQD"))
+        )
+        relative5 = hyg5 - lqd5 if credit_aligned and hyg5 is not None and lqd5 is not None else None
+        relative20 = hyg20 - lqd20 if credit_aligned and hyg20 is not None and lqd20 is not None else None
         vix_change = _return(vix, 5)
-        vix_ratio = _ratio(_last(vix), _last(vix3m))
-        relative = lambda symbol: self._relative_return(_series(history, "index_price", symbol), spx, 5)
+        vix_ratio = _ratio(_last(vix), _last(vix3m)) if _aligned((vix_point, vix3m_point), self.market, history[-1].session_slot) else None
+        relative = lambda symbol: self._relative_return(
+            _series(history, "index_price", symbol), spx, 5,
+            _aligned((_point_for(selected, "index_price", symbol), spx_point), self.market, history[-1].session_slot)
+            and _history_aligned(history, self.market, (("index_price", symbol), ("index_price", "SPX"))),
+        )
         return {
             "hyg_lqd_relative_return_5d": relative5,
             "hyg_lqd_relative_return_20d": relative20,
@@ -376,6 +474,6 @@ class USFeatureStrategy(_FeatureStrategy):
         }
 
     @staticmethod
-    def _relative_return(left: pd.Series, right: pd.Series, horizon: int) -> float | None:
+    def _relative_return(left: pd.Series, right: pd.Series, horizon: int, aligned: bool) -> float | None:
         left_return, right_return = _return(left, horizon), _return(right, horizon)
-        return None if left_return is None or right_return is None else left_return - right_return
+        return None if not aligned or left_return is None or right_return is None else left_return - right_return

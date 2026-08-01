@@ -115,12 +115,118 @@ class CommonFeatureTests(TestCase):
     def test_phase_boundary_and_metadata_contract(self):
         self.assertEqual(derive_market_phase(-0.049999), MarketPhase.FIRST_SHOCK)
         self.assertEqual(derive_market_phase(-0.05), MarketPhase.CONTINUATION)
-        self.assertEqual(derive_market_phase(None), MarketPhase.FIRST_SHOCK)
+        self.assertIsNone(derive_market_phase(None))
         self.assertEqual(FEATURE_VERSION, "market-warning-v1")
         for name, metadata in FEATURE_METADATA.items():
             with self.subTest(name=name):
                 self.assertEqual(set(metadata), {"source", "availability", "missing", "direction", "unit", "version"})
                 self.assertEqual(metadata["version"], FEATURE_VERSION)
+
+    def test_missing_drawdown_does_not_invent_market_phase(self):
+        raw = snapshot(point("index_price", 100.0, AS_OF), point("index_change_pct", 0.0, AS_OF))
+
+        result = AShareFeatureStrategy().build(raw, ())
+
+        self.assertIsNone(result.features["drawdown_20d"])
+        self.assertIsNone(result.features["market_phase"])
+
+    def test_common_features_require_an_explicit_market_benchmark(self):
+        market = Market.US
+        history = history_from_series("index_price", [100.0, 101.0], market=market, symbol="HYG")
+        raw = snapshot(
+            point("index_price", 98.0, AS_OF, market=market, symbol="HYG"),
+            point("index_price", 100.0, AS_OF, market=market, symbol="LQD"),
+            point("index_price", 96.0, AS_OF, market=market, symbol="SOXX"),
+            point("open", 97.0, AS_OF, market=market, symbol="HYG"),
+            point("high", 99.0, AS_OF, market=market, symbol="HYG"),
+            point("low", 95.0, AS_OF, market=market, symbol="HYG"),
+            market=market,
+            session_slot="intraday",
+        )
+
+        result = USFeatureStrategy().build(raw, history)
+
+        for name in ("return_1d", "drawdown_20d", "ma20_distance", "realized_volatility_5d", "range_pct"):
+            self.assertIsNone(result.features[name], name)
+
+    def test_intraday_and_close_snapshots_on_one_market_day_count_once(self):
+        market = Market.A_SHARE
+        close_time = datetime(2026, 8, 31, 7, 0, tzinfo=UTC)
+        history = tuple(
+            snapshot(
+                point("index_price", 100.0, close_time - timedelta(days=20 - index), market=market),
+                market=market,
+                at=close_time - timedelta(days=20 - index),
+            )
+            for index in range(19)
+        ) + (
+            snapshot(
+                point("index_price", 90.0, close_time - timedelta(hours=3), market=market),
+                market=market,
+                at=close_time - timedelta(hours=3),
+                session_slot="intraday",
+            ),
+        )
+        raw = snapshot(
+            point("index_price", 100.0, close_time, market=market),
+            point("index_change_pct", 0.0, close_time, market=market),
+            market=market,
+            at=close_time,
+        )
+
+        result = AShareFeatureStrategy().build(raw, history)
+
+        self.assertIsNone(result.features["return_20d"])
+        self.assertEqual(result.features["drawdown_20d"], 0.0)
+
+    def test_same_market_day_alignment_is_required_for_ohlc_and_multi_leg_features(self):
+        market = Market.US
+        history = tuple(
+            snapshot(
+                point("index_price", 100.0, AS_OF - timedelta(days=days), market=market, symbol=symbol),
+                market=market,
+                at=AS_OF - timedelta(days=days),
+            )
+            for days in range(1, 6)
+            for symbol in ("SPX", "HYG", "LQD", "RUT")
+        )
+        raw = snapshot(
+            point("index_price", 100.0, AS_OF, market=market, symbol="SPX"),
+            point("index_change_pct", 0.0, AS_OF, market=market, symbol="SPX"),
+            point("open", 98.0, AS_OF - timedelta(days=1), market=market, symbol="SPX"),
+            point("high", 101.0, AS_OF, market=market, symbol="SPX"),
+            point("low", 97.0, AS_OF, market=market, symbol="SPX"),
+            point("index_price", 99.0, AS_OF, market=market, symbol="HYG"),
+            point("index_price", 100.0, AS_OF - timedelta(days=1), market=market, symbol="LQD"),
+            point("vix", 24.0, AS_OF, market=market, symbol="VIX"),
+            point("vix3m", 23.0, AS_OF - timedelta(days=1), market=market, symbol="VIX3M"),
+            point("index_price", 95.0, AS_OF - timedelta(days=1), market=market, symbol="RUT"),
+            market=market,
+            session_slot="close",
+        )
+
+        result = USFeatureStrategy().build(raw, history)
+
+        for name in ("range_pct", "close_location", "hyg_lqd_relative_return_5d", "vix_vix3m_ratio", "russell_spx_relative_return_5d"):
+            self.assertIsNone(result.features[name], name)
+
+    def test_metadata_declares_actual_endpoint_requirements(self):
+        self.assertEqual(FEATURE_METADATA["return_1d"]["availability"], "2 observations visible by as_of")
+        self.assertEqual(FEATURE_METADATA["return_20d"]["availability"], "21 observations visible by as_of")
+        self.assertEqual(FEATURE_METADATA["margin_balance_growth_20d"]["availability"], "21 disclosed observations visible by as_of")
+
+    def test_nonzero_ma_slope_and_nonempty_volatility_ratio_use_rolling_inputs(self):
+        closes = [100.0, 110.0, 99.0, 108.9, 98.01, 107.811] + [100.0 + index for index in range(15)]
+        history = history_from_series("index_price", closes[:-1])
+        raw = snapshot(
+            point("index_price", closes[-1], AS_OF),
+            point("index_change_pct", closes[-1] / closes[-2] - 1, AS_OF),
+        )
+
+        result = AShareFeatureStrategy().build(raw, history)
+
+        self.assertIsNotNone(result.features["volatility_ratio_5d_20d"])
+        self.assertNotEqual(result.features["ma20_slope"], 0.0)
 
 
 class AShareFeatureTests(TestCase):
@@ -221,7 +327,7 @@ class USFeatureTests(TestCase):
         second = USFeatureStrategy().build(raw, ())
 
         self.assertTrue(first.source_times)
-        self.assertEqual(first.source_times, {"a": at, "z": at})
+        self.assertEqual(first.source_times, {"z:first": at, "z:last": at})
         self.assertEqual(first.evidence_ids, second.evidence_ids)
         self.assertEqual(first.evidence_ids, tuple(sorted(first.evidence_ids)))
         self.assertTrue(all(item.evidence_id.startswith("us:market-warning-v1:") for item in first.evidence))
@@ -242,6 +348,33 @@ class USFeatureTests(TestCase):
 
         self.assertNotIn("future_metadata", result.source_times)
         self.assertTrue(all(value <= AS_OF for value in result.source_times.values()))
+
+    def test_rolling_and_multi_leg_evidence_lists_all_input_sources(self):
+        market = Market.US
+        old = AS_OF - timedelta(days=1)
+        history = (
+            snapshot(point("index_price", 100.0, old, market=market, symbol="SPX", source="spx_history"), market=market, at=old),
+            snapshot(point("index_price", 100.0, old, market=market, symbol="HYG", source="hyg_history"), market=market, at=old),
+            snapshot(point("index_price", 100.0, old, market=market, symbol="LQD", source="lqd_history"), market=market, at=old),
+        )
+        raw = snapshot(
+            point("index_price", 101.0, AS_OF, market=market, symbol="SPX", source="spx_current"),
+            point("index_change_pct", 1.0, AS_OF, market=market, symbol="SPX"),
+            point("index_price", 98.0, AS_OF, market=market, symbol="HYG", source="hyg_current"),
+            point("index_price", 100.0, AS_OF, market=market, symbol="LQD", source="lqd_current"),
+            market=market,
+            session_slot="intraday",
+        )
+
+        result = USFeatureStrategy().build(raw, history)
+
+        return_evidence = next(item for item in result.evidence if item.evidence_id.split(":")[2] == "return_1d")
+        relative_evidence = next(item for item in result.evidence if item.evidence_id.split(":")[2] == "hyg_lqd_relative_return_5d")
+        self.assertEqual(return_evidence.source, "spx_current+spx_history")
+        self.assertEqual(relative_evidence.source, "hyg_current+hyg_history+lqd_current+lqd_history")
+        self.assertEqual(relative_evidence.as_of_time, AS_OF)
+        self.assertEqual(result.source_times["spx_history:first"], old)
+        self.assertEqual(result.source_times["spx_history:last"], old)
 
 
 if __name__ == "__main__":
