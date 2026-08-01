@@ -551,6 +551,29 @@ class TushareDataAdapterTests(unittest.TestCase):
         self.assertEqual(len(pro.calls), first_count)
         self.assertNotIn("valuation", {point.field for point in first[0].points})
 
+    def test_later_inception_a_share_indexes_are_optional_for_historical_cache(self):
+        class EarlyHistoryPro(MockTusharePro):
+            def index_daily(self, **kwargs):
+                frame = super().index_daily(**kwargs)
+                return frame if kwargs["ts_code"] == "000001.SH" else pd.DataFrame()
+
+        pro = EarlyHistoryPro()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            adapter = TushareAShareDataAdapter(
+                pro=pro,
+                cache=RawDataCache(Path(temp_dir)),
+            )
+            first = tuple(adapter.backfill(date(2026, 7, 20), date(2026, 7, 20)))
+            first_count = len(pro.calls)
+            second = tuple(adapter.backfill(date(2026, 7, 20), date(2026, 7, 20)))
+
+        self.assertEqual(first, second)
+        self.assertEqual(len(pro.calls), first_count)
+        self.assertEqual(
+            {point.symbol for point in first[0].points if point.field == "index_price"},
+            {"000001.SH"},
+        )
+
     def test_empty_core_tushare_result_is_not_cached_and_retries(self):
         pro = MockTusharePro(all_empty=True)
         with tempfile.TemporaryDirectory() as temp_dir:

@@ -21,6 +21,7 @@ from tradingagents.harness.market_warning.quality import QUALITY_POLICY_V1, eval
 
 _SHANGHAI = ZoneInfo("Asia/Shanghai")
 _BENCHMARKS = ("000001.SH", "399001.SZ", "000300.SH", "000905.SH", "399006.SZ", "000688.SH")
+_CORE_BENCHMARKS = frozenset({"000001.SH"})
 _DAILY_ROW_LIMIT = 6000
 FALLBACK_CALENDAR_VERSION = "weekday-fallback-v1"
 TUSHARE_DISCLOSURE_POLICY_VERSION = "tushare-disclosure-v2"
@@ -392,13 +393,18 @@ class TushareAShareDataAdapter:
             if use_current_industry
             else _FetchResult(pd.DataFrame(), True)
         )
+        core_index_results = [
+            result
+            for symbol, result in zip(_BENCHMARKS, index_results, strict=True)
+            if symbol in _CORE_BENCHMARKS
+        ]
         index_complete = all(result.complete for result in index_results) and all(
             (selected := self._latest_rows(
                 result.frame, "trade_date", as_of_time, "tushare_index_daily"
             )) is not None
             and selected[1] == expected_observation_date
             and any(_core_index_values(row) is not None for _, row in selected[0].iterrows())
-            for result in index_results
+            for result in core_index_results
         )
         complete = daily_complete and stock_basic.complete and index_complete
 
