@@ -7,6 +7,7 @@ from datetime import datetime
 from enum import Enum
 from math import isfinite
 from numbers import Real
+from types import MappingProxyType
 from typing import Any, Mapping
 
 
@@ -103,8 +104,10 @@ class RawMarketSnapshot:
         for point in self.points:
             if not isinstance(point, MarketDataPoint):
                 raise ValueError("points must contain MarketDataPoint values")
-        for timestamp in self.source_times.values():
+        source_times = dict(self.source_times)
+        for timestamp in source_times.values():
             _require_aware(timestamp, "source_times value")
+        object.__setattr__(self, "source_times", MappingProxyType(source_times))
 
 
 @dataclass(frozen=True)
@@ -143,6 +146,7 @@ class FeatureSnapshot:
         evidence_ids = tuple(item.evidence_id for item in evidence)
         if len(evidence_ids) != len(set(evidence_ids)):
             raise ValueError("evidence IDs must be unique")
+        object.__setattr__(self, "features", MappingProxyType(dict(self.features)))
         object.__setattr__(self, "evidence", evidence)
 
     @property

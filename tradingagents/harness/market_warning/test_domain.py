@@ -14,6 +14,7 @@ from tradingagents.harness.market_warning.domain import (
     LLMContextAssessment,
     Market,
     QuantRiskAssessment,
+    RawMarketSnapshot,
 )
 
 
@@ -110,6 +111,61 @@ class DomainValidationTests(TestCase):
                 evidence=evidence,
                 data_quality="fresh",
             )
+
+    def test_raw_snapshot_copies_source_times_from_caller(self):
+        source_times = {"primary": AS_OF}
+        snapshot = RawMarketSnapshot(
+            market=Market.A_SHARE,
+            as_of_time=AS_OF,
+            session_slot="premarket",
+            source_times=source_times,
+        )
+
+        source_times["late"] = datetime(2026, 8, 1, 9, 36)
+
+        self.assertEqual(snapshot.source_times, {"primary": AS_OF})
+
+    def test_raw_snapshot_source_times_are_read_only(self):
+        snapshot = RawMarketSnapshot(
+            market=Market.A_SHARE,
+            as_of_time=AS_OF,
+            session_slot="premarket",
+            source_times={"primary": AS_OF},
+        )
+
+        with self.assertRaises(TypeError):
+            snapshot.source_times["late"] = AS_OF
+
+    def test_feature_snapshot_copies_features_from_caller(self):
+        features = {"breadth": 0.25}
+        snapshot = FeatureSnapshot(
+            market=Market.A_SHARE,
+            as_of_time=AS_OF,
+            session_slot="premarket",
+            feature_version="test-v1",
+            features=features,
+            evidence=(),
+            data_quality="fresh",
+        )
+
+        features["breadth"] = 0.90
+        features["volatility"] = 0.80
+
+        self.assertEqual(snapshot.features, {"breadth": 0.25})
+
+    def test_feature_snapshot_features_are_read_only(self):
+        snapshot = FeatureSnapshot(
+            market=Market.A_SHARE,
+            as_of_time=AS_OF,
+            session_slot="premarket",
+            feature_version="test-v1",
+            features={"breadth": 0.25},
+            evidence=(),
+            data_quality="fresh",
+        )
+
+        with self.assertRaises(TypeError):
+            snapshot.features["breadth"] = 0.90
 
 
 if __name__ == "__main__":
