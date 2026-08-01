@@ -320,6 +320,102 @@ class AShareFeatureTests(TestCase):
 
 
 class USFeatureTests(TestCase):
+    def _credit_history(self, *, include_vix: bool = True):
+        market = Market.US
+        points = []
+        for days in range(1, 6):
+            at = AS_OF - timedelta(days=days)
+            row = [
+                point("index_price", 100.0, at, market=market, symbol="SPX", source="spx"),
+                point("index_price", 100.0, at, market=market, symbol="HYG", source="hyg"),
+                point("index_price", 100.0, at, market=market, symbol="LQD", source="lqd"),
+            ]
+            if include_vix:
+                row.append(point("vix", 20.0, at, market=market, symbol="VIX", source="vix"))
+            points.append(snapshot(*row, market=market, at=at, session_slot="intraday"))
+        return tuple(points)
+
+    def _credit_raw(self, *, vix_time: datetime | None = AS_OF, include_vix3m: bool = True):
+        market = Market.US
+        points = [
+            point("index_price", 100.0, AS_OF, market=market, symbol="SPX", source="spx"),
+            point("index_change_pct", 0.0, AS_OF, market=market, symbol="SPX"),
+            point("index_price", 98.0, AS_OF, market=market, symbol="HYG", source="hyg"),
+            point("index_price", 100.0, AS_OF, market=market, symbol="LQD", source="lqd"),
+        ]
+        if vix_time is not None:
+            points.append(point("vix", 25.0, vix_time, market=market, symbol="VIX", source="vix"))
+        if include_vix3m:
+            points.append(point("vix3m", 24.0, AS_OF, market=market, symbol="VIX3M", source="vix3m"))
+        return snapshot(*points, market=market, session_slot="intraday")
+
+    def test_stale_vix_observation_cannot_confirm_valid_credit_weakness(self):
+        result = USFeatureStrategy().build(
+            self._credit_raw(vix_time=AS_OF - timedelta(days=1), include_vix3m=False),
+            self._credit_history(),
+        )
+
+        self.assertIsNone(result.features["vix_change_5d"])
+        self.assertIsNone(result.features["credit_volatility_transition"])
+
+    def test_credit_transition_uses_vix_change_when_vix3m_is_missing(self):
+        result = USFeatureStrategy().build(self._credit_raw(include_vix3m=False), self._credit_history())
+
+        self.assertAlmostEqual(result.features["vix_change_5d"], 0.25)
+        self.assertTrue(result.features["credit_volatility_transition"])
+        evidence = next(item for item in result.evidence if item.evidence_id.split(":")[2] == "credit_volatility_transition")
+        self.assertEqual(evidence.source, "hyg+lqd+vix")
+
+    def test_credit_transition_uses_vix_ratio_when_vix_history_is_missing(self):
+        result = USFeatureStrategy().build(self._credit_raw(), self._credit_history(include_vix=False))
+
+        self.assertIsNone(result.features["vix_change_5d"])
+        self.assertTrue(result.features["credit_volatility_transition"])
+        evidence = next(item for item in result.evidence if item.evidence_id.split(":")[2] == "credit_volatility_transition")
+        self.assertEqual(evidence.source, "hyg+lqd+vix+vix3m")
+
+    def test_credit_transition_is_unavailable_without_either_volatility_confirmation(self):
+        result = USFeatureStrategy().build(
+            self._credit_raw(vix_time=None, include_vix3m=False), self._credit_history(include_vix=False)
+        )
+
+        self.assertIsNone(result.features["credit_volatility_transition"])
+
+    def test_vix_metadata_matches_endpoint_and_or_path_contract(self):
+        self.assertEqual(
+            FEATURE_METADATA["vix_change_5d"]["availability"],
+            "5-market-day span with two aligned endpoints visible by as_of",
+        )
+        self.assertEqual(
+            FEATURE_METADATA["credit_volatility_transition"]["availability"],
+            "aligned HYG/LQD credit weakness AND (aligned 5-day VIX change OR current aligned VIX/VIX3M ratio)",
+        )
+
+    def test_vix_change_evidence_uses_only_five_day_endpoints(self):
+        market = Market.US
+        history = tuple(
+            snapshot(
+                point("index_price", 100.0, AS_OF - timedelta(days=days), market=market, symbol="SPX"),
+                point("vix", 20.0 + days, AS_OF - timedelta(days=days), market=market, symbol="VIX", source=f"vix_{days}"),
+                market=market,
+                at=AS_OF - timedelta(days=days),
+                session_slot="intraday",
+            )
+            for days in range(1, 6)
+        )
+        raw = snapshot(
+            point("index_price", 100.0, AS_OF, market=market, symbol="SPX"),
+            point("index_change_pct", 0.0, AS_OF, market=market, symbol="SPX"),
+            point("vix", 30.0, AS_OF, market=market, symbol="VIX", source="vix_now"),
+            market=market,
+            session_slot="intraday",
+        )
+
+        result = USFeatureStrategy().build(raw, history)
+
+        evidence = next(item for item in result.evidence if item.evidence_id.split(":")[2] == "vix_change_5d")
+        self.assertEqual(evidence.source, "vix_5+vix_now")
+
     def test_us_relative_strength_volatility_and_transition_features(self):
         market = Market.US
         history = (

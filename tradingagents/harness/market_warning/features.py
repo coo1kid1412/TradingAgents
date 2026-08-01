@@ -76,12 +76,12 @@ _US_METADATA = {
     "hyg_lqd_relative_return_5d": _metadata("HYG and LQD closes", "6 aligned observations visible by as_of", "more negative is risk-off", "ratio"),
     "hyg_lqd_relative_return_20d": _metadata("HYG and LQD closes", "21 aligned observations visible by as_of", "more negative is risk-off", "ratio"),
     "vix": _metadata("VIX", "observation visible by as_of", "higher is risk-off", "index"),
-    "vix_change_5d": _metadata("VIX", "6 observations visible by as_of", "higher is risk-off", "ratio"),
+    "vix_change_5d": _metadata("VIX", "5-market-day span with two aligned endpoints visible by as_of", "higher is risk-off", "ratio"),
     "vix_vix3m_ratio": _metadata("VIX and VIX3M", "aligned observations visible by as_of", "higher is risk-off", "ratio"),
     "russell_spx_relative_return_5d": _metadata("Russell 2000 and S&P 500 closes", "6 aligned observations visible by as_of", "more negative is risk-off", "ratio"),
     "nasdaq_spx_relative_return_5d": _metadata("Nasdaq and S&P 500 closes", "6 aligned observations visible by as_of", "more negative is risk-off", "ratio"),
     "soxx_spx_relative_return_5d": _metadata("SOXX and S&P 500 closes", "6 aligned observations visible by as_of", "more negative is risk-off", "ratio"),
-    "credit_volatility_transition": _metadata("HYG LQD VIX VIX3M", "6 aligned HYG/LQD/VIX observations plus current aligned VIX3M visible by as_of", "true is risk-off", "boolean"),
+    "credit_volatility_transition": _metadata("HYG LQD VIX VIX3M", "aligned HYG/LQD credit weakness AND (aligned 5-day VIX change OR current aligned VIX/VIX3M ratio)", "true is risk-off", "boolean"),
 }
 
 FEATURE_METADATA = {**_COMMON_METADATA, **_A_SHARE_METADATA, **_US_METADATA}
@@ -248,6 +248,15 @@ def _series(history: tuple[RawMarketSnapshot, ...], field: str, symbol: str | No
     return pd.Series(values, dtype="float64")
 
 
+def _observation_series(history: tuple[RawMarketSnapshot, ...], field: str, symbol: str) -> pd.Series:
+    values: list[float] = []
+    for item in history:
+        point = _point_for(_points_at(item), field, symbol)
+        aligned = point is not None and _market_day(point.data_time, item.market) == _observation_date(item, item.market)
+        values.append(float(point.value) if aligned else float("nan"))
+    return pd.Series(values, dtype="float64")
+
+
 def _last(series: pd.Series) -> float | None:
     if series.empty or pd.isna(series.iloc[-1]):
         return None
@@ -323,7 +332,7 @@ class _FeatureStrategy:
         history = _visible_history(raw, prior_history)
         features = self._common_features(history, selected)
         features.update(self._market_features(history, selected))
-        provenance = {name: self._provenance_points(name, history, selected) for name in features}
+        provenance = {name: self._provenance_points(name, history, selected, features) for name in features}
         evidence = tuple(
             self._evidence(name, features[name], provenance[name], raw.as_of_time)
             for name in sorted(features)
@@ -399,7 +408,11 @@ class _FeatureStrategy:
         )
 
     def _provenance_points(
-        self, name: str, history: tuple[RawMarketSnapshot, ...], selected: tuple[MarketDataPoint, ...]
+        self,
+        name: str,
+        history: tuple[RawMarketSnapshot, ...],
+        selected: tuple[MarketDataPoint, ...],
+        features: dict[str, Any],
     ) -> tuple[MarketDataPoint, ...]:
         symbol = self._main_symbol(selected)
         if name in _COMMON_METADATA and symbol is None:
@@ -440,16 +453,32 @@ class _FeatureStrategy:
             "breadth_up_pct", "breadth_above_ma20_pct", "new_low_20d_pct", "industry_decline_pct",
             "margin_buying", "limit_down_pct", "shibor_3m", "vix", "vix_vix3m_ratio", "range_pct", "close_location",
         }
+        if name == "vix_change_5d":
+            result = []
+            for item in (history[-6], history[-1]) if len(history) >= 6 else ():
+                point = _point_for(_points_at(item), "vix", "VIX")
+                if point is not None and _market_day(point.data_time, item.market) == _observation_date(item, item.market):
+                    result.append(point)
+            return tuple(result)
         if name == "credit_volatility_transition":
             result = []
             for item in history[-6:]:
                 visible = _points_at(item)
-                for field, input_symbol in (("index_price", "HYG"), ("index_price", "LQD"), ("vix", "VIX")):
+                for field, input_symbol in (("index_price", "HYG"), ("index_price", "LQD")):
                     point = _point_for(visible, field, input_symbol)
                     if point is not None:
                         result.append(point)
-            vix3m = _point_for(_points_at(history[-1]), "vix3m", "VIX3M")
-            return tuple(result + ([vix3m] if vix3m is not None else []))
+            if features["vix_change_5d"] is not None and features["vix_change_5d"] >= 0.20:
+                for item in (history[-6], history[-1]):
+                    point = _point_for(_points_at(item), "vix", "VIX")
+                    if point is not None:
+                        result.append(point)
+            elif features["vix_vix3m_ratio"] is not None and features["vix_vix3m_ratio"] >= 1.0:
+                for field, input_symbol in (("vix", "VIX"), ("vix3m", "VIX3M")):
+                    point = _point_for(_points_at(history[-1]), field, input_symbol)
+                    if point is not None:
+                        result.append(point)
+            return tuple(result)
         result = []
         window = 1 if name in current_only else windows.get(name, 1)
         for item in history[-window:]:
@@ -502,7 +531,7 @@ class USFeatureStrategy(_FeatureStrategy):
         hyg = _series(history, "index_price", "HYG")
         lqd = _series(history, "index_price", "LQD")
         spx = _series(history, "index_price", "SPX")
-        vix = _series(history, "vix", "VIX")
+        vix = _observation_series(history, "vix", "VIX")
         vix3m = _series(history, "vix3m", "VIX3M")
         hyg_point = _point_for(selected, "index_price", "HYG")
         lqd_point = _point_for(selected, "index_price", "LQD")
