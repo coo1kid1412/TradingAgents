@@ -199,7 +199,7 @@ CREATE TABLE IF NOT EXISTS market_warning_feature_snapshots (
     session_slot TEXT NOT NULL,
     feature_version TEXT NOT NULL,
     data_status TEXT NOT NULL,
-    reliability_grade TEXT,
+    reliability_grade TEXT NOT NULL,
     features_json TEXT NOT NULL,
     evidence_json TEXT NOT NULL,
     source_times_json TEXT NOT NULL,

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import shutil
+import sqlite3
 import sys
 import tempfile
 from contextlib import contextmanager
@@ -56,6 +57,8 @@ def make_snapshot(**changes) -> FeatureSnapshot:
             ),
         ),
         "data_quality": "partial",
+        "reliability_grade": "B",
+        "source_times": {"exchange": AS_OF},
     }
     values.update(changes)
     return FeatureSnapshot(**values)
@@ -109,15 +112,20 @@ def make_decision(**changes) -> FinalWarningDecision:
     return FinalWarningDecision(**values)
 
 
-def save_complete_decision(repository: SQLiteWarningRepository, snapshot: FeatureSnapshot | None = None) -> int:
+def save_complete_decision(
+    repository: SQLiteWarningRepository, snapshot: FeatureSnapshot | None = None
+) -> tuple[int, tuple[int, int]]:
     feature_snapshot_id = repository.save_feature_snapshot(snapshot or make_snapshot())
-    prediction_id = repository.save_prediction(feature_snapshot_id, make_quant())
+    prediction_ids = repository.save_predictions(feature_snapshot_id, make_quant())
     reasoning_id = repository.save_reasoning(feature_snapshot_id, make_reasoning(), "reasoning-v1")
-    return repository.save_decision(
-        feature_snapshot_id,
-        (prediction_id,),
-        reasoning_id,
-        make_decision(),
+    return (
+        repository.save_decision(
+            feature_snapshot_id,
+            prediction_ids,
+            reasoning_id,
+            make_decision(),
+        ),
+        prediction_ids,
     )
 
 
@@ -131,6 +139,11 @@ class SQLiteWarningRepositoryTests(TestCase):
                         "SELECT name FROM sqlite_master WHERE type = 'table'"
                     )
                 }
+                reliability_not_null = next(
+                    row["notnull"]
+                    for row in connection.execute("PRAGMA table_info(market_warning_feature_snapshots)")
+                    if row["name"] == "reliability_grade"
+                )
 
         self.assertTrue(
             {
@@ -142,20 +155,21 @@ class SQLiteWarningRepositoryTests(TestCase):
                 "market_warning_model_registry",
             }.issubset(tables)
         )
+        self.assertEqual(reliability_not_null, 1)
 
     def test_round_trip_persists_snapshot_two_horizons_reasoning_and_decision(self):
         with temporary_database() as db_path:
             repository = SQLiteWarningRepository(db_path)
-            decision_id = save_complete_decision(repository)
+            decision_id, prediction_ids = save_complete_decision(repository)
 
             with _db.connect(db_path) as connection:
                 snapshot_row = connection.execute(
-                    "SELECT features_json, evidence_json, source_times_json "
+                    "SELECT reliability_grade, features_json, evidence_json, source_times_json "
                     "FROM market_warning_feature_snapshots WHERE id = ?",
                     (1,),
                 ).fetchone()
                 prediction_rows = connection.execute(
-                    "SELECT horizon, probability, base_rate FROM market_warning_predictions "
+                    "SELECT id, horizon, probability, base_rate FROM market_warning_predictions "
                     "WHERE feature_snapshot_id = ? ORDER BY horizon",
                     (1,),
                 ).fetchall()
@@ -164,20 +178,25 @@ class SQLiteWarningRepositoryTests(TestCase):
                     (1,),
                 ).fetchone()
                 decision_row = connection.execute(
-                    "SELECT model_version FROM market_warning_decisions WHERE id = ?",
+                    "SELECT model_version, prediction_ids_json FROM market_warning_decisions WHERE id = ?",
                     (decision_id,),
                 ).fetchone()
 
             self.assertGreater(decision_id, 0)
+            self.assertEqual(snapshot_row["reliability_grade"], "B")
             self.assertEqual(json.loads(snapshot_row["features_json"])["breadth_pct"], 22.0)
             self.assertEqual(json.loads(snapshot_row["evidence_json"])[0]["evidence_id"], "breadth-1")
-            self.assertEqual(json.loads(snapshot_row["source_times_json"]), {})
+            self.assertEqual(json.loads(snapshot_row["source_times_json"]), {"exchange": AS_OF.isoformat()})
             self.assertEqual(
-                [(row["horizon"], row["probability"], row["base_rate"]) for row in prediction_rows],
-                [("1d", 0.35, 0.10), ("3d", 0.48, 0.16)],
+                [(row["id"], row["horizon"], row["probability"], row["base_rate"]) for row in prediction_rows],
+                [
+                    (prediction_ids[0], "1d", 0.35, 0.10),
+                    (prediction_ids[1], "3d", 0.48, 0.16),
+                ],
             )
             self.assertEqual(json.loads(reasoning_row["structured_json"])["market_scenario"], "broad deleveraging")
             self.assertEqual(decision_row["model_version"], "quant-v1")
+            self.assertEqual(json.loads(decision_row["prediction_ids_json"]), list(prediction_ids))
             self.assertEqual(repository.load_latest_decision(Market.A_SHARE), make_decision())
             self.assertEqual(
                 repository.load_previous_decision(Market.A_SHARE, AS_OF + timedelta(minutes=1)),
@@ -187,7 +206,7 @@ class SQLiteWarningRepositoryTests(TestCase):
     def test_alert_claim_is_atomic_across_repository_instances(self):
         with temporary_database() as db_path:
             first_repository = SQLiteWarningRepository(db_path)
-            decision_id = save_complete_decision(first_repository)
+            decision_id, _ = save_complete_decision(first_repository)
             second_repository = SQLiteWarningRepository(db_path)
 
             self.assertTrue(first_repository.claim_alert("a-share:2026-08-01", decision_id, "payload-sha"))
@@ -204,6 +223,58 @@ class SQLiteWarningRepositoryTests(TestCase):
             self.assertEqual(alert["push_status"], "sent")
             self.assertIsNotNone(alert["sent_at"])
             self.assertIsNone(alert["error_summary"])
+
+    def test_save_feature_snapshot_rejects_empty_source_times(self):
+        with temporary_database() as db_path:
+            repository = SQLiteWarningRepository(db_path)
+
+            with self.assertRaises(ValueError):
+                repository.save_feature_snapshot(make_snapshot(source_times={}))
+
+            with _db.connect(db_path) as connection:
+                count = connection.execute(
+                    "SELECT COUNT(*) AS row_count FROM market_warning_feature_snapshots"
+                ).fetchone()["row_count"]
+            self.assertEqual(count, 0)
+
+    def test_save_decision_rejects_prediction_from_another_snapshot(self):
+        with temporary_database() as db_path:
+            repository = SQLiteWarningRepository(db_path)
+            feature_snapshot_id = repository.save_feature_snapshot(make_snapshot())
+            prediction_ids = repository.save_predictions(feature_snapshot_id, make_quant())
+            other_snapshot_id = repository.save_feature_snapshot(
+                make_snapshot(as_of_time=AS_OF + timedelta(minutes=1))
+            )
+            other_prediction_ids = repository.save_predictions(other_snapshot_id, make_quant())
+
+            with self.assertRaises(ValueError):
+                repository.save_decision(
+                    feature_snapshot_id,
+                    (prediction_ids[0], other_prediction_ids[1]),
+                    None,
+                    make_decision(),
+                )
+
+    def test_save_decision_rejects_unknown_prediction_id(self):
+        with temporary_database() as db_path:
+            repository = SQLiteWarningRepository(db_path)
+            feature_snapshot_id = repository.save_feature_snapshot(make_snapshot())
+            prediction_ids = repository.save_predictions(feature_snapshot_id, make_quant())
+
+            with self.assertRaises(ValueError):
+                repository.save_decision(
+                    feature_snapshot_id,
+                    (prediction_ids[0], 999999),
+                    None,
+                    make_decision(),
+                )
+
+    def test_alert_claim_reraises_invalid_decision_foreign_key(self):
+        with temporary_database() as db_path:
+            repository = SQLiteWarningRepository(db_path)
+
+            with self.assertRaises(sqlite3.IntegrityError):
+                repository.claim_alert("invalid-decision", 999999, "payload-sha")
 
     def test_register_model_replaces_active_model_for_market_and_horizon(self):
         with temporary_database() as db_path:

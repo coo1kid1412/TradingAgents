@@ -135,6 +135,8 @@ class FeatureSnapshot:
     features: Mapping[str, Any]
     evidence: tuple[Evidence, ...]
     data_quality: DataStatus
+    reliability_grade: str = "D"
+    source_times: Mapping[str, datetime] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "market", _coerce_enum(self.market, Market, "market"))
@@ -146,8 +148,14 @@ class FeatureSnapshot:
         evidence_ids = tuple(item.evidence_id for item in evidence)
         if len(evidence_ids) != len(set(evidence_ids)):
             raise ValueError("evidence IDs must be unique")
+        if not isinstance(self.reliability_grade, str) or not self.reliability_grade:
+            raise ValueError("reliability_grade must not be empty")
+        source_times = dict(self.source_times)
+        for timestamp in source_times.values():
+            _require_aware(timestamp, "source_times value")
         object.__setattr__(self, "features", MappingProxyType(dict(self.features)))
         object.__setattr__(self, "evidence", evidence)
+        object.__setattr__(self, "source_times", MappingProxyType(source_times))
 
     @property
     def evidence_ids(self) -> tuple[str, ...]:

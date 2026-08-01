@@ -43,7 +43,9 @@ class ReasoningPort(Protocol):
 class WarningRepository(Protocol):
     def save_feature_snapshot(self, snapshot: FeatureSnapshot) -> int: ...
 
-    def save_prediction(self, feature_snapshot_id: int, assessment: QuantRiskAssessment) -> int: ...
+    def save_predictions(
+        self, feature_snapshot_id: int, assessment: QuantRiskAssessment
+    ) -> tuple[int, int]: ...
 
     def save_reasoning(
         self, feature_snapshot_id: int, assessment: LLMContextAssessment, model_name: str

@@ -81,6 +81,8 @@ class SQLiteWarningRepository:
         self._db_path = db_path
 
     def save_feature_snapshot(self, snapshot: FeatureSnapshot) -> int:
+        if not snapshot.source_times:
+            raise ValueError("source_times must not be empty when saving a feature snapshot")
         with _db.connect(self._db_path) as connection:
             cursor = connection.execute(
                 "INSERT INTO market_warning_feature_snapshots "
@@ -93,21 +95,21 @@ class SQLiteWarningRepository:
                     snapshot.session_slot,
                     snapshot.feature_version,
                     snapshot.data_quality.value,
-                    None,
+                    snapshot.reliability_grade,
                     _json_dump(dict(snapshot.features)),
                     _evidence_json(snapshot.evidence),
-                    _json_dump({}),
+                    _json_dump(dict(snapshot.source_times)),
                 ),
             )
             return int(cursor.lastrowid)
 
-    def save_prediction(self, feature_snapshot_id: int, assessment: QuantRiskAssessment) -> int:
+    def save_predictions(self, feature_snapshot_id: int, assessment: QuantRiskAssessment) -> tuple[int, int]:
         rows = (
             ("1d", assessment.crash_1d_probability, assessment.base_rate_1d),
             ("3d", assessment.crash_3d_probability, assessment.base_rate_3d),
         )
         with _db.connect(self._db_path) as connection:
-            first_prediction_id: int | None = None
+            prediction_ids: list[int] = []
             for horizon, probability, base_rate in rows:
                 cursor = connection.execute(
                     "INSERT INTO market_warning_predictions "
@@ -126,9 +128,8 @@ class SQLiteWarningRepository:
                         _json_dump(list(assessment.top_contributors)),
                     ),
                 )
-                if first_prediction_id is None:
-                    first_prediction_id = int(cursor.lastrowid)
-            return first_prediction_id  # The 1d row is the method's stable primary ID.
+                prediction_ids.append(int(cursor.lastrowid))
+            return (prediction_ids[0], prediction_ids[1])
 
     def save_reasoning(
         self, feature_snapshot_id: int, assessment: LLMContextAssessment, model_name: str
@@ -156,16 +157,22 @@ class SQLiteWarningRepository:
         decision: FinalWarningDecision,
     ) -> int:
         with _db.connect(self._db_path) as connection:
-            model_version = None
-            if prediction_ids:
-                prediction = connection.execute(
-                    "SELECT model_version FROM market_warning_predictions "
-                    "WHERE id = ? AND feature_snapshot_id = ?",
-                    (prediction_ids[0], feature_snapshot_id),
-                ).fetchone()
-                if prediction is None:
-                    raise ValueError("prediction_ids must belong to feature_snapshot_id")
-                model_version = prediction["model_version"]
+            if len(prediction_ids) != 2 or len(set(prediction_ids)) != 2:
+                raise ValueError("prediction_ids must contain distinct 1d and 3d prediction IDs")
+            placeholders = ", ".join("?" for _ in prediction_ids)
+            predictions = connection.execute(
+                "SELECT id, horizon, model_version FROM market_warning_predictions "
+                f"WHERE feature_snapshot_id = ? AND id IN ({placeholders})",
+                (feature_snapshot_id, *prediction_ids),
+            ).fetchall()
+            if len(predictions) != len(prediction_ids):
+                raise ValueError("prediction_ids must all belong to feature_snapshot_id")
+            if {row["horizon"] for row in predictions} != {"1d", "3d"}:
+                raise ValueError("prediction_ids must reference one 1d and one 3d prediction")
+            model_versions = {row["model_version"] for row in predictions}
+            if len(model_versions) != 1:
+                raise ValueError("prediction_ids must share one model_version")
+            model_version = model_versions.pop()
             cursor = connection.execute(
                 "INSERT INTO market_warning_decisions "
                 "(feature_snapshot_id, prediction_ids_json, reasoning_id, baseline_level, final_level, "
@@ -228,8 +235,10 @@ class SQLiteWarningRepository:
                     "VALUES (?, ?, ?, ?, ?, ?)",
                     (idempotency_key, decision_id, payload_hash, "claimed", None, None),
                 )
-        except sqlite3.IntegrityError:
-            return False
+        except sqlite3.IntegrityError as exc:
+            if "UNIQUE constraint failed: market_warning_alerts.idempotency_key" in str(exc):
+                return False
+            raise
         return True
 
     def finish_alert(self, idempotency_key: str, status: str, error_summary: str | None = None) -> None:

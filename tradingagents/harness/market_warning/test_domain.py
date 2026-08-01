@@ -167,6 +167,49 @@ class DomainValidationTests(TestCase):
         with self.assertRaises(TypeError):
             snapshot.features["breadth"] = 0.90
 
+    def test_feature_snapshot_defaults_to_conservative_reliability_grade(self):
+        snapshot = FeatureSnapshot(
+            market=Market.A_SHARE,
+            as_of_time=AS_OF,
+            session_slot="premarket",
+            feature_version="test-v1",
+            features={},
+            evidence=(),
+            data_quality="fresh",
+        )
+
+        self.assertEqual(snapshot.reliability_grade, "D")
+
+    def test_feature_snapshot_freezes_timezone_aware_source_times(self):
+        source_times = {"exchange": AS_OF}
+        snapshot = FeatureSnapshot(
+            market=Market.A_SHARE,
+            as_of_time=AS_OF,
+            session_slot="premarket",
+            feature_version="test-v1",
+            features={},
+            evidence=(),
+            data_quality="fresh",
+            source_times=source_times,
+        )
+
+        source_times["late"] = AS_OF
+
+        self.assertEqual(snapshot.source_times, {"exchange": AS_OF})
+        with self.assertRaises(TypeError):
+            snapshot.source_times["late"] = AS_OF
+        with self.assertRaises(ValueError):
+            FeatureSnapshot(
+                market=Market.A_SHARE,
+                as_of_time=AS_OF,
+                session_slot="premarket",
+                feature_version="test-v1",
+                features={},
+                evidence=(),
+                data_quality="fresh",
+                source_times={"naive": datetime(2026, 8, 1, 9, 35)},
+            )
+
 
 if __name__ == "__main__":
     main()
