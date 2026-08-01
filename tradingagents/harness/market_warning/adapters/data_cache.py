@@ -1,11 +1,13 @@
-"""Atomic raw normalized cache for market-warning adapters."""
+"""Atomic, generation-checked raw cache for market-warning adapters."""
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import tempfile
-from datetime import datetime
+import uuid
+from datetime import date, datetime
 from enum import Enum
 from pathlib import Path
 from typing import Any, Iterable, Mapping
@@ -13,12 +15,12 @@ from typing import Any, Iterable, Mapping
 from tradingagents.harness.market_warning.domain import DataStatus, Market, MarketDataPoint, RawMarketSnapshot
 
 
-SCHEMA_VERSION = "raw-market-cache-v1"
+SCHEMA_VERSION = "raw-market-cache-v2"
 DEFAULT_RAW_CACHE_ROOT = Path("harness_data/market_warning/raw")
 
 
 def _json_value(value: Any) -> Any:
-    if isinstance(value, datetime):
+    if isinstance(value, (date, datetime)):
         return value.isoformat()
     if isinstance(value, Enum):
         return value.value
@@ -29,6 +31,14 @@ def _json_value(value: Any) -> Any:
     return value
 
 
+def _canonical(value: Any) -> Any:
+    return json.loads(json.dumps(_json_value(value), ensure_ascii=False, sort_keys=True, separators=(",", ":")))
+
+
+def _canonical_text(value: Any) -> str:
+    return json.dumps(_canonical(value), ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
 def _parse_time(value: str | datetime | None) -> datetime | None:
     if value is None or isinstance(value, datetime):
         return value
@@ -36,7 +46,7 @@ def _parse_time(value: str | datetime | None) -> datetime | None:
 
 
 class RawDataCache:
-    """Store normalized vendor rows under market/dataset/year partitions."""
+    """Store normalized vendor rows under market/dataset/data-year partitions."""
 
     def __init__(self, root: Path | str = DEFAULT_RAW_CACHE_ROOT) -> None:
         self.root = Path(root)
@@ -57,50 +67,93 @@ class RawDataCache:
         source: str,
         fetched_at: datetime,
         snapshot: Mapping[str, Any] | None = None,
+        complete: bool = True,
     ) -> Path:
         materialized = [dict(row) for row in rows]
         data_times = [
-            parsed
-            for row in materialized
-            if (parsed := _parse_time(row.get("data_time"))) is not None
+            parsed for row in materialized if (parsed := _parse_time(row.get("data_time"))) is not None
         ]
         data_path = self.data_path(market, dataset, year, cache_key)
         manifest_path = data_path.with_suffix(".manifest.json")
         data_path.parent.mkdir(parents=True, exist_ok=True)
-        manifest = {
-            "query": _json_value(query),
+        generation = uuid.uuid4().hex
+        header = {"generation": generation, "schema_version": SCHEMA_VERSION}
+        lines = [
+            json.dumps(header, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+            *(
+                json.dumps(_json_value(row), ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+                for row in materialized
+            ),
+        ]
+        data_bytes = ("\n".join(lines) + "\n").encode("utf-8")
+        manifest: dict[str, Any] = {
+            "query": _canonical(query),
             "source": source,
             "fetched_at": fetched_at.isoformat(),
             "min_data_time": min(data_times).isoformat() if data_times else None,
             "max_data_time": max(data_times).isoformat() if data_times else None,
             "rows": len(materialized),
             "schema_version": SCHEMA_VERSION,
+            "generation": generation,
+            "data_sha256": hashlib.sha256(data_bytes).hexdigest(),
+            "complete": bool(complete),
         }
         if snapshot is not None:
             manifest["snapshot"] = _json_value(snapshot)
-        data_text = "".join(
-            json.dumps(_json_value(row), ensure_ascii=False, separators=(",", ":")) + "\n"
-            for row in materialized
-        )
-        self._atomic_write(data_path, data_text)
-        self._atomic_write(
-            manifest_path,
-            json.dumps(manifest, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
-        )
+        manifest_bytes = json.dumps(
+            manifest, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+        self._atomic_write(data_path, data_bytes)
+        self._atomic_write(manifest_path, manifest_bytes)
         return data_path
 
     def read_rows(
-        self, *, market: Market, dataset: str, year: int, cache_key: str
+        self,
+        *,
+        market: Market,
+        dataset: str,
+        year: int,
+        cache_key: str,
+        query: Mapping[str, Any],
     ) -> tuple[list[dict[str, Any]], dict[str, Any]] | None:
         data_path = self.data_path(market, dataset, year, cache_key)
         manifest_path = data_path.with_suffix(".manifest.json")
         if not data_path.exists() or not manifest_path.exists():
             return None
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        if manifest.get("schema_version") != SCHEMA_VERSION:
-            return None
-        rows = [json.loads(line) for line in data_path.read_text(encoding="utf-8").splitlines() if line]
-        if len(rows) != manifest.get("rows"):
+        try:
+            data_bytes = data_path.read_bytes()
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            if not isinstance(manifest, dict):
+                return None
+            if manifest.get("schema_version") != SCHEMA_VERSION or not manifest.get("complete"):
+                return None
+            if not isinstance(manifest.get("generation"), str) or not manifest["generation"]:
+                return None
+            if _canonical_text(manifest.get("query")) != _canonical_text(query):
+                return None
+            if manifest.get("data_sha256") != hashlib.sha256(data_bytes).hexdigest():
+                return None
+            decoded = data_bytes.decode("utf-8").splitlines()
+            if not decoded:
+                return None
+            header = json.loads(decoded[0])
+            if (
+                not isinstance(header, dict)
+                or header.get("schema_version") != SCHEMA_VERSION
+                or header.get("generation") != manifest["generation"]
+            ):
+                return None
+            rows = [json.loads(line) for line in decoded[1:] if line]
+            row_count = manifest.get("rows")
+            if (
+                any(not isinstance(row, dict) for row in rows)
+                or isinstance(row_count, bool)
+                or not isinstance(row_count, int)
+                or row_count < 0
+                or len(rows) != row_count
+            ):
+                return None
+        except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError):
             return None
         return rows, manifest
 
@@ -113,6 +166,7 @@ class RawDataCache:
         query: Mapping[str, Any],
         source: str,
         fetched_at: datetime,
+        complete: bool = True,
     ) -> Path:
         rows = [
             {
@@ -145,50 +199,62 @@ class RawDataCache:
                 "data_status": snapshot.data_status.value,
                 "source_times": snapshot.source_times,
             },
+            complete=complete,
         )
 
     def read_snapshot(
-        self, *, market: Market, dataset: str, year: int, cache_key: str
+        self,
+        *,
+        market: Market,
+        dataset: str,
+        year: int,
+        cache_key: str,
+        query: Mapping[str, Any],
     ) -> RawMarketSnapshot | None:
-        cached = self.read_rows(market=market, dataset=dataset, year=year, cache_key=cache_key)
+        cached = self.read_rows(
+            market=market, dataset=dataset, year=year, cache_key=cache_key, query=query
+        )
         if cached is None:
             return None
         rows, manifest = cached
         metadata = manifest.get("snapshot")
         if not isinstance(metadata, dict):
             return None
-        points = tuple(
-            MarketDataPoint(
-                market=row["market"],
-                symbol=row["symbol"],
-                field=row["field"],
-                value=row.get("value"),
-                data_time=datetime.fromisoformat(row["data_time"]),
-                fetched_at=datetime.fromisoformat(row["fetched_at"]),
-                source=row["source"],
-                quality_status=row.get("quality_status", DataStatus.FRESH.value),
-                available_at=_parse_time(row.get("available_at")),
+        try:
+            points = tuple(
+                MarketDataPoint(
+                    market=row["market"],
+                    symbol=row["symbol"],
+                    field=row["field"],
+                    value=row.get("value"),
+                    data_time=datetime.fromisoformat(row["data_time"]),
+                    fetched_at=datetime.fromisoformat(row["fetched_at"]),
+                    source=row["source"],
+                    quality_status=row.get("quality_status", DataStatus.FRESH.value),
+                    available_at=_parse_time(row.get("available_at")),
+                )
+                for row in rows
             )
-            for row in rows
-        )
-        return RawMarketSnapshot(
-            market=metadata["market"],
-            as_of_time=datetime.fromisoformat(metadata["as_of_time"]),
-            session_slot=metadata["session_slot"],
-            points=points,
-            data_status=metadata.get("data_status", DataStatus.FRESH.value),
-            source_times={
-                source_name: datetime.fromisoformat(timestamp)
-                for source_name, timestamp in metadata.get("source_times", {}).items()
-            },
-        )
+            return RawMarketSnapshot(
+                market=metadata["market"],
+                as_of_time=datetime.fromisoformat(metadata["as_of_time"]),
+                session_slot=metadata["session_slot"],
+                points=points,
+                data_status=metadata.get("data_status", DataStatus.FRESH.value),
+                source_times={
+                    source_name: datetime.fromisoformat(timestamp)
+                    for source_name, timestamp in metadata.get("source_times", {}).items()
+                },
+            )
+        except (KeyError, TypeError, ValueError):
+            return None
 
     @staticmethod
-    def _atomic_write(path: Path, content: str) -> None:
+    def _atomic_write(path: Path, content: bytes) -> None:
         temp_path: Path | None = None
         try:
             with tempfile.NamedTemporaryFile(
-                mode="w", encoding="utf-8", dir=path.parent, prefix=f".{path.name}.", suffix=".tmp", delete=False
+                mode="wb", dir=path.parent, prefix=f".{path.name}.", suffix=".tmp", delete=False
             ) as handle:
                 handle.write(content)
                 handle.flush()

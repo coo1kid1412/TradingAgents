@@ -17,6 +17,7 @@ class QualityPolicy:
 
     version: str = "quality-v1"
     intraday_core_quote_max_age: timedelta = timedelta(minutes=10)
+    complete_daily_max_age: timedelta = timedelta(days=7)
     cross_source_price_tolerance: float = 0.005
     cross_source_timestamp_skew: timedelta = timedelta(seconds=120)
     daily_disclosure_cutoffs: Mapping[Market, time] = field(
@@ -234,15 +235,9 @@ def _is_daily_slot(session_slot: str) -> bool:
     return normalized in {"daily", "close", "closing", "eod", "end_of_day"} or "close" in normalized
 
 
-def _cutoff_instant(market: Market, session_slot: str, as_of_time: datetime, policy: QualityPolicy) -> datetime | None:
-    if not _is_daily_slot(session_slot):
-        return None
-    cutoff = policy.daily_disclosure_cutoffs.get(market)
-    if cutoff is None:
-        return None
-    local = as_of_time.astimezone(_EXCHANGE_ZONES[market])
-    local_cutoff = datetime.combine(local.date(), cutoff, tzinfo=_EXCHANGE_ZONES[market])
-    return local_cutoff.astimezone(as_of_time.tzinfo)
+def _is_premarket_slot(session_slot: str) -> bool:
+    normalized = session_slot.strip().lower()
+    return normalized in {"premarket", "pre-market", "before_open"} or "premarket" in normalized
 
 
 def _source_conflict(
@@ -344,18 +339,23 @@ def evaluate_data_quality(
     else:
         stale = point_stale
         if covered_core:
-            stale = stale or any(
-                evaluation_time - point.data_time > policy.intraday_core_quote_max_age
-                or point.data_time > evaluation_time
-                for point in points
-                if _canonical_field(point.field) in covered_core
+            core_values = tuple(
+                point for point in points if _canonical_field(point.field) in covered_core
             )
-            cutoff = _cutoff_instant(snapshot.market, snapshot.session_slot, snapshot.as_of_time, policy)
-            if cutoff is not None:
+            if _is_premarket_slot(snapshot.session_slot) or _is_daily_slot(snapshot.session_slot):
+                zone = _EXCHANGE_ZONES[snapshot.market]
+                evaluation_date = evaluation_time.astimezone(zone).date()
+                max_days = policy.complete_daily_max_age.days
                 stale = stale or any(
-                    point.data_time < cutoff
-                    for point in points
-                    if _canonical_field(point.field) in covered_core
+                    point.data_time > evaluation_time
+                    or (evaluation_date - point.data_time.astimezone(zone).date()).days > max_days
+                    for point in core_values
+                )
+            else:
+                stale = stale or any(
+                    evaluation_time - point.data_time > policy.intraday_core_quote_max_age
+                    or point.data_time > evaluation_time
+                    for point in core_values
                 )
         if stale:
             status = DataStatus.STALE

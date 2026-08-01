@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from datetime import datetime
+from typing import Any
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -46,35 +47,41 @@ def _quote_points(quote: IntradayQuote, symbol: str, fetched_at: datetime) -> tu
 def _cross_section_points(frame: pd.DataFrame | None, as_of_time: datetime, fetched_at: datetime) -> tuple[MarketDataPoint, ...]:
     if frame is None or frame.empty:
         return ()
-    required = {"last", "pre_close"}
+    required = {"last", "pre_close", "data_time"}
     if not required.issubset(frame.columns):
         return ()
     rows = frame.copy()
-    data_time = as_of_time
-    if "data_time" in rows:
-        def normalize_time(value: object) -> datetime | None:
-            try:
-                parsed = pd.Timestamp(value)
-            except (TypeError, ValueError):
-                return None
-            if pd.isna(parsed):
-                return None
-            return (
-                parsed.tz_localize(_SHANGHAI).to_pydatetime()
-                if parsed.tzinfo is None
-                else parsed.tz_convert(_SHANGHAI).to_pydatetime()
-            )
 
-        rows["_data_time"] = rows["data_time"].map(normalize_time)
-        rows = rows[rows["_data_time"].notna() & (rows["_data_time"] <= as_of_time)].copy()
-        if rows.empty:
-            return ()
-        data_time = max(rows["_data_time"])
+    def normalize_time(value: object) -> datetime | None:
+        try:
+            parsed = pd.Timestamp(value)
+        except (TypeError, ValueError):
+            return None
+        if pd.isna(parsed):
+            return None
+        return (
+            parsed.tz_localize(_SHANGHAI).to_pydatetime()
+            if parsed.tzinfo is None
+            else parsed.tz_convert(_SHANGHAI).to_pydatetime()
+        )
+
+    rows["_data_time"] = rows["data_time"].map(normalize_time)
+    rows = rows[rows["_data_time"].notna() & (rows["_data_time"] <= as_of_time)].copy()
+    if rows.empty:
+        return ()
     rows["last"] = pd.to_numeric(rows["last"], errors="coerce")
     rows["pre_close"] = pd.to_numeric(rows["pre_close"], errors="coerce")
     rows = rows[(rows["last"] > 0) & (rows["pre_close"] > 0)].copy()
     if rows.empty:
         return ()
+    data_time = max(rows["_data_time"])
+    source = "realtime_cross_section"
+    if "source" in rows:
+        sources = sorted(
+            {str(value).strip() for value in rows["source"].dropna() if str(value).strip()}
+        )
+        if sources:
+            source = "+".join(sources)
     rows["return"] = rows["last"] / rows["pre_close"] - 1.0
     values: dict[str, float] = {"breadth_up_pct": float((rows["return"] > 0).mean() * 100.0)}
     if "ma20" in rows:
@@ -99,7 +106,7 @@ def _cross_section_points(frame: pd.DataFrame | None, as_of_time: datetime, fetc
             value=value,
             data_time=data_time,
             fetched_at=fetched_at,
-            source="realtime_cross_section",
+            source=source,
             available_at=data_time,
         )
         for field, value in values.items()

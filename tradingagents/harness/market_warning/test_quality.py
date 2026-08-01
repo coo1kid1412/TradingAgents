@@ -5,6 +5,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import sys
 from unittest import TestCase, main
+from zoneinfo import ZoneInfo
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 
@@ -19,6 +20,8 @@ from tradingagents.harness.market_warning.quality import (
 
 UTC = timezone.utc
 NOW = datetime(2026, 8, 3, 16, 0, tzinfo=UTC)
+SHANGHAI = ZoneInfo("Asia/Shanghai")
+NEW_YORK = ZoneInfo("America/New_York")
 
 
 def point(
@@ -275,30 +278,95 @@ class QualityEvaluationTests(TestCase):
         self.assertLess(below_boundary.optional_coverage, 0.70)
         self.assertEqual(below_boundary.reliability_grade, "B")
 
-    def test_stale_data_time_is_unavailable_even_when_fetched_today(self):
-        cached_close = (
-            point(
-                "index_price",
-                100,
-                data_time=NOW - timedelta(days=1),
-                fetched_at=NOW - timedelta(minutes=1),
-            ),
-            point(
-                "index_change_pct",
-                -0.4,
-                data_time=NOW - timedelta(days=1),
-                fetched_at=NOW - timedelta(minutes=1),
+    def test_a_share_friday_close_is_fresh_on_monday_premarket_when_disclosed(self):
+        as_of = datetime(2026, 8, 3, 8, 30, tzinfo=SHANGHAI)
+        data_time = datetime(2026, 7, 31, 15, 0, tzinfo=SHANGHAI)
+        available_at = datetime(2026, 7, 31, 18, 0, tzinfo=SHANGHAI)
+        raw = RawMarketSnapshot(
+            market=Market.A_SHARE,
+            as_of_time=as_of,
+            session_slot="premarket",
+            points=(
+                point("index_price", 100, data_time=data_time, available_at=available_at),
+                point("index_change_pct", -0.4, data_time=data_time, available_at=available_at),
             ),
         )
 
-        assessment = evaluate_data_quality(
-            snapshot(*cached_close, market=Market.US, session_slot="close"),
-            QUALITY_POLICY_V1,
-            NOW,
+        assessment = evaluate_data_quality(raw, QUALITY_POLICY_V1, as_of)
+
+        self.assertEqual(assessment.status, DataStatus.FRESH)
+
+    def test_us_friday_close_is_fresh_on_monday_premarket_when_disclosed(self):
+        as_of = datetime(2026, 8, 3, 8, 30, tzinfo=NEW_YORK)
+        data_time = datetime(2026, 7, 31, 16, 0, tzinfo=NEW_YORK)
+        raw = RawMarketSnapshot(
+            market=Market.US,
+            as_of_time=as_of,
+            session_slot="premarket",
+            points=(
+                point("index_price", 100, market=Market.US, symbol="SPX", data_time=data_time, available_at=data_time),
+                point("index_change_pct", -0.4, market=Market.US, symbol="SPX", data_time=data_time, available_at=data_time),
+            ),
         )
+
+        assessment = evaluate_data_quality(raw, QUALITY_POLICY_V1, as_of)
+
+        self.assertEqual(assessment.status, DataStatus.FRESH)
+
+    def test_recent_complete_daily_close_is_fresh_for_daily_session(self):
+        as_of = datetime(2026, 8, 3, 16, 30, tzinfo=NEW_YORK)
+        data_time = datetime(2026, 7, 31, 16, 0, tzinfo=NEW_YORK)
+        raw = RawMarketSnapshot(
+            market=Market.US,
+            as_of_time=as_of,
+            session_slot="close",
+            points=(
+                point("index_price", 100, market=Market.US, symbol="SPX", data_time=data_time, available_at=data_time),
+                point("index_change_pct", -0.4, market=Market.US, symbol="SPX", data_time=data_time, available_at=data_time),
+            ),
+        )
+
+        self.assertEqual(evaluate_data_quality(raw, QUALITY_POLICY_V1, as_of).status, DataStatus.FRESH)
+
+    def test_same_t_minus_one_daily_close_is_stale_during_intraday_session(self):
+        cases = (
+            (Market.A_SHARE, SHANGHAI, 15, "000001.SH"),
+            (Market.US, NEW_YORK, 16, "SPX"),
+        )
+        for market, zone, close_hour, symbol in cases:
+            with self.subTest(market=market):
+                as_of = datetime(2026, 8, 3, 10, 0, tzinfo=zone)
+                data_time = datetime(2026, 7, 31, close_hour, 0, tzinfo=zone)
+                raw = RawMarketSnapshot(
+                    market=market,
+                    as_of_time=as_of,
+                    session_slot="intraday",
+                    points=(
+                        point("index_price", 100, market=market, symbol=symbol, data_time=data_time, available_at=data_time),
+                        point("index_change_pct", -0.4, market=market, symbol=symbol, data_time=data_time, available_at=data_time),
+                    ),
+                )
+
+                assessment = evaluate_data_quality(raw, QUALITY_POLICY_V1, as_of)
+
+                self.assertEqual(assessment.status, DataStatus.STALE)
+
+    def test_premarket_daily_close_older_than_seven_local_dates_is_stale(self):
+        as_of = datetime(2026, 8, 10, 8, 30, tzinfo=NEW_YORK)
+        data_time = datetime(2026, 8, 2, 16, 0, tzinfo=NEW_YORK)
+        raw = RawMarketSnapshot(
+            market=Market.US,
+            as_of_time=as_of,
+            session_slot="premarket",
+            points=(
+                point("index_price", 100, market=Market.US, symbol="SPX", data_time=data_time, available_at=data_time),
+                point("index_change_pct", -0.4, market=Market.US, symbol="SPX", data_time=data_time, available_at=data_time),
+            ),
+        )
+
+        assessment = evaluate_data_quality(raw, QUALITY_POLICY_V1, as_of)
 
         self.assertEqual(assessment.status, DataStatus.STALE)
-        self.assertEqual(assessment.reliability_grade, "UNAVAILABLE")
 
     def test_conflicting_sources_force_unavailable(self):
         assessment = evaluate_data_quality(
