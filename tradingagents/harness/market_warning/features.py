@@ -10,7 +10,15 @@ from zoneinfo import ZoneInfo
 
 import pandas as pd
 
-from .domain import Evidence, FeatureSnapshot, Market, MarketDataPoint, MarketPhase, RawMarketSnapshot
+from .domain import (
+    DataStatus,
+    Evidence,
+    FeatureSnapshot,
+    Market,
+    MarketDataPoint,
+    MarketPhase,
+    RawMarketSnapshot,
+)
 from .ohlc import (
     A_SHARE_BROAD_BENCHMARKS,
     US_BROAD_BENCHMARKS,
@@ -20,7 +28,11 @@ from .ohlc import (
 from .quality import QUALITY_POLICY_V1, evaluate_data_quality, select_point_in_time
 
 
-FEATURE_VERSION = "market-warning-v1"
+FEATURE_VERSION = "market-warning-v2"
+
+_USABLE_POINT_STATUSES = frozenset(
+    {DataStatus.FRESH, DataStatus.PARTIAL, DataStatus.SHADOW}
+)
 
 
 def _metadata(source: str, availability: str, direction: str, unit: str) -> dict[str, str]:
@@ -36,6 +48,12 @@ def _metadata(source: str, availability: str, direction: str, unit: str) -> dict
 
 _COMMON_METADATA = {
     "return_1d": _metadata("broad index close", "2 observations visible by as_of", "negative is risk-off", "ratio"),
+    "audited_ohlc_return_1d": _metadata(
+        "two source-coherent broad-index OHLC observations",
+        "current and immediately prior market observations each have complete, aligned, quality-usable OHLC",
+        "negative is risk-off",
+        "ratio",
+    ),
     "return_5d": _metadata("broad index close", "6 observations visible by as_of", "negative is risk-off", "ratio"),
     "return_20d": _metadata("broad index close", "21 observations visible by as_of", "negative is risk-off", "ratio"),
     "return_60d": _metadata("broad index close", "61 observations visible by as_of", "negative is risk-off", "ratio"),
@@ -60,7 +78,12 @@ _COMMON_METADATA = {
     "range_zscore_20d": _metadata("index OHLC", "20 aligned OHLC observations visible by as_of", "higher is stress", "z-score"),
     "close_location": _metadata("index high low close", "same-session OHLC visible by as_of", "lower is risk-off", "ratio"),
     "volume_zscore_20d": _metadata("broad index volume", "20 observations visible by as_of", "higher is stress", "z-score"),
-    "abnormal_range_weak_close_transition": _metadata("index OHLC and close history", "range z-score, close location, and 1-day return available", "true is risk-off", "boolean"),
+    "abnormal_range_weak_close_transition": _metadata(
+        "index OHLC history and audited OHLC return",
+        "range z-score, close location, and audited OHLC 1-day return available",
+        "true is risk-off",
+        "boolean",
+    ),
 }
 
 _A_SHARE_METADATA = {
@@ -253,6 +276,7 @@ def _point_for(points: Iterable[MarketDataPoint], field: str, symbol: str | None
         for point in points
         if _canonical_field(point.field) == _canonical_field(field) and (symbol is None or point.symbol.upper() == symbol.upper())
         and _number(point.value) is not None
+        and point.quality_status in _USABLE_POINT_STATUSES
     ]
     if not candidates:
         return None
@@ -286,6 +310,30 @@ def _range_series(history: tuple[RawMarketSnapshot, ...], symbol: str) -> pd.Ser
         value = None if not ohlc.valid else (high - low) / open_value
         values.append(float("nan") if value is None else value)
     return pd.Series(values, dtype="float64")
+
+
+def _audited_ohlc_return_inputs(
+    history: tuple[RawMarketSnapshot, ...], symbol: str
+) -> tuple[tuple[MarketDataPoint, ...], float | None]:
+    """Return exact inputs and return for the latest two consecutive OHLC assessments."""
+
+    if len(history) < 2 or not _current_observation_is_usable(history[-1]):
+        return (), None
+    previous = _ohlc_at(history[-2], symbol)
+    current = _ohlc_at(history[-1], symbol)
+    if not previous.valid or not current.valid:
+        return (), None
+    if _observation_date(history[-2], history[-2].market) == _observation_date(
+        history[-1], history[-1].market
+    ):
+        return (), None
+
+    previous_close = _number(previous.close_point.value) if previous.close_point is not None else None
+    current_close = _number(current.close_point.value) if current.close_point is not None else None
+    if previous_close in (None, 0.0) or current_close is None:
+        return (), None
+    inputs = (previous.close_point, *current.points)
+    return tuple(point for point in inputs if point is not None), current_close / previous_close - 1.0
 
 
 def _last(series: pd.Series) -> float | None:
@@ -390,6 +438,9 @@ class _FeatureStrategy:
             close.iloc[-1] = float("nan")
         volumes = _series(history, "volume", symbol) if symbol is not None else pd.Series([float("nan")] * len(history))
         ranges = _range_series(history, symbol) if symbol is not None else pd.Series([float("nan")] * len(history))
+        _, audited_ohlc_return_1d = (
+            _audited_ohlc_return_inputs(history, symbol) if symbol is not None else ((), None)
+        )
         ohlc = (
             assess_ohlc_invariants(
                 selected,
@@ -448,11 +499,12 @@ class _FeatureStrategy:
         )
         abnormal_range_transition = (
             None
-            if range_zscore is None or close_location is None or return_1d is None
-            else range_zscore >= 2.0 and close_location <= 0.25 and return_1d < 0.0
+            if range_zscore is None or close_location is None or audited_ohlc_return_1d is None
+            else range_zscore >= 2.0 and close_location <= 0.25 and audited_ohlc_return_1d < 0.0
         )
         return {
             "return_1d": return_1d, "return_5d": _return(close, 5), "return_20d": _return(close, 20),
+            "audited_ohlc_return_1d": audited_ohlc_return_1d,
             "return_60d": _return(close, 60), "return_120d": _return(close, 120), "return_252d": _return(close, 252),
             "drawdown_20d": _drawdown(close, 20), "drawdown_60d": _drawdown(close, 60), "drawdown_252d": _drawdown(close, 252),
             "market_phase": phase.value if phase is not None else None,
@@ -472,10 +524,18 @@ class _FeatureStrategy:
         source_time = max((point.data_time for point in points), default=as_of_time)
         source = "+".join(sorted({point.source for point in points})) or "unavailable"
         state = "unavailable" if value is None else f"value={value}"
+        audit_inputs = ""
+        if name == "audited_ohlc_return_1d" and points:
+            rendered = ",".join(
+                f"{point.source}/{point.symbol}/{_canonical_field(point.field)}@"
+                f"{point.data_time.isoformat()}={point.value}"
+                for point in points
+            )
+            audit_inputs = f"; inputs=[{rendered}]"
         return Evidence(
             evidence_id=f"{self.market.value}:{FEATURE_VERSION}:{name}:{as_of_time.isoformat()}",
             group="feature",
-            summary=f"{name}: {state}; direction={metadata['direction']}",
+            summary=f"{name}: {state}; direction={metadata['direction']}{audit_inputs}",
             value=value,
             source=source,
             as_of_time=source_time,
@@ -498,11 +558,31 @@ class _FeatureStrategy:
             "abnormal_range_weak_close_transition",
         }:
             window = 1 if name in {"range_pct", "close_location"} else 20
-            return tuple(
+            points = tuple(
                 point
                 for item in history[-window:]
                 for point in _ohlc_at(item, symbol).points
             )
+            if name == "abnormal_range_weak_close_transition":
+                audited_points, _ = _audited_ohlc_return_inputs(history, symbol)
+                seen: set[tuple[str, str, str, datetime, datetime]] = set()
+                combined = []
+                for point in (*points, *audited_points):
+                    key = (
+                        point.source,
+                        point.symbol,
+                        _canonical_field(point.field),
+                        point.data_time,
+                        point.fetched_at,
+                    )
+                    if key not in seen:
+                        seen.add(key)
+                        combined.append(point)
+                return tuple(combined)
+            return points
+        if name == "audited_ohlc_return_1d":
+            points, _ = _audited_ohlc_return_inputs(history, symbol)
+            return points
         inputs = [("index_price", symbol)]
         if name in {"range_pct", "close_location"}:
             inputs = [("index_price", symbol), ("open", symbol), ("high", symbol), ("low", symbol)]
@@ -536,7 +616,7 @@ class _FeatureStrategy:
                 ("index_price", "SOXX"),
             ]
         windows = {
-            "return_1d": 2, "return_5d": 6, "return_20d": 21, "return_60d": 61,
+            "return_1d": 2, "audited_ohlc_return_1d": 2, "return_5d": 6, "return_20d": 21, "return_60d": 61,
             "return_120d": 121, "return_252d": 253, "drawdown_20d": 20, "drawdown_60d": 60,
             "drawdown_252d": 252, "market_phase": 20, "ma20_distance": 20, "ma50_distance": 50,
             "ma200_distance": 200, "ma20_slope": 21, "ma50_slope": 51, "ma200_slope": 201,

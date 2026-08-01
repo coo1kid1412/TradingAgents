@@ -85,6 +85,7 @@ def history_from_series(
 class CommonFeatureTests(TestCase):
     def test_range_zscore_and_transition_metadata_have_auditable_missing_contracts(self):
         names = (
+            "audited_ohlc_return_1d",
             "range_zscore_20d",
             "abnormal_range_weak_close_transition",
             "breadth_deterioration_transition",
@@ -162,7 +163,7 @@ class CommonFeatureTests(TestCase):
         self.assertEqual(derive_market_phase(-0.049999), MarketPhase.FIRST_SHOCK)
         self.assertEqual(derive_market_phase(-0.05), MarketPhase.CONTINUATION)
         self.assertIsNone(derive_market_phase(None))
-        self.assertEqual(FEATURE_VERSION, "market-warning-v1")
+        self.assertEqual(FEATURE_VERSION, "market-warning-v2")
         for name, metadata in FEATURE_METADATA.items():
             with self.subTest(name=name):
                 self.assertEqual(set(metadata), {"source", "availability", "missing", "direction", "unit", "version"})
@@ -515,7 +516,7 @@ class USFeatureTests(TestCase):
         self.assertEqual(first.source_times, {"z:first": at, "z:last": at})
         self.assertEqual(first.evidence_ids, second.evidence_ids)
         self.assertEqual(first.evidence_ids, tuple(sorted(first.evidence_ids)))
-        self.assertTrue(all(item.evidence_id.startswith("us:market-warning-v1:") for item in first.evidence))
+        self.assertTrue(all(item.evidence_id.startswith("us:market-warning-v2:") for item in first.evidence))
 
     def test_source_times_exclude_future_audit_metadata(self):
         raw = RawMarketSnapshot(
@@ -729,6 +730,7 @@ class PolicyReachabilityIntegrationTests(TestCase):
 
         expected_zscore = (ranges[-1] - sum(ranges) / len(ranges)) / pstdev(ranges)
         self.assertAlmostEqual(result.features["range_zscore_20d"], expected_zscore)
+        self.assertAlmostEqual(result.features["audited_ohlc_return_1d"], -0.08)
         self.assertTrue(result.features["abnormal_range_weak_close_transition"])
         self.assertEqual(baseline_level(self.quant(0.01), result), RiskLevel.RED)
         evidence = next(
@@ -738,6 +740,149 @@ class PolicyReachabilityIntegrationTests(TestCase):
         self.assertEqual(evidence.as_of_time, AS_OF)
         self.assertIn("candle_history:first", result.source_times)
         self.assertIn("candle_now:last", result.source_times)
+
+    def test_unusable_newer_historical_close_cannot_pollute_returns_or_range_trigger(self):
+        for status in (DataStatus.STALE, DataStatus.CONFLICTED, DataStatus.INSUFFICIENT):
+            with self.subTest(status=status):
+                history = []
+                for days in range(19, 0, -1):
+                    at = AS_OF - timedelta(days=days)
+                    candle_at = at - timedelta(minutes=1) if days == 1 else at
+                    points = [
+                        point("index_price", 92.0, candle_at, source="coherent_history"),
+                        point("open", 92.0, candle_at, source="coherent_history"),
+                        point("high", 92.92, candle_at, source="coherent_history"),
+                        point("low", 91.08, candle_at, source="coherent_history"),
+                    ]
+                    if days == 1:
+                        points.append(
+                            point(
+                                "index_price",
+                                120.0,
+                                at,
+                                source="bad_incomplete_close",
+                                quality_status=status,
+                            )
+                        )
+                    history.append(snapshot(*points, at=at))
+                raw = snapshot(
+                    point("index_price", 92.0, AS_OF, source="coherent_current"),
+                    point("index_change_pct", 0.0, AS_OF, source="coherent_current"),
+                    point("open", 100.0, AS_OF, source="coherent_current"),
+                    point("high", 110.0, AS_OF, source="coherent_current"),
+                    point("low", 90.0, AS_OF, source="coherent_current"),
+                )
+
+                result = AShareFeatureStrategy().build(raw, tuple(history))
+
+                self.assertEqual(result.features["return_1d"], 0.0)
+                self.assertEqual(result.features["audited_ohlc_return_1d"], 0.0)
+                self.assertFalse(result.features["abnormal_range_weak_close_transition"])
+                self.assertEqual(baseline_level(self.quant(0.01), result), RiskLevel.GREEN)
+                audited = next(
+                    item
+                    for item in result.evidence
+                    if item.evidence_id.split(":")[2] == "audited_ohlc_return_1d"
+                )
+                self.assertNotIn("bad_incomplete_close", audited.source)
+                self.assertNotIn("bad_incomplete_close", audited.summary)
+
+    def test_fresh_incomplete_close_cannot_hijack_audited_ohlc_return(self):
+        history = []
+        for days in range(19, 0, -1):
+            at = AS_OF - timedelta(days=days)
+            candle_at = at - timedelta(minutes=1) if days == 1 else at
+            points = [
+                point("index_price", 92.0, candle_at, source="coherent_history"),
+                point("open", 92.0, candle_at, source="coherent_history"),
+                point("high", 92.92, candle_at, source="coherent_history"),
+                point("low", 91.08, candle_at, source="coherent_history"),
+            ]
+            if days == 1:
+                points.append(point("index_price", 120.0, at, source="fresh_incomplete_close"))
+            history.append(snapshot(*points, at=at))
+        raw = snapshot(
+            point("index_price", 92.0, AS_OF, source="coherent_current"),
+            point("index_change_pct", 0.0, AS_OF, source="coherent_current"),
+            point("open", 100.0, AS_OF, source="coherent_current"),
+            point("high", 110.0, AS_OF, source="coherent_current"),
+            point("low", 90.0, AS_OF, source="coherent_current"),
+        )
+
+        result = AShareFeatureStrategy().build(raw, tuple(history))
+
+        self.assertAlmostEqual(result.features["return_1d"], 92.0 / 120.0 - 1.0)
+        self.assertEqual(result.features["audited_ohlc_return_1d"], 0.0)
+        self.assertFalse(result.features["abnormal_range_weak_close_transition"])
+        self.assertEqual(baseline_level(self.quant(0.01), result), RiskLevel.GREEN)
+
+    def test_missing_prior_coherent_ohlc_bar_disables_audited_return_and_hard_trigger(self):
+        history = tuple(
+            snapshot(
+                point("index_price", 92.0, AS_OF - timedelta(days=days), source="coherent_history"),
+                point("open", 92.0, AS_OF - timedelta(days=days), source="coherent_history"),
+                point("high", 92.92, AS_OF - timedelta(days=days), source="coherent_history"),
+                point("low", 91.08, AS_OF - timedelta(days=days), source="coherent_history"),
+                at=AS_OF - timedelta(days=days),
+            )
+            for days in range(20, 1, -1)
+        ) + (
+            snapshot(
+                point("index_price", 120.0, AS_OF - timedelta(days=1), source="incomplete"),
+                at=AS_OF - timedelta(days=1),
+            ),
+        )
+        raw = snapshot(
+            point("index_price", 92.0, AS_OF, source="coherent_current"),
+            point("index_change_pct", 0.0, AS_OF, source="coherent_current"),
+            point("open", 100.0, AS_OF, source="coherent_current"),
+            point("high", 110.0, AS_OF, source="coherent_current"),
+            point("low", 90.0, AS_OF, source="coherent_current"),
+        )
+
+        result = AShareFeatureStrategy().build(raw, history)
+
+        self.assertIsNone(result.features["audited_ohlc_return_1d"])
+        self.assertIsNone(result.features["abnormal_range_weak_close_transition"])
+        self.assertEqual(baseline_level(self.quant(0.01), result), RiskLevel.GREEN)
+
+    def test_audited_return_evidence_names_exact_endpoint_and_current_ohlc_inputs(self):
+        prior = AS_OF - timedelta(days=1)
+        result = AShareFeatureStrategy().build(
+            snapshot(
+                point("index_price", 92.0, AS_OF, source="current_candle"),
+                point("index_change_pct", -8.0, AS_OF, source="current_candle"),
+                point("open", 100.0, AS_OF, source="current_candle"),
+                point("high", 110.0, AS_OF, source="current_candle"),
+                point("low", 90.0, AS_OF, source="current_candle"),
+            ),
+            (
+                snapshot(
+                    point("index_price", 100.0, prior, source="prior_candle"),
+                    point("open", 100.0, prior, source="prior_candle"),
+                    point("high", 101.0, prior, source="prior_candle"),
+                    point("low", 99.0, prior, source="prior_candle"),
+                    at=prior,
+                ),
+            ),
+        )
+
+        audited = next(
+            item
+            for item in result.evidence
+            if item.evidence_id.split(":")[2] == "audited_ohlc_return_1d"
+        )
+        self.assertEqual(audited.source, "current_candle+prior_candle")
+        for expected in (
+            "prior_candle/INDEX/index_price@",
+            "current_candle/INDEX/open@",
+            "current_candle/INDEX/high@",
+            "current_candle/INDEX/low@",
+            "current_candle/INDEX/index_price@",
+        ):
+            self.assertIn(expected, audited.summary)
+        self.assertIn("prior_candle:first", result.source_times)
+        self.assertIn("current_candle:last", result.source_times)
 
     def test_reviewer_invalid_close_regression_is_unknown_not_red(self):
         history = tuple(

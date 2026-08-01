@@ -179,9 +179,25 @@ class BaselinePolicyTests(TestCase):
             with self.subTest(market=market):
                 snapshot = make_snapshot(
                     market=market,
-                    features={"range_zscore_20d": 3.0, "close_location": 0.15, "return_1d": daily_return},
+                    features={
+                        "range_zscore_20d": 3.0,
+                        "close_location": 0.15,
+                        "audited_ohlc_return_1d": daily_return,
+                    },
                 )
                 self.assertEqual(baseline_level(make_quant(), snapshot), RiskLevel.RED)
+
+    def test_market_range_hard_trigger_never_uses_generic_model_return(self):
+        snapshot = make_snapshot(
+            features={
+                "range_zscore_20d": 9.0,
+                "close_location": 0.0,
+                "return_1d": -0.20,
+                "audited_ohlc_return_1d": None,
+            }
+        )
+
+        self.assertEqual(baseline_level(make_quant(), snapshot), RiskLevel.GREEN)
 
     def test_a_share_breadth_hard_triggers_require_negative_index_confirmation(self):
         cases = (
@@ -209,7 +225,11 @@ class BaselinePolicyTests(TestCase):
                 )
 
     def test_source_failure_never_becomes_a_hard_market_trigger(self):
-        hard = {"range_zscore_20d": 9.0, "close_location": 0.0, "return_1d": -0.20}
+        hard = {
+            "range_zscore_20d": 9.0,
+            "close_location": 0.0,
+            "audited_ohlc_return_1d": -0.20,
+        }
         for status in (DataStatus.CONFLICTED, DataStatus.STALE, DataStatus.INSUFFICIENT):
             with self.subTest(status=status):
                 self.assertEqual(
@@ -221,7 +241,11 @@ class BaselinePolicyTests(TestCase):
         bad_values = (None, True, "3.0", float("nan"), float("inf"))
         for value in bad_values:
             with self.subTest(value=value):
-                features = {"range_zscore_20d": value, "close_location": 0.10, "return_1d": -0.10}
+                features = {
+                    "range_zscore_20d": value,
+                    "close_location": 0.10,
+                    "audited_ohlc_return_1d": -0.10,
+                }
                 self.assertEqual(baseline_level(make_quant(), make_snapshot(features=features)), RiskLevel.GREEN)
 
 

@@ -19,7 +19,7 @@ from .domain import (
 
 
 POLICY_VERSION = "market-warning-policy-v1"
-HARD_TRIGGER_VERSION = "market-warning-hard-triggers-v1"
+HARD_TRIGGER_VERSION = "market-warning-hard-triggers-v2"
 
 _UNUSABLE_DATA = frozenset({DataStatus.CONFLICTED, DataStatus.STALE, DataStatus.INSUFFICIENT})
 _ORDERED_LEVELS = (RiskLevel.GREEN, RiskLevel.YELLOW, RiskLevel.ORANGE, RiskLevel.RED)
@@ -82,7 +82,7 @@ def _has_transition_signal(snapshot: FeatureSnapshot) -> bool:
 def _market_range_hard_trigger(snapshot: FeatureSnapshot) -> bool:
     range_zscore = _feature(snapshot, "range_zscore_20d")
     close_location = _feature(snapshot, "close_location")
-    daily_return = _feature(snapshot, "return_1d")
+    daily_return = _feature(snapshot, "audited_ohlc_return_1d")
     return_threshold = -0.020 if snapshot.market == Market.A_SHARE else -0.015
     return (
         range_zscore is not None
