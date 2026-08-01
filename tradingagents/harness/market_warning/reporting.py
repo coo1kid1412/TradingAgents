@@ -1,0 +1,278 @@
+"""Deterministic, typed Markdown reports for market-warning decisions."""
+
+from __future__ import annotations
+
+import os
+import re
+import tempfile
+from datetime import datetime
+from math import isfinite
+from numbers import Real
+from pathlib import Path
+from typing import Any
+from zoneinfo import ZoneInfo
+
+from .domain import (
+    DataStatus,
+    FinalWarningDecision,
+    LLMContextAssessment,
+    Market,
+    MarketPhase,
+    RiskLevel,
+    RunnerResult,
+)
+
+
+_MARKET_NAMES = {Market.A_SHARE: "A股", Market.US: "美股"}
+_MARKET_ZONES = {
+    Market.A_SHARE: ZoneInfo("Asia/Shanghai"),
+    Market.US: ZoneInfo("America/New_York"),
+}
+_LAMPS = {
+    RiskLevel.GREEN: "绿灯 GREEN",
+    RiskLevel.YELLOW: "黄灯 YELLOW",
+    RiskLevel.ORANGE: "橙灯 ORANGE",
+    RiskLevel.RED: "红灯 RED",
+    RiskLevel.UNKNOWN: "未知 UNKNOWN",
+}
+_IMMEDIATE_ACTIONS = {
+    RiskLevel.GREEN: "可按既定计划参与，但仍须执行个股止损。",
+    RiskLevel.YELLOW: "不追高，优先等待回踩确认。",
+    RiskLevel.ORANGE: "暂停追涨，仅允许小仓位条件单，并复核高波动持仓。",
+    RiskLevel.RED: "停止新增仓位，主动降低高波动暴露。",
+    RiskLevel.UNKNOWN: "暂停新增仓位，先修复数据或模型，再判断风险。",
+}
+_PHASES = {
+    MarketPhase.FIRST_SHOCK: "首次冲击（尚未进入明显续跌区间）",
+    MarketPhase.CONTINUATION: "延续下跌（市场已处于回撤后的脆弱阶段）",
+}
+_THINK_RE = re.compile(r"<think>[\s\S]*?</think>", re.IGNORECASE)
+_SENSITIVE_RE = re.compile(
+    r"traceback|api\s*error|provider\s+error|(?:api[_ -]?key\s*=)|"
+    r"minimax_api_key|\bsk-[A-Za-z0-9_-]+|\{\s*[\"']",
+    re.IGNORECASE,
+)
+
+
+def _require_complete(result: RunnerResult) -> FinalWarningDecision:
+    if not isinstance(result, RunnerResult) or result.decision is None:
+        raise ValueError("result must contain a final decision")
+    return result.decision
+
+
+def _safe_text(value: Any, fallback: str = "[内容已脱敏]") -> str:
+    if not isinstance(value, str):
+        return fallback
+    cleaned = _THINK_RE.sub("", value).strip()
+    if not cleaned or _SENSITIVE_RE.search(cleaned) or "<think>" in cleaned.lower():
+        return fallback
+    return cleaned.replace("\r", " ").replace("\n", " ")[:500]
+
+
+def _percentage(value: Any) -> str:
+    if isinstance(value, bool) or not isinstance(value, Real) or not isfinite(float(value)):
+        return "不可用"
+    return f"{float(value) * 100:.2f}%"
+
+
+def _cap(value: float) -> str:
+    return f"{value:.0f}%" if float(value).is_integer() else f"{value:.1f}%"
+
+
+def _first_block(decision: FinalWarningDecision) -> str:
+    return "\n".join(
+        (
+            f"> **【{_LAMPS[decision.final_level]}】立即操作：{_IMMEDIATE_ACTIONS[decision.final_level]}**",
+            f"> 入场门：`{decision.entry_gate}` | 新增仓位上限：`{_cap(decision.new_position_cap_pct)}` | "
+            f"持仓动作：`{decision.holding_action}`",
+        )
+    )
+
+
+def _probability_section(result: RunnerResult) -> str:
+    quant = result.quant_assessment
+    if quant is None or quant.reliability_grade == "UNAVAILABLE":
+        rows = "| 1日 | 不可用 | 不可用 |\n| 3日 | 不可用 | 不可用 |"
+    else:
+        rows = (
+            f"| 1日 | {_percentage(quant.crash_1d_probability)} | {_percentage(quant.base_rate_1d)} |\n"
+            f"| 3日 | {_percentage(quant.crash_3d_probability)} | {_percentage(quant.base_rate_3d)} |"
+        )
+    return (
+        "## 概率判断\n"
+        "以下是校准模型的概率估计，不代表确定会发生。\n\n"
+        "| 观察窗口 | 骤跌概率 | 历史基准率 |\n"
+        "|---|---:|---:|\n"
+        f"{rows}"
+    )
+
+
+def _phase_section(result: RunnerResult) -> str:
+    quant = result.quant_assessment
+    phase = _PHASES.get(quant.market_phase) if quant is not None else None
+    if quant is None or phase is None:
+        rendered = "当前阶段不可可靠判定。"
+    else:
+        rendered = f"`{quant.market_phase.value}`：{phase}"
+    return f"## 市场阶段\n{rendered}"
+
+
+def _previous_section(
+    decision: FinalWarningDecision, previous: FinalWarningDecision | None
+) -> str:
+    if previous is None:
+        change = "无可比的上一份有效决策。"
+    elif previous.final_level == decision.final_level:
+        change = f"维持 {decision.final_level.value}，状态为 `{decision.state_transition}`。"
+    else:
+        change = (
+            f"{previous.final_level.value} -> {decision.final_level.value}，"
+            f"状态为 `{decision.state_transition}`。"
+        )
+    return f"## 相比上一份\n{change}"
+
+
+def _contributor_section(result: RunnerResult) -> str:
+    quant = result.quant_assessment
+    rows = [] if quant is None else list(quant.top_contributors[:3])
+    if not rows:
+        return "## 主要驱动\n暂无可审计的模型驱动项。"
+    rendered = []
+    for index, item in enumerate(rows, start=1):
+        if isinstance(item, dict):
+            feature = _safe_text(str(item.get("feature", "未命名特征")), "未命名特征")
+            contribution = item.get("contribution")
+            numeric = (
+                f"{float(contribution):+.3f}"
+                if isinstance(contribution, Real)
+                and not isinstance(contribution, bool)
+                and isfinite(float(contribution))
+                else "不可用"
+            )
+            rendered.append(f"{index}. `{feature}`：模型贡献 {numeric}")
+        else:
+            rendered.append(f"{index}. 未命名驱动项")
+    return "## 主要驱动\n" + "\n".join(rendered)
+
+
+def _context_section(context: LLMContextAssessment | None) -> str:
+    if context is None:
+        return "## M3 情景校验\n本时点未调用 M3；量化与代码规则独立有效。"
+    if context.reasoning_status != "validated":
+        return "## M3 情景校验\nM3 本次不可用；未改变代码基线。"
+    causal = " -> ".join(_safe_text(item) for item in context.causal_chain)
+    conflicts = "；".join(_safe_text(item) for item in context.overlooked_risks)
+    if not conflicts:
+        conflicts = "已引用反向证据，但没有额外风险摘要。"
+    return "\n".join(
+        (
+            "## M3 情景校验",
+            f"- 场景：{_safe_text(context.market_scenario)}",
+            f"- 因果链：{causal or '[内容已脱敏]'}",
+            f"- 反向证据/遗漏风险：{conflicts}",
+            f"- 建议：{context.recommended_risk_level.value}，置信度 {_percentage(context.confidence)}；"
+            f"{_safe_text(context.action_reason)}",
+        )
+    )
+
+
+def _metadata_section(result: RunnerResult) -> str:
+    snapshot = result.feature_snapshot
+    quant = result.quant_assessment
+    status = snapshot.data_quality.value if snapshot is not None else "insufficient"
+    reliability = snapshot.reliability_grade if snapshot is not None else "UNAVAILABLE"
+    feature_version = snapshot.feature_version if snapshot is not None else "unavailable"
+    model_version = quant.model_version if quant is not None else "unavailable"
+    calibration = quant.calibration_version if quant is not None else "unavailable"
+    shadow = (
+        "\n- 运行限制：影子运行，仅供观察，不联动个股生产硬门控。"
+        if status == DataStatus.SHADOW.value
+        else ""
+    )
+    unknown = (
+        "\n- 解释：数据不足不等于低风险；UNKNOWN 也不等于 RED。"
+        if result.decision and result.decision.final_level == RiskLevel.UNKNOWN
+        else ""
+    )
+    return (
+        "## 数据与模型\n"
+        f"- 数据状态：`{status}`；可靠度：`{reliability}`\n"
+        f"- 特征版本：`{feature_version}`\n"
+        f"- 模型版本：`{model_version}`；校准版本：`{calibration}`"
+        f"{shadow}{unknown}"
+    )
+
+
+def render_premarket_report(
+    result: RunnerResult, previous: FinalWarningDecision | None
+) -> str:
+    """Render the fixed reading order used for every premarket report."""
+
+    decision = _require_complete(result)
+    market_name = _MARKET_NAMES[result.market]
+    local_time = result.as_of_time.astimezone(_MARKET_ZONES[result.market])
+    sections = (
+        _first_block(decision),
+        f"# {market_name}大盘骤跌概率预警\n\n评估时间：`{local_time.isoformat(timespec='minutes')}`",
+        _probability_section(result),
+        _phase_section(result),
+        _previous_section(decision, previous),
+        _contributor_section(result),
+        _context_section(result.context_assessment),
+        _metadata_section(result),
+    )
+    return "\n\n".join(sections) + "\n"
+
+
+def render_upgrade_report(
+    result: RunnerResult, previous: FinalWarningDecision | None
+) -> str:
+    """Render an intraday alert with the same first-screen action contract."""
+
+    decision = _require_complete(result)
+    report = render_premarket_report(result, previous)
+    marker = "# " + _MARKET_NAMES[result.market] + "大盘骤跌概率预警"
+    return report.replace(marker, marker + "（盘中升级）", 1)
+
+
+def report_path(result: RunnerResult, root: Path | str) -> Path:
+    local_time = result.as_of_time.astimezone(_MARKET_ZONES[result.market])
+    slot = re.sub(r"[^a-z0-9_-]+", "-", result.session_slot.strip().lower()).strip("-")
+    if not slot:
+        slot = "evaluation"
+    return (
+        Path(root)
+        / result.market.value
+        / local_time.date().isoformat()
+        / f"{local_time:%H%M}-{slot}.md"
+    )
+
+
+def write_report(
+    result: RunnerResult,
+    previous: FinalWarningDecision | None,
+    root: Path | str = Path("reports/market_warning"),
+) -> Path:
+    """Atomically write a report and return its deterministic path."""
+
+    target = report_path(result, root)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    content = (
+        render_premarket_report(result, previous)
+        if "premarket" in result.session_slot.lower()
+        else render_upgrade_report(result, previous)
+    )
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{target.name}.", suffix=".tmp", dir=target.parent
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as stream:
+            stream.write(content)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, target)
+    except Exception:
+        temporary.unlink(missing_ok=True)
+        raise
+    return target

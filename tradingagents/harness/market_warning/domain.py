@@ -253,6 +253,7 @@ class RunnerResult:
     quant_assessment: QuantRiskAssessment | None = None
     context_assessment: LLMContextAssessment | None = None
     decision: FinalWarningDecision | None = None
+    decision_id: int | None = None
     report_path: str | None = None
     error_class: str | None = None
 
