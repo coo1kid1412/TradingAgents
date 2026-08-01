@@ -192,6 +192,7 @@ class LLMContextAssessment:
     confidence: float
     action_reason: str
     reasoning_status: str
+    error_class: str | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -204,6 +205,10 @@ class LLMContextAssessment:
         object.__setattr__(self, "supporting_evidence_ids", tuple(self.supporting_evidence_ids))
         object.__setattr__(self, "conflicting_evidence_ids", tuple(self.conflicting_evidence_ids))
         object.__setattr__(self, "overlooked_risks", tuple(self.overlooked_risks))
+        if self.error_class is not None and (
+            not isinstance(self.error_class, str) or not self.error_class.strip()
+        ):
+            raise ValueError("error_class must be a non-empty string or None")
 
 
 @dataclass(frozen=True)

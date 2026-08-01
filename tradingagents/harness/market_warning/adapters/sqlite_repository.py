@@ -144,7 +144,7 @@ class SQLiteWarningRepository:
                     model_name,
                     assessment.reasoning_status,
                     _reasoning_json(assessment),
-                    None,
+                    assessment.error_class,
                 ),
             )
             return int(cursor.lastrowid)

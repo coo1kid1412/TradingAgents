@@ -123,7 +123,7 @@ class BaseLLMClient(ABC):
         return WallClockTimeoutLLM(
             self.get_llm(),
             timeout=self._get_timeout(),
-            max_retries=2,
+            max_retries=self.kwargs.get("wall_clock_max_retries", 2),
         )
 
 
