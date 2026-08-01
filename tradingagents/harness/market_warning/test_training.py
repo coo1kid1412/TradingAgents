@@ -286,6 +286,21 @@ class PartitionTests(TestCase):
             pd.to_datetime(calibration["as_of_time"], utc=True).min(),
         )
 
+    def test_production_calibration_expands_until_both_horizons_have_two_classes(self):
+        frame = _dated_frame("2020-01-02", 1400)
+        frame.loc[:, ["label_1d", "label_3d"]] = False
+        frame.loc[900, ["label_1d", "label_3d"]] = True
+
+        _, calibration = production_partitions(frame, Market.US)
+
+        self.assertGreater(len(calibration), 252)
+        self.assertEqual(set(calibration["label_1d"].astype(bool)), {False, True})
+        self.assertEqual(set(calibration["label_3d"].astype(bool)), {False, True})
+        self.assertEqual(
+            pd.to_datetime(calibration["as_of_time"], utc=True).max(),
+            pd.to_datetime(frame["as_of_time"], utc=True).max(),
+        )
+
     def test_frozen_test_excludes_null_or_august_three_day_label_windows(self):
         frame = pd.DataFrame(
             {
@@ -485,12 +500,17 @@ class TrainingCommandTests(TestCase):
             self.assertIn(command, result.stdout)
 
     def test_task12_flags_parse_and_missing_inputs_fail_actionably(self):
-        result = self._run(
-            "train",
-            "--start", "2000-01-01",
-            "--test-end", "2026-07-31",
-            "--version", "market-warning-v1",
-        )
+        with tempfile.TemporaryDirectory(prefix="warning_missing_inputs_") as directory:
+            root = Path(directory)
+            result = self._run(
+                "train",
+                "--dataset-a-share", str(root / "missing-a-share.joblib"),
+                "--dataset-us", str(root / "missing-us.joblib"),
+                "--artifact-root", str(root / "models"),
+                "--start", "2000-01-01",
+                "--test-end", "2026-07-31",
+                "--version", "market-warning-v1",
+            )
 
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("--dataset", result.stderr)
@@ -509,12 +529,16 @@ class TrainingCommandTests(TestCase):
         self.assertIn("--output", result.stderr)
 
     def test_promote_does_not_fake_success_before_task12_evaluation_exists(self):
-        result = self._run(
-            "promote",
-            "--start", "2000-01-01",
-            "--test-end", "2026-07-31",
-            "--version", "market-warning-v1",
-        )
+        with tempfile.TemporaryDirectory(prefix="warning_missing_manifest_") as directory:
+            root = Path(directory)
+            result = self._run(
+                "promote",
+                "--artifact-root", str(root / "models"),
+                "--manifest", str(root / "missing-manifest.json"),
+                "--start", "2000-01-01",
+                "--test-end", "2026-07-31",
+                "--version", "market-warning-v1",
+            )
 
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("Task 12", result.stderr)
@@ -617,6 +641,8 @@ class TrainingCommandTests(TestCase):
             self.assertIn("AUPRC", report)
             self.assertIn("FIRST_SHOCK", report)
             self.assertIn("危机贡献", report)
+            self.assertIn("部署动作", report)
+            self.assertNotIn("gate failed", report)
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
             self.assertEqual(manifest["model_version"], "four-model-v1")
             self.assertEqual(len(manifest["models"]), 4)

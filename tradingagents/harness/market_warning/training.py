@@ -232,6 +232,7 @@ def production_partitions(
     market: Market,
     *,
     calibration_sessions: int = 252,
+    max_calibration_sessions: int = 1260,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Return a latest-date refit split after the frozen evaluation is complete."""
 
@@ -246,7 +247,28 @@ def production_partitions(
     if len(eligible) < 80:
         raise ValueError("production refit requires at least 80 labeled sessions")
     calibration_size = min(calibration_sessions, max(40, len(eligible) // 5))
+    maximum_size = min(max_calibration_sessions, len(eligible) - 80)
+    if maximum_size < calibration_size:
+        maximum_size = calibration_size
+    required_targets = ("label_1d", "label_3d")
+    if any(target not in eligible for target in required_targets):
+        raise ValueError("production refit requires both horizon labels")
+    while calibration_size < maximum_size:
+        candidate = eligible.tail(calibration_size)
+        if all(
+            set(candidate[target].dropna().astype(int).unique()) == {0, 1}
+            for target in required_targets
+        ):
+            break
+        calibration_size = min(maximum_size, calibration_size + 126)
     calibration = eligible.tail(calibration_size).copy()
+    if any(
+        set(calibration[target].dropna().astype(int).unique()) != {0, 1}
+        for target in required_targets
+    ):
+        raise ValueError(
+            "production calibration cannot find both label classes within the maximum window"
+        )
     calibration_start = calibration["as_of_time"].min()
     training = eligible.loc[
         eligible["as_of_time"].lt(calibration_start)
@@ -1102,6 +1124,7 @@ def _model_record_payload(record: Mapping[str, Any]) -> dict[str, Any]:
 
 def _render_evaluation_report(manifest: Mapping[str, Any]) -> str:
     models = tuple(manifest.get("models", ()))
+    eligible = bool(manifest["eligible_for_promotion"])
     lines = [
         f"# 大盘骤跌预警模型评估：{manifest['model_version']}",
         "",
@@ -1110,7 +1133,13 @@ def _render_evaluation_report(manifest: Mapping[str, Any]) -> str:
         f"- 数据区间：{manifest['frozen_start']} 至 {manifest['frozen_test_end']}",
         f"- 特征版本：`{manifest['feature_version']}`",
         "- 切分：开发集 2000-2012、校准集 2013-2019、冻结测试集 2020-2026-07-31；边界保留 3 个交易日隔离。",
-        f"- 晋级状态：**{'通过全部门槛' if manifest['eligible_for_promotion'] else '未通过，保持未激活'}**",
+        f"- 晋级状态：**{'通过全部门槛' if eligible else '未通过，保持未激活'}**",
+        "- 部署动作："
+        + (
+            "允许进入人工复核与原子晋级。"
+            if eligible
+            else "只保留未激活候选模型；不安装生产定时任务，也不联动个股门控。"
+        ),
         "",
         "## 四模型汇总",
         "",
@@ -1119,10 +1148,13 @@ def _render_evaluation_report(manifest: Mapping[str, Any]) -> str:
     ]
     for model in models:
         evaluation = model["evaluation"]
+        market_name = {"a_share": "A股", "us": "美股"}.get(
+            model["market"], model["market"]
+        )
         lines.append(
             "| {market} | {horizon} | {brier:.4f} | {constant:.4f} | {auprc:.4f} | "
             "{prevalence:.4f} | {ece:.4f} | {budget:.2f} | {cutoff} |".format(
-                market=model["market"],
+                market=market_name,
                 horizon=model["horizon"],
                 brier=evaluation["brier_score"],
                 constant=evaluation["constant_base_rate_brier"],
@@ -1135,13 +1167,19 @@ def _render_evaluation_report(manifest: Mapping[str, Any]) -> str:
         )
     if manifest.get("promotion_failures"):
         lines.extend(["", "## 未通过门槛", ""])
-        lines.extend(f"- {failure}" for failure in manifest["promotion_failures"])
+        lines.extend(
+            f"- {_readable_promotion_failure(failure)}"
+            for failure in manifest["promotion_failures"]
+        )
     lines.extend(["", "## 分阶段、校准与危机贡献", ""])
     for model in models:
         evaluation = model["evaluation"]
+        market_name = {"a_share": "A股", "us": "美股"}.get(
+            model["market"], model["market"]
+        )
         lines.extend(
             [
-                f"### {model['market']} / {model['horizon']}",
+                f"### {market_name} / {model['horizon']}",
                 "",
                 "| 阶段 | 样本 | 正例 | 告警 | 命中 | 召回率 |",
                 "|---|---:|---:|---:|---:|---:|",
@@ -1155,7 +1193,7 @@ def _render_evaluation_report(manifest: Mapping[str, Any]) -> str:
                 f"{metrics['alerts']} | {metrics['true_positives']} | {recall} |"
             )
         crisis = ", ".join(
-            f"{name}={value:.1%}"
+            f"{'非危机期' if name == 'non_crisis' else name}={value:.1%}"
             for name, value in sorted(evaluation["crisis_contribution"].items())
         )
         nonempty_bins = sum(1 for item in evaluation["calibration_bins"] if item["count"])
@@ -1164,12 +1202,43 @@ def _render_evaluation_report(manifest: Mapping[str, Any]) -> str:
                 "",
                 f"- 危机贡献：{crisis}",
                 f"- 校准分箱：10 组，其中 {nonempty_bins} 组有测试样本。",
-                f"- 旧系统召回率：{evaluation['old_market_risk_recall']}",
-                f"- 相同旧系统预算下模型召回率：{evaluation['model_recall_at_old_budget']}",
+                f"- 旧系统召回率：{_format_optional_rate(evaluation['old_market_risk_recall'])}",
+                "- 相同旧系统预算下模型召回率："
+                f"{_format_optional_rate(evaluation['model_recall_at_old_budget'])}",
                 "",
             ]
         )
     return "\n".join(lines).rstrip() + "\n"
+
+
+def _readable_promotion_failure(failure: object) -> str:
+    rendered = str(failure)
+    replacements = {
+        "Brier gate failed": "Brier 分数未优于常数基线",
+        "AUPRC gate failed": "AUPRC 未优于正样本流行率",
+        "calibration gate failed": "ECE 校准误差超过 0.05",
+        "crisis concentration gate failed": "命中过度集中于单一危机阶段",
+        "alert budget gate failed": "月均橙灯/红灯次数超过 6 次",
+        "missing evaluation report": "缺少模型评估",
+        "duplicate evaluation report": "模型评估重复",
+        "malformed evaluation report": "模型评估格式错误",
+        "non-finite evaluation metric": "模型评估包含非有限数值",
+        "malformed crisis contribution": "危机贡献格式错误",
+    }
+    for prefix, replacement in replacements.items():
+        if rendered.startswith(prefix):
+            rendered = rendered.replace(prefix, replacement, 1)
+            break
+    return rendered.replace("a_share/", "A股/").replace("us/", "美股/")
+
+
+def _format_optional_rate(value: object) -> str:
+    if value is None:
+        return "N/A"
+    try:
+        return f"{float(value):.1%}"
+    except (TypeError, ValueError):
+        return "N/A"
 
 
 def _atomic_write_text(path: Path, content: str) -> None:
