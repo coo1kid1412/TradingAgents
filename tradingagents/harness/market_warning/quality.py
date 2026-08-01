@@ -72,6 +72,8 @@ _FIELD_ALIASES = {
     "vix": "volatility",
 }
 
+_PRICE_FIELDS = frozenset({"index_price", "open", "high", "low", "close", "last", "price"})
+
 _EXCHANGE_ZONES = {
     Market.A_SHARE: ZoneInfo("Asia/Shanghai"),
     Market.US: ZoneInfo("America/New_York"),
@@ -175,7 +177,7 @@ def _numeric(value: Any) -> float | None:
 
 
 def _relative_deviation(left: float, right: float) -> float:
-    denominator = max(abs(left), abs(right))
+    denominator = abs(left) or max(abs(left), abs(right))
     if denominator == 0:
         return 0.0
     return abs(left - right) / denominator
@@ -197,13 +199,18 @@ def combine_source_quotes(
 
     left = _numeric(primary.value)
     right = _numeric(secondary.value)
+    price_field = _is_price_field(primary.field)
+    timestamp_conflicted = abs(primary.data_time - secondary.data_time) > QUALITY_POLICY_V1.cross_source_timestamp_skew
+    value_conflicted = price_field and (
+        left is None or right is None or _relative_deviation(left, right) > float(tolerance)
+    )
     conflicted = (
         primary.quality_status == DataStatus.CONFLICTED
         or secondary.quality_status == DataStatus.CONFLICTED
-        or left is None
-        or right is None
-        or _relative_deviation(left, right) > float(tolerance)
+        or timestamp_conflicted
+        or value_conflicted
     )
+    stale = primary.quality_status == DataStatus.STALE or secondary.quality_status == DataStatus.STALE
     available_times = [value for value in (primary.available_at, secondary.available_at) if value is not None]
     return MarketDataPoint(
         market=primary.market,
@@ -213,7 +220,7 @@ def combine_source_quotes(
         data_time=max(primary.data_time, secondary.data_time),
         fetched_at=max(primary.fetched_at, secondary.fetched_at),
         source=f"{primary.source}+{secondary.source}",
-        quality_status=DataStatus.CONFLICTED if conflicted else DataStatus.FRESH,
+        quality_status=DataStatus.CONFLICTED if conflicted else DataStatus.STALE if stale else DataStatus.FRESH,
         available_at=max(available_times) if available_times else None,
     )
 
@@ -242,6 +249,8 @@ def _source_conflict(
     for point in points:
         grouped.setdefault((point.symbol, _canonical_field(point.field)), []).append(point)
     for quotes in grouped.values():
+        if not _is_price_field(quotes[0].field):
+            continue
         sources = {quote.source for quote in quotes}
         if len(sources) < 2:
             continue
@@ -258,6 +267,14 @@ def _source_conflict(
                 if abs(left.data_time - right.data_time) > policy.cross_source_timestamp_skew:
                     return True
     return False
+
+
+def _is_price_field(field_name: str) -> bool:
+    return _canonical_field(field_name) in _PRICE_FIELDS
+
+
+def _source_names(source: str) -> frozenset[str]:
+    return frozenset(part for part in source.split("+") if part)
 
 
 def _coverage(fields: tuple[str, ...], points: tuple[MarketDataPoint, ...]) -> tuple[frozenset[str], float]:
@@ -285,11 +302,22 @@ def evaluate_data_quality(
     optional_fields = tuple(_canonical_field(value) for value in policy.optional_fields)
     covered_core, core_coverage = _coverage(core_fields, points)
     covered_optional, optional_coverage = _coverage(optional_fields, points)
-    source_count = len({point.source for point in points})
+    source_count = len(set().union(*(_source_names(point.source) for point in points))) if points else 0
     core_points = tuple(point for point in points if _canonical_field(point.field) in covered_core)
-    core_source_count = len({point.source for point in core_points})
+    core_source_count = (
+        len(set().union(*(_source_names(point.source) for point in core_points))) if core_points else 0
+    )
     core_dual_source = all(
-        len({point.source for point in core_points if _canonical_field(point.field) == field}) >= 2
+        len(
+            set().union(
+                *(
+                    _source_names(point.source)
+                    for point in core_points
+                    if _canonical_field(point.field) == field
+                )
+            )
+        )
+        >= 2
         for field in covered_core
     )
     latest_data_time = max((point.data_time for point in points), default=None)
@@ -299,14 +327,18 @@ def evaluate_data_quality(
     conflicted = _source_conflict(points, policy) or any(
         point.quality_status == DataStatus.CONFLICTED for point in points
     )
-    point_stale = any(point.quality_status == DataStatus.STALE for point in points)
+    point_stale = any(
+        point.quality_status == DataStatus.STALE
+        for point in points
+        if _canonical_field(point.field) in covered_core
+    )
     if conflicted:
         status = DataStatus.CONFLICTED
         reasons.append("independent sources exceed price or timestamp tolerance")
     else:
         stale = point_stale
         if covered_core:
-            stale = any(
+            stale = stale or any(
                 evaluation_time - point.data_time > policy.intraday_core_quote_max_age
                 or point.data_time > evaluation_time
                 for point in points

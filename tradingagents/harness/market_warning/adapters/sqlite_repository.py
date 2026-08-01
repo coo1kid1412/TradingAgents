@@ -12,7 +12,7 @@ from typing import Any
 
 from tradingagents.harness import db as _db
 
-from ..domain import (
+from tradingagents.harness.market_warning.domain import (
     Evidence,
     FeatureSnapshot,
     FinalWarningDecision,
