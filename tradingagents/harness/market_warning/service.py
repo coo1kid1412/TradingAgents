@@ -128,6 +128,31 @@ class MarketWarningService:
         market_value = Market(market)
         error_class: str | None = None
 
+        load_evaluation = getattr(self.repository, "load_evaluation", None)
+        if callable(load_evaluation):
+            try:
+                existing = load_evaluation(market_value, as_of_time)
+            except Exception:
+                existing = None
+                error_class = "repository_error"
+            if isinstance(existing, RunnerResult):
+                try:
+                    previous = self.repository.load_previous_decision(market_value, as_of_time)
+                except Exception:
+                    previous = None
+                result = existing
+                try:
+                    path = write_report(result, previous, self.report_root)
+                    result = replace(result, report_path=str(path))
+                except Exception:
+                    result = replace(result, error_class="report_error")
+                if self.notifier is not None:
+                    try:
+                        self.notifier.notify(result)
+                    except Exception:
+                        result = replace(result, error_class="notifier_error")
+                return result
+
         try:
             raw = self.data_port.load_snapshot(market_value, as_of_time, session_slot)
             if not isinstance(raw, RawMarketSnapshot):

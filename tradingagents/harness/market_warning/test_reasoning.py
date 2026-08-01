@@ -5,6 +5,7 @@ import os
 import sqlite3
 import tempfile
 import time
+from contextlib import closing
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -221,12 +222,43 @@ class PromptAndCallPolicyTests(TestCase):
         self.assertNotIn("<think>", prompt.lower())
         self.assertLess(len(prompt), 12_000)
 
+    def test_top_contributor_evidence_is_always_inside_the_exposed_evidence_budget(self) -> None:
+        snapshot = replace(
+            make_snapshot(),
+            evidence=tuple(
+                Evidence(
+                    evidence_id=f"ev-{index}",
+                    group="feature",
+                    summary=f"signal {index}",
+                    value=index,
+                    source="test",
+                    as_of_time=NOW,
+                )
+                for index in range(1, 21)
+            ),
+        )
+        quant = replace(
+            make_quant(),
+            top_contributors=(
+                {"feature": "late-top", "contribution": 9.0, "evidence_id": "ev-17"},
+            ),
+        )
+
+        prompt = json.loads(build_reasoning_prompt(snapshot, quant, make_previous()))
+        exposed = {item["evidence_id"] for item in prompt["evidence"]}
+
+        self.assertEqual(len(prompt["evidence"]), 16)
+        self.assertIn("ev-17", exposed)
+        self.assertEqual(prompt["top_contributors"][0]["evidence_id"], "ev-17")
+
     def test_call_policy_matches_session_and_transition_contract(self) -> None:
         self.assertTrue(should_call_reasoning("premarket", RiskLevel.GREEN, None))
         self.assertFalse(should_call_reasoning("intraday", RiskLevel.GREEN, RiskLevel.GREEN))
         self.assertFalse(should_call_reasoning("intraday", RiskLevel.YELLOW, RiskLevel.GREEN))
         self.assertTrue(should_call_reasoning("intraday", RiskLevel.ORANGE, RiskLevel.YELLOW))
         self.assertTrue(should_call_reasoning("intraday", RiskLevel.RED, RiskLevel.ORANGE))
+        self.assertFalse(should_call_reasoning("intraday", RiskLevel.ORANGE, RiskLevel.ORANGE))
+        self.assertFalse(should_call_reasoning("intraday", RiskLevel.RED, RiskLevel.RED))
 
 
 class AdapterTests(TestCase):
@@ -246,6 +278,37 @@ class AdapterTests(TestCase):
         result = self._adapter(llm).assess(make_snapshot(), make_quant(), make_previous())
 
         self.assertEqual(result.reasoning_status, "validated")
+
+    def test_adapter_validates_against_the_same_contributor_first_evidence_budget_as_prompt(self) -> None:
+        snapshot = replace(
+            make_snapshot(),
+            evidence=tuple(
+                Evidence(
+                    evidence_id=f"ev-{index}",
+                    group="feature",
+                    summary=f"signal {index}",
+                    value=index,
+                    source="test",
+                    as_of_time=NOW,
+                )
+                for index in range(1, 21)
+            ),
+        )
+        quant = replace(
+            make_quant(),
+            top_contributors=(
+                {"feature": "late-top", "contribution": 9.0, "evidence_id": "ev-17"},
+            ),
+        )
+        payload = valid_payload()
+        payload["supporting_evidence_ids"] = ["ev-17", "ev-2"]
+        llm = FakeLLM([json.dumps(payload), json.dumps(payload)])
+
+        result = self._adapter(llm).assess(snapshot, quant, make_previous())
+
+        self.assertEqual(result.reasoning_status, "validated")
+        self.assertEqual(result.supporting_evidence_ids[0], "ev-17")
+        self.assertEqual(len(llm.calls), 1)
         self.assertNotIn("PRIVATE", repr(result))
         self.assertEqual(len(llm.calls), 1)
         config = llm.calls[0][1]
@@ -429,6 +492,7 @@ class AdapterTests(TestCase):
             "https://example.invalid/v1",
             timeout=45,
             max_tokens=2048,
+            max_retries=0,
             wall_clock_max_retries=0,
         )
         self.assertIs(adapter.llm, wrapped)
@@ -507,7 +571,7 @@ class ReasoningPersistenceTests(TestCase):
             reasoning_id = repository.save_reasoning(
                 snapshot_id, assessment, "MiniMax-M3"
             )
-            with sqlite3.connect(db_path) as connection:
+            with closing(sqlite3.connect(db_path)) as connection:
                 row = connection.execute(
                     "SELECT structured_json, error_class FROM market_warning_reasoning WHERE id = ?",
                     (reasoning_id,),

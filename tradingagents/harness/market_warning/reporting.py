@@ -292,9 +292,10 @@ def render_upgrade_report(
 
     decision = _require_complete(result)
     local_time = result.as_of_time.astimezone(_MARKET_ZONES[result.market])
+    mode = "盘中升级" if decision.push_required else "盘中评估"
     sections = (
         _first_block(decision),
-        f"# {_MARKET_NAMES[result.market]}大盘骤跌概率预警（盘中升级）\n\n"
+        f"# {_MARKET_NAMES[result.market]}大盘骤跌概率预警（{mode}）\n\n"
         f"评估时间：`{local_time.isoformat(timespec='minutes')}`",
         _previous_section(decision, previous).replace("## 相比上一份", "## 变化", 1),
         _trigger_section(result),

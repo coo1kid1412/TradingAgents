@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-CRON_LINE='*/5 * * * * cd /Users/lailixiang/WorkSpace/QoderWorkspace/TradingAgents && .venv/bin/python -m tradingagents.harness.market_warning.runner >> harness_data/logs/market_warning.log 2>&1'
+PROJECT_ROOT='/Users/lailixiang/WorkSpace/QoderWorkspace/TradingAgents'
+LOG_DIR="$PROJECT_ROOT/harness_data/logs"
+CRON_LINE="*/5 * * * * cd $PROJECT_ROOT && .venv/bin/python -m tradingagents.harness.market_warning.runner >> harness_data/logs/market_warning.log 2>&1"
 
 printf '%s\n' "$CRON_LINE"
 
@@ -19,6 +21,8 @@ if printf '%s\n' "$existing" | grep -Fqx "$CRON_LINE"; then
   printf 'Already installed.\n'
   exit 0
 fi
+
+mkdir -p "$LOG_DIR"
 
 {
   if [[ -n "$existing" ]]; then

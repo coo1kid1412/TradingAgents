@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import json
+import io
 import tempfile
+from contextlib import redirect_stdout
 from datetime import datetime, timezone
 from pathlib import Path
-from unittest import TestCase, main
+from unittest import TestCase, main, mock
 from zoneinfo import ZoneInfo
 
 from tradingagents.harness import db as _db
@@ -20,7 +22,13 @@ from tradingagents.harness.market_warning.domain import (
     RiskLevel,
     RunnerResult,
 )
-from tradingagents.harness.market_warning.runner import due_evaluations, run_due_evaluations
+from tradingagents.harness.market_warning.runner import (
+    _load_history_incrementally,
+    _reasoning_adapter,
+    due_evaluations,
+    main as runner_main,
+    run_due_evaluations,
+)
 
 
 UTC = timezone.utc
@@ -33,6 +41,7 @@ class CalendarSchedulingTests(TestCase):
     def test_a_share_premarket_and_both_intraday_windows(self) -> None:
         cases = (
             ("2026-08-03T08:30:00+08:00", "premarket"),
+            ("2026-08-03T08:35:00+08:00", "premarket"),
             ("2026-08-03T09:35:00+08:00", "intraday-0935"),
             ("2026-08-03T11:25:00+08:00", "intraday-1125"),
             ("2026-08-03T13:05:00+08:00", "intraday-1305"),
@@ -124,6 +133,96 @@ class RunnerTests(TestCase):
 
         self.assertEqual(len(results), 1)
         self.assertEqual(results[0].session_slot, "premarket")
+
+    def test_m3_initialization_failure_becomes_a_persistable_fallback_adapter(self) -> None:
+        repository = mock.Mock()
+        repository.circuit_breaker.return_value = mock.Mock()
+        with mock.patch(
+            "tradingagents.harness.market_warning.adapters.minimax_reasoning."
+            "MiniMaxReasoningAdapter.from_environment",
+            side_effect=RuntimeError("private initialization failure"),
+        ):
+            reasoning = _reasoning_adapter(repository)
+
+        result = _result(1, RiskLevel.ORANGE, slot="premarket")
+        assessment = reasoning.assess(
+            result.feature_snapshot,
+            result.quant_assessment,
+            None,
+        )
+        self.assertEqual(assessment.reasoning_status, "fallback")
+        self.assertEqual(assessment.error_class, "initialization_error")
+
+    def test_intraday_history_is_cache_only_and_premarket_fetches_one_missing_session(self) -> None:
+        cached_snapshot = _result(1, RiskLevel.GREEN, slot="premarket").feature_snapshot
+        cached_snapshot = FeatureSnapshot(
+            market=cached_snapshot.market,
+            as_of_time=datetime(2026, 7, 31, 1, 0, tzinfo=UTC),
+            session_slot=cached_snapshot.session_slot,
+            feature_version=cached_snapshot.feature_version,
+            features=cached_snapshot.features,
+            evidence=cached_snapshot.evidence,
+            data_quality=cached_snapshot.data_quality,
+            reliability_grade=cached_snapshot.reliability_grade,
+            source_times={"fixture": datetime(2026, 7, 31, 1, 0, tzinfo=UTC)},
+        )
+        cached = (cached_snapshot,)
+
+        class Cache:
+            def list_snapshots(self, market, dataset, start_date, end_date):
+                self.window = (market, dataset, start_date, end_date)
+                return cached
+
+        class Daily:
+            def __init__(self):
+                self.calls = []
+
+            def backfill(self, start_date, end_date):
+                self.calls.append((start_date, end_date))
+                return ()
+
+        cache = Cache()
+        daily = Daily()
+        as_of = datetime.fromisoformat("2026-08-03T09:35:00+08:00")
+        previous_session = lambda _current: datetime(2026, 7, 31).date()
+
+        intraday = _load_history_incrementally(
+            cache,
+            daily,
+            Market.A_SHARE,
+            as_of,
+            "intraday-0935",
+            previous_session,
+        )
+        self.assertEqual(intraday, cached)
+        self.assertEqual(daily.calls, [])
+
+        _load_history_incrementally(
+            cache,
+            daily,
+            Market.A_SHARE,
+            as_of.replace(hour=8, minute=30),
+            "premarket",
+            previous_session,
+        )
+        self.assertEqual(daily.calls, [(datetime(2026, 7, 31).date(), datetime(2026, 7, 31).date())])
+
+    def test_cli_returns_nonzero_when_a_due_evaluation_is_degraded(self) -> None:
+        degraded = RunnerResult(
+            **{
+                **_result(1, RiskLevel.GREEN, slot="premarket").__dict__,
+                "error_class": "model_unavailable",
+            }
+        )
+        with mock.patch(
+            "tradingagents.harness.market_warning.runner.run_due_evaluations",
+            return_value=(degraded,),
+        ), redirect_stdout(io.StringIO()):
+            code = runner_main(
+                ["--market", "a_share", "--at", "2026-08-03T08:30:00+08:00"]
+            )
+
+        self.assertEqual(code, 1)
 
 
 def _decision(level: RiskLevel, transition: str, push: bool) -> FinalWarningDecision:
@@ -269,6 +368,30 @@ class FeishuNotifierTests(TestCase):
             self.assertFalse(second.notify(result))
             self.assertEqual(len(sent), 1)
 
+    def test_notifier_sends_the_persisted_report_instead_of_rerendering_without_previous_state(self) -> None:
+        class Repository:
+            def claim_alert(self, *_args, **_kwargs):
+                return True
+
+            def finish_alert(self, *_args, **_kwargs):
+                pass
+
+        with tempfile.TemporaryDirectory() as directory:
+            report = Path(directory) / "warning.md"
+            report.write_text("persisted ORANGE -> RED report", encoding="utf-8")
+            result = _result(
+                1,
+                RiskLevel.RED,
+                slot="intraday-0940",
+                transition="UPGRADE_ORANGE_TO_RED",
+                push=True,
+            )
+            result = RunnerResult(**{**result.__dict__, "report_path": str(report)})
+            sent: list[str] = []
+
+            self.assertTrue(FeishuNotifier(Repository(), sender=sent.append).notify(result))
+            self.assertEqual(sent, ["persisted ORANGE -> RED report"])
+
     def test_failed_alert_can_be_explicitly_retried_without_new_row(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             db_path = Path(directory) / "warning.db"
@@ -299,6 +422,16 @@ class FeishuNotifierTests(TestCase):
             self.assertEqual(rows[0]["push_status"], "sent")
             self.assertIsNone(rows[0]["error_summary"])
             self.assertEqual(len(sent), 1)
+
+
+class InstallerTests(TestCase):
+    def test_cron_installer_creates_log_directory_before_installing_redirect(self) -> None:
+        script = (
+            Path(__file__).resolve().parents[3] / "scripts/install_market_warning_cron.sh"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn('mkdir -p "$LOG_DIR"', script)
+        self.assertLess(script.index('mkdir -p "$LOG_DIR"'), script.rindex("| crontab -"))
 
 
 if __name__ == "__main__":

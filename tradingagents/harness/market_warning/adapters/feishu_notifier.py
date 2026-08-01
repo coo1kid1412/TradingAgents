@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 from collections.abc import Callable
 from datetime import datetime
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from tradingagents.harness.market_risk_daily import _send_feishu_message
@@ -69,11 +70,15 @@ class FeishuNotifier:
     def notify(self, result: RunnerResult) -> bool:
         if not should_notify(result) or result.decision_id is None:
             return False
-        message = (
-            render_premarket_report(result, None)
-            if "premarket" in result.session_slot.lower()
-            else render_upgrade_report(result, None)
-        )
+        report_path = Path(result.report_path) if result.report_path else None
+        if report_path is not None and report_path.is_file():
+            message = report_path.read_text(encoding="utf-8")
+        else:
+            message = (
+                render_premarket_report(result, None)
+                if "premarket" in result.session_slot.lower()
+                else render_upgrade_report(result, None)
+            )
         payload_hash = hashlib.sha256(message.encode("utf-8")).hexdigest()
         key = _idempotency_key(result)
         if not self.repository.claim_alert(

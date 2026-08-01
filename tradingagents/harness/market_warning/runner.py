@@ -50,7 +50,7 @@ def _slot_for_market(market: Market, now: datetime) -> EvaluationSlot | None:
     row = _calendar_row(market, local.date())
     if row is None:
         return None
-    if local.time() == time(8, 30):
+    if local.time() in {time(8, 30), time(8, 35)}:
         return EvaluationSlot(market, local, "premarket", local.date())
     if not _on_five_minute_grid(local):
         return None
@@ -120,6 +120,53 @@ class _SessionDataPort:
         return adapter.load_snapshot(market, as_of_time, session_slot)
 
 
+def _load_history_incrementally(
+    cache,
+    daily,
+    market: Market,
+    as_of_time: datetime,
+    session_slot: str,
+    previous_session,
+):
+    """Use cache intraday; premarket may fetch only the latest completed session."""
+
+    zone = _MARKET_ZONES[Market(market)]
+    local_date = as_of_time.astimezone(zone).date()
+    incremental = ()
+    if "premarket" in session_slot.lower():
+        latest = previous_session(local_date)
+        try:
+            incremental = tuple(daily.backfill(latest, latest))
+        except Exception:
+            incremental = ()
+    cached = cache.list_snapshots(
+        market,
+        "daily_snapshot",
+        local_date - timedelta(days=420),
+        local_date,
+    )
+    merged = {
+        (item.as_of_time, item.session_slot): item
+        for item in (*cached, *incremental)
+        if item.as_of_time < as_of_time
+    }
+    return tuple(item for _, item in sorted(merged.items()))
+
+
+def _reasoning_adapter(repository):
+    from tradingagents.harness.market_warning.adapters.minimax_reasoning import (
+        MiniMaxReasoningAdapter,
+        UnavailableReasoningAdapter,
+    )
+
+    try:
+        return MiniMaxReasoningAdapter.from_environment(
+            breaker=repository.circuit_breaker("minimax-m3")
+        )
+    except Exception:
+        return UnavailableReasoningAdapter("initialization_error")
+
+
 def _load_environment() -> None:
     try:
         from dotenv import load_dotenv
@@ -135,7 +182,6 @@ def _default_service_factory(slot: EvaluationSlot, force: bool):
     _load_environment()
     from tradingagents.harness.market_warning.adapters.data_cache import RawDataCache
     from tradingagents.harness.market_warning.adapters.feishu_notifier import FeishuNotifier
-    from tradingagents.harness.market_warning.adapters.minimax_reasoning import MiniMaxReasoningAdapter
     from tradingagents.harness.market_warning.adapters.sqlite_repository import SQLiteWarningRepository
     from tradingagents.harness.market_warning.adapters.tushare_data import TushareAShareDataAdapter
     from tradingagents.harness.market_warning.adapters.us_market_data import YahooUSDataAdapter
@@ -146,30 +192,42 @@ def _default_service_factory(slot: EvaluationSlot, force: bool):
 
     repository = SQLiteWarningRepository()
     cache = RawDataCache(_PROJECT_ROOT / "harness_data/market_warning/raw")
+    from tradingagents.harness.market_warning.calendars import session_resolvers
+
+    next_session, previous_session, calendar_version = session_resolvers(slot.market)
     if slot.market == Market.A_SHARE:
         from tradingagents.dataflows.tushare_vendor import _get_tushare_api
 
         pro = _get_tushare_api()
-        daily = TushareAShareDataAdapter(pro=pro, cache=cache)
+        daily = TushareAShareDataAdapter(
+            pro=pro,
+            cache=cache,
+            next_trading_day=next_session,
+            previous_session=previous_session,
+            calendar_version=calendar_version,
+        )
         data_port = _SessionDataPort(daily, RealtimeAShareDataAdapter(pro=pro))
         strategy = AShareFeatureStrategy()
     else:
-        daily = YahooUSDataAdapter(cache=cache)
+        daily = YahooUSDataAdapter(
+            cache=cache,
+            previous_session=previous_session,
+            calendar_version=calendar_version,
+        )
         data_port = _SessionDataPort(daily)
         strategy = USFeatureStrategy()
 
-    zone = _MARKET_ZONES[slot.market]
-
     def load_history(_market: Market, as_of_time: datetime):
-        local_date = as_of_time.astimezone(zone).date()
-        return tuple(daily.backfill(local_date - timedelta(days=420), local_date - timedelta(days=1)))
-
-    try:
-        reasoning = MiniMaxReasoningAdapter.from_environment(
-            breaker=repository.circuit_breaker("minimax-m3")
+        return _load_history_incrementally(
+            cache,
+            daily,
+            slot.market,
+            as_of_time,
+            slot.session_slot,
+            previous_session,
         )
-    except Exception:
-        reasoning = None
+
+    reasoning = _reasoning_adapter(repository)
     return MarketWarningService(
         data_port=data_port,
         feature_strategies={slot.market: strategy},
@@ -242,7 +300,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 }
             )
     print(json.dumps(summaries, ensure_ascii=False, sort_keys=True))
-    return 0
+    return 1 if any(getattr(item, "error_class", None) for item in results) else 0
 
 
 if __name__ == "__main__":

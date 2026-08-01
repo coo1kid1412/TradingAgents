@@ -239,6 +239,19 @@ class ReportGoldenTests(TestCase):
         self.assertNotIn("## 概率判断", report)
         self.assertNotIn("## 数据与模型", report)
 
+    def test_silent_intraday_poll_is_titled_evaluation_not_upgrade(self) -> None:
+        result = _result(RiskLevel.GREEN)
+        result = replace(
+            result,
+            session_slot="intraday-0935",
+            feature_snapshot=replace(result.feature_snapshot, session_slot="intraday-0935"),
+        )
+
+        report = render_upgrade_report(result, _decision(RiskLevel.GREEN))
+
+        self.assertIn("（盘中评估）", report)
+        self.assertNotIn("（盘中升级）", report)
+
     def test_metadata_and_authorization_shaped_text_are_redacted(self) -> None:
         unsafe_context = replace(
             _context(),

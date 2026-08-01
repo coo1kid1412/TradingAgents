@@ -203,9 +203,11 @@ def should_call_reasoning(
         return False
     if "premarket" in normalized_slot:
         return True
-    if candidate_level in {RiskLevel.ORANGE, RiskLevel.RED}:
-        return True
-    return previous_level == RiskLevel.ORANGE and candidate_level == RiskLevel.RED
+    if candidate_level == RiskLevel.ORANGE:
+        return previous_level not in {RiskLevel.ORANGE, RiskLevel.RED}
+    if candidate_level == RiskLevel.RED:
+        return previous_level != RiskLevel.RED
+    return False
 
 
 def _json_value(value: Any) -> Any:
@@ -235,6 +237,25 @@ def build_reasoning_prompt(
     """Build compact point-in-time context and an exact output schema."""
 
     baseline = baseline_level(quant, snapshot)
+    contributor_ids = tuple(
+        str(item.get("evidence_id"))
+        for item in quant.top_contributors[:5]
+        if isinstance(item, Mapping) and item.get("evidence_id")
+    )
+    by_id = {item.evidence_id: item for item in snapshot.evidence}
+    exposed_items = []
+    exposed_ids: set[str] = set()
+    for evidence_id in contributor_ids:
+        item = by_id.get(evidence_id)
+        if item is not None and evidence_id not in exposed_ids:
+            exposed_items.append(item)
+            exposed_ids.add(evidence_id)
+    for item in snapshot.evidence:
+        if len(exposed_items) >= 16:
+            break
+        if item.evidence_id not in exposed_ids:
+            exposed_items.append(item)
+            exposed_ids.add(item.evidence_id)
     evidence = [
         {
             "evidence_id": item.evidence_id,
@@ -242,8 +263,15 @@ def build_reasoning_prompt(
             "value": _json_value(item.value),
             "as_of_time": item.as_of_time.isoformat() if item.as_of_time else None,
         }
-        for item in snapshot.evidence[:16]
+        for item in exposed_items
     ]
+    top_contributors = tuple(
+        item
+        for item in quant.top_contributors[:5]
+        if not isinstance(item, Mapping)
+        or not item.get("evidence_id")
+        or str(item.get("evidence_id")) in exposed_ids
+    )
     context = {
         "task": "Assess whether evidence supports raising the code baseline by at most one level.",
         "strict_json_output": True,
@@ -261,7 +289,7 @@ def build_reasoning_prompt(
             "base_rate_3d": quant.base_rate_3d,
             "market_phase": quant.market_phase.value,
         },
-        "top_contributors": _json_value(quant.top_contributors[:5]),
+        "top_contributors": _json_value(top_contributors),
         "evidence": evidence,
         "constraints": [
             "Use only listed evidence_id values.",

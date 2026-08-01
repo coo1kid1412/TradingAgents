@@ -115,6 +115,18 @@ def _fallback(error_class: str) -> LLMContextAssessment:
     )
 
 
+class UnavailableReasoningAdapter:
+    """ReasoningPort that persists a coarse initialization failure."""
+
+    model_name = "MiniMax-M3"
+
+    def __init__(self, error_class: str = "initialization_error") -> None:
+        self.error_class = error_class
+
+    def assess(self, snapshot, quant, previous) -> LLMContextAssessment:
+        return _fallback(self.error_class)
+
+
 def _repair_prompt(
     original_prompt: str,
     error_class: str,
@@ -171,6 +183,7 @@ class MiniMaxReasoningAdapter:
             base_url,
             timeout=timeout,
             max_tokens=max_tokens,
+            max_retries=0,
             wall_clock_max_retries=0,
         )
         return cls(client.get_llm_wrapped(), timeout=timeout, breaker=breaker)
@@ -186,10 +199,15 @@ class MiniMaxReasoningAdapter:
 
         try:
             prompt = build_reasoning_prompt(snapshot, quant, previous)
+            prompt_context = json.loads(prompt)
+            valid_ids = tuple(
+                str(item["evidence_id"])
+                for item in prompt_context.get("evidence", ())
+                if isinstance(item, Mapping) and item.get("evidence_id")
+            )
         except Exception:
             self.breaker.record_failure()
             return _fallback("prompt_error")
-        valid_ids = tuple(item.evidence_id for item in snapshot.evidence[:16])
         baseline = baseline_level(quant, snapshot)
         first_error: str | None = None
         request = prompt

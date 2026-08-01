@@ -21,6 +21,8 @@ from tradingagents.harness.market_warning.domain import (
 )
 from tradingagents.harness.market_warning.quality import DataQualityAssessment
 from tradingagents.harness.market_warning.service import MarketWarningService
+from tradingagents.harness.market_warning.adapters.feishu_notifier import FeishuNotifier
+from tradingagents.harness.market_warning.adapters.sqlite_repository import SQLiteWarningRepository
 
 
 NOW = datetime(2026, 8, 3, 0, 30, tzinfo=timezone.utc)
@@ -368,6 +370,43 @@ class MarketWarningServiceTests(TestCase):
             self.assertIsNotNone(repository.saved_decision)
             self.assertTrue(Path(result.report_path).is_file())
             self.assertNotIn("webhook secret", Path(result.report_path).read_text())
+
+    def test_same_time_retry_reuses_persisted_evaluation_and_resends_failed_alert(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            db_path = Path(directory) / "warning.db"
+            repository = SQLiteWarningRepository(db_path)
+            first_events: list[str] = []
+            failing = FeishuNotifier(
+                repository,
+                sender=lambda _message: (_ for _ in ()).throw(RuntimeError("send failed")),
+            )
+            first_service, _ = self._service(
+                first_events,
+                directory,
+                repository=repository,
+                notifier=failing,
+            )
+            first = first_service.evaluate(Market.A_SHARE, NOW, "premarket")
+            self.assertIsNotNone(first.decision_id)
+            self.assertEqual(first.error_class, "notifier_error")
+
+            sent: list[str] = []
+            retry_events: list[str] = []
+            retry_service, _ = self._service(
+                retry_events,
+                directory,
+                repository=SQLiteWarningRepository(db_path),
+                notifier=FeishuNotifier(
+                    SQLiteWarningRepository(db_path),
+                    sender=sent.append,
+                    retry_failed=True,
+                ),
+            )
+            retried = retry_service.evaluate(Market.A_SHARE, NOW, "premarket")
+
+            self.assertEqual(retried.decision_id, first.decision_id)
+            self.assertEqual(len(sent), 1)
+            self.assertNotIn("load_data", retry_events)
 
     def test_ordinary_intraday_yellow_skips_reasoning_and_notification(self) -> None:
         events: list[str] = []
