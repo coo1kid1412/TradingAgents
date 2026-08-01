@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import inspect
+import hashlib
 import json
 import subprocess
 import sys
@@ -25,11 +26,13 @@ from sklearn.preprocessing import StandardScaler
 sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 
 from tradingagents.harness.market_warning.domain import Market
+from tradingagents.harness.market_warning.adapters.sqlite_repository import SQLiteWarningRepository
 from tradingagents.harness.market_warning.training import (
     EvaluationReport,
     build_labels,
     evaluate_model,
     fit_model,
+    production_partitions,
     time_partitions,
 )
 import tradingagents.harness.market_warning.training as training_module
@@ -75,6 +78,29 @@ def _dated_frame(start: str, rows: int, *, feature_version: str = "market-warnin
 
 
 class LabelTests(TestCase):
+    def test_mixed_new_york_dst_offsets_remain_timezone_aware_and_label_safely(self):
+        times = pd.Series(
+            [
+                datetime.fromisoformat("2025-01-02T16:00:00-05:00"),
+                datetime.fromisoformat("2025-03-10T16:00:00-04:00"),
+                datetime.fromisoformat("2025-07-01T16:00:00-04:00"),
+                datetime.fromisoformat("2025-11-03T16:00:00-05:00"),
+            ]
+        )
+        frame = pd.DataFrame(
+            {
+                "as_of_time": times,
+                "close": [100.0, 99.0, 98.0, 97.0],
+                "feature_available_at": times,
+            }
+        )
+        frame.attrs["availability_proof"] = {"*": "feature_available_at"}
+
+        result = build_labels(frame, Market.US)
+
+        self.assertEqual(len(result), 4)
+        self.assertTrue(result.attrs["point_in_time_validated"])
+
     def test_a_share_thresholds_are_inclusive_at_exact_boundaries(self):
         frame = _with_label_availability(pd.DataFrame(
             {
@@ -228,6 +254,37 @@ class PartitionTests(TestCase):
 
         self.assertTrue(dev.empty)
         self.assertEqual(len(validation), 1)
+
+    def test_production_partitions_refit_through_latest_labeled_window(self):
+        frame = pd.concat(
+            [
+                _dated_frame("2008-01-01", 120),
+                _dated_frame("2014-01-01", 60),
+                _dated_frame("2025-01-02", 300),
+            ],
+            ignore_index=True,
+        )
+        frame.attrs.update(_dated_frame("2008-01-01", 4).attrs)
+
+        train, calibration = production_partitions(frame, Market.A_SHARE)
+
+        self.assertEqual(len(calibration), 96)
+        self.assertEqual(
+            pd.to_datetime(calibration["as_of_time"], utc=True).max(),
+            pd.to_datetime(frame["as_of_time"], utc=True).max(),
+        )
+        self.assertGreaterEqual(
+            training_module._embargo_sessions(
+                Market.A_SHARE,
+                pd.to_datetime(train["as_of_time"], utc=True).max(),
+                pd.to_datetime(calibration["as_of_time"], utc=True).min(),
+            ),
+            3,
+        )
+        self.assertLess(
+            pd.to_datetime(train["label_end_3d"], utc=True).max(),
+            pd.to_datetime(calibration["as_of_time"], utc=True).min(),
+        )
 
     def test_frozen_test_excludes_null_or_august_three_day_label_windows(self):
         frame = pd.DataFrame(
@@ -439,16 +496,28 @@ class TrainingCommandTests(TestCase):
         self.assertIn("--dataset", result.stderr)
         self.assertIn("Task 12", result.stderr)
 
-    def test_backfill_and_promote_do_not_fake_success_before_task12_inputs_exist(self):
-        for command in ("backfill", "promote"):
-            result = self._run(
-                command,
-                "--start", "2000-01-01",
-                "--test-end", "2026-07-31",
-                "--version", "market-warning-v1",
-            )
-            self.assertNotEqual(result.returncode, 0)
-            self.assertIn("Task 12", result.stderr)
+    def test_backfill_requires_an_explicit_market_and_output(self):
+        result = self._run(
+            "backfill",
+            "--start", "2026-07-01",
+            "--test-end", "2026-07-31",
+            "--version", "market-warning-v1",
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("--market", result.stderr)
+        self.assertIn("--output", result.stderr)
+
+    def test_promote_does_not_fake_success_before_task12_evaluation_exists(self):
+        result = self._run(
+            "promote",
+            "--start", "2000-01-01",
+            "--test-end", "2026-07-31",
+            "--version", "market-warning-v1",
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Task 12", result.stderr)
 
     def test_cli_rejects_unsafe_model_versions_before_dispatch(self):
         for version in (".", "..", "../escape", "nested/version", r"nested\version", "/absolute"):
@@ -504,6 +573,136 @@ class TrainingCommandTests(TestCase):
             )
             self.assertEqual(evaluated.returncode, 0, evaluated.stderr)
             self.assertEqual(json.loads(evaluated.stdout)["horizon"], "1d")
+
+    def test_train_without_single_model_flags_builds_four_model_manifest_and_report(self):
+        with tempfile.TemporaryDirectory(prefix="warning_train_all_") as directory:
+            root = Path(directory)
+            dataset = pd.concat(
+                [
+                    _dated_frame("2008-01-01", 120),
+                    _dated_frame("2014-01-01", 60),
+                    _dated_frame("2020-01-02", 80),
+                ],
+                ignore_index=True,
+            )
+            dataset.attrs.update(_dated_frame("2008-01-01", 4).attrs)
+            a_share_path = root / "a-share.joblib"
+            us_path = root / "us.joblib"
+            joblib.dump(dataset, a_share_path)
+            joblib.dump(dataset, us_path)
+            report_path = root / "evaluation.md"
+            manifest_path = root / "manifest.json"
+
+            trained = self._run(
+                "train",
+                "--dataset-a-share", str(a_share_path),
+                "--dataset-us", str(us_path),
+                "--artifact-root", str(root / "models"),
+                "--db", str(root / "warning.db"),
+                "--report", str(report_path),
+                "--manifest", str(manifest_path),
+                "--start", "2000-01-01",
+                "--test-end", "2026-07-31",
+                "--version", "four-model-v1",
+            )
+
+            self.assertEqual(trained.returncode, 0, trained.stderr)
+            payload = json.loads(trained.stdout)
+            self.assertEqual(len(payload["models"]), 4)
+            self.assertTrue(all(not model["active"] for model in payload["models"]))
+            self.assertTrue(report_path.is_file())
+            self.assertTrue(manifest_path.is_file())
+            report = report_path.read_text(encoding="utf-8")
+            self.assertIn("Brier", report)
+            self.assertIn("AUPRC", report)
+            self.assertIn("FIRST_SHOCK", report)
+            self.assertIn("危机贡献", report)
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            self.assertEqual(manifest["model_version"], "four-model-v1")
+            self.assertEqual(len(manifest["models"]), 4)
+            self.assertIn("calibration_bins", manifest["models"][0]["evaluation"])
+            for model in manifest["models"]:
+                self.assertGreaterEqual(model["training_cutoff"], "2020-01-01")
+                self.assertIn("production_partitions", model)
+                self.assertLess(
+                    model["evaluation_bundle"]["calibration_end"],
+                    model["training_cutoff"],
+                )
+                bundle = joblib.load(model["artifact_path"])
+                self.assertEqual(
+                    bundle.calibration_end.isoformat(),
+                    model["production_partitions"]["calibration"]["end"],
+                )
+
+    def test_promote_verifies_manifest_and_atomically_activates_four_registered_models(self):
+        with tempfile.TemporaryDirectory(prefix="warning_promote_") as directory:
+            root = Path(directory)
+            artifact_root = root / "models"
+            version = "promotion-v1"
+            version_root = artifact_root / version
+            version_root.mkdir(parents=True)
+            db_path = root / "warning.db"
+            repository = SQLiteWarningRepository(db_path)
+            models = []
+            for market in Market:
+                for horizon in ("1d", "3d"):
+                    artifact = version_root / f"{market.value}-{horizon}.joblib"
+                    artifact.write_bytes(f"{market.value}/{horizon}".encode())
+                    checksum = hashlib.sha256(artifact.read_bytes()).hexdigest()
+                    record = {
+                        "model_version": version,
+                        "market": market,
+                        "horizon": horizon,
+                        "feature_version": "market-warning-v1",
+                        "calibration_version": "platt-v1",
+                        "training_cutoff": "2019-12-31",
+                        "artifact_path": str(artifact),
+                        "artifact_sha256": checksum,
+                        "metrics": {},
+                        "base_rate": 0.02,
+                        "active": False,
+                    }
+                    repository.register_model(record)
+                    models.append(
+                        {
+                            **{key: value.value if isinstance(value, Market) else value for key, value in record.items()},
+                            "evaluation": {
+                                "market": market.value,
+                                "horizon": horizon,
+                                "prevalence": 0.02,
+                                "brier_score": 0.015,
+                                "constant_base_rate_brier": 0.019,
+                                "average_precision": 0.08,
+                                "expected_calibration_error": 0.03,
+                                "monthly_alert_entries": 4.0,
+                                "crisis_contribution": {"2008": 0.3, "2020": 0.3, "non_crisis": 0.4},
+                            },
+                        }
+                    )
+            manifest_path = root / "manifest.json"
+            manifest_path.write_text(
+                json.dumps({"model_version": version, "models": models}),
+                encoding="utf-8",
+            )
+
+            promoted = self._run(
+                "promote",
+                "--artifact-root", str(artifact_root),
+                "--db", str(db_path),
+                "--manifest", str(manifest_path),
+                "--start", "2000-01-01",
+                "--test-end", "2026-07-31",
+                "--version", version,
+            )
+
+            self.assertEqual(promoted.returncode, 0, promoted.stderr)
+            self.assertEqual(json.loads(promoted.stdout)["activated_models"], 4)
+            for market in Market:
+                for horizon in ("1d", "3d"):
+                    active = SQLiteWarningRepository(db_path).load_active_model(
+                        market, horizon
+                    )
+                    self.assertEqual(active["model_version"], version)
 
     def test_task6_dependencies_import_with_supported_versions(self):
         sklearn_version = tuple(int(part) for part in sklearn.__version__.split(".")[:2])

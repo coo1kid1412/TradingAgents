@@ -7,7 +7,7 @@ import shutil
 import sqlite3
 import sys
 import tempfile
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import TestCase, main
@@ -134,6 +134,22 @@ def save_complete_decision(
 
 
 class SQLiteWarningRepositoryTests(TestCase):
+    @staticmethod
+    def _model_record(version: str, market: Market, horizon: str, *, active: bool):
+        return {
+            "model_version": version,
+            "market": market,
+            "horizon": horizon,
+            "feature_version": "market-warning-v1",
+            "calibration_version": "platt-v1",
+            "training_cutoff": "2019-12-31",
+            "artifact_path": f"/tmp/{version}-{market.value}-{horizon}.joblib",
+            "artifact_sha256": "a" * 64,
+            "metrics": {"brier_score": 0.01},
+            "base_rate": 0.02,
+            "active": active,
+        }
+
     def test_init_db_closes_its_schema_connection(self):
         with temporary_database() as db_path:
             opened = []
@@ -195,7 +211,7 @@ class SQLiteWarningRepositoryTests(TestCase):
 
     def test_existing_decision_table_migration_is_idempotent(self):
         with temporary_database() as db_path:
-            with sqlite3.connect(db_path) as connection:
+            with closing(sqlite3.connect(db_path)) as connection:
                 connection.execute(
                     "CREATE TABLE market_warning_decisions ("
                     "id INTEGER PRIMARY KEY AUTOINCREMENT, feature_snapshot_id INTEGER NOT NULL UNIQUE, "
@@ -209,13 +225,53 @@ class SQLiteWarningRepositoryTests(TestCase):
             _db.init_db(db_path)
             _db.init_db(db_path)
 
-            with sqlite3.connect(db_path) as connection:
+            with closing(sqlite3.connect(db_path)) as connection:
                 columns = {
                     row[1]: row for row in connection.execute("PRAGMA table_info(market_warning_decisions)")
                 }
             self.assertEqual(columns["valid_snapshot_count"][3], 1)
             self.assertEqual(columns["valid_snapshot_count"][4], "0")
             self.assertIn("retained_risk_level", columns)
+
+    def test_activate_model_set_switches_all_four_horizons_in_one_commit(self):
+        with temporary_database() as db_path:
+            repository = SQLiteWarningRepository(db_path)
+            for market in Market:
+                for horizon in ("1d", "3d"):
+                    repository.register_model(
+                        self._model_record("old-v1", market, horizon, active=True)
+                    )
+                    repository.register_model(
+                        self._model_record("new-v1", market, horizon, active=False)
+                    )
+
+            activated = repository.activate_model_set("new-v1")
+
+            self.assertEqual(len(activated), 4)
+            for market in Market:
+                for horizon in ("1d", "3d"):
+                    active = repository.load_active_model(market, horizon)
+                    self.assertEqual(active["model_version"], "new-v1")
+
+    def test_activate_incomplete_model_set_rolls_back_without_touching_active_models(self):
+        with temporary_database() as db_path:
+            repository = SQLiteWarningRepository(db_path)
+            for market in Market:
+                for horizon in ("1d", "3d"):
+                    repository.register_model(
+                        self._model_record("old-v1", market, horizon, active=True)
+                    )
+            repository.register_model(
+                self._model_record("broken-v1", Market.US, "1d", active=False)
+            )
+
+            with self.assertRaisesRegex(ValueError, "four-model"):
+                repository.activate_model_set("broken-v1")
+
+            for market in Market:
+                for horizon in ("1d", "3d"):
+                    active = repository.load_active_model(market, horizon)
+                    self.assertEqual(active["model_version"], "old-v1")
 
     def test_round_trip_persists_snapshot_two_horizons_reasoning_and_decision(self):
         with temporary_database() as db_path:

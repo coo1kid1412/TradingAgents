@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import os
 import re
 import sys
+import tempfile
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -26,10 +29,25 @@ from .domain import Market
 from .features import FEATURE_VERSION
 
 
+_CANONICAL_MODULE = "tradingagents.harness.market_warning.training"
+if __name__ == "__main__":
+    sys.modules[_CANONICAL_MODULE] = sys.modules[__name__]
+
+
 MODEL_VERSION = "market-warning-logistic-v1"
 CALIBRATION_VERSION = "platt-v1"
 EMBARGO_TRADING_DAYS = 3
 TEST_END = pd.Timestamp("2026-07-31", tz="UTC")
+_PROJECT_ROOT = Path(__file__).resolve().parents[3]
+_DEFAULT_FEATURE_ROOT = _PROJECT_ROOT / "harness_data/market_warning/features"
+_DEFAULT_DATASETS = {
+    Market.A_SHARE: _DEFAULT_FEATURE_ROOT / "a-share-2000-2026-07-31.joblib",
+    Market.US: _DEFAULT_FEATURE_ROOT / "us-2000-2026-07-31.joblib",
+}
+_DEFAULT_ARTIFACT_ROOT = _PROJECT_ROOT / "harness_data/models/market_warning"
+_DEFAULT_EVALUATION_REPORT = (
+    _PROJECT_ROOT / "reports/market_warning/model-evaluation/market-warning-v1.md"
+)
 _MODEL_VERSION_PATTERN = re.compile(
     r"[A-Za-z0-9](?:[A-Za-z0-9._-]{0,62}[A-Za-z0-9])?\Z"
 )
@@ -139,6 +157,10 @@ class ModelBundle:
         return tuple(rows)
 
 
+if __name__ == "__main__":
+    ModelBundle.__module__ = _CANONICAL_MODULE
+
+
 def build_labels(index_frame: pd.DataFrame, market: Market) -> pd.DataFrame:
     """Attach frozen 1-day and worst cumulative 3-day labels to index rows."""
 
@@ -205,6 +227,46 @@ def time_partitions(frame: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, pd
     return tuple(partitions)  # type: ignore[return-value]
 
 
+def production_partitions(
+    frame: pd.DataFrame,
+    market: Market,
+    *,
+    calibration_sessions: int = 252,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Return a latest-date refit split after the frozen evaluation is complete."""
+
+    market = Market(market)
+    values = frame.copy()
+    values["as_of_time"] = pd.to_datetime(_as_of_times(values), utc=True)
+    values = values.sort_values("as_of_time", kind="stable")
+    if "label_end_3d" not in values:
+        raise ValueError("frame must include label_end_3d for production refit")
+    label_ends = pd.to_datetime(values["label_end_3d"], utc=True, errors="coerce")
+    eligible = values.loc[label_ends.notna()].copy()
+    if len(eligible) < 80:
+        raise ValueError("production refit requires at least 80 labeled sessions")
+    calibration_size = min(calibration_sessions, max(40, len(eligible) // 5))
+    calibration = eligible.tail(calibration_size).copy()
+    calibration_start = calibration["as_of_time"].min()
+    training = eligible.loc[
+        eligible["as_of_time"].lt(calibration_start)
+        & pd.to_datetime(eligible["label_end_3d"], utc=True, errors="coerce").lt(calibration_start)
+    ].copy()
+    while not training.empty and _embargo_sessions(
+        market,
+        training["as_of_time"].max(),
+        calibration_start,
+    ) < EMBARGO_TRADING_DAYS:
+        training = training.iloc[:-1].copy()
+    if training.empty:
+        raise ValueError("production refit has no training rows after the embargo")
+    training["partition"] = "production_train"
+    calibration["partition"] = "production_calibration"
+    training.attrs.update(frame.attrs)
+    calibration.attrs.update(frame.attrs)
+    return training.reset_index(drop=True), calibration.reset_index(drop=True)
+
+
 def fit_model(
     train: pd.DataFrame,
     calibration: pd.DataFrame,
@@ -217,13 +279,25 @@ def fit_model(
 
     market = Market(market)
     target = _target_column(horizon)
-    train_times = pd.to_datetime(_as_of_times(train), utc=True)
-    calibration_times = pd.to_datetime(_as_of_times(calibration), utc=True)
     if train.empty or calibration.empty:
         raise ValueError("training and calibration windows must not be empty")
-    if train_times.max() >= calibration_times.min():
+    train_times = pd.to_datetime(_as_of_times(train), utc=True)
+    calibration_times = pd.to_datetime(_as_of_times(calibration), utc=True)
+    if target not in train or target not in calibration:
+        raise ValueError(f"training and calibration frames must include {target}")
+    train_labeled = train[target].notna()
+    calibration_labeled = calibration[target].notna()
+    labeled_train_times = train_times.loc[train_labeled]
+    labeled_calibration_times = calibration_times.loc[calibration_labeled]
+    if labeled_train_times.empty or labeled_calibration_times.empty:
+        raise ValueError("training and calibration windows must contain labeled rows")
+    if labeled_train_times.max() >= labeled_calibration_times.min():
         raise ValueError("calibration window must be later than the training window")
-    if _embargo_sessions(market, train_times.max(), calibration_times.min()) < EMBARGO_TRADING_DAYS:
+    if _embargo_sessions(
+        market,
+        labeled_train_times.max(),
+        labeled_calibration_times.min(),
+    ) < EMBARGO_TRADING_DAYS:
         raise ValueError("calibration window must follow a three-trading-day embargo")
     feature_version = str(train.attrs.get("feature_version", FEATURE_VERSION))
     calibration_feature_version = str(calibration.attrs.get("feature_version", feature_version))
@@ -276,10 +350,10 @@ def fit_model(
         calibration_version=CALIBRATION_VERSION,
         calibration_method="platt",
         base_rate=float(y_train.mean()),
-        training_start=train_times.min().to_pydatetime(),
-        training_end=train_times.max().to_pydatetime(),
-        calibration_start=calibration_times.min().to_pydatetime(),
-        calibration_end=calibration_times.max().to_pydatetime(),
+        training_start=labeled_train_times.min().to_pydatetime(),
+        training_end=labeled_train_times.max().to_pydatetime(),
+        calibration_start=labeled_calibration_times.min().to_pydatetime(),
+        calibration_end=labeled_calibration_times.max().to_pydatetime(),
         pipeline=pipeline,
         calibrator=calibrator,
     )
@@ -337,10 +411,14 @@ def _as_of_times(frame: pd.DataFrame) -> pd.Series:
         values = pd.Series(frame.index, index=frame.index)
     else:
         raise ValueError("frame must include as_of_time or use a DatetimeIndex")
-    parsed = pd.to_datetime(values, errors="raise")
-    if getattr(parsed.dt, "tz", None) is None:
-        raise ValueError("as_of_time must be timezone-aware")
-    return parsed
+    for value in values:
+        try:
+            timestamp = pd.Timestamp(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("as_of_time must contain valid timestamps") from exc
+        if timestamp.tzinfo is None or timestamp.utcoffset() is None:
+            raise ValueError("as_of_time must be timezone-aware")
+    return pd.to_datetime(values, errors="raise", utc=True)
 
 
 def _target_column(horizon: str) -> str:
@@ -540,23 +618,32 @@ def _command_parser() -> argparse.ArgumentParser:
 
     backfill = commands.add_parser("backfill", help="Prepare point-in-time history (Task 12 gated)")
     add_frozen_window(backfill)
+    backfill.add_argument("--market", choices=[market.value for market in Market])
+    backfill.add_argument("--output")
+    backfill.add_argument("--cache-root")
 
-    train = commands.add_parser("train", help="Fit and register one local validated model bundle")
+    train = commands.add_parser("train", help="Fit one local bundle or the frozen four-model set")
     add_frozen_window(train)
     train.add_argument("--dataset")
     train.add_argument("--market", choices=[market.value for market in Market])
     train.add_argument("--horizon", choices=("1d", "3d"))
     train.add_argument("--artifact-root")
     train.add_argument("--db")
+    train.add_argument("--dataset-a-share")
+    train.add_argument("--dataset-us")
+    train.add_argument("--report")
+    train.add_argument("--manifest")
 
     evaluate = commands.add_parser("evaluate", help="Evaluate one local bundle on the frozen test partition")
     add_frozen_window(evaluate)
     evaluate.add_argument("--dataset")
     evaluate.add_argument("--artifact")
 
-    promote = commands.add_parser("promote", help="Promote passing artifacts (Task 12 gated)")
+    promote = commands.add_parser("promote", help="Verify and atomically promote four passing artifacts")
     add_frozen_window(promote)
     promote.add_argument("--db")
+    promote.add_argument("--artifact-root")
+    promote.add_argument("--manifest")
     return parser
 
 
@@ -564,21 +651,25 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = _command_parser()
     args = parser.parse_args(argv)
     try:
-        _validate_cli_window(args.start, args.test_end)
+        if args.command == "backfill":
+            _validate_backfill_window(args.start, args.test_end)
+        else:
+            _validate_cli_window(args.start, args.test_end)
         try:
             validate_model_version(args.version)
         except ValueError as exc:
             raise ValueError(f"--version is invalid: {exc}") from exc
         if args.command == "backfill":
-            raise ValueError(
-                "Task 12 input is not ready: backfill requires production data-source orchestration and cache auditing"
-            )
+            payload = _run_backfill_command(args)
+            print(json.dumps(payload, sort_keys=True, separators=(",", ":")))
+            return 0
         if args.command == "promote":
-            raise ValueError(
-                "Task 12 input is not ready: promote requires all four frozen evaluation reports to pass promotion gates"
-            )
+            payload = _run_promote_command(args)
+            print(json.dumps(payload, sort_keys=True, separators=(",", ":")))
+            return 0
         if args.command == "train":
-            payload = _run_train_command(args)
+            single_model = any((args.dataset, args.market, args.horizon))
+            payload = _run_train_command(args) if single_model else _run_train_all_command(args)
         else:
             payload = _run_evaluate_command(args)
     except (FileNotFoundError, OSError, TypeError, ValueError) as exc:
@@ -595,6 +686,82 @@ def _validate_cli_window(start: str, test_end: str) -> None:
         raise ValueError("--start must include the frozen development window beginning 2000-01-01")
     if end_date != TEST_END.tz_localize(None):
         raise ValueError("--test-end must remain frozen at 2026-07-31")
+
+
+def _validate_backfill_window(start: str, test_end: str) -> None:
+    try:
+        start_date = pd.Timestamp(start)
+        end_date = pd.Timestamp(test_end)
+    except ValueError as exc:
+        raise ValueError("backfill dates must use YYYY-MM-DD") from exc
+    if start_date > end_date:
+        raise ValueError("backfill --start must not be after --test-end")
+    if end_date > TEST_END.tz_localize(None):
+        raise ValueError("backfill --test-end must not pass the frozen 2026-07-31 cutoff")
+
+
+def _calendar_resolvers(market: Market):
+    from .calendars import session_resolvers
+
+    return session_resolvers(market)
+
+
+def _run_backfill_command(args: argparse.Namespace) -> dict[str, Any]:
+    missing = [name for name in ("market", "output") if not getattr(args, name)]
+    if missing:
+        flags = ", ".join(f"--{name}" for name in missing)
+        raise ValueError(f"Task 12 backfill requires {flags}")
+    try:
+        from dotenv import load_dotenv
+
+        load_dotenv(_PROJECT_ROOT / ".env", override=False)
+    except ImportError:
+        pass
+    from .adapters.data_cache import RawDataCache
+    from .adapters.tushare_data import TushareAShareDataAdapter
+    from .adapters.us_market_data import YahooUSDataAdapter
+    from .backfill import run_backfill
+    from .features import AShareFeatureStrategy, USFeatureStrategy
+
+    market = Market(args.market)
+    cache_root = Path(args.cache_root or _PROJECT_ROOT / "harness_data/market_warning/raw")
+    cache = RawDataCache(cache_root)
+    next_session, previous_session, calendar_version = _calendar_resolvers(market)
+    if market == Market.A_SHARE:
+        from tradingagents.dataflows.tushare_vendor import _get_tushare_api
+
+        requests_per_minute = float(
+            os.getenv("TUSHARE_BACKFILL_REQUESTS_PER_MINUTE", "450")
+        )
+        if not 1 <= requests_per_minute <= 500:
+            raise ValueError(
+                "TUSHARE_BACKFILL_REQUESTS_PER_MINUTE must be between 1 and 500"
+            )
+        adapter = TushareAShareDataAdapter(
+            pro=_get_tushare_api(),
+            cache=cache,
+            next_trading_day=next_session,
+            previous_session=previous_session,
+            calendar_version=calendar_version,
+            minimum_request_interval=60.0 / requests_per_minute,
+            max_fetch_attempts=3,
+        )
+        strategy = AShareFeatureStrategy()
+    else:
+        adapter = YahooUSDataAdapter(
+            cache=cache,
+            previous_session=previous_session,
+            calendar_version=calendar_version,
+        )
+        strategy = USFeatureStrategy()
+    return run_backfill(
+        market,
+        args.start,
+        args.test_end,
+        adapter,
+        strategy,
+        Path(args.output),
+    )
 
 
 def _load_cli_dataset(path_value: str | None, start: str, test_end: str) -> pd.DataFrame:
@@ -655,6 +822,175 @@ def _run_train_command(args: argparse.Namespace) -> dict[str, Any]:
     }
 
 
+def _run_train_all_command(args: argparse.Namespace) -> dict[str, Any]:
+    from .adapters.sqlite_repository import SQLiteWarningRepository
+    from .backfill import promotion_failures
+    from .probability import save_model_bundle
+
+    dataset_paths = {
+        Market.A_SHARE: Path(args.dataset_a_share or _DEFAULT_DATASETS[Market.A_SHARE]),
+        Market.US: Path(args.dataset_us or _DEFAULT_DATASETS[Market.US]),
+    }
+    missing = [market.value for market, path in dataset_paths.items() if not path.is_file()]
+    if missing:
+        raise FileNotFoundError(
+            "Task 12 input is not ready: missing --dataset-a-share/--dataset-us frozen "
+            f"point-in-time datasets for {', '.join(missing)}"
+        )
+    artifact_root = Path(args.artifact_root or _DEFAULT_ARTIFACT_ROOT)
+    repository = SQLiteWarningRepository(args.db)
+    models: list[dict[str, Any]] = []
+    for market in Market:
+        dataset = _load_cli_dataset(
+            str(dataset_paths[market]),
+            args.start,
+            args.test_end,
+        )
+        if str(dataset.attrs.get("label_market", market.value)) != market.value:
+            raise ValueError(f"dataset market marker does not match {market.value}")
+        dev, validation, test = time_partitions(dataset)
+        partitions = _partition_payload(dev, validation, test)
+        production_train, production_calibration = production_partitions(dataset, market)
+        production_windows = _production_partition_payload(
+            production_train,
+            production_calibration,
+        )
+        for horizon in ("1d", "3d"):
+            evaluation_bundle = fit_model(
+                dev,
+                validation,
+                market,
+                horizon,
+                model_version=args.version,
+            )
+            evaluation = _evaluation_payload(evaluate_model(evaluation_bundle, test))
+            production_bundle = fit_model(
+                production_train,
+                production_calibration,
+                market,
+                horizon,
+                model_version=args.version,
+            )
+            record = save_model_bundle(
+                production_bundle,
+                artifact_root,
+                repository,
+                active=False,
+            )
+            record = dict(record)
+            evaluation_windows = _bundle_window_payload(evaluation_bundle)
+            record["metrics"] = {
+                **dict(record["metrics"]),
+                "evaluation": evaluation,
+                "evaluation_bundle": evaluation_windows,
+            }
+            repository.register_model(record)
+            models.append(
+                {
+                    **_model_record_payload(record),
+                    "dataset": str(dataset_paths[market]),
+                    "partitions": partitions,
+                    "production_partitions": production_windows,
+                    "evaluation_bundle": evaluation_windows,
+                    "evaluation": evaluation,
+                }
+            )
+
+    reports = [model["evaluation"] for model in models]
+    failures = promotion_failures(reports)
+    manifest_path = Path(
+        args.manifest or artifact_root / args.version / "evaluation-manifest.json"
+    )
+    report_path = Path(args.report or _DEFAULT_EVALUATION_REPORT)
+    manifest = {
+        "model_version": args.version,
+        "feature_version": FEATURE_VERSION,
+        "frozen_start": args.start,
+        "frozen_test_end": args.test_end,
+        "eligible_for_promotion": not failures,
+        "promotion_failures": list(failures),
+        "models": models,
+    }
+    _atomic_write_text(
+        manifest_path,
+        json.dumps(manifest, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
+    )
+    _atomic_write_text(report_path, _render_evaluation_report(manifest))
+    return {
+        "model_version": args.version,
+        "models": models,
+        "eligible_for_promotion": not failures,
+        "promotion_failures": list(failures),
+        "manifest": str(manifest_path),
+        "report": str(report_path),
+    }
+
+
+def _run_promote_command(args: argparse.Namespace) -> dict[str, Any]:
+    from .adapters.sqlite_repository import SQLiteWarningRepository
+    from .backfill import promotion_failures
+
+    artifact_root = Path(args.artifact_root or _DEFAULT_ARTIFACT_ROOT).resolve()
+    manifest_path = Path(
+        args.manifest or artifact_root / args.version / "evaluation-manifest.json"
+    )
+    if not manifest_path.is_file():
+        raise FileNotFoundError(
+            f"Task 12 input is not ready: evaluation manifest does not exist: {manifest_path}"
+        )
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if not isinstance(manifest, Mapping) or manifest.get("model_version") != args.version:
+        raise ValueError("evaluation manifest model_version does not match --version")
+    models = manifest.get("models")
+    if not isinstance(models, list):
+        raise ValueError("evaluation manifest models must be a list")
+    reports = [model.get("evaluation", {}) for model in models if isinstance(model, Mapping)]
+    failures = promotion_failures(reports)
+    if failures:
+        raise ValueError("promotion gates failed: " + "; ".join(failures))
+
+    expected = {(market.value, horizon) for market in Market for horizon in ("1d", "3d")}
+    indexed = {
+        (str(model.get("market")), str(model.get("horizon"))): model
+        for model in models
+        if isinstance(model, Mapping)
+    }
+    if set(indexed) != expected or len(models) != len(expected):
+        raise ValueError("evaluation manifest must contain one complete four-model set")
+    repository = SQLiteWarningRepository(args.db)
+    registered = {
+        (record["market"].value, str(record["horizon"])): record
+        for record in repository.load_model_set(args.version)
+    }
+    if set(registered) != expected:
+        raise ValueError("registry must contain one complete four-model set")
+    version_root = (artifact_root / args.version).resolve()
+    for key in sorted(expected):
+        model = indexed[key]
+        record = registered[key]
+        artifact = Path(str(model.get("artifact_path", ""))).resolve()
+        if not artifact.is_file() or not artifact.is_relative_to(version_root):
+            raise ValueError(f"artifact is missing or outside the version root: {key[0]}/{key[1]}")
+        checksum = _file_sha256(artifact)
+        expected_checksum = str(model.get("artifact_sha256", ""))
+        if checksum != expected_checksum or checksum != str(record["artifact_sha256"]):
+            raise ValueError(f"artifact checksum mismatch: {key[0]}/{key[1]}")
+        if Path(str(record["artifact_path"])).resolve() != artifact:
+            raise ValueError(f"registry artifact path mismatch: {key[0]}/{key[1]}")
+        if str(record["feature_version"]) != str(model.get("feature_version")):
+            raise ValueError(f"registry feature version mismatch: {key[0]}/{key[1]}")
+        if str(record["calibration_version"]) != str(model.get("calibration_version")):
+            raise ValueError(f"registry calibration version mismatch: {key[0]}/{key[1]}")
+
+    activated = repository.activate_model_set(args.version)
+    return {
+        "model_version": args.version,
+        "activated_models": len(activated),
+        "active": True,
+        "manifest": str(manifest_path),
+    }
+
+
 def _run_evaluate_command(args: argparse.Namespace) -> dict[str, Any]:
     if not args.artifact:
         raise ValueError("evaluate requires --artifact from a completed local train command")
@@ -684,7 +1020,178 @@ def _evaluation_payload(report: EvaluationReport) -> dict[str, Any]:
         "monthly_alert_entries": report.monthly_alert_entries,
         "old_market_risk_recall": report.old_market_risk_recall,
         "model_recall_at_old_budget": report.model_recall_at_old_budget,
+        "calibration_bins": [
+            {
+                "lower_bound": item.lower_bound,
+                "upper_bound": item.upper_bound,
+                "count": item.count,
+                "mean_probability": item.mean_probability,
+                "observed_rate": item.observed_rate,
+            }
+            for item in report.calibration_bins
+        ],
+        "phase_breakdown": {
+            name: {
+                "observations": metrics.observations,
+                "positives": metrics.positives,
+                "alerts": metrics.alerts,
+                "true_positives": metrics.true_positives,
+                "recall": metrics.recall,
+            }
+            for name, metrics in report.phase_breakdown.items()
+        },
+        "crisis_contribution": dict(report.crisis_contribution),
     }
+
+
+def _partition_payload(
+    dev: pd.DataFrame,
+    validation: pd.DataFrame,
+    test: pd.DataFrame,
+) -> dict[str, Any]:
+    result: dict[str, Any] = {"embargo_trading_days": EMBARGO_TRADING_DAYS}
+    for name, frame in (("dev", dev), ("validation", validation), ("test", test)):
+        times = pd.to_datetime(_as_of_times(frame), utc=True)
+        result[name] = {
+            "rows": len(frame),
+            "start": times.min().isoformat() if len(times) else None,
+            "end": times.max().isoformat() if len(times) else None,
+        }
+    return result
+
+
+def _production_partition_payload(
+    training: pd.DataFrame,
+    calibration: pd.DataFrame,
+) -> dict[str, Any]:
+    result: dict[str, Any] = {"embargo_trading_days": EMBARGO_TRADING_DAYS}
+    for name, frame in (("training", training), ("calibration", calibration)):
+        times = pd.to_datetime(_as_of_times(frame), utc=True)
+        result[name] = {
+            "rows": len(frame),
+            "start": times.min().isoformat(),
+            "end": times.max().isoformat(),
+        }
+    return result
+
+
+def _bundle_window_payload(bundle: ModelBundle) -> dict[str, str]:
+    return {
+        "training_start": bundle.training_start.isoformat(),
+        "training_end": bundle.training_end.isoformat(),
+        "calibration_start": bundle.calibration_start.isoformat(),
+        "calibration_end": bundle.calibration_end.isoformat(),
+    }
+
+
+def _model_record_payload(record: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        "model_version": str(record["model_version"]),
+        "market": Market(record["market"]).value,
+        "horizon": str(record["horizon"]),
+        "feature_version": str(record["feature_version"]),
+        "calibration_version": str(record["calibration_version"]),
+        "training_cutoff": str(record["training_cutoff"]),
+        "artifact_path": str(record["artifact_path"]),
+        "artifact_sha256": str(record["artifact_sha256"]),
+        "metrics": dict(record["metrics"]),
+        "base_rate": float(record["base_rate"]),
+        "active": bool(record.get("active", False)),
+    }
+
+
+def _render_evaluation_report(manifest: Mapping[str, Any]) -> str:
+    models = tuple(manifest.get("models", ()))
+    lines = [
+        f"# 大盘骤跌预警模型评估：{manifest['model_version']}",
+        "",
+        "## 冻结窗口与结论",
+        "",
+        f"- 数据区间：{manifest['frozen_start']} 至 {manifest['frozen_test_end']}",
+        f"- 特征版本：`{manifest['feature_version']}`",
+        "- 切分：开发集 2000-2012、校准集 2013-2019、冻结测试集 2020-2026-07-31；边界保留 3 个交易日隔离。",
+        f"- 晋级状态：**{'通过全部门槛' if manifest['eligible_for_promotion'] else '未通过，保持未激活'}**",
+        "",
+        "## 四模型汇总",
+        "",
+        "| 市场 | 周期 | Brier | 常数基线 | AUPRC | 流行率 | ECE | 月均升级次数 | 生产校准截止 |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|---|",
+    ]
+    for model in models:
+        evaluation = model["evaluation"]
+        lines.append(
+            "| {market} | {horizon} | {brier:.4f} | {constant:.4f} | {auprc:.4f} | "
+            "{prevalence:.4f} | {ece:.4f} | {budget:.2f} | {cutoff} |".format(
+                market=model["market"],
+                horizon=model["horizon"],
+                brier=evaluation["brier_score"],
+                constant=evaluation["constant_base_rate_brier"],
+                auprc=evaluation["average_precision"],
+                prevalence=evaluation["prevalence"],
+                ece=evaluation["expected_calibration_error"],
+                budget=evaluation["monthly_alert_entries"],
+                cutoff=model["training_cutoff"],
+            )
+        )
+    if manifest.get("promotion_failures"):
+        lines.extend(["", "## 未通过门槛", ""])
+        lines.extend(f"- {failure}" for failure in manifest["promotion_failures"])
+    lines.extend(["", "## 分阶段、校准与危机贡献", ""])
+    for model in models:
+        evaluation = model["evaluation"]
+        lines.extend(
+            [
+                f"### {model['market']} / {model['horizon']}",
+                "",
+                "| 阶段 | 样本 | 正例 | 告警 | 命中 | 召回率 |",
+                "|---|---:|---:|---:|---:|---:|",
+            ]
+        )
+        for phase in ("FIRST_SHOCK", "CONTINUATION"):
+            metrics = evaluation["phase_breakdown"][phase]
+            recall = "N/A" if metrics["recall"] is None else f"{metrics['recall']:.3f}"
+            lines.append(
+                f"| {phase} | {metrics['observations']} | {metrics['positives']} | "
+                f"{metrics['alerts']} | {metrics['true_positives']} | {recall} |"
+            )
+        crisis = ", ".join(
+            f"{name}={value:.1%}"
+            for name, value in sorted(evaluation["crisis_contribution"].items())
+        )
+        nonempty_bins = sum(1 for item in evaluation["calibration_bins"] if item["count"])
+        lines.extend(
+            [
+                "",
+                f"- 危机贡献：{crisis}",
+                f"- 校准分箱：10 组，其中 {nonempty_bins} 组有测试样本。",
+                f"- 旧系统召回率：{evaluation['old_market_risk_recall']}",
+                f"- 相同旧系统预算下模型召回率：{evaluation['model_recall_at_old_budget']}",
+                "",
+            ]
+        )
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def _atomic_write_text(path: Path, content: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
+    )
+    os.close(descriptor)
+    temporary = Path(temporary_name)
+    try:
+        temporary.write_text(content, encoding="utf-8")
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 if __name__ == "__main__":

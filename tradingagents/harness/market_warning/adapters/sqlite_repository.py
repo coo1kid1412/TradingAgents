@@ -13,12 +13,16 @@ from typing import Any
 from tradingagents.harness import db as _db
 
 from tradingagents.harness.market_warning.domain import (
+    DataStatus,
     Evidence,
     FeatureSnapshot,
     FinalWarningDecision,
     LLMContextAssessment,
     Market,
+    MarketPhase,
     QuantRiskAssessment,
+    RiskLevel,
+    RunnerResult,
 )
 
 
@@ -305,6 +309,123 @@ class SQLiteWarningRepository:
             )
             return int(cursor.lastrowid)
 
+    def load_evaluation(self, market: Market, as_of_time: datetime) -> RunnerResult | None:
+        """Rebuild one already-persisted evaluation for idempotent retries."""
+
+        with _db.connect(self._db_path) as connection:
+            row = connection.execute(
+                "SELECT s.id AS snapshot_id, s.market, s.as_of_time, s.session_slot, "
+                "s.feature_version, s.data_status AS snapshot_status, s.reliability_grade AS snapshot_grade, "
+                "s.features_json, s.evidence_json, s.source_times_json, "
+                "d.id AS decision_id, d.prediction_ids_json, d.reasoning_id, d.baseline_level, "
+                "d.final_level, d.transition, d.entry_gate, d.new_position_cap_pct, "
+                "d.holding_action, d.push_required, d.data_status AS data_status, "
+                "d.reasons_json, d.valid_snapshot_count, d.retained_risk_level "
+                "FROM market_warning_feature_snapshots AS s "
+                "INNER JOIN market_warning_decisions AS d ON d.feature_snapshot_id = s.id "
+                "WHERE s.market = ? AND s.as_of_time = ? "
+                "ORDER BY s.id DESC LIMIT 1",
+                (Market(market).value, _stored_time(as_of_time)),
+            ).fetchone()
+            if row is None:
+                return None
+            prediction_ids = tuple(json.loads(row["prediction_ids_json"]))
+            if len(prediction_ids) != 2:
+                return None
+            placeholders = ", ".join("?" for _ in prediction_ids)
+            predictions = connection.execute(
+                "SELECT id, horizon, probability, base_rate, market_phase, reliability_grade, "
+                "model_version, calibration_version, top_contributors_json "
+                f"FROM market_warning_predictions WHERE id IN ({placeholders}) "
+                "ORDER BY horizon",
+                prediction_ids,
+            ).fetchall()
+            reasoning = None
+            if row["reasoning_id"] is not None:
+                reasoning = connection.execute(
+                    "SELECT reasoning_status, structured_json, error_class "
+                    "FROM market_warning_reasoning WHERE id = ?",
+                    (row["reasoning_id"],),
+                ).fetchone()
+        if len(predictions) != 2 or {item["horizon"] for item in predictions} != {"1d", "3d"}:
+            return None
+
+        evidence_rows = json.loads(row["evidence_json"])
+        snapshot = FeatureSnapshot(
+            market=row["market"],
+            as_of_time=datetime.fromisoformat(row["as_of_time"]),
+            session_slot=row["session_slot"],
+            feature_version=row["feature_version"],
+            features=json.loads(row["features_json"]),
+            evidence=tuple(
+                Evidence(
+                    evidence_id=item["evidence_id"],
+                    group=item["group"],
+                    summary=item["summary"],
+                    value=item.get("value"),
+                    source=item.get("source"),
+                    as_of_time=(
+                        datetime.fromisoformat(item["as_of_time"])
+                        if item.get("as_of_time")
+                        else None
+                    ),
+                )
+                for item in evidence_rows
+            ),
+            data_quality=DataStatus(row["snapshot_status"]),
+            reliability_grade=row["snapshot_grade"],
+            source_times={
+                key: datetime.fromisoformat(value)
+                for key, value in json.loads(row["source_times_json"]).items()
+            },
+        )
+        by_horizon = {item["horizon"]: item for item in predictions}
+        first = by_horizon["1d"]
+        third = by_horizon["3d"]
+        if (
+            first["market_phase"] != third["market_phase"]
+            or first["model_version"] != third["model_version"]
+            or first["calibration_version"] != third["calibration_version"]
+        ):
+            return None
+        quant = QuantRiskAssessment(
+            crash_1d_probability=first["probability"],
+            crash_3d_probability=third["probability"],
+            market_phase=MarketPhase(first["market_phase"]),
+            base_rate_1d=first["base_rate"],
+            base_rate_3d=third["base_rate"],
+            reliability_grade=first["reliability_grade"],
+            model_version=first["model_version"],
+            calibration_version=first["calibration_version"],
+            top_contributors=tuple(json.loads(first["top_contributors_json"])),
+        )
+        context = None
+        if reasoning is not None:
+            payload = json.loads(reasoning["structured_json"])
+            context = LLMContextAssessment(
+                market_scenario=payload["market_scenario"],
+                causal_chain=tuple(payload["causal_chain"]),
+                supporting_evidence_ids=tuple(payload["supporting_evidence_ids"]),
+                conflicting_evidence_ids=tuple(payload["conflicting_evidence_ids"]),
+                overlooked_risks=tuple(payload["overlooked_risks"]),
+                recommended_risk_level=RiskLevel(payload["recommended_risk_level"]),
+                confidence=payload["confidence"],
+                action_reason=payload["action_reason"],
+                reasoning_status=reasoning["reasoning_status"],
+                error_class=reasoning["error_class"],
+            )
+        decision = self._decision_from_row(row)
+        return RunnerResult(
+            market=Market(row["market"]),
+            as_of_time=datetime.fromisoformat(row["as_of_time"]),
+            session_slot=row["session_slot"],
+            feature_snapshot=snapshot,
+            quant_assessment=quant,
+            context_assessment=context,
+            decision=decision,
+            decision_id=int(row["decision_id"]),
+        )
+
     def load_latest_decision(
         self, market: Market, as_of_time: datetime | None = None
     ) -> FinalWarningDecision | None:
@@ -424,6 +545,64 @@ class SQLiteWarningRepository:
             ).fetchone()
         if row is None:
             return None
+        return {
+            "model_version": row["model_version"],
+            "market": Market(row["market"]),
+            "horizon": row["horizon"],
+            "feature_version": row["feature_version"],
+            "calibration_version": row["calibration_version"],
+            "training_cutoff": row["training_cutoff"],
+            "artifact_path": row["artifact_path"],
+            "artifact_sha256": row["artifact_sha256"],
+            "metrics": json.loads(row["metrics_json"]),
+            "base_rate": row["base_rate"],
+            "active": bool(row["active"]),
+            "created_at": row["created_at"],
+        }
+
+    def load_model_set(self, model_version: str) -> tuple[dict[str, Any], ...]:
+        with _db.connect(self._db_path) as connection:
+            rows = connection.execute(
+                "SELECT model_version, market, horizon, feature_version, calibration_version, "
+                "training_cutoff, artifact_path, artifact_sha256, metrics_json, base_rate, active, created_at "
+                "FROM market_warning_model_registry WHERE model_version = ? "
+                "ORDER BY market, horizon",
+                (model_version,),
+            ).fetchall()
+        return tuple(self._model_record_from_row(row) for row in rows)
+
+    def activate_model_set(self, model_version: str) -> tuple[dict[str, Any], ...]:
+        """Atomically activate one complete A-share/US, 1d/3d model set."""
+
+        expected = {(market.value, horizon) for market in Market for horizon in ("1d", "3d")}
+        with _db.connect(self._db_path) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            rows = connection.execute(
+                "SELECT model_version, market, horizon, feature_version, calibration_version, "
+                "training_cutoff, artifact_path, artifact_sha256, metrics_json, base_rate, active, created_at "
+                "FROM market_warning_model_registry WHERE model_version = ? "
+                "ORDER BY market, horizon",
+                (model_version,),
+            ).fetchall()
+            actual = {(row["market"], row["horizon"]) for row in rows}
+            if actual != expected or len(rows) != len(expected):
+                raise ValueError("model version must contain one complete four-model set")
+            for market, horizon in sorted(expected):
+                connection.execute(
+                    "UPDATE market_warning_model_registry SET active = 0 "
+                    "WHERE market = ? AND horizon = ?",
+                    (market, horizon),
+                )
+            cursor = connection.execute(
+                "UPDATE market_warning_model_registry SET active = 1 WHERE model_version = ?",
+                (model_version,),
+            )
+            if cursor.rowcount != len(expected):
+                raise ValueError("four-model activation did not update every expected row")
+        return self.load_model_set(model_version)
+
+    @staticmethod
+    def _model_record_from_row(row: sqlite3.Row) -> dict[str, Any]:
         return {
             "model_version": row["model_version"],
             "market": Market(row["market"]),
