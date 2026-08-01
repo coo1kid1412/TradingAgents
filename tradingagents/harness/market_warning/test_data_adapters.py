@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import sys
 import tempfile
 import unittest
@@ -290,7 +291,7 @@ class TushareDataAdapterTests(unittest.TestCase):
             "tushare_margin": datetime(2026, 7, 21, 9, 0, tzinfo=SHANGHAI),
             "tushare_shibor": datetime(2026, 7, 20, 12, 0, tzinfo=SHANGHAI),
             "tushare_limit_list": datetime(2026, 7, 20, 18, 0, tzinfo=SHANGHAI),
-            "tushare_moneyflow": datetime(2026, 7, 20, 18, 0, tzinfo=SHANGHAI),
+            "tushare_moneyflow": datetime(2026, 7, 20, 19, 0, tzinfo=SHANGHAI),
         }
         for source, available_at in expected_availability.items():
             self.assertEqual(
@@ -314,6 +315,19 @@ class TushareDataAdapterTests(unittest.TestCase):
         self.assertNotIn("margin_balance", {point.field for point in before.points})
         margin = next(point for point in at_disclosure.points if point.field == "margin_balance")
         self.assertEqual(margin.available_at, datetime(2026, 7, 20, 9, 0, tzinfo=SHANGHAI))
+
+    def test_moneyflow_is_hidden_at_1859_and_visible_at_1900(self):
+        adapter = TushareAShareDataAdapter(pro=MockTusharePro())
+        before = adapter.load_snapshot(
+            Market.A_SHARE, datetime(2026, 7, 20, 18, 59, tzinfo=SHANGHAI), "post_market"
+        )
+        at_disclosure = adapter.load_snapshot(
+            Market.A_SHARE, datetime(2026, 7, 20, 19, 0, tzinfo=SHANGHAI), "post_market"
+        )
+
+        self.assertNotIn("money_flow_net", {point.field for point in before.points})
+        moneyflow = next(point for point in at_disclosure.points if point.field == "money_flow_net")
+        self.assertEqual(moneyflow.available_at, datetime(2026, 7, 20, 19, 0, tzinfo=SHANGHAI))
 
     def test_truncated_6000_row_cross_section_never_emits_partial_breadth(self):
         snapshot = TushareAShareDataAdapter(pro=MockTusharePro(truncate_latest=True)).load_snapshot(
@@ -362,7 +376,7 @@ class TushareDataAdapterTests(unittest.TestCase):
 
         self.assertGreater(len(pro.calls), first_count)
 
-    def test_legal_empty_tushare_result_can_be_cached(self):
+    def test_empty_core_tushare_result_is_not_cached_and_retries(self):
         pro = MockTusharePro(all_empty=True)
         with tempfile.TemporaryDirectory() as temp_dir:
             adapter = TushareAShareDataAdapter(pro=pro, cache=RawDataCache(Path(temp_dir)))
@@ -370,11 +384,41 @@ class TushareDataAdapterTests(unittest.TestCase):
             first_count = len(pro.calls)
             self.assertEqual(tuple(adapter.backfill(date(2026, 7, 20), date(2026, 7, 20))), ())
 
-        self.assertEqual(len(pro.calls), first_count)
+        self.assertGreater(len(pro.calls), first_count)
+
+    def test_historical_backfill_does_not_apply_current_stock_basic_industry(self):
+        pro = MockTusharePro()
+        adapter = TushareAShareDataAdapter(
+            pro=pro,
+            clock=lambda: datetime(2026, 8, 1, 9, 0, tzinfo=SHANGHAI),
+        )
+
+        result = tuple(adapter.backfill(date(2026, 7, 20), date(2026, 7, 20)))
+
+        self.assertEqual(len(result), 1)
+        self.assertNotIn("industry_decline_pct", {point.field for point in result[0].points})
+
+    def test_calendar_resolver_controls_premarket_expected_session(self):
+        friday = date(2026, 7, 17)
+        pro = MockTusharePro(latest_trade_date="20260717")
+        adapter = TushareAShareDataAdapter(
+            pro=pro,
+            previous_session=lambda current: friday,
+            calendar_version="exchange-calendar-test-v1",
+        )
+
+        snapshot = adapter.load_snapshot(
+            Market.A_SHARE, datetime(2026, 7, 21, 8, 30, tzinfo=SHANGHAI), "premarket"
+        )
+
+        self.assertEqual(snapshot.data_status, DataStatus.FRESH)
+        index_calls = [kwargs for name, kwargs in pro.calls if name == "index_daily"]
+        self.assertTrue(index_calls)
+        self.assertEqual({kwargs["end_date"] for kwargs in index_calls}, {"20260717"})
 
     def test_new_year_backfill_finds_t_minus_one_cache_in_previous_data_year(self):
-        query = {"trade_date": "20270101"}
         as_of = datetime(2027, 1, 1, 9, 0, tzinfo=SHANGHAI)
+        expected_date = date(2026, 12, 31)
         point = MarketDataPoint(
             market=Market.A_SHARE, symbol="000001.SH", field="index_price", value=100.0,
             data_time=datetime(2026, 12, 31, 15, 0, tzinfo=SHANGHAI),
@@ -387,11 +431,19 @@ class TushareDataAdapterTests(unittest.TestCase):
         pro = MockTusharePro(all_empty=True)
         with tempfile.TemporaryDirectory() as temp_dir:
             cache = RawDataCache(Path(temp_dir))
+            adapter = TushareAShareDataAdapter(
+                pro=pro,
+                cache=cache,
+                next_trading_day=lambda current: current,
+                previous_session=lambda current: expected_date,
+                calendar_version="exchange-calendar-test-v1",
+            )
+            query = adapter._cache_query(date(2027, 1, 1), as_of, expected_date)
             cache.write_snapshot(
                 dataset="daily_snapshot", cache_key="2027-01-01", snapshot=cached,
                 query=query, source="tushare", fetched_at=as_of,
             )
-            result = tuple(TushareAShareDataAdapter(pro=pro, cache=cache).backfill(date(2027, 1, 1), date(2027, 1, 1)))
+            result = tuple(adapter.backfill(date(2027, 1, 1), date(2027, 1, 1)))
 
         self.assertEqual(result, (cached,))
         self.assertEqual(pro.calls, [])
@@ -544,6 +596,36 @@ class YahooDataAdapterTests(unittest.TestCase):
         self.assertEqual(snapshot.data_status, DataStatus.INSUFFICIENT)
         self.assertEqual(snapshot.points, ())
 
+    def test_monday_close_without_monday_bar_is_insufficient_and_not_cached(self):
+        calls = []
+
+        def friday_only(**kwargs):
+            calls.append(kwargs)
+            return _yahoo_frame(interval=kwargs["interval"])
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            adapter = YahooUSDataAdapter(download=friday_only, cache=RawDataCache(Path(temp_dir)))
+            first = tuple(adapter.backfill(date(2026, 8, 3), date(2026, 8, 3)))
+            second = tuple(adapter.backfill(date(2026, 8, 3), date(2026, 8, 3)))
+
+        self.assertEqual(first, ())
+        self.assertEqual(second, ())
+        self.assertEqual(len(calls), 2)
+
+    def test_empty_yahoo_core_batch_is_not_cached_and_retries(self):
+        calls = []
+
+        def empty(**kwargs):
+            calls.append(kwargs)
+            return pd.DataFrame()
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            adapter = YahooUSDataAdapter(download=empty, cache=RawDataCache(Path(temp_dir)))
+            self.assertEqual(tuple(adapter.backfill(date(2026, 7, 31), date(2026, 7, 31))), ())
+            self.assertEqual(tuple(adapter.backfill(date(2026, 7, 31), date(2026, 7, 31))), ())
+
+        self.assertEqual(len(calls), 2)
+
     def test_yahoo_exception_and_none_return_insufficient_without_raising(self):
         def failed(**kwargs):
             raise RuntimeError("temporary Yahoo failure")
@@ -620,6 +702,37 @@ class YahooDataAdapterTests(unittest.TestCase):
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
 
         self.assertEqual(manifest["fetched_at"], fetched_at.isoformat())
+
+    def test_cache_query_records_policy_calendar_asof_and_expected_date_and_version_change_misses(self):
+        first_download, first_calls = self._download()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            cache = RawDataCache(root)
+            first = YahooUSDataAdapter(
+                download=first_download,
+                cache=cache,
+                calendar_version="weekday-fallback-v1",
+                disclosure_policy_version="yahoo-disclosure-v2",
+            )
+            tuple(first.backfill(date(2026, 7, 31), date(2026, 7, 31)))
+            manifest_path = next(root.glob("us/daily_snapshot/2026/*.manifest.json"))
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+
+            second_download, second_calls = self._download()
+            second = YahooUSDataAdapter(
+                download=second_download,
+                cache=cache,
+                calendar_version="exchange-calendar-v1",
+                disclosure_policy_version="yahoo-disclosure-v2",
+            )
+            tuple(second.backfill(date(2026, 7, 31), date(2026, 7, 31)))
+
+        self.assertEqual(len(first_calls), 1)
+        self.assertEqual(len(second_calls), 1)
+        self.assertEqual(manifest["query"]["calendar_version"], "weekday-fallback-v1")
+        self.assertEqual(manifest["query"]["disclosure_policy_version"], "yahoo-disclosure-v2")
+        self.assertEqual(manifest["query"]["as_of_time"], "2026-07-31T16:00:00-04:00")
+        self.assertEqual(manifest["query"]["expected_observation_date"], "2026-07-31")
 
 
 class RawDataCacheTests(unittest.TestCase):
@@ -720,6 +833,75 @@ class RawDataCacheTests(unittest.TestCase):
             )
 
         self.assertIsNone(result)
+
+    def test_json_valid_but_structurally_invalid_snapshot_is_a_cache_miss(self):
+        query = {"trade_date": "20260731"}
+        snapshot = _snapshot_for_cache(
+            as_of=datetime(2026, 7, 31, 16, 0, tzinfo=NEW_YORK),
+            data_time=datetime(2026, 7, 31, 16, 0, tzinfo=NEW_YORK),
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            cache = RawDataCache(Path(temp_dir))
+            data_path = cache.write_snapshot(
+                dataset="daily_snapshot",
+                cache_key="2026-07-31",
+                snapshot=snapshot,
+                query=query,
+                source="yahoo_finance",
+                fetched_at=snapshot.as_of_time,
+            )
+            manifest_path = data_path.with_suffix(".manifest.json")
+            pristine_data = data_path.read_bytes()
+            pristine_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+
+            metadata_cases = (
+                ("source_times", []),
+                ("points", {"not": "a list"}),
+                ("data_status", "not-a-status"),
+                ("as_of_time", "not-a-time"),
+                ("session_slot", ["close"]),
+            )
+            for key, value in metadata_cases:
+                with self.subTest(metadata_key=key):
+                    manifest = json.loads(json.dumps(pristine_manifest))
+                    manifest["snapshot"][key] = value
+                    data_path.write_bytes(pristine_data)
+                    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+                    self.assertIsNone(
+                        cache.read_snapshot(
+                            market=Market.US,
+                            dataset="daily_snapshot",
+                            year=2026,
+                            cache_key="2026-07-31",
+                            query=query,
+                        )
+                    )
+
+            row_cases = (
+                ("quality_status", "not-a-status"),
+                ("data_time", "not-a-time"),
+                ("field", ["index_price"]),
+                ("source", {"vendor": "yahoo"}),
+            )
+            for key, value in row_cases:
+                with self.subTest(row_key=key):
+                    lines = pristine_data.decode("utf-8").splitlines()
+                    row = json.loads(lines[1])
+                    row[key] = value
+                    changed_data = (lines[0] + "\n" + json.dumps(row, separators=(",", ":")) + "\n").encode("utf-8")
+                    manifest = json.loads(json.dumps(pristine_manifest))
+                    manifest["data_sha256"] = hashlib.sha256(changed_data).hexdigest()
+                    data_path.write_bytes(changed_data)
+                    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+                    self.assertIsNone(
+                        cache.read_snapshot(
+                            market=Market.US,
+                            dataset="daily_snapshot",
+                            year=2026,
+                            cache_key="2026-07-31",
+                            query=query,
+                        )
+                    )
 
 
 if __name__ == "__main__":

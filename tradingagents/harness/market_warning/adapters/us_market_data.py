@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Iterator, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date, datetime, time, timedelta
 from math import isfinite
 from typing import Any
@@ -13,10 +13,12 @@ import pandas as pd
 
 from tradingagents.harness.market_warning.adapters.data_cache import RawDataCache
 from tradingagents.harness.market_warning.domain import Market, MarketDataPoint, RawMarketSnapshot
-from tradingagents.harness.market_warning.quality import evaluate_data_quality
+from tradingagents.harness.market_warning.quality import QUALITY_POLICY_V1, evaluate_data_quality
 
 
 _NEW_YORK = ZoneInfo("America/New_York")
+FALLBACK_CALENDAR_VERSION = "weekday-fallback-v1"
+YAHOO_DISCLOSURE_POLICY_VERSION = "yahoo-disclosure-v2"
 
 YAHOO_TICKERS = {
     "SPX": "^GSPC",
@@ -46,6 +48,20 @@ def _number(value: Any) -> float | None:
     return result if isfinite(result) else None
 
 
+def _previous_weekday(current: date) -> date:
+    candidate = current - timedelta(days=1)
+    while candidate.weekday() >= 5:
+        candidate -= timedelta(days=1)
+    return candidate
+
+
+def _is_close_slot(session_slot: str) -> bool:
+    normalized = session_slot.strip().lower()
+    return normalized in {
+        "daily", "close", "closing", "eod", "end_of_day", "post_market", "postmarket",
+    } or "close" in normalized or "post_market" in normalized or "postmarket" in normalized
+
+
 @dataclass(frozen=True)
 class _LoadResult:
     snapshot: RawMarketSnapshot
@@ -61,11 +77,17 @@ class YahooUSDataAdapter:
         ticker_map: Mapping[str, str] | None = None,
         cache: RawDataCache | None = None,
         clock: Callable[[], datetime] | None = None,
+        previous_session: Callable[[date], date] = _previous_weekday,
+        calendar_version: str = FALLBACK_CALENDAR_VERSION,
+        disclosure_policy_version: str = YAHOO_DISCLOSURE_POLICY_VERSION,
     ) -> None:
         self.download = download
         self.ticker_map = dict(ticker_map or YAHOO_TICKERS)
         self.cache = cache
         self.clock = clock
+        self.previous_session = previous_session
+        self.calendar_version = calendar_version
+        self.disclosure_policy_version = disclosure_policy_version
 
     def _column(self, frame: pd.DataFrame, ticker: str, field: str) -> pd.Series:
         if isinstance(frame.columns, pd.MultiIndex):
@@ -120,15 +142,27 @@ class YahooUSDataAdapter:
         return close[mask]
 
     def _has_complete_batch(
-        self, frame: pd.DataFrame, as_of_time: datetime, *, daily: bool
+        self,
+        frame: pd.DataFrame,
+        as_of_time: datetime,
+        *,
+        daily: bool,
+        expected_date: date,
     ) -> bool:
         if frame.empty:
-            return True
+            return False
         minimum_rows = 2 if daily else 1
-        return all(
-            len(self._visible_close(frame, ticker, as_of_time, daily=daily)) >= minimum_rows
-            for ticker in self.ticker_map.values()
-        )
+        for ticker in self.ticker_map.values():
+            visible = self._visible_close(frame, ticker, as_of_time, daily=daily)
+            if len(visible) < minimum_rows:
+                return False
+            if self._timestamp(visible.index[-1], daily=daily).date() != expected_date:
+                return False
+        return True
+
+    def _expected_observation_date(self, as_of_time: datetime, session_slot: str) -> date:
+        local_date = as_of_time.astimezone(_NEW_YORK).date()
+        return local_date if _is_close_slot(session_slot) else self.previous_session(local_date)
 
     def _points(
         self,
@@ -136,12 +170,16 @@ class YahooUSDataAdapter:
         quote_frame: pd.DataFrame | None,
         as_of_time: datetime,
         fetched_at: datetime,
+        expected_daily_date: date,
     ) -> tuple[MarketDataPoint, ...]:
         points: list[MarketDataPoint] = []
         intraday = quote_frame is not None
         for symbol, ticker in self.ticker_map.items():
             daily_close = self._visible_close(daily_frame, ticker, as_of_time, daily=True)
-            if len(daily_close) < 2:
+            if (
+                len(daily_close) < 2
+                or self._timestamp(daily_close.index[-1], daily=True).date() != expected_daily_date
+            ):
                 continue
             if intraday:
                 quote_close = self._visible_close(quote_frame, ticker, as_of_time, daily=False)
@@ -185,8 +223,9 @@ class YahooUSDataAdapter:
                 )
         return tuple(points)
 
-    @staticmethod
-    def _snapshot(as_of_time: datetime, session_slot: str, points: tuple[MarketDataPoint, ...]) -> RawMarketSnapshot:
+    def _snapshot(
+        self, as_of_time: datetime, session_slot: str, points: tuple[MarketDataPoint, ...]
+    ) -> RawMarketSnapshot:
         source_times = {"yahoo_finance": max(point.data_time for point in points)} if points else {}
         raw = RawMarketSnapshot(
             market=Market.US,
@@ -200,7 +239,13 @@ class YahooUSDataAdapter:
             as_of_time=raw.as_of_time,
             session_slot=raw.session_slot,
             points=raw.points,
-            data_status=evaluate_data_quality(raw).status,
+            data_status=evaluate_data_quality(
+                raw,
+                replace(
+                    QUALITY_POLICY_V1,
+                    previous_session=lambda market, current: self.previous_session(current),
+                ),
+            ).status,
             source_times=raw.source_times,
         )
 
@@ -210,27 +255,46 @@ class YahooUSDataAdapter:
         if Market(market) != Market.US:
             raise ValueError("YahooUSDataAdapter only supports us")
         fetched_at = self.clock() if self.clock is not None else datetime.now(_NEW_YORK)
+        expected_daily_date = self._expected_observation_date(as_of_time, session_slot)
         daily_frame, daily_complete = self._download_frame(self._query(as_of_time, "1d"))
         if not daily_complete:
             return _LoadResult(self._snapshot(as_of_time, session_slot, ()), False, fetched_at)
-        complete = self._has_complete_batch(daily_frame, as_of_time, daily=True)
+        complete = self._has_complete_batch(
+            daily_frame,
+            as_of_time,
+            daily=True,
+            expected_date=expected_daily_date,
+        )
         quote_frame: pd.DataFrame | None = None
         if "intraday" in session_slot.strip().lower():
             quote_frame, quote_fetched = self._download_frame(self._query(as_of_time, "5m"))
             if not quote_fetched:
                 return _LoadResult(self._snapshot(as_of_time, session_slot, ()), False, fetched_at)
-            complete = complete and self._has_complete_batch(quote_frame, as_of_time, daily=False)
-        points = self._points(daily_frame, quote_frame, as_of_time, fetched_at)
+            complete = complete and self._has_complete_batch(
+                quote_frame,
+                as_of_time,
+                daily=False,
+                expected_date=as_of_time.astimezone(_NEW_YORK).date(),
+            )
+        points = self._points(
+            daily_frame, quote_frame, as_of_time, fetched_at, expected_daily_date
+        )
         return _LoadResult(self._snapshot(as_of_time, session_slot, points), complete, fetched_at)
 
     def load_snapshot(self, market: Market, as_of_time: datetime, session_slot: str) -> RawMarketSnapshot:
         return self._load_snapshot_result(market, as_of_time, session_slot).snapshot
 
-    def _cache_query(self, current: date) -> dict[str, Any]:
+    def _cache_query(
+        self, current: date, as_of_time: datetime, expected_observation_date: date
+    ) -> dict[str, Any]:
         return {
             "trade_date": current.isoformat(),
             "interval": "1d",
             "tickers": list(self.ticker_map.values()),
+            "as_of_time": as_of_time.isoformat(),
+            "expected_observation_date": expected_observation_date.isoformat(),
+            "calendar_version": self.calendar_version,
+            "disclosure_policy_version": self.disclosure_policy_version,
         }
 
     def _read_cached(self, current: date, cache_key: str, query: Mapping[str, Any]) -> RawMarketSnapshot | None:
@@ -254,10 +318,11 @@ class YahooUSDataAdapter:
         current = start_date
         while current <= end_date:
             cache_key = current.isoformat()
-            query = self._cache_query(current)
+            as_of_time = datetime.combine(current, time(16, 0), tzinfo=_NEW_YORK)
+            expected_observation_date = self._expected_observation_date(as_of_time, "close")
+            query = self._cache_query(current, as_of_time, expected_observation_date)
             snapshot = self._read_cached(current, cache_key, query)
             if snapshot is None:
-                as_of_time = datetime.combine(current, time(16, 0), tzinfo=_NEW_YORK)
                 result = self._load_snapshot_result(Market.US, as_of_time, "close")
                 snapshot = result.snapshot
                 if self.cache is not None and result.complete:

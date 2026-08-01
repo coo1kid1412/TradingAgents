@@ -278,7 +278,7 @@ class QualityEvaluationTests(TestCase):
         self.assertLess(below_boundary.optional_coverage, 0.70)
         self.assertEqual(below_boundary.reliability_grade, "B")
 
-    def test_a_share_friday_close_is_fresh_on_monday_premarket_when_disclosed(self):
+    def test_a_share_friday_close_is_fresh_on_monday_premarket_with_session_resolver(self):
         as_of = datetime(2026, 8, 3, 8, 30, tzinfo=SHANGHAI)
         data_time = datetime(2026, 7, 31, 15, 0, tzinfo=SHANGHAI)
         available_at = datetime(2026, 7, 31, 18, 0, tzinfo=SHANGHAI)
@@ -292,11 +292,12 @@ class QualityEvaluationTests(TestCase):
             ),
         )
 
-        assessment = evaluate_data_quality(raw, QUALITY_POLICY_V1, as_of)
+        policy = replace(QUALITY_POLICY_V1, previous_session=lambda market, current: current - timedelta(days=3))
+        assessment = evaluate_data_quality(raw, policy, as_of)
 
         self.assertEqual(assessment.status, DataStatus.FRESH)
 
-    def test_us_friday_close_is_fresh_on_monday_premarket_when_disclosed(self):
+    def test_us_friday_close_is_fresh_on_monday_premarket_with_session_resolver(self):
         as_of = datetime(2026, 8, 3, 8, 30, tzinfo=NEW_YORK)
         data_time = datetime(2026, 7, 31, 16, 0, tzinfo=NEW_YORK)
         raw = RawMarketSnapshot(
@@ -309,17 +310,35 @@ class QualityEvaluationTests(TestCase):
             ),
         )
 
-        assessment = evaluate_data_quality(raw, QUALITY_POLICY_V1, as_of)
+        policy = replace(QUALITY_POLICY_V1, previous_session=lambda market, current: current - timedelta(days=3))
+        assessment = evaluate_data_quality(raw, policy, as_of)
 
         self.assertEqual(assessment.status, DataStatus.FRESH)
 
-    def test_recent_complete_daily_close_is_fresh_for_daily_session(self):
+    def test_monday_close_and_postmarket_require_monday_observation(self):
         as_of = datetime(2026, 8, 3, 16, 30, tzinfo=NEW_YORK)
         data_time = datetime(2026, 7, 31, 16, 0, tzinfo=NEW_YORK)
+        for session_slot in ("close", "post_market"):
+            with self.subTest(session_slot=session_slot):
+                raw = RawMarketSnapshot(
+                    market=Market.US,
+                    as_of_time=as_of,
+                    session_slot=session_slot,
+                    points=(
+                        point("index_price", 100, market=Market.US, symbol="SPX", data_time=data_time, available_at=data_time),
+                        point("index_change_pct", -0.4, market=Market.US, symbol="SPX", data_time=data_time, available_at=data_time),
+                    ),
+                )
+
+                self.assertEqual(evaluate_data_quality(raw, QUALITY_POLICY_V1, as_of).status, DataStatus.STALE)
+
+    def test_postmarket_accepts_same_session_daily_observation(self):
+        as_of = datetime(2026, 8, 3, 17, 0, tzinfo=NEW_YORK)
+        data_time = datetime(2026, 8, 3, 16, 0, tzinfo=NEW_YORK)
         raw = RawMarketSnapshot(
             market=Market.US,
             as_of_time=as_of,
-            session_slot="close",
+            session_slot="post_market",
             points=(
                 point("index_price", 100, market=Market.US, symbol="SPX", data_time=data_time, available_at=data_time),
                 point("index_change_pct", -0.4, market=Market.US, symbol="SPX", data_time=data_time, available_at=data_time),
@@ -327,6 +346,22 @@ class QualityEvaluationTests(TestCase):
         )
 
         self.assertEqual(evaluate_data_quality(raw, QUALITY_POLICY_V1, as_of).status, DataStatus.FRESH)
+
+    def test_premarket_resolver_rejects_observation_from_wrong_previous_session(self):
+        as_of = datetime(2026, 8, 3, 8, 30, tzinfo=NEW_YORK)
+        friday = datetime(2026, 7, 31, 16, 0, tzinfo=NEW_YORK)
+        raw = RawMarketSnapshot(
+            market=Market.US,
+            as_of_time=as_of,
+            session_slot="premarket",
+            points=(
+                point("index_price", 100, market=Market.US, symbol="SPX", data_time=friday, available_at=friday),
+                point("index_change_pct", -0.4, market=Market.US, symbol="SPX", data_time=friday, available_at=friday),
+            ),
+        )
+        policy = replace(QUALITY_POLICY_V1, previous_session=lambda market, current: current - timedelta(days=4))
+
+        self.assertEqual(evaluate_data_quality(raw, policy, as_of).status, DataStatus.STALE)
 
     def test_same_t_minus_one_daily_close_is_stale_during_intraday_session(self):
         cases = (
@@ -351,22 +386,22 @@ class QualityEvaluationTests(TestCase):
 
                 self.assertEqual(assessment.status, DataStatus.STALE)
 
-    def test_premarket_daily_close_older_than_seven_local_dates_is_stale(self):
-        as_of = datetime(2026, 8, 10, 8, 30, tzinfo=NEW_YORK)
-        data_time = datetime(2026, 8, 2, 16, 0, tzinfo=NEW_YORK)
-        raw = RawMarketSnapshot(
-            market=Market.US,
-            as_of_time=as_of,
-            session_slot="premarket",
-            points=(
-                point("index_price", 100, market=Market.US, symbol="SPX", data_time=data_time, available_at=data_time),
-                point("index_change_pct", -0.4, market=Market.US, symbol="SPX", data_time=data_time, available_at=data_time),
-            ),
-        )
+    def test_premarket_fallback_allows_fourteen_days_but_not_fifteen(self):
+        as_of = datetime(2026, 8, 17, 8, 30, tzinfo=NEW_YORK)
+        for age_days, expected in ((14, DataStatus.FRESH), (15, DataStatus.STALE)):
+            with self.subTest(age_days=age_days):
+                data_time = datetime(2026, 8, 17 - age_days, 16, 0, tzinfo=NEW_YORK)
+                raw = RawMarketSnapshot(
+                    market=Market.US,
+                    as_of_time=as_of,
+                    session_slot="premarket",
+                    points=(
+                        point("index_price", 100, market=Market.US, symbol="SPX", data_time=data_time, available_at=data_time),
+                        point("index_change_pct", -0.4, market=Market.US, symbol="SPX", data_time=data_time, available_at=data_time),
+                    ),
+                )
 
-        assessment = evaluate_data_quality(raw, QUALITY_POLICY_V1, as_of)
-
-        self.assertEqual(assessment.status, DataStatus.STALE)
+                self.assertEqual(evaluate_data_quality(raw, QUALITY_POLICY_V1, as_of).status, expected)
 
     def test_conflicting_sources_force_unavailable(self):
         assessment = evaluate_data_quality(

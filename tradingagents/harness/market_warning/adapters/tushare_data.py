@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Iterator, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date, datetime, time, timedelta
 from math import isfinite
 from typing import Any
@@ -13,12 +13,14 @@ import pandas as pd
 
 from tradingagents.harness.market_warning.adapters.data_cache import RawDataCache
 from tradingagents.harness.market_warning.domain import Market, MarketDataPoint, RawMarketSnapshot
-from tradingagents.harness.market_warning.quality import evaluate_data_quality
+from tradingagents.harness.market_warning.quality import QUALITY_POLICY_V1, evaluate_data_quality
 
 
 _SHANGHAI = ZoneInfo("Asia/Shanghai")
 _BENCHMARKS = ("000001.SH", "399001.SZ", "000300.SH", "000905.SH", "399006.SZ", "000688.SH")
 _DAILY_ROW_LIMIT = 6000
+FALLBACK_CALENDAR_VERSION = "weekday-fallback-v1"
+TUSHARE_DISCLOSURE_POLICY_VERSION = "tushare-disclosure-v2"
 
 
 def _number(value: Any) -> float | None:
@@ -45,6 +47,20 @@ def _next_weekday(on_date: date) -> date:
     return candidate
 
 
+def _previous_weekday(on_date: date) -> date:
+    candidate = on_date - timedelta(days=1)
+    while candidate.weekday() >= 5:
+        candidate -= timedelta(days=1)
+    return candidate
+
+
+def _is_close_slot(session_slot: str) -> bool:
+    normalized = session_slot.strip().lower()
+    return normalized in {
+        "daily", "close", "closing", "eod", "end_of_day", "post_market", "postmarket",
+    } or "close" in normalized or "post_market" in normalized or "postmarket" in normalized
+
+
 def _data_time(on_date: date, hour: int = 15) -> datetime:
     return datetime.combine(on_date, time(hour), tzinfo=_SHANGHAI)
 
@@ -56,6 +72,8 @@ def _available_at(source: str, on_date: date, next_trading_day: Callable[[date],
         return datetime.combine(next_trading_day(on_date), time(9), tzinfo=_SHANGHAI)
     if source == "tushare_daily_basic":
         return datetime.combine(on_date + timedelta(days=1), time.min, tzinfo=_SHANGHAI)
+    if source == "tushare_moneyflow":
+        return datetime.combine(on_date, time(19), tzinfo=_SHANGHAI)
     return datetime.combine(on_date, time(18), tzinfo=_SHANGHAI)
 
 
@@ -80,11 +98,17 @@ class TushareAShareDataAdapter:
         cache: RawDataCache | None = None,
         clock: Callable[[], datetime] | None = None,
         next_trading_day: Callable[[date], date] = _next_weekday,
+        previous_session: Callable[[date], date] = _previous_weekday,
+        calendar_version: str = FALLBACK_CALENDAR_VERSION,
+        disclosure_policy_version: str = TUSHARE_DISCLOSURE_POLICY_VERSION,
     ) -> None:
         self.pro = pro
         self.cache = cache
         self.clock = clock
         self.next_trading_day = next_trading_day
+        self.previous_session = previous_session
+        self.calendar_version = calendar_version
+        self.disclosure_policy_version = disclosure_policy_version
 
     def _fetch(self, method_name: str, **kwargs: Any) -> _FetchResult:
         method = getattr(self.pro, method_name, None)
@@ -132,8 +156,13 @@ class TushareAShareDataAdapter:
         latest = max(dated["_date"])
         return dated[dated["_date"] == latest].copy(), latest
 
-    @staticmethod
-    def _snapshot(as_of_time: datetime, session_slot: str, points: tuple[MarketDataPoint, ...]) -> RawMarketSnapshot:
+    def _expected_observation_date(self, as_of_time: datetime, session_slot: str) -> date:
+        local_date = as_of_time.astimezone(_SHANGHAI).date()
+        return local_date if _is_close_slot(session_slot) else self.previous_session(local_date)
+
+    def _snapshot(
+        self, as_of_time: datetime, session_slot: str, points: tuple[MarketDataPoint, ...]
+    ) -> RawMarketSnapshot:
         source_times = {
             source: max(point.data_time for point in points if point.source == source)
             for source in sorted({point.source for point in points})
@@ -150,27 +179,57 @@ class TushareAShareDataAdapter:
             as_of_time=raw.as_of_time,
             session_slot=raw.session_slot,
             points=raw.points,
-            data_status=evaluate_data_quality(raw).status,
+            data_status=evaluate_data_quality(
+                raw,
+                replace(
+                    QUALITY_POLICY_V1,
+                    previous_session=lambda market, current: self.previous_session(current),
+                ),
+            ).status,
             source_times=raw.source_times,
         )
 
     def _load_snapshot_result(
-        self, market: Market, as_of_time: datetime, session_slot: str
+        self,
+        market: Market,
+        as_of_time: datetime,
+        session_slot: str,
+        *,
+        allow_current_industry: bool = True,
     ) -> _LoadResult:
         if Market(market) != Market.A_SHARE:
             raise ValueError("TushareAShareDataAdapter only supports a_share")
         fetched_at = self.clock() if self.clock is not None else datetime.now(_SHANGHAI)
         local_as_of = as_of_time.astimezone(_SHANGHAI)
-        end_date = local_as_of.date() - timedelta(days=1)
+        expected_observation_date = self._expected_observation_date(as_of_time, session_slot)
+        end_date = expected_observation_date
         start_date = end_date - timedelta(days=45)
         range_query = {"start_date": start_date.strftime("%Y%m%d"), "end_date": end_date.strftime("%Y%m%d")}
 
         index_results = [self._fetch("index_daily", ts_code=symbol, **range_query) for symbol in _BENCHMARKS]
         daily, daily_complete = self._daily_history(start_date, end_date)
-        stock_basic = self._fetch(
-            "stock_basic", exchange="", list_status="L", fields="ts_code,symbol,name,area,industry,list_status"
+        use_current_industry = (
+            allow_current_industry
+            and fetched_at.astimezone(_SHANGHAI).date() == local_as_of.date()
         )
-        complete = daily_complete and stock_basic.complete and all(result.complete for result in index_results)
+        stock_basic = (
+            self._fetch(
+                "stock_basic",
+                exchange="",
+                list_status="L",
+                fields="ts_code,symbol,name,area,industry,list_status",
+            )
+            if use_current_industry
+            else _FetchResult(pd.DataFrame(), True)
+        )
+        index_complete = all(result.complete for result in index_results) and all(
+            (selected := self._latest_rows(
+                result.frame, "trade_date", as_of_time, "tushare_index_daily"
+            )) is not None
+            and selected[1] == expected_observation_date
+            for result in index_results
+        )
+        complete = daily_complete and stock_basic.complete and index_complete
 
         market_dates: list[date] = []
         selected_daily = self._latest_rows(daily, "trade_date", as_of_time, "tushare_daily")
@@ -191,9 +250,24 @@ class TushareAShareDataAdapter:
         }
         complete = complete and all(result.complete for result in auxiliary.values())
 
-        points = list(self._index_points([result.frame for result in index_results], fetched_at, as_of_time))
-        if daily_complete and stock_basic.complete:
-            points.extend(self._breadth_points(daily, stock_basic.frame, fetched_at, as_of_time))
+        points = list(
+            self._index_points(
+                [result.frame for result in index_results],
+                fetched_at,
+                as_of_time,
+                expected_observation_date,
+            )
+        )
+        if daily_complete:
+            points.extend(
+                self._breadth_points(
+                    daily,
+                    stock_basic.frame,
+                    fetched_at,
+                    as_of_time,
+                    expected_observation_date,
+                )
+            )
         points.extend(self._daily_basic_points(auxiliary["daily_basic"].frame, fetched_at, as_of_time))
         points.extend(self._margin_points(auxiliary["margin"].frame, fetched_at, as_of_time))
         points.extend(self._shibor_points(auxiliary["shibor"].frame, fetched_at, as_of_time))
@@ -205,11 +279,15 @@ class TushareAShareDataAdapter:
         return self._load_snapshot_result(market, as_of_time, session_slot).snapshot
 
     def _index_points(
-        self, frames: list[pd.DataFrame], fetched_at: datetime, as_of_time: datetime
+        self,
+        frames: list[pd.DataFrame],
+        fetched_at: datetime,
+        as_of_time: datetime,
+        expected_observation_date: date,
     ) -> Iterator[MarketDataPoint]:
         for frame in frames:
             selected = self._latest_rows(frame, "trade_date", as_of_time, "tushare_index_daily")
-            if selected is None:
+            if selected is None or selected[1] != expected_observation_date:
                 continue
             rows, trade_date = selected
             row = rows.iloc[0]
@@ -235,9 +313,10 @@ class TushareAShareDataAdapter:
         stock_basic: pd.DataFrame,
         fetched_at: datetime,
         as_of_time: datetime,
+        expected_observation_date: date,
     ) -> Iterator[MarketDataPoint]:
         selected = self._latest_rows(frame, "trade_date", as_of_time, "tushare_daily")
-        if selected is None:
+        if selected is None or selected[1] != expected_observation_date:
             return
         current, trade_date = selected
         current = current.copy()
@@ -365,9 +444,16 @@ class TushareAShareDataAdapter:
             available_at=_available_at(source, trade_date, self.next_trading_day),
         )
 
-    @staticmethod
-    def _cache_query(current: date) -> dict[str, str]:
-        return {"trade_date": current.strftime("%Y%m%d")}
+    def _cache_query(
+        self, current: date, as_of_time: datetime, expected_observation_date: date
+    ) -> dict[str, str]:
+        return {
+            "trade_date": current.strftime("%Y%m%d"),
+            "as_of_time": as_of_time.isoformat(),
+            "expected_observation_date": expected_observation_date.isoformat(),
+            "calendar_version": self.calendar_version,
+            "disclosure_policy_version": self.disclosure_policy_version,
+        }
 
     def _read_cached(self, current: date, cache_key: str, query: Mapping[str, Any]) -> RawMarketSnapshot | None:
         if self.cache is None:
@@ -390,11 +476,17 @@ class TushareAShareDataAdapter:
         current = start_date
         while current <= end_date:
             cache_key = current.isoformat()
-            query = self._cache_query(current)
+            as_of_time = datetime.combine(self.next_trading_day(current), time(9), tzinfo=_SHANGHAI)
+            expected_observation_date = self._expected_observation_date(as_of_time, "premarket")
+            query = self._cache_query(current, as_of_time, expected_observation_date)
             snapshot = self._read_cached(current, cache_key, query)
             if snapshot is None:
-                as_of_time = datetime.combine(self.next_trading_day(current), time(9), tzinfo=_SHANGHAI)
-                result = self._load_snapshot_result(Market.A_SHARE, as_of_time, "premarket")
+                result = self._load_snapshot_result(
+                    Market.A_SHARE,
+                    as_of_time,
+                    "premarket",
+                    allow_current_industry=False,
+                )
                 snapshot = result.snapshot
                 if self.cache is not None and result.complete:
                     self.cache.write_snapshot(

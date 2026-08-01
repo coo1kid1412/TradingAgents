@@ -221,6 +221,34 @@ class RawDataCache:
         if not isinstance(metadata, dict):
             return None
         try:
+            source_times = metadata.get("source_times", {})
+            if not isinstance(source_times, Mapping):
+                return None
+            if "points" in metadata and not isinstance(metadata["points"], list):
+                return None
+            if not isinstance(metadata.get("session_slot"), str) or not metadata["session_slot"]:
+                return None
+            snapshot_market = Market(metadata.get("market"))
+            snapshot_status = DataStatus(metadata.get("data_status", DataStatus.FRESH.value))
+            if snapshot_market != Market(market):
+                return None
+            for row in rows:
+                if any(
+                    not isinstance(row.get(field_name), str) or not row[field_name]
+                    for field_name in ("market", "symbol", "field", "source", "data_time", "fetched_at")
+                ):
+                    return None
+                if Market(row["market"]) != snapshot_market:
+                    return None
+                DataStatus(row.get("quality_status", DataStatus.FRESH.value))
+                available_at = row.get("available_at")
+                if available_at is not None and not isinstance(available_at, str):
+                    return None
+            parsed_source_times: dict[str, datetime] = {}
+            for source_name, timestamp in source_times.items():
+                if not isinstance(source_name, str) or not source_name or not isinstance(timestamp, str):
+                    return None
+                parsed_source_times[source_name] = datetime.fromisoformat(timestamp)
             points = tuple(
                 MarketDataPoint(
                     market=row["market"],
@@ -236,17 +264,14 @@ class RawDataCache:
                 for row in rows
             )
             return RawMarketSnapshot(
-                market=metadata["market"],
+                market=snapshot_market,
                 as_of_time=datetime.fromisoformat(metadata["as_of_time"]),
                 session_slot=metadata["session_slot"],
                 points=points,
-                data_status=metadata.get("data_status", DataStatus.FRESH.value),
-                source_times={
-                    source_name: datetime.fromisoformat(timestamp)
-                    for source_name, timestamp in metadata.get("source_times", {}).items()
-                },
+                data_status=snapshot_status,
+                source_times=parsed_source_times,
             )
-        except (KeyError, TypeError, ValueError):
+        except (AttributeError, KeyError, TypeError, ValueError):
             return None
 
     @staticmethod

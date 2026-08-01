@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime, time, timedelta
+from datetime import date, datetime, time, timedelta
 from math import isclose, isfinite
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 from zoneinfo import ZoneInfo
 
 from .domain import DataStatus, Market, MarketDataPoint, RawMarketSnapshot
@@ -17,7 +17,8 @@ class QualityPolicy:
 
     version: str = "quality-v1"
     intraday_core_quote_max_age: timedelta = timedelta(minutes=10)
-    complete_daily_max_age: timedelta = timedelta(days=7)
+    complete_daily_max_age: timedelta = timedelta(days=14)
+    previous_session: Callable[[Market, date], date] | None = None
     cross_source_price_tolerance: float = 0.005
     cross_source_timestamp_skew: timedelta = timedelta(seconds=120)
     daily_disclosure_cutoffs: Mapping[Market, time] = field(
@@ -232,7 +233,9 @@ def combine_source_quotes(
 
 def _is_daily_slot(session_slot: str) -> bool:
     normalized = session_slot.strip().lower()
-    return normalized in {"daily", "close", "closing", "eod", "end_of_day"} or "close" in normalized
+    return normalized in {
+        "daily", "close", "closing", "eod", "end_of_day", "post_market", "postmarket",
+    } or "close" in normalized or "post_market" in normalized or "postmarket" in normalized
 
 
 def _is_premarket_slot(session_slot: str) -> bool:
@@ -342,15 +345,31 @@ def evaluate_data_quality(
             core_values = tuple(
                 point for point in points if _canonical_field(point.field) in covered_core
             )
-            if _is_premarket_slot(snapshot.session_slot) or _is_daily_slot(snapshot.session_slot):
+            if _is_daily_slot(snapshot.session_slot):
+                zone = _EXCHANGE_ZONES[snapshot.market]
+                evaluation_date = evaluation_time.astimezone(zone).date()
+                stale = stale or any(
+                    point.data_time > evaluation_time
+                    or point.data_time.astimezone(zone).date() != evaluation_date
+                    for point in core_values
+                )
+            elif _is_premarket_slot(snapshot.session_slot):
                 zone = _EXCHANGE_ZONES[snapshot.market]
                 evaluation_date = evaluation_time.astimezone(zone).date()
                 max_days = policy.complete_daily_max_age.days
-                stale = stale or any(
-                    point.data_time > evaluation_time
-                    or (evaluation_date - point.data_time.astimezone(zone).date()).days > max_days
-                    for point in core_values
-                )
+                if policy.previous_session is not None:
+                    expected_date = policy.previous_session(snapshot.market, evaluation_date)
+                    stale = stale or any(
+                        point.data_time > evaluation_time
+                        or point.data_time.astimezone(zone).date() != expected_date
+                        for point in core_values
+                    )
+                else:
+                    stale = stale or any(
+                        point.data_time > evaluation_time
+                        or (evaluation_date - point.data_time.astimezone(zone).date()).days > max_days
+                        for point in core_values
+                    )
             else:
                 stale = stale or any(
                     evaluation_time - point.data_time > policy.intraday_core_quote_max_age
