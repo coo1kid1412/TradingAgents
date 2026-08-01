@@ -5,6 +5,7 @@
 """
 
 import contextlib
+import datetime as _dt
 import io
 import json
 import os
@@ -14,12 +15,23 @@ import tempfile
 from pathlib import Path
 
 from tradingagents.harness.market_risk import (
+    compose_effective_market_gate,
     compute_market_risk_snapshot,
     infer_market,
     save_market_risk_snapshot,
     load_latest_market_risk_snapshot,
     load_market_risk_for_ticker,
+    load_market_warning_for_ticker,
     enforce_snapshot_freshness,
+)
+from tradingagents.harness.market_warning.adapters.sqlite_repository import SQLiteWarningRepository
+from tradingagents.harness.market_warning.domain import (
+    DataStatus,
+    FeatureSnapshot,
+    FinalWarningDecision,
+    Market,
+    MarketPhase,
+    QuantRiskAssessment,
 )
 from tradingagents.harness import market_risk_daily
 from tradingagents.harness.market_risk_daily import is_market_trading_day, run_market_risk_daily, _send_feishu_message
@@ -227,10 +239,190 @@ def test_cli_treats_dry_run_as_success():
     finally:
         market_risk_daily.run_market_risk_daily = saved_run
         sys.argv = saved_argv
-
     assert rc == 0
     assert "a_share: dry_run / push=skipped" in buf.getvalue()
 
+
+def _warning(level="ORANGE", market=Market.A_SHARE, status=DataStatus.FRESH):
+    actions = {
+        "GREEN": ("OPEN", 100.0),
+        "YELLOW": ("OPEN", 100.0),
+        "ORANGE": ("CONDITIONAL", 3.0),
+        "RED": ("WAIT", 0.0),
+        "UNKNOWN": ("WAIT", 0.0),
+    }
+    gate, cap = actions[level]
+    return {
+        "market": market.value,
+        "as_of_time": "2026-08-03T01:35:00+00:00",
+        "session_slot": "intraday-0935",
+        "warning_level": level,
+        "baseline_level": level,
+        "entry_gate": gate,
+        "position_cap_pct": cap,
+        "holding_action": "REDUCE" if level == "RED" else "HOLD",
+        "transition": f"INITIAL_{level}",
+        "data_status": status.value,
+        "phase": "FIRST_SHOCK",
+        "probabilities": {"1d": 0.05, "3d": 0.10},
+        "base_rates": {"1d": 0.01, "3d": 0.02},
+        "reasons": ["calibrated warning"],
+    }
+
+
+def test_warning_orange_strictly_composes_without_touching_long_term_fields():
+    legacy = {
+        "market": "a_share", "entry_gate": "OPEN", "position_cap_pct": 20,
+        "risk_level": "低", "long_term_rating": "BUY", "target_price_12m": 150,
+        "reasons": ["legacy calm"],
+    }
+
+    result = compose_effective_market_gate(legacy, _warning("ORANGE"), "a_share")
+
+    assert result["entry_gate"] == "CONDITIONAL"
+    assert result["position_cap_pct"] == 3
+    assert result["long_term_rating"] == "BUY"
+    assert result["target_price_12m"] == 150
+    assert result["effective_gate_source"] == "market_warning"
+    assert result["warning_level"] == "ORANGE"
+
+
+def test_warning_red_and_unknown_force_wait_while_legacy_wait_remains_strictest():
+    open_legacy = {"market": "a_share", "entry_gate": "OPEN", "position_cap_pct": 20, "reasons": []}
+    for level in ("RED", "UNKNOWN"):
+        result = compose_effective_market_gate(open_legacy, _warning(level), "a_share")
+        assert result["entry_gate"] == "WAIT"
+        assert result["position_cap_pct"] == 0
+
+    wait_legacy = {"market": "a_share", "entry_gate": "WAIT", "position_cap_pct": 0, "reasons": []}
+    result = compose_effective_market_gate(wait_legacy, _warning("GREEN"), "a_share")
+    assert result["entry_gate"] == "WAIT"
+    assert result["position_cap_pct"] == 0
+    assert result["effective_gate_source"] == "legacy_market_risk"
+
+
+def test_us_shadow_warning_is_visible_but_does_not_override_production_gate():
+    legacy = {"market": "us", "entry_gate": "OPEN", "position_cap_pct": 20, "reasons": []}
+
+    result = compose_effective_market_gate(
+        legacy,
+        _warning("RED", market=Market.US, status=DataStatus.SHADOW),
+        "us",
+    )
+
+    assert result["entry_gate"] == "OPEN"
+    assert result["position_cap_pct"] == 20
+    assert result["warning_level"] == "RED"
+    assert result["market_warning"]["data_status"] == "shadow"
+    assert result["effective_gate_source"] == "legacy_market_risk"
+
+
+def _persist_warning(db_path, *, market, at, status="fresh", level="ORANGE"):
+    repository = SQLiteWarningRepository(db_path)
+    snapshot = FeatureSnapshot(
+        market=market,
+        as_of_time=_dt.datetime.fromisoformat(at),
+        session_slot="intraday-0935",
+        feature_version="market-warning-v2",
+        features={"market_phase": "FIRST_SHOCK"},
+        evidence=(),
+        data_quality=status,
+        reliability_grade="A" if status == "fresh" else "C",
+        source_times={"fixture": _dt.datetime.fromisoformat(at)},
+    )
+    quant = QuantRiskAssessment(
+        crash_1d_probability=0.05,
+        crash_3d_probability=0.10,
+        market_phase=MarketPhase.FIRST_SHOCK,
+        base_rate_1d=0.01,
+        base_rate_3d=0.02,
+        reliability_grade="A",
+        model_version="model-v2",
+        calibration_version="platt-v2",
+        top_contributors=(),
+    )
+    actions = {"ORANGE": ("CONDITIONAL", 3.0), "RED": ("WAIT", 0.0)}
+    gate, cap = actions[level]
+    decision = FinalWarningDecision(
+        baseline_level=level,
+        final_level=level,
+        state_transition=f"INITIAL_{level}",
+        entry_gate=gate,
+        new_position_cap_pct=cap,
+        holding_action="HOLD_OR_REDUCE" if level == "ORANGE" else "REDUCE",
+        push_required=True,
+        decision_reasons=("test warning",),
+        data_status=status,
+    )
+    snapshot_id = repository.save_feature_snapshot(snapshot)
+    prediction_ids = repository.save_predictions(snapshot_id, quant)
+    repository.save_decision(snapshot_id, prediction_ids, None, decision)
+
+
+def test_stale_a_share_warning_fails_closed_but_shadow_us_does_not():
+    with _tmp_dir() as tmp_path:
+        db_path = tmp_path / "risk.db"
+        _persist_warning(
+            db_path,
+            market=Market.A_SHARE,
+            at="2026-08-03T01:35:00+00:00",
+        )
+        stale = load_market_warning_for_ticker(
+            "300308",
+            "2026-08-03",
+            db_path,
+            analysis_time="2026-08-03T10:00:00+08:00",
+        )
+        assert stale["warning_level"] == "UNKNOWN"
+        assert stale["entry_gate"] == "WAIT"
+        assert stale["position_cap_pct"] == 0
+        assert "陈旧" in "；".join(stale["reasons"])
+        assert "市场压力" not in "；".join(stale["reasons"])
+
+    with _tmp_dir() as tmp_path:
+        db_path = tmp_path / "risk.db"
+        _persist_warning(
+            db_path,
+            market=Market.US,
+            at="2026-08-03T13:35:00+00:00",
+            status="shadow",
+            level="RED",
+        )
+        shadow = load_market_warning_for_ticker(
+            "NVDA",
+            "2026-08-03",
+            db_path,
+            analysis_time="2026-08-03T11:00:00-04:00",
+        )
+        assert shadow["warning_level"] == "RED"
+        assert shadow["data_status"] == "shadow"
+
+
+def test_warning_loader_never_reads_a_later_same_day_decision():
+    with _tmp_dir() as tmp_path:
+        db_path = tmp_path / "risk.db"
+        _persist_warning(
+            db_path,
+            market=Market.A_SHARE,
+            at="2026-08-03T01:35:00+00:00",
+            level="ORANGE",
+        )
+        _persist_warning(
+            db_path,
+            market=Market.A_SHARE,
+            at="2026-08-03T06:55:00+00:00",
+            level="RED",
+        )
+
+        warning = load_market_warning_for_ticker(
+            "300308",
+            "2026-08-03",
+            db_path,
+            analysis_time="2026-08-03T09:40:00+08:00",
+        )
+
+        assert warning["warning_level"] == "ORANGE"
+        assert warning["as_of_time"] == "2026-08-03T01:35:00+00:00"
 
 if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]

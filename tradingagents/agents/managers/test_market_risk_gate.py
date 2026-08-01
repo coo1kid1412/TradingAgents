@@ -25,6 +25,28 @@ def test_medium_risk_keeps_conditional_entry_but_caps_size():
     assert result["effective_size_high_pct"] == 6
 
 
+def test_warning_orange_uses_existing_conditional_vocabulary_and_three_percent_cap():
+    result = apply_market_risk_gate.invoke({
+        "entry_gate": "CONDITIONAL", "position_cap_pct": 3,
+        "proposed_action": "BUY_NOW", "proposed_size_low_pct": 2, "proposed_size_high_pct": 8,
+    })
+
+    assert result["effective_action"] == "CONDITIONAL"
+    assert result["effective_size_low_pct"] == 2
+    assert result["effective_size_high_pct"] == 3
+
+
+def test_warning_unknown_uses_existing_wait_vocabulary():
+    result = apply_market_risk_gate.invoke({
+        "entry_gate": "WAIT", "position_cap_pct": 0,
+        "proposed_action": "BUY_NOW", "proposed_size_low_pct": 2, "proposed_size_high_pct": 8,
+    })
+
+    assert result["effective_action"] == "WAIT"
+    assert result["effective_size_low_pct"] == 0
+    assert result["effective_size_high_pct"] == 0
+
+
 if __name__ == "__main__":
     import sys
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]

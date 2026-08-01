@@ -10,6 +10,7 @@ import datetime as _dt
 import json
 import re
 from typing import Any, Iterable
+from zoneinfo import ZoneInfo
 
 from tradingagents.harness import db as _db
 
@@ -17,6 +18,8 @@ from tradingagents.harness import db as _db
 SNAPSHOT_VERSION = "v1"
 _POSITION_CAP = {"低": 20, "中": 6, "高": 3, "极高": 0, "数据不足": 0}
 _A_SHARE_CHECKPOINTS = ((9, 35, "09:35"), (11, 15, "11:15"), (14, 30, "14:30"))
+_GATE_SEVERITY = {"OPEN": 0, "CONDITIONAL": 1, "WAIT": 2}
+_WARNING_UNUSABLE = {"conflicted", "stale", "insufficient"}
 
 
 def infer_market(ticker: str) -> str:
@@ -206,12 +209,233 @@ def enforce_snapshot_freshness(
     return stale
 
 
+def _warning_expected_time(now: _dt.datetime) -> _dt.datetime | None:
+    """Latest A-share five-minute checkpoint expected at ``now``."""
+    current = now.time()
+    if current < _dt.time(8, 30):
+        return None
+    if current < _dt.time(9, 35):
+        return now.replace(hour=8, minute=30, second=0, microsecond=0)
+    if current <= _dt.time(11, 25):
+        minute = (now.minute // 5) * 5
+        return now.replace(minute=minute, second=0, microsecond=0)
+    if current < _dt.time(13, 5):
+        return now.replace(hour=11, minute=25, second=0, microsecond=0)
+    if current <= _dt.time(14, 55):
+        minute = (now.minute // 5) * 5
+        return now.replace(minute=minute, second=0, microsecond=0)
+    return now.replace(hour=14, minute=55, second=0, microsecond=0)
+
+
+def _enforce_warning_freshness(
+    warning: dict[str, Any] | None,
+    trade_date: str,
+    analysis_time: str | None,
+) -> dict[str, Any] | None:
+    if not warning or warning.get("market") != "a_share":
+        return warning
+    if warning.get("data_status") == "shadow":
+        return warning
+    now = (
+        _dt.datetime.fromisoformat(analysis_time)
+        if analysis_time
+        else _dt.datetime.now(ZoneInfo("Asia/Shanghai"))
+    )
+    if now.tzinfo is None or now.utcoffset() is None:
+        now = now.replace(tzinfo=ZoneInfo("Asia/Shanghai"))
+    now = now.astimezone(ZoneInfo("Asia/Shanghai"))
+    if str(trade_date) != now.date().isoformat():
+        return warning
+    try:
+        captured = _dt.datetime.fromisoformat(str(warning.get("as_of_time")))
+        if captured.tzinfo is None or captured.utcoffset() is None:
+            raise ValueError("warning timestamp must be timezone-aware")
+        captured = captured.astimezone(ZoneInfo("Asia/Shanghai"))
+    except (TypeError, ValueError):
+        captured = None
+    expected = _warning_expected_time(now)
+    stale_by_clock = (
+        expected is not None
+        and (
+            captured is None
+            or captured.date() != now.date()
+            or captured < expected - _dt.timedelta(minutes=10)
+        )
+    )
+    unusable = str(warning.get("data_status") or "") in _WARNING_UNUSABLE
+    if not stale_by_clock and not unusable:
+        return warning
+
+    result = dict(warning)
+    result["warning_level"] = "UNKNOWN"
+    result["entry_gate"] = "WAIT"
+    result["position_cap_pct"] = 0.0
+    result["holding_action"] = "HOLD"
+    result["data_status"] = "stale" if stale_by_clock else warning.get("data_status")
+    reasons = list(warning.get("reasons") or [])
+    if stale_by_clock:
+        reasons.append(
+            "市场预警快照陈旧：未达到当前应有的五分钟检查点；仅表示无法可靠判断"
+        )
+    else:
+        reasons.append(
+            f"市场预警数据状态为 {warning.get('data_status')}；仅表示无法可靠判断"
+        )
+    result["reasons"] = reasons
+    result["required_checkpoint"] = expected.strftime("%H:%M") if expected else None
+    return result
+
+
+def load_market_warning_for_ticker(
+    ticker: str,
+    trade_date: str,
+    db_path=None,
+    analysis_time: str | None = None,
+) -> dict[str, Any] | None:
+    """Load the latest typed warning and its two calibrated probabilities."""
+    market = infer_market(ticker)
+    if market not in {"a_share", "us"}:
+        return None
+    market_zone = ZoneInfo("Asia/Shanghai" if market == "a_share" else "America/New_York")
+    if analysis_time:
+        cutoff = _dt.datetime.fromisoformat(analysis_time)
+        if cutoff.tzinfo is None or cutoff.utcoffset() is None:
+            cutoff = cutoff.replace(tzinfo=market_zone)
+    else:
+        cutoff = _dt.datetime.combine(
+            _dt.date.fromisoformat(trade_date),
+            _dt.time.max,
+            tzinfo=market_zone,
+        )
+    cutoff_text = cutoff.astimezone(_dt.timezone.utc).isoformat()
+    with _db.connect(db_path) as conn:
+        rows = conn.execute(
+            """SELECT d.baseline_level, d.final_level, d.transition, d.entry_gate,
+                      d.new_position_cap_pct, d.holding_action, d.push_required,
+                      d.data_status, d.reasons_json, d.model_version,
+                      s.market, s.as_of_time, s.session_slot, s.reliability_grade,
+                      p.horizon, p.probability, p.base_rate, p.market_phase,
+                      p.calibration_version
+               FROM market_warning_decisions AS d
+               JOIN market_warning_feature_snapshots AS s ON s.id = d.feature_snapshot_id
+               JOIN market_warning_predictions AS p ON p.feature_snapshot_id = s.id
+               WHERE d.id = (
+                   SELECT d2.id
+                   FROM market_warning_decisions AS d2
+                   JOIN market_warning_feature_snapshots AS s2 ON s2.id = d2.feature_snapshot_id
+                   WHERE s2.market = ? AND s2.as_of_time <= ?
+                   ORDER BY s2.as_of_time DESC, d2.id DESC LIMIT 1
+               )
+               ORDER BY p.horizon""",
+            (market, cutoff_text),
+        ).fetchall()
+    if len(rows) != 2 or {row["horizon"] for row in rows} != {"1d", "3d"}:
+        return None
+    first = rows[0]
+    probabilities = {row["horizon"]: row["probability"] for row in rows}
+    base_rates = {row["horizon"]: row["base_rate"] for row in rows}
+    warning = {
+        "market": first["market"],
+        "as_of_time": first["as_of_time"],
+        "session_slot": first["session_slot"],
+        "warning_level": first["final_level"],
+        "baseline_level": first["baseline_level"],
+        "entry_gate": first["entry_gate"],
+        "position_cap_pct": first["new_position_cap_pct"],
+        "holding_action": first["holding_action"],
+        "transition": first["transition"],
+        "push_required": bool(first["push_required"]),
+        "data_status": first["data_status"],
+        "reliability_grade": first["reliability_grade"],
+        "phase": first["market_phase"],
+        "probabilities": probabilities,
+        "base_rates": base_rates,
+        "model_version": first["model_version"],
+        "calibration_version": first["calibration_version"],
+        "reasons": list(json.loads(first["reasons_json"])),
+    }
+    return _enforce_warning_freshness(warning, trade_date, analysis_time)
+
+
+def compose_effective_market_gate(
+    legacy_snapshot: dict[str, Any] | None,
+    warning_decision: dict[str, Any] | None,
+    market: str,
+) -> dict[str, Any] | None:
+    """Compose legacy and warning gates without changing long-horizon fields."""
+    if not legacy_snapshot and not warning_decision:
+        return None
+    legacy = dict(legacy_snapshot or {})
+    warning = dict(warning_decision or {})
+    result = dict(legacy)
+    result["legacy_market_risk"] = legacy if legacy else None
+    result["market_warning"] = warning if warning else None
+    result["warning_level"] = warning.get("warning_level")
+    result["warning_phase"] = warning.get("phase")
+    result["warning_probabilities"] = warning.get("probabilities")
+
+    legacy_gate = str(legacy.get("entry_gate") or "OPEN").upper()
+    if legacy_gate not in _GATE_SEVERITY:
+        legacy_gate = "WAIT"
+    try:
+        legacy_cap = float(legacy.get("position_cap_pct", 100.0))
+    except (TypeError, ValueError):
+        legacy_cap = 0.0
+    result["effective_gate_source"] = "legacy_market_risk" if legacy else "none"
+
+    production_warning = bool(warning) and not (
+        market == "us" and warning.get("data_status") == "shadow"
+    )
+    if production_warning:
+        warning_gate = str(warning.get("entry_gate") or "WAIT").upper()
+        if warning_gate not in _GATE_SEVERITY:
+            warning_gate = "WAIT"
+        try:
+            warning_cap = float(warning.get("position_cap_pct", 0.0))
+        except (TypeError, ValueError):
+            warning_cap = 0.0
+        warning_stricter = (
+            _GATE_SEVERITY[warning_gate] > _GATE_SEVERITY[legacy_gate]
+            or (
+                _GATE_SEVERITY[warning_gate] == _GATE_SEVERITY[legacy_gate]
+                and warning_cap < legacy_cap
+            )
+        )
+        if warning_stricter or not legacy:
+            result["entry_gate"] = warning_gate
+            result["position_cap_pct"] = min(legacy_cap, warning_cap) if legacy else warning_cap
+            result["effective_gate_source"] = "market_warning"
+            if warning.get("data_status") in _WARNING_UNUSABLE:
+                result["data_status"] = warning.get("data_status")
+                result["required_checkpoint"] = warning.get("required_checkpoint")
+        else:
+            result["entry_gate"] = legacy_gate
+            result["position_cap_pct"] = legacy_cap
+    elif legacy:
+        result["entry_gate"] = legacy_gate
+        result["position_cap_pct"] = legacy_cap
+
+    reasons = list(legacy.get("reasons") or [])
+    if warning:
+        reasons.extend(f"market_warning: {reason}" for reason in warning.get("reasons") or [])
+    result["reasons"] = reasons
+    return result
+
+
 def load_market_risk_for_ticker(
     ticker: str,
     trade_date: str,
     db_path=None,
     analysis_time: str | None = None,
 ) -> dict[str, Any] | None:
-    """供个股图读取：按 ticker 市场取分析日及之前最近有效快照。"""
-    snapshot = load_latest_market_risk_snapshot(infer_market(ticker), trade_date, db_path)
-    return enforce_snapshot_freshness(snapshot, trade_date, analysis_time=analysis_time)
+    """Compatibility boundary returning the strictest effective market gate."""
+    market = infer_market(ticker)
+    legacy = load_latest_market_risk_snapshot(market, trade_date, db_path)
+    legacy = enforce_snapshot_freshness(legacy, trade_date, analysis_time=analysis_time)
+    warning = load_market_warning_for_ticker(
+        ticker,
+        trade_date,
+        db_path,
+        analysis_time=analysis_time,
+    )
+    return compose_effective_market_gate(legacy, warning, market)
