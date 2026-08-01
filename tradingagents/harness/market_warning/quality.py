@@ -9,6 +9,7 @@ from typing import Any, Callable, Mapping
 from zoneinfo import ZoneInfo
 
 from .domain import DataStatus, Market, MarketDataPoint, RawMarketSnapshot
+from .ohlc import assess_ohlc_invariants
 
 
 @dataclass(frozen=True)
@@ -328,9 +329,16 @@ def evaluate_data_quality(
     latest_fetched_at = max((point.fetched_at for point in points), default=None)
     reasons: list[str] = []
 
-    conflicted = _source_conflict(points, policy) or any(
+    ohlc = assess_ohlc_invariants(
+        points,
+        snapshot.market,
+        snapshot.session_slot,
+        timestamp_skew=policy.cross_source_timestamp_skew,
+    )
+    source_conflicted = _source_conflict(points, policy) or any(
         point.quality_status == DataStatus.CONFLICTED for point in points
     )
+    conflicted = source_conflicted or ohlc.conflicted
     point_stale = any(
         point.quality_status == DataStatus.STALE
         for point in points
@@ -338,7 +346,10 @@ def evaluate_data_quality(
     )
     if conflicted:
         status = DataStatus.CONFLICTED
-        reasons.append("independent sources exceed price or timestamp tolerance")
+        if source_conflicted:
+            reasons.append("independent sources exceed price or timestamp tolerance")
+        if ohlc.conflicted:
+            reasons.append("selected benchmark OHLC violates finite positive price or range invariants")
     else:
         stale = point_stale
         if covered_core:

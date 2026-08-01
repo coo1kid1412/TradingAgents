@@ -163,6 +163,117 @@ class SourceCombinationTests(TestCase):
 
 
 class QualityEvaluationTests(TestCase):
+    def test_complete_aligned_invalid_ohlc_is_conflicted_and_unavailable(self):
+        cases = (
+            ("close_below_low", 100.0, 110.0, 90.0, 80.0),
+            ("open_above_high", 111.0, 110.0, 90.0, 100.0),
+            ("high_below_low", 100.0, 89.0, 90.0, 90.0),
+            ("zero_open", 0.0, 110.0, 90.0, 100.0),
+            ("negative_open", -1.0, 110.0, 90.0, 100.0),
+            ("zero_high", 1.0, 0.0, 0.0, 0.0),
+            ("negative_low", 100.0, 110.0, -1.0, 100.0),
+            ("zero_close", 100.0, 110.0, 90.0, 0.0),
+            ("negative_close", 100.0, 110.0, 90.0, -1.0),
+            ("nan_open", float("nan"), 110.0, 90.0, 100.0),
+            ("infinite_high", 100.0, float("inf"), 90.0, 100.0),
+            ("boolean_low", 100.0, 110.0, False, 100.0),
+            ("string_close", 100.0, 110.0, 90.0, "100"),
+        )
+        for name, open_value, high, low, close in cases:
+            with self.subTest(name=name):
+                assessment = evaluate_data_quality(
+                    snapshot(
+                        point("index_price", close),
+                        point("index_change_pct", -1.0),
+                        point("open", open_value),
+                        point("high", high),
+                        point("low", low),
+                    ),
+                    QUALITY_POLICY_V1,
+                    NOW,
+                )
+                self.assertEqual(assessment.status, DataStatus.CONFLICTED)
+                self.assertEqual(assessment.reliability_grade, "UNAVAILABLE")
+                self.assertTrue(any("OHLC" in reason for reason in assessment.reasons))
+
+    def test_valid_boundary_close_equal_low_is_not_conflicted(self):
+        assessment = evaluate_data_quality(
+            snapshot(
+                point("index_price", 90.0),
+                point("index_change_pct", -10.0),
+                point("open", 100.0),
+                point("high", 110.0),
+                point("low", 90.0),
+            ),
+            QUALITY_POLICY_V1,
+            NOW,
+        )
+
+        self.assertNotEqual(assessment.status, DataStatus.CONFLICTED)
+
+    def test_incomplete_ohlc_keeps_missing_semantics_without_false_conflict(self):
+        assessment = evaluate_data_quality(
+            snapshot(
+                point("index_price", 100.0),
+                point("index_change_pct", 0.0),
+                point("open", 100.0),
+                point("high", 101.0),
+            ),
+            QUALITY_POLICY_V1,
+            NOW,
+        )
+
+        self.assertNotEqual(assessment.status, DataStatus.CONFLICTED)
+
+    def test_invalid_ohlc_on_non_benchmark_symbol_is_not_compared_to_benchmark(self):
+        assessment = evaluate_data_quality(
+            snapshot(
+                point("index_price", 100.0, market=Market.US, symbol="SPX"),
+                point("index_change_pct", 0.0, market=Market.US, symbol="SPX"),
+                point("index_price", 80.0, market=Market.US, symbol="HYG"),
+                point("open", 100.0, market=Market.US, symbol="HYG"),
+                point("high", 110.0, market=Market.US, symbol="HYG"),
+                point("low", 90.0, market=Market.US, symbol="HYG"),
+                market=Market.US,
+            ),
+            QUALITY_POLICY_V1,
+            NOW,
+        )
+
+        self.assertNotEqual(assessment.status, DataStatus.CONFLICTED)
+
+    def test_invalid_primary_benchmark_is_not_hidden_by_valid_fallback_benchmark(self):
+        assessment = evaluate_data_quality(
+            snapshot(
+                point("index_price", float("nan"), symbol="INDEX"),
+                point("index_change_pct", 0.0, symbol="INDEX"),
+                point("index_price", 100.0, symbol="000300.SH"),
+                point("open", 100.0, symbol="000300.SH"),
+                point("high", 101.0, symbol="000300.SH"),
+                point("low", 99.0, symbol="000300.SH"),
+            ),
+            QUALITY_POLICY_V1,
+            NOW,
+        )
+
+        self.assertEqual(assessment.status, DataStatus.CONFLICTED)
+        self.assertEqual(assessment.reliability_grade, "UNAVAILABLE")
+
+    def test_misaligned_ohlc_is_missing_not_cross_observation_conflict(self):
+        assessment = evaluate_data_quality(
+            snapshot(
+                point("index_price", 80.0),
+                point("index_change_pct", -20.0),
+                point("open", 100.0, data_time=NOW - timedelta(days=1)),
+                point("high", 110.0),
+                point("low", 90.0),
+            ),
+            QUALITY_POLICY_V1,
+            NOW,
+        )
+
+        self.assertNotEqual(assessment.status, DataStatus.CONFLICTED)
+
     def test_fresh_dual_source_core_complete_with_optional_coverage_is_grade_a(self):
         points = (
             point("index_price", 100, source="primary"),

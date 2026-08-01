@@ -11,12 +11,16 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 
 from .domain import Evidence, FeatureSnapshot, Market, MarketDataPoint, MarketPhase, RawMarketSnapshot
+from .ohlc import (
+    A_SHARE_BROAD_BENCHMARKS,
+    US_BROAD_BENCHMARKS,
+    assess_ohlc_invariants,
+    select_benchmark_symbol,
+)
 from .quality import QUALITY_POLICY_V1, evaluate_data_quality, select_point_in_time
 
 
 FEATURE_VERSION = "market-warning-v1"
-A_SHARE_BROAD_BENCHMARKS = ("INDEX", "000001.SH", "399001.SZ", "000300.SH", "000905.SH", "399006.SZ", "000688.SH")
-US_BROAD_BENCHMARKS = ("SPX", "^GSPC", "INDEX")
 
 
 def _metadata(source: str, availability: str, direction: str, unit: str) -> dict[str, str]:
@@ -52,8 +56,8 @@ _COMMON_METADATA = {
     "realized_volatility_60d": _metadata("broad index close", "61 observations visible by as_of", "higher is risk-off", "ratio"),
     "volatility_ratio_5d_20d": _metadata("broad index close", "21 observations visible by as_of", "higher is risk-off", "ratio"),
     "volatility_ratio_20d_60d": _metadata("broad index close", "61 observations visible by as_of", "higher is risk-off", "ratio"),
-    "range_pct": _metadata("index high low open", "same-session OHLC visible by as_of", "higher is risk-off", "ratio"),
-    "range_zscore_20d": _metadata("index high low open", "20 aligned OHLC observations visible by as_of", "higher is stress", "z-score"),
+    "range_pct": _metadata("index OHLC", "same-session OHLC visible by as_of", "higher is risk-off", "ratio"),
+    "range_zscore_20d": _metadata("index OHLC", "20 aligned OHLC observations visible by as_of", "higher is stress", "z-score"),
     "close_location": _metadata("index high low close", "same-session OHLC visible by as_of", "lower is risk-off", "ratio"),
     "volume_zscore_20d": _metadata("broad index volume", "20 observations visible by as_of", "higher is stress", "z-score"),
     "abnormal_range_weak_close_transition": _metadata("index OHLC and close history", "range z-score, close location, and 1-day return available", "true is risk-off", "boolean"),
@@ -264,20 +268,17 @@ def _observation_series(history: tuple[RawMarketSnapshot, ...], field: str, symb
 def _range_series(history: tuple[RawMarketSnapshot, ...], symbol: str) -> pd.Series:
     values: list[float] = []
     for item in history:
-        visible = _points_at(item)
-        open_point = _point_for(visible, "open", symbol)
-        high_point = _point_for(visible, "high", symbol)
-        low_point = _point_for(visible, "low", symbol)
-        aligned = _aligned(
-            (open_point, high_point, low_point),
+        ohlc = assess_ohlc_invariants(
+            _points_at(item),
             item.market,
             item.session_slot,
-            _observation_date(item, item.market),
+            timestamp_skew=QUALITY_POLICY_V1.cross_source_timestamp_skew,
+            benchmark_symbol=symbol,
         )
-        open_value = _number(open_point.value) if open_point is not None else None
-        high = _number(high_point.value) if high_point is not None else None
-        low = _number(low_point.value) if low_point is not None else None
-        value = None if not aligned or open_value in (None, 0) or high is None or low is None else (high - low) / open_value
+        open_value = _number(ohlc.open_point.value) if ohlc.open_point is not None else None
+        high = _number(ohlc.high_point.value) if ohlc.high_point is not None else None
+        low = _number(ohlc.low_point.value) if ohlc.low_point is not None else None
+        value = None if not ohlc.valid else (high - low) / open_value
         values.append(float("nan") if value is None else value)
     return pd.Series(values, dtype="float64")
 
@@ -375,8 +376,7 @@ class _FeatureStrategy:
         )
 
     def _main_symbol(self, selected: tuple[MarketDataPoint, ...]) -> str | None:
-        allowed = A_SHARE_BROAD_BENCHMARKS if self.market == Market.A_SHARE else US_BROAD_BENCHMARKS
-        return next((symbol for symbol in allowed if _point_for(selected, "index_price", symbol) is not None), None)
+        return select_benchmark_symbol(selected, self.market)
 
     def _common_features(self, history: tuple[RawMarketSnapshot, ...], selected: tuple[MarketDataPoint, ...]) -> dict[str, Any]:
         symbol = self._main_symbol(selected)
@@ -386,9 +386,20 @@ class _FeatureStrategy:
         current = _last(close)
         volumes = _series(history, "volume", symbol) if symbol is not None else pd.Series([float("nan")] * len(history))
         ranges = _range_series(history, symbol) if symbol is not None else pd.Series([float("nan")] * len(history))
-        high_point = _point_for(selected, "high", symbol) if symbol is not None else None
-        low_point = _point_for(selected, "low", symbol) if symbol is not None else None
-        open_point = _point_for(selected, "open", symbol) if symbol is not None else None
+        ohlc = (
+            assess_ohlc_invariants(
+                selected,
+                self.market,
+                history[-1].session_slot,
+                timestamp_skew=QUALITY_POLICY_V1.cross_source_timestamp_skew,
+                benchmark_symbol=symbol,
+            )
+            if symbol is not None
+            else None
+        )
+        high_point = ohlc.high_point if ohlc is not None else None
+        low_point = ohlc.low_point if ohlc is not None else None
+        open_point = ohlc.open_point if ohlc is not None else None
         high = _number(high_point.value) if high_point is not None else None
         low = _number(low_point.value) if low_point is not None else None
         open_value = _number(open_point.value) if open_point is not None else None
@@ -402,11 +413,10 @@ class _FeatureStrategy:
         range_pct = None if high is None or low is None or open_value in (None, 0) else (high - low) / open_value
         close_location = None if high is None or low is None or current is None or high == low else (current - low) / (high - low)
         phase = derive_market_phase(_drawdown(close, 20))
-        ohlc_aligned = _current_observation_is_usable(history[-1]) and _aligned(
-            (open_point, high_point, low_point, _point_for(selected, "index_price", symbol)),
-            self.market,
-            history[-1].session_slot,
-            _observation_date(history[-1], self.market),
+        ohlc_valid = (
+            _current_observation_is_usable(history[-1])
+            and ohlc is not None
+            and ohlc.valid
         )
         return_1d = _return(close, 1)
         range_zscore = (
@@ -428,11 +438,11 @@ class _FeatureStrategy:
             "ma20_slope": _ma_slope(close, 20), "ma50_slope": _ma_slope(close, 50), "ma200_slope": _ma_slope(close, 200),
             "realized_volatility_5d": vol5, "realized_volatility_20d": vol20, "realized_volatility_60d": vol60,
             "volatility_ratio_5d_20d": _ratio(vol5, vol20), "volatility_ratio_20d_60d": _ratio(vol20, vol60),
-            "range_pct": range_pct if ohlc_aligned else None,
-            "range_zscore_20d": range_zscore if ohlc_aligned else None,
-            "close_location": close_location if ohlc_aligned else None,
+            "range_pct": range_pct if ohlc_valid else None,
+            "range_zscore_20d": range_zscore if ohlc_valid else None,
+            "close_location": close_location if ohlc_valid else None,
             "volume_zscore_20d": None if volume_mean is None or volume_std in (None, 0) or _last(volumes) is None else (_last(volumes) - volume_mean) / volume_std,
-            "abnormal_range_weak_close_transition": abnormal_range_transition if ohlc_aligned else None,
+            "abnormal_range_weak_close_transition": abnormal_range_transition if ohlc_valid else None,
         }
 
     def _evidence(self, name: str, value: Any, points: tuple[MarketDataPoint, ...], as_of_time: datetime) -> Evidence:
@@ -463,7 +473,7 @@ class _FeatureStrategy:
         if name in {"range_pct", "close_location"}:
             inputs = [("index_price", symbol), ("open", symbol), ("high", symbol), ("low", symbol)]
         elif name == "range_zscore_20d":
-            inputs = [("open", symbol), ("high", symbol), ("low", symbol)]
+            inputs = [("index_price", symbol), ("open", symbol), ("high", symbol), ("low", symbol)]
         elif name == "abnormal_range_weak_close_transition":
             inputs = [("index_price", symbol), ("open", symbol), ("high", symbol), ("low", symbol)]
         elif name == "volume_zscore_20d":

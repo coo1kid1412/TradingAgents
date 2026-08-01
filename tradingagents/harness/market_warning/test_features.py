@@ -732,10 +732,103 @@ class PolicyReachabilityIntegrationTests(TestCase):
         evidence = next(
             item for item in result.evidence if item.evidence_id.split(":")[2] == "range_zscore_20d"
         )
-        self.assertEqual(evidence.source, "ohlc_history+ohlc_now")
+        self.assertEqual(evidence.source, "close_history+close_now+ohlc_history+ohlc_now")
         self.assertEqual(evidence.as_of_time, AS_OF)
         self.assertIn("ohlc_history:first", result.source_times)
         self.assertIn("ohlc_now:last", result.source_times)
+
+    def test_reviewer_invalid_close_regression_is_unknown_not_red(self):
+        history = tuple(
+            snapshot(
+                point("index_price", 100.0, AS_OF - timedelta(days=days), source="close_history"),
+                point("open", 100.0, AS_OF - timedelta(days=days), source="ohlc_history"),
+                point("high", 101.0, AS_OF - timedelta(days=days), source="ohlc_history"),
+                point("low", 99.0, AS_OF - timedelta(days=days), source="ohlc_history"),
+                at=AS_OF - timedelta(days=days),
+            )
+            for days in range(19, 0, -1)
+        )
+        raw = snapshot(
+            point("index_price", 80.0, AS_OF, source="close_now"),
+            point("index_change_pct", -20.0, AS_OF, source="close_now"),
+            point("open", 100.0, AS_OF, source="ohlc_now"),
+            point("high", 110.0, AS_OF, source="ohlc_now"),
+            point("low", 90.0, AS_OF, source="ohlc_now"),
+        )
+
+        result = AShareFeatureStrategy().build(raw, history)
+
+        self.assertEqual(result.data_quality, DataStatus.CONFLICTED)
+        self.assertEqual(result.reliability_grade, "UNAVAILABLE")
+        for name in (
+            "range_pct",
+            "range_zscore_20d",
+            "close_location",
+            "abnormal_range_weak_close_transition",
+        ):
+            self.assertIsNone(result.features[name], name)
+        self.assertEqual(baseline_level(self.quant(0.01), result), RiskLevel.UNKNOWN)
+
+    def test_historical_invalid_ohlc_is_nan_and_cannot_create_range_zscore(self):
+        history = tuple(
+            snapshot(
+                point("index_price", 100.0, AS_OF - timedelta(days=days)),
+                point("open", 100.0, AS_OF - timedelta(days=days)),
+                point("high", 99.0 if days == 10 else 101.0, AS_OF - timedelta(days=days)),
+                point("low", 101.0 if days == 10 else 99.0, AS_OF - timedelta(days=days)),
+                at=AS_OF - timedelta(days=days),
+            )
+            for days in range(19, 0, -1)
+        )
+        raw = snapshot(
+            point("index_price", 92.0, AS_OF),
+            point("index_change_pct", -8.0, AS_OF),
+            point("open", 100.0, AS_OF),
+            point("high", 110.0, AS_OF),
+            point("low", 90.0, AS_OF),
+        )
+
+        result = AShareFeatureStrategy().build(raw, history)
+
+        self.assertIsNone(result.features["range_zscore_20d"])
+        self.assertIsNone(result.features["abnormal_range_weak_close_transition"])
+        self.assertNotEqual(result.data_quality, DataStatus.CONFLICTED)
+        self.assertEqual(baseline_level(self.quant(0.01), result), RiskLevel.GREEN)
+
+    def test_valid_close_at_low_and_incomplete_ohlc_keep_exact_missing_semantics(self):
+        old = AS_OF - timedelta(days=1)
+        history = (snapshot(point("index_price", 100.0, old), at=old),)
+        valid = AShareFeatureStrategy().build(
+            snapshot(
+                point("index_price", 90.0, AS_OF),
+                point("index_change_pct", -10.0, AS_OF),
+                point("open", 100.0, AS_OF),
+                point("high", 110.0, AS_OF),
+                point("low", 90.0, AS_OF),
+            ),
+            history,
+        )
+        incomplete = AShareFeatureStrategy().build(
+            snapshot(
+                point("index_price", 99.0, AS_OF),
+                point("index_change_pct", -1.0, AS_OF),
+                point("open", 100.0, AS_OF),
+                point("high", 101.0, AS_OF),
+            ),
+            history,
+        )
+
+        self.assertAlmostEqual(valid.features["range_pct"], 0.20)
+        self.assertEqual(valid.features["close_location"], 0.0)
+        self.assertNotEqual(valid.data_quality, DataStatus.CONFLICTED)
+        for name in (
+            "range_pct",
+            "range_zscore_20d",
+            "close_location",
+            "abnormal_range_weak_close_transition",
+        ):
+            self.assertIsNone(incomplete.features[name], name)
+        self.assertNotEqual(incomplete.data_quality, DataStatus.CONFLICTED)
 
 
 if __name__ == "__main__":
