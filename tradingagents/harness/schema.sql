@@ -188,3 +188,115 @@ CREATE TABLE IF NOT EXISTS market_risk_snapshots (
 
 CREATE INDEX IF NOT EXISTS idx_market_risk_snapshot_date
     ON market_risk_snapshots(as_of_date);
+
+-- ============================================================================
+-- market_warning_*: 双市场骤跌预警的可审计输入、判断、推送记录
+-- ============================================================================
+CREATE TABLE IF NOT EXISTS market_warning_feature_snapshots (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    market TEXT NOT NULL,
+    as_of_time TEXT NOT NULL,
+    session_slot TEXT NOT NULL,
+    feature_version TEXT NOT NULL,
+    data_status TEXT NOT NULL,
+    reliability_grade TEXT,
+    features_json TEXT NOT NULL,
+    evidence_json TEXT NOT NULL,
+    source_times_json TEXT NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE (market, as_of_time, feature_version)
+);
+
+CREATE INDEX IF NOT EXISTS idx_market_warning_feature_snapshots_market_time
+    ON market_warning_feature_snapshots(market, as_of_time);
+
+CREATE TABLE IF NOT EXISTS market_warning_predictions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    feature_snapshot_id INTEGER NOT NULL,
+    horizon TEXT NOT NULL,
+    probability REAL NOT NULL,
+    base_rate REAL NOT NULL,
+    market_phase TEXT NOT NULL,
+    reliability_grade TEXT NOT NULL,
+    model_version TEXT NOT NULL,
+    calibration_version TEXT NOT NULL,
+    top_contributors_json TEXT NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE (feature_snapshot_id, model_version, horizon),
+    FOREIGN KEY (feature_snapshot_id) REFERENCES market_warning_feature_snapshots(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_market_warning_predictions_snapshot
+    ON market_warning_predictions(feature_snapshot_id);
+
+CREATE TABLE IF NOT EXISTS market_warning_reasoning (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    feature_snapshot_id INTEGER NOT NULL,
+    model_name TEXT NOT NULL,
+    reasoning_status TEXT NOT NULL,
+    structured_json TEXT NOT NULL,
+    error_class TEXT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (feature_snapshot_id) REFERENCES market_warning_feature_snapshots(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_market_warning_reasoning_snapshot
+    ON market_warning_reasoning(feature_snapshot_id);
+
+CREATE TABLE IF NOT EXISTS market_warning_decisions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    feature_snapshot_id INTEGER NOT NULL UNIQUE,
+    prediction_ids_json TEXT NOT NULL,
+    reasoning_id INTEGER,
+    baseline_level TEXT NOT NULL,
+    final_level TEXT NOT NULL,
+    transition TEXT NOT NULL,
+    entry_gate TEXT NOT NULL,
+    new_position_cap_pct REAL NOT NULL,
+    holding_action TEXT NOT NULL,
+    push_required INTEGER NOT NULL,
+    data_status TEXT NOT NULL,
+    reasons_json TEXT NOT NULL,
+    model_version TEXT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (feature_snapshot_id) REFERENCES market_warning_feature_snapshots(id),
+    FOREIGN KEY (reasoning_id) REFERENCES market_warning_reasoning(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_market_warning_decisions_snapshot
+    ON market_warning_decisions(feature_snapshot_id);
+
+CREATE TABLE IF NOT EXISTS market_warning_alerts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    idempotency_key TEXT NOT NULL UNIQUE,
+    decision_id INTEGER NOT NULL,
+    payload_hash TEXT NOT NULL,
+    push_status TEXT NOT NULL DEFAULT 'claimed',
+    sent_at TIMESTAMP,
+    error_summary TEXT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (decision_id) REFERENCES market_warning_decisions(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_market_warning_alerts_decision
+    ON market_warning_alerts(decision_id);
+
+CREATE TABLE IF NOT EXISTS market_warning_model_registry (
+    model_version TEXT NOT NULL,
+    market TEXT NOT NULL,
+    horizon TEXT NOT NULL,
+    feature_version TEXT NOT NULL,
+    calibration_version TEXT NOT NULL,
+    training_cutoff TEXT NOT NULL,
+    artifact_path TEXT NOT NULL,
+    artifact_sha256 TEXT NOT NULL,
+    metrics_json TEXT NOT NULL,
+    base_rate REAL NOT NULL,
+    active INTEGER NOT NULL DEFAULT 0,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (model_version, market, horizon)
+);
+
+CREATE INDEX IF NOT EXISTS idx_market_warning_model_registry_active
+    ON market_warning_model_registry(market, horizon)
+    WHERE active = 1;
