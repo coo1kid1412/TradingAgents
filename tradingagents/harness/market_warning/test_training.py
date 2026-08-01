@@ -3,11 +3,16 @@
 from __future__ import annotations
 
 import inspect
+import json
+import subprocess
 import sys
+import tempfile
+import tomllib
 from datetime import datetime, timezone
 from pathlib import Path
 from unittest import TestCase, main
 
+import joblib
 import numpy as np
 import pandas as pd
 from sklearn.impute import SimpleImputer
@@ -30,6 +35,14 @@ import tradingagents.harness.market_warning.training as training_module
 
 
 UTC = timezone.utc
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
+
+
+def _with_label_availability(frame: pd.DataFrame) -> pd.DataFrame:
+    values = frame.copy()
+    values["feature_available_at"] = values["as_of_time"]
+    values.attrs["availability_proof"] = {"*": "feature_available_at"}
+    return values
 
 
 def _dated_frame(start: str, rows: int, *, feature_version: str = "market-warning-v1") -> pd.DataFrame:
@@ -45,23 +58,30 @@ def _dated_frame(start: str, rows: int, *, feature_version: str = "market-warnin
             "market_phase": np.where(np.arange(rows) % 4 == 0, "CONTINUATION", "FIRST_SHOCK"),
             "label_1d": labels,
             "label_3d": labels | ((np.arange(rows) % 17) == 0),
+            "label_end_3d": dates + pd.offsets.BDay(3),
             "old_market_risk_alert": np.arange(rows) % 11 == 0,
+            "feature_available_at": dates,
+            "label_source_available_at": dates,
         }
     )
     frame.attrs["feature_version"] = feature_version
+    frame.attrs["point_in_time_validated"] = True
+    frame.attrs["availability_proof"] = {
+        "*": "feature_available_at",
+        "label_source": "label_source_available_at",
+    }
     return frame
 
 
 class LabelTests(TestCase):
     def test_a_share_thresholds_are_inclusive_at_exact_boundaries(self):
-        frame = pd.DataFrame(
+        frame = _with_label_availability(pd.DataFrame(
             {
                 "as_of_time": pd.bdate_range("2026-01-05", periods=5, tz="Asia/Shanghai"),
                 "close": [100.0, 96.0, 94.0001, 94.0, 100.0],
-                "feature_available_at": pd.bdate_range("2026-01-05", periods=5, tz="Asia/Shanghai"),
                 "known_signal": [1, 2, 3, 4, 5],
             }
-        )
+        ))
 
         result = build_labels(frame, Market.A_SHARE)
 
@@ -74,12 +94,12 @@ class LabelTests(TestCase):
         self.assertTrue(pd.isna(result.loc[4, "label_3d"]))
 
     def test_us_thresholds_do_not_round_near_boundary_values(self):
-        frame = pd.DataFrame(
+        frame = _with_label_availability(pd.DataFrame(
             {
                 "as_of_time": pd.bdate_range("2026-02-02", periods=6, tz="America/New_York"),
                 "close": [100.0, 97.0001, 95.0001, 95.0001, 92.150095, 101.0],
             }
-        )
+        ))
 
         result = build_labels(frame, Market.US)
 
@@ -88,13 +108,13 @@ class LabelTests(TestCase):
         self.assertTrue(bool(result.loc[1, "label_3d"]))
 
     def test_labels_change_only_with_future_prices_not_feature_values(self):
-        frame = pd.DataFrame(
+        frame = _with_label_availability(pd.DataFrame(
             {
                 "as_of_time": pd.bdate_range("2026-03-02", periods=5, tz="UTC"),
                 "close": [100.0, 101.0, 102.0, 103.0, 104.0],
                 "known_signal": [10, 20, 30, 40, 50],
             }
-        )
+        ))
         feature_mutation = frame.copy()
         feature_mutation.loc[1:, "known_signal"] = -999
         price_mutation = frame.copy()
@@ -118,6 +138,7 @@ class LabelTests(TestCase):
                 "feature_available_at": [times[0], times[1], times[2] + pd.Timedelta(minutes=1), times[3]],
             }
         )
+        frame.attrs["availability_proof"] = {"*": "feature_available_at"}
 
         with self.assertRaisesRegex(ValueError, "point-in-time"):
             build_labels(frame, Market.A_SHARE)
@@ -128,13 +149,44 @@ class LabelTests(TestCase):
             {
                 "as_of_time": times,
                 "close": [100.0, 99.0, 98.0, 97.0],
+                "close_available_at": times,
                 "breadth": [60.0, 55.0, 50.0, 45.0],
                 "breadth_available_at": [times[0], times[1] + pd.Timedelta(seconds=1), times[2], times[3]],
             }
         )
+        frame.attrs["availability_proof"] = {
+            "close": "close_available_at",
+            "breadth": "breadth_available_at",
+        }
 
         with self.assertRaisesRegex(ValueError, "breadth_available_at"):
             build_labels(frame, Market.A_SHARE)
+
+    def test_labeling_without_documented_availability_proof_fails_closed(self):
+        frame = pd.DataFrame(
+            {
+                "as_of_time": pd.bdate_range("2026-05-04", periods=4, tz="UTC"),
+                "close": [100.0, 99.0, 98.0, 97.0],
+                "signal": [1.0, 2.0, 3.0, 4.0],
+            }
+        )
+
+        with self.assertRaisesRegex(ValueError, "availability proof"):
+            build_labels(frame, Market.A_SHARE)
+
+    def test_value_strictly_above_threshold_is_not_rounded_into_positive_label(self):
+        frame = _with_label_availability(
+            pd.DataFrame(
+                {
+                    "as_of_time": pd.bdate_range("2026-06-01", periods=5, tz="UTC"),
+                    "close": [100.0, 96.00000000005, 100.0, 100.0, 100.0],
+                }
+            )
+        )
+
+        result = build_labels(frame, Market.A_SHARE)
+
+        self.assertFalse(bool(result.loc[0, "label_1d"]))
 
 
 class PartitionTests(TestCase):
@@ -142,9 +194,15 @@ class PartitionTests(TestCase):
         dates = pd.DatetimeIndex(
             list(pd.bdate_range("2012-12-24", "2013-01-08", tz="UTC"))
             + list(pd.bdate_range("2019-12-20", "2020-01-08", tz="UTC"))
-            + list(pd.bdate_range("2026-07-29", "2026-08-04", tz="UTC"))
+            + list(pd.bdate_range("2026-07-24", "2026-08-05", tz="UTC"))
         )
-        frame = pd.DataFrame({"as_of_time": dates, "value": np.arange(len(dates))})
+        frame = pd.DataFrame(
+            {
+                "as_of_time": dates,
+                "label_end_3d": dates + pd.offsets.BDay(3),
+                "value": np.arange(len(dates)),
+            }
+        )
 
         dev, validation, test = time_partitions(frame)
 
@@ -152,7 +210,7 @@ class PartitionTests(TestCase):
         self.assertEqual(validation["as_of_time"].min(), pd.Timestamp("2013-01-01", tz="UTC"))
         self.assertEqual(validation["as_of_time"].max(), pd.Timestamp("2019-12-26", tz="UTC"))
         self.assertEqual(test["as_of_time"].min(), pd.Timestamp("2020-01-01", tz="UTC"))
-        self.assertEqual(test["as_of_time"].max(), pd.Timestamp("2026-07-31", tz="UTC"))
+        self.assertEqual(test["as_of_time"].max(), pd.Timestamp("2026-07-28", tz="UTC"))
         self.assertTrue((dev["partition"] == "dev").all())
         self.assertTrue((validation["partition"] == "validation").all())
         self.assertTrue((test["partition"] == "test").all())
@@ -170,17 +228,50 @@ class PartitionTests(TestCase):
         self.assertTrue(dev.empty)
         self.assertEqual(len(validation), 1)
 
+    def test_frozen_test_excludes_null_or_august_three_day_label_windows(self):
+        frame = pd.DataFrame(
+            {
+                "as_of_time": pd.to_datetime(
+                    ["2026-07-27", "2026-07-28", "2026-07-29", "2026-07-30", "2026-07-31"], utc=True
+                ),
+                "label_end_3d": pd.to_datetime(
+                    ["2026-07-30", "2026-07-31", "2026-08-03", None, "2026-08-05"], utc=True
+                ),
+            }
+        )
+
+        _, _, test = time_partitions(frame)
+
+        self.assertEqual(
+            test["as_of_time"].tolist(),
+            [pd.Timestamp("2026-07-27", tz="UTC"), pd.Timestamp("2026-07-28", tz="UTC")],
+        )
+
+    def test_partitions_require_explicit_three_day_label_end_proof(self):
+        frame = pd.DataFrame(
+            {"as_of_time": pd.to_datetime(["2012-12-20", "2013-01-02", "2020-01-02"], utc=True)}
+        )
+
+        with self.assertRaisesRegex(ValueError, "label_end_3d"):
+            time_partitions(frame)
+
     def test_partition_outputs_are_chronological_even_if_input_rows_are_not(self):
         dates = pd.to_datetime(
             ["2013-01-08", "2013-01-02", "2013-01-04", "2013-01-01", "2013-01-09", "2013-01-03", "2013-01-07"],
             utc=True,
         )
-        frame = pd.DataFrame({"as_of_time": dates, "value": [6, 2, 4, 1, 7, 3, 5]})
+        frame = pd.DataFrame(
+            {
+                "as_of_time": dates,
+                "label_end_3d": dates + pd.offsets.BDay(3),
+                "value": [6, 2, 4, 1, 7, 3, 5],
+            }
+        )
 
         _, validation, _ = time_partitions(frame)
 
         self.assertTrue(validation["as_of_time"].is_monotonic_increasing)
-        self.assertEqual(validation["value"].tolist(), [1, 2, 3, 4])
+        self.assertEqual(validation["value"].tolist(), [1, 2, 3, 4, 5, 6, 7])
 
     def test_training_module_has_no_random_split_or_synthetic_oversampling(self):
         source = inspect.getsource(training_module).lower().replace(" ", "")
@@ -224,6 +315,35 @@ class ModelTrainingTests(TestCase):
         with self.assertRaisesRegex(ValueError, "embargo"):
             fit_model(train, calibration, Market.A_SHARE, "1d")
 
+    def test_fit_model_requires_explicit_point_in_time_validation_marker(self):
+        train = _dated_frame("2008-01-01", 100)
+        calibration = _dated_frame("2014-01-01", 45)
+        train.attrs.pop("point_in_time_validated")
+
+        with self.assertRaisesRegex(ValueError, "point-in-time validated"):
+            fit_model(train, calibration, Market.A_SHARE, "1d")
+
+    def test_fit_model_requires_proof_for_every_feature_and_label_source(self):
+        train = _dated_frame("2008-01-01", 100)
+        calibration = _dated_frame("2014-01-01", 45)
+        train.attrs["availability_proof"] = {"signal": "feature_available_at"}
+
+        with self.assertRaisesRegex(ValueError, "availability proof"):
+            fit_model(train, calibration, Market.A_SHARE, "1d")
+
+    def test_fit_model_rejects_future_feature_or_label_source_availability(self):
+        train = _dated_frame("2008-01-01", 100)
+        calibration = _dated_frame("2014-01-01", 45)
+        train.loc[3, "feature_available_at"] = train.loc[3, "as_of_time"] + pd.Timedelta(seconds=1)
+
+        with self.assertRaisesRegex(ValueError, "feature_available_at"):
+            fit_model(train, calibration, Market.A_SHARE, "1d")
+
+        train = _dated_frame("2008-01-01", 100)
+        train.loc[4, "label_source_available_at"] = train.loc[4, "as_of_time"] + pd.Timedelta(seconds=1)
+        with self.assertRaisesRegex(ValueError, "label_source_available_at"):
+            fit_model(train, calibration, Market.A_SHARE, "1d")
+
     def test_four_market_horizon_bundles_are_independent(self):
         train = _dated_frame("2005-01-03", 100)
         calibration = _dated_frame("2014-01-02", 45)
@@ -254,6 +374,10 @@ class ModelTrainingTests(TestCase):
         self.assertAlmostEqual(report.brier_score, brier_score_loss(expected_labels, expected_probabilities))
         self.assertAlmostEqual(report.average_precision, average_precision_score(expected_labels, expected_probabilities))
         self.assertAlmostEqual(report.prevalence, float(expected_labels.mean()))
+        self.assertAlmostEqual(
+            report.constant_base_rate_brier,
+            brier_score_loss(expected_labels, np.full(len(expected_labels), bundle.base_rate)),
+        )
         self.assertEqual(len(report.calibration_bins), 10)
         self.assertIn("FIRST_SHOCK", report.phase_breakdown)
         self.assertIn("CONTINUATION", report.phase_breakdown)
@@ -263,6 +387,101 @@ class ModelTrainingTests(TestCase):
         self.assertIsNotNone(report.model_recall_at_old_budget)
         self.assertGreaterEqual(report.constant_base_rate_brier, 0)
         self.assertGreaterEqual(report.expected_calibration_error, 0)
+
+
+class TrainingCommandTests(TestCase):
+    def _run(self, *arguments):
+        return subprocess.run(
+            [sys.executable, "-m", "tradingagents.harness.market_warning.training", *arguments],
+            cwd=PROJECT_ROOT,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+    def test_command_help_exposes_all_task6_subcommands(self):
+        result = self._run("--help")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for command in ("backfill", "train", "evaluate", "promote"):
+            self.assertIn(command, result.stdout)
+
+    def test_task12_flags_parse_and_missing_inputs_fail_actionably(self):
+        result = self._run(
+            "train",
+            "--start", "2000-01-01",
+            "--test-end", "2026-07-31",
+            "--version", "market-warning-v1",
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("--dataset", result.stderr)
+        self.assertIn("Task 12", result.stderr)
+
+    def test_backfill_and_promote_do_not_fake_success_before_task12_inputs_exist(self):
+        for command in ("backfill", "promote"):
+            result = self._run(
+                command,
+                "--start", "2000-01-01",
+                "--test-end", "2026-07-31",
+                "--version", "market-warning-v1",
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("Task 12", result.stderr)
+
+    def test_train_and_evaluate_execute_with_validated_local_dataset(self):
+        with tempfile.TemporaryDirectory(prefix="warning_cli_") as directory:
+            root = Path(directory)
+            dataset = pd.concat(
+                [
+                    _dated_frame("2008-01-01", 120),
+                    _dated_frame("2014-01-01", 60),
+                    _dated_frame("2020-01-02", 80),
+                ],
+                ignore_index=True,
+            )
+            dataset.attrs.update(_dated_frame("2008-01-01", 4).attrs)
+            dataset_path = root / "dataset.joblib"
+            joblib.dump(dataset, dataset_path)
+
+            trained = self._run(
+                "train",
+                "--dataset", str(dataset_path),
+                "--market", "us",
+                "--horizon", "1d",
+                "--artifact-root", str(root / "models"),
+                "--db", str(root / "warning.db"),
+                "--start", "2000-01-01",
+                "--test-end", "2026-07-31",
+                "--version", "cli-fixture-v1",
+            )
+            self.assertEqual(trained.returncode, 0, trained.stderr)
+            payload = json.loads(trained.stdout)
+            artifact = Path(payload["artifact_path"])
+            self.assertTrue(artifact.is_file())
+
+            evaluated = self._run(
+                "evaluate",
+                "--dataset", str(dataset_path),
+                "--artifact", str(artifact),
+                "--start", "2000-01-01",
+                "--test-end", "2026-07-31",
+                "--version", "cli-fixture-v1",
+            )
+            self.assertEqual(evaluated.returncode, 0, evaluated.stderr)
+            self.assertEqual(json.loads(evaluated.stdout)["horizon"], "1d")
+
+    def test_lock_contains_declared_task6_dependencies(self):
+        with (PROJECT_ROOT / "uv.lock").open("rb") as stream:
+            lock = tomllib.load(stream)
+        project = next(package for package in lock["package"] if package["name"] == "tradingagents")
+        dependency_names = {dependency["name"] for dependency in project["dependencies"]}
+        requirements = {requirement["name"]: requirement.get("specifier") for requirement in project["metadata"]["requires-dist"]}
+
+        self.assertIn("scikit-learn", dependency_names)
+        self.assertIn("exchange-calendars", dependency_names)
+        self.assertEqual(requirements["scikit-learn"], ">=1.7,<2")
+        self.assertEqual(requirements["exchange-calendars"], ">=4.11,<5")
 
 
 if __name__ == "__main__":

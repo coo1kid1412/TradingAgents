@@ -52,7 +52,7 @@ def save_model_bundle(
             "horizon": bundle.horizon,
             "feature_version": bundle.feature_version,
             "calibration_version": bundle.calibration_version,
-            "training_cutoff": bundle.calibration_end.date().isoformat(),
+            "training_cutoff": _utc_date(bundle.calibration_end).isoformat(),
             "artifact_path": str(target),
             "artifact_sha256": checksum,
             "metrics": {
@@ -127,9 +127,11 @@ class SklearnProbabilityModel:
         now = self._now()
         if now.tzinfo is None or now.utcoffset() is None:
             raise ValueError("model clock must be timezone-aware")
-        if cutoff > snapshot.as_of_time.date():
+        snapshot_date = _utc_date(snapshot.as_of_time)
+        now_date = _utc_date(now)
+        if cutoff > snapshot_date:
             raise ValueError("model training cutoff is after prediction time")
-        if now.date() - cutoff > self._max_model_age:
+        if now_date - cutoff > self._max_model_age:
             raise ValueError("model registry entry is stale")
         artifact = Path(str(record["artifact_path"])).resolve()
         if not artifact.is_relative_to(self._artifact_root):
@@ -140,6 +142,22 @@ class SklearnProbabilityModel:
         bundle = joblib.load(artifact)
         if not isinstance(bundle, ModelBundle):
             raise TypeError("artifact is not a ModelBundle")
+        bundle_dates = (
+            bundle.training_start,
+            bundle.training_end,
+            bundle.calibration_start,
+            bundle.calibration_end,
+        )
+        if any(value.tzinfo is None or value.utcoffset() is None for value in bundle_dates):
+            raise ValueError("bundle timestamps must be timezone-aware")
+        if not (
+            bundle.training_start <= bundle.training_end
+            < bundle.calibration_start <= bundle.calibration_end
+            <= snapshot.as_of_time
+        ):
+            raise ValueError("bundle contains future or non-chronological metadata")
+        if cutoff != _utc_date(bundle.calibration_end):
+            raise ValueError("registry training cutoff does not match bundle calibration end")
         expected = (
             bundle.market == snapshot.market,
             bundle.horizon == horizon,
@@ -211,7 +229,13 @@ def _sha256(path: Path) -> str:
 
 def _date_value(value: Any) -> date:
     if isinstance(value, datetime):
-        return value.date()
+        return _utc_date(value)
     if isinstance(value, date):
         return value
     return date.fromisoformat(str(value)[:10])
+
+
+def _utc_date(value: datetime) -> date:
+    if value.tzinfo is None or value.utcoffset() is None:
+        raise ValueError("timestamp must be timezone-aware")
+    return value.astimezone(timezone.utc).date()

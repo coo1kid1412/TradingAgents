@@ -6,6 +6,7 @@ import hashlib
 import shutil
 import sys
 import tempfile
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import TestCase, main
@@ -54,9 +55,16 @@ def _training_frame(start: str, rows: int) -> pd.DataFrame:
             "market_phase": np.where(signal < 0, "FIRST_SHOCK", "CONTINUATION"),
             "label_1d": labels,
             "label_3d": labels | (np.arange(rows) % 14 == 0),
+            "feature_available_at": dates,
+            "label_source_available_at": dates,
         }
     )
     frame.attrs["feature_version"] = FEATURE_VERSION
+    frame.attrs["point_in_time_validated"] = True
+    frame.attrs["availability_proof"] = {
+        "*": "feature_available_at",
+        "label_source": "label_source_available_at",
+    }
     return frame
 
 
@@ -189,6 +197,39 @@ class ProbabilityArtifactTests(TestCase):
         record = dict(records["3d"])
         record["feature_version"] = "wrong-registry-version"
         self.repository.register_model(record)
+
+        result = self._model().predict(_snapshot())
+
+        self.assertEqual(result.reliability_grade, "UNAVAILABLE")
+
+    def test_registry_training_cutoff_must_equal_bundle_calibration_end(self):
+        records = self._register_both()
+        record = dict(records["3d"])
+        record["training_cutoff"] = "2015-01-01"
+        self.repository.register_model(record)
+
+        result = self._model().predict(_snapshot())
+
+        self.assertEqual(result.reliability_grade, "UNAVAILABLE")
+
+    def test_registry_datetime_cutoff_is_normalized_to_utc_date(self):
+        records = self._register_both()
+        local_zone = timezone(timedelta(hours=-5))
+        record = dict(records["3d"])
+        record["training_cutoff"] = self.bundles["3d"].calibration_end.astimezone(local_zone)
+        self.repository.register_model(record)
+
+        result = self._model().predict(_snapshot())
+
+        self.assertEqual(result.reliability_grade, "A")
+
+    def test_future_bundle_calibration_metadata_returns_unavailable(self):
+        future = datetime(2027, 1, 4, tzinfo=timezone.utc)
+        self.bundles = {
+            horizon: replace(bundle, calibration_end=future)
+            for horizon, bundle in self.bundles.items()
+        }
+        self._register_both()
 
         result = self._model().predict(_snapshot())
 

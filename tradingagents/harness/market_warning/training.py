@@ -2,14 +2,19 @@
 
 from __future__ import annotations
 
+import argparse
+import json
+import sys
 from dataclasses import dataclass
 from datetime import datetime
+from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Mapping, Sequence
 
 import numpy as np
 import pandas as pd
 import exchange_calendars as xcals
+import joblib
 from sklearn.impute import SimpleImputer
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import average_precision_score, brier_score_loss
@@ -143,24 +148,24 @@ def build_labels(index_frame: pd.DataFrame, market: Market) -> pd.DataFrame:
     closes = pd.to_numeric(frame["close"], errors="coerce")
     if closes.isna().any() or (closes <= 0).any():
         raise ValueError("close must contain finite positive values")
-    availability_columns = [column for column in frame if column.endswith("_available_at")]
-    for column in availability_columns:
-        available = pd.to_datetime(frame[column], utc=True, errors="coerce")
-        comparable_times = pd.to_datetime(times, utc=True)
-        invalid = available.notna() & (available > comparable_times)
-        if invalid.any():
-            raise ValueError(f"point-in-time violation: {column} is after as_of_time")
+    source_columns = tuple(
+        column
+        for column in frame
+        if column != "as_of_time"
+        and column not in _NON_FEATURE_COLUMNS - {"close"}
+        and not column.endswith("_available_at")
+    )
+    _validate_availability_proof(frame, source_columns)
 
     future_1d = closes.shift(-1) / closes - 1.0
     future_returns = pd.concat(
         [closes.shift(-offset) / closes - 1.0 for offset in range(1, 4)], axis=1
     )
     future_worst_3d = future_returns.min(axis=1, skipna=False)
-    epsilon = 1e-12
     frame["future_return_1d"] = future_1d
     frame["future_worst_return_3d"] = future_worst_3d
-    frame["label_1d"] = future_1d.le(_LABEL_THRESHOLDS[market]["1d"] + epsilon).where(future_1d.notna()).astype("boolean")
-    frame["label_3d"] = future_worst_3d.le(_LABEL_THRESHOLDS[market]["3d"] + epsilon).where(future_worst_3d.notna()).astype("boolean")
+    frame["label_1d"] = future_1d.le(_LABEL_THRESHOLDS[market]["1d"]).where(future_1d.notna()).astype("boolean")
+    frame["label_3d"] = future_worst_3d.le(_LABEL_THRESHOLDS[market]["3d"]).where(future_worst_3d.notna()).astype("boolean")
     frame["label_end_1d"] = times.shift(-1)
     frame["label_end_3d"] = times.shift(-3)
     frame.attrs.update(index_frame.attrs)
@@ -182,17 +187,14 @@ def time_partitions(frame: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, pd
         ("test", pd.Timestamp("2020-01-01", tz="UTC"), TEST_END + pd.Timedelta(days=1) - pd.Timedelta(microseconds=1)),
     )
     partitions: list[pd.DataFrame] = []
-    has_label_end = "label_end_3d" in values
-    label_ends = pd.to_datetime(values["label_end_3d"], utc=True, errors="coerce") if has_label_end else None
+    if "label_end_3d" not in values:
+        raise ValueError("frame must include label_end_3d for boundary-safe partitions")
+    label_ends = pd.to_datetime(values["label_end_3d"], utc=True, errors="coerce")
     for name, start, end in definitions:
         mask = times.between(start, end, inclusive="both")
         part = values.loc[mask].copy()
-        if name != "test":
-            if has_label_end:
-                ends = label_ends.loc[part.index]
-                part = part.loc[ends.notna() & ends.le(end)]
-            elif len(part):
-                part = part.iloc[:-EMBARGO_TRADING_DAYS] if len(part) > EMBARGO_TRADING_DAYS else part.iloc[0:0]
+        ends = label_ends.loc[part.index]
+        part = part.loc[ends.notna() & ends.le(end)]
         part["partition"] = name
         part.attrs.update(frame.attrs)
         partitions.append(part.reset_index(drop=True))
@@ -204,6 +206,8 @@ def fit_model(
     calibration: pd.DataFrame,
     market: Market,
     horizon: str,
+    *,
+    model_version: str = MODEL_VERSION,
 ) -> ModelBundle:
     """Fit one deterministic logistic pipeline and a later sigmoid calibrator."""
 
@@ -233,6 +237,8 @@ def fit_model(
     missing_calibration = set(feature_names).difference(calibration.columns)
     if missing_calibration:
         raise ValueError(f"calibration is missing features: {sorted(missing_calibration)}")
+    _validate_training_frame(train, feature_names)
+    _validate_training_frame(calibration, feature_names)
 
     x_train, y_train = _labeled_rows(train, feature_names, target)
     x_calibration, y_calibration = _labeled_rows(calibration, feature_names, target)
@@ -262,7 +268,7 @@ def fit_model(
         horizon=horizon,
         feature_names=feature_names,
         feature_version=feature_version,
-        model_version=MODEL_VERSION,
+        model_version=model_version,
         calibration_version=CALIBRATION_VERSION,
         calibration_method="platt",
         base_rate=float(y_train.mean()),
@@ -308,7 +314,7 @@ def evaluate_model(bundle: ModelBundle, test: pd.DataFrame) -> EvaluationReport:
         prevalence=prevalence,
         brier_score=float(brier_score_loss(y_true, probabilities)),
         average_precision=float(average_precision_score(y_true, probabilities)),
-        constant_base_rate_brier=float(brier_score_loss(y_true, np.full(len(y_true), prevalence))),
+        constant_base_rate_brier=float(brier_score_loss(y_true, np.full(len(y_true), bundle.base_rate))),
         expected_calibration_error=float(ece),
         calibration_bins=bins,
         phase_breakdown=phases,
@@ -336,6 +342,34 @@ def _target_column(horizon: str) -> str:
     if horizon not in {"1d", "3d"}:
         raise ValueError("horizon must be '1d' or '3d'")
     return f"label_{horizon}"
+
+
+def _validate_training_frame(frame: pd.DataFrame, feature_names: Sequence[str]) -> None:
+    if frame.attrs.get("point_in_time_validated") is not True:
+        raise ValueError("training frame must carry an explicit point-in-time validated marker")
+    proof = frame.attrs.get("availability_proof")
+    if not isinstance(proof, Mapping):
+        raise ValueError("training frame must document availability proof")
+    label_source = "close" if "close" in proof else "label_source"
+    _validate_availability_proof(frame, tuple(feature_names) + (label_source,))
+
+
+def _validate_availability_proof(frame: pd.DataFrame, source_names: Sequence[str]) -> None:
+    proof = frame.attrs.get("availability_proof")
+    if not isinstance(proof, Mapping) or not proof:
+        raise ValueError("frame must document availability proof for every source")
+    as_of = pd.to_datetime(_as_of_times(frame), utc=True)
+    for source_name in source_names:
+        availability_column = proof.get(source_name, proof.get("*"))
+        if not isinstance(availability_column, str) or not availability_column:
+            raise ValueError(f"availability proof is missing source: {source_name}")
+        if availability_column not in frame:
+            raise ValueError(f"availability proof column is missing: {availability_column}")
+        available = pd.to_datetime(frame[availability_column], utc=True, errors="coerce")
+        if available.isna().any():
+            raise ValueError(f"availability proof contains missing timestamps: {availability_column}")
+        if (available > as_of).any():
+            raise ValueError(f"point-in-time violation: {availability_column} is after as_of_time")
 
 
 def _embargo_sessions(market: Market, training_end: pd.Timestamp, calibration_start: pd.Timestamp) -> int:
@@ -473,3 +507,161 @@ def _recall_at_budget(labels: np.ndarray, probabilities: np.ndarray, budget: int
         order = np.argsort(-probabilities, kind="stable")[: min(budget, len(labels))]
         selected[order] = True
     return float((selected & labels.astype(bool)).sum()) / positives
+
+
+def _command_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Leakage-safe market-warning model operations")
+    commands = parser.add_subparsers(dest="command", required=True)
+
+    def add_frozen_window(command: argparse.ArgumentParser) -> None:
+        command.add_argument("--start", default="2000-01-01")
+        command.add_argument("--test-end", default="2026-07-31")
+        command.add_argument("--version", default=MODEL_VERSION)
+
+    backfill = commands.add_parser("backfill", help="Prepare point-in-time history (Task 12 gated)")
+    add_frozen_window(backfill)
+
+    train = commands.add_parser("train", help="Fit and register one local validated model bundle")
+    add_frozen_window(train)
+    train.add_argument("--dataset")
+    train.add_argument("--market", choices=[market.value for market in Market])
+    train.add_argument("--horizon", choices=("1d", "3d"))
+    train.add_argument("--artifact-root")
+    train.add_argument("--db")
+
+    evaluate = commands.add_parser("evaluate", help="Evaluate one local bundle on the frozen test partition")
+    add_frozen_window(evaluate)
+    evaluate.add_argument("--dataset")
+    evaluate.add_argument("--artifact")
+
+    promote = commands.add_parser("promote", help="Promote passing artifacts (Task 12 gated)")
+    add_frozen_window(promote)
+    promote.add_argument("--db")
+    return parser
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    parser = _command_parser()
+    args = parser.parse_args(argv)
+    try:
+        _validate_cli_window(args.start, args.test_end)
+        if args.command == "backfill":
+            raise ValueError(
+                "Task 12 input is not ready: backfill requires production data-source orchestration and cache auditing"
+            )
+        if args.command == "promote":
+            raise ValueError(
+                "Task 12 input is not ready: promote requires all four frozen evaluation reports to pass promotion gates"
+            )
+        if args.command == "train":
+            payload = _run_train_command(args)
+        else:
+            payload = _run_evaluate_command(args)
+    except (FileNotFoundError, OSError, TypeError, ValueError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    print(json.dumps(payload, sort_keys=True, separators=(",", ":")))
+    return 0
+
+
+def _validate_cli_window(start: str, test_end: str) -> None:
+    start_date = pd.Timestamp(start)
+    end_date = pd.Timestamp(test_end)
+    if start_date > pd.Timestamp("2000-01-01"):
+        raise ValueError("--start must include the frozen development window beginning 2000-01-01")
+    if end_date != TEST_END.tz_localize(None):
+        raise ValueError("--test-end must remain frozen at 2026-07-31")
+
+
+def _load_cli_dataset(path_value: str | None, start: str, test_end: str) -> pd.DataFrame:
+    if not path_value:
+        raise ValueError("Task 12 input is not ready: provide --dataset with a validated point-in-time joblib DataFrame")
+    path = Path(path_value)
+    if not path.is_file():
+        raise FileNotFoundError(f"dataset does not exist: {path}")
+    frame = joblib.load(path)
+    if not isinstance(frame, pd.DataFrame):
+        raise TypeError("--dataset must contain a pandas DataFrame")
+    times = pd.to_datetime(_as_of_times(frame), utc=True)
+    start_time = pd.Timestamp(start, tz="UTC")
+    end_time = pd.Timestamp(test_end, tz="UTC") + pd.Timedelta(days=1) - pd.Timedelta(microseconds=1)
+    selected = frame.loc[times.between(start_time, end_time, inclusive="both")].copy()
+    selected.attrs.update(frame.attrs)
+    if selected.empty:
+        raise ValueError("--dataset contains no rows in the requested frozen window")
+    return selected
+
+
+def _run_train_command(args: argparse.Namespace) -> dict[str, Any]:
+    dataset = _load_cli_dataset(args.dataset, args.start, args.test_end)
+    missing = [
+        name
+        for name in ("market", "horizon", "artifact_root", "db")
+        if not getattr(args, name)
+    ]
+    if missing:
+        flags = ", ".join(f"--{name.replace('_', '-')}" for name in missing)
+        raise ValueError(f"local training also requires {flags}")
+    dev, validation, test = time_partitions(dataset)
+    bundle = fit_model(
+        dev,
+        validation,
+        Market(args.market),
+        args.horizon,
+        model_version=args.version,
+    )
+    report = evaluate_model(bundle, test)
+    from .adapters.sqlite_repository import SQLiteWarningRepository
+    from .probability import save_model_bundle
+
+    record = save_model_bundle(
+        bundle,
+        Path(args.artifact_root),
+        SQLiteWarningRepository(Path(args.db)),
+        active=False,
+    )
+    return {
+        "artifact_path": record["artifact_path"],
+        "artifact_sha256": record["artifact_sha256"],
+        "market": bundle.market.value,
+        "horizon": bundle.horizon,
+        "model_version": bundle.model_version,
+        "evaluation": _evaluation_payload(report),
+        "active": False,
+    }
+
+
+def _run_evaluate_command(args: argparse.Namespace) -> dict[str, Any]:
+    if not args.artifact:
+        raise ValueError("evaluate requires --artifact from a completed local train command")
+    dataset = _load_cli_dataset(args.dataset, args.start, args.test_end)
+    artifact = Path(args.artifact)
+    if not artifact.is_file():
+        raise FileNotFoundError(f"artifact does not exist: {artifact}")
+    bundle = joblib.load(artifact)
+    if not isinstance(bundle, ModelBundle):
+        raise TypeError("--artifact must contain a ModelBundle")
+    if bundle.model_version != args.version:
+        raise ValueError("--version does not match the model artifact")
+    _, _, test = time_partitions(dataset)
+    return _evaluation_payload(evaluate_model(bundle, test))
+
+
+def _evaluation_payload(report: EvaluationReport) -> dict[str, Any]:
+    return {
+        "market": report.market.value,
+        "horizon": report.horizon,
+        "observations": report.observations,
+        "prevalence": report.prevalence,
+        "brier_score": report.brier_score,
+        "average_precision": report.average_precision,
+        "constant_base_rate_brier": report.constant_base_rate_brier,
+        "expected_calibration_error": report.expected_calibration_error,
+        "monthly_alert_entries": report.monthly_alert_entries,
+        "old_market_risk_recall": report.old_market_risk_recall,
+        "model_recall_at_old_budget": report.model_recall_at_old_budget,
+    }
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
