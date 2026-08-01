@@ -24,7 +24,10 @@ from tradingagents.harness.market_warning.domain import (
     Market,
     QuantRiskAssessment,
 )
-from tradingagents.harness.market_warning.adapters.sqlite_repository import SQLiteWarningRepository
+from tradingagents.harness.market_warning.adapters.sqlite_repository import (
+    SQLiteCircuitBreaker,
+    SQLiteWarningRepository,
+)
 from tradingagents.harness.market_warning.policy import build_final_decision
 
 
@@ -376,6 +379,37 @@ class SQLiteWarningRepositoryTests(TestCase):
             self.assertEqual(alert["push_status"], "sent")
             self.assertIsNotNone(alert["sent_at"])
             self.assertIsNone(alert["error_summary"])
+
+    def test_circuit_breaker_state_survives_new_process_instances(self):
+        with temporary_database() as db_path:
+            current = [AS_OF]
+            clock = lambda: current[0]
+            first = SQLiteCircuitBreaker(
+                db_path,
+                "minimax-m3",
+                failure_threshold=3,
+                cooldown=timedelta(minutes=30),
+                clock=clock,
+            )
+            for _ in range(3):
+                first.record_failure()
+
+            second = SQLiteCircuitBreaker(
+                db_path,
+                "minimax-m3",
+                failure_threshold=3,
+                cooldown=timedelta(minutes=30),
+                clock=clock,
+            )
+            self.assertFalse(second.allow_call())
+            self.assertEqual(second.consecutive_failures, 3)
+
+            current[0] += timedelta(minutes=31)
+            self.assertTrue(second.allow_call())
+            second.record_success()
+            third = SQLiteCircuitBreaker(db_path, "minimax-m3", clock=clock)
+            self.assertEqual(third.consecutive_failures, 0)
+            self.assertTrue(third.allow_call())
 
     def test_save_feature_snapshot_rejects_empty_source_times(self):
         with temporary_database() as db_path:

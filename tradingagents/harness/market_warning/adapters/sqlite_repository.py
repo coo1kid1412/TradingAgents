@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from collections.abc import Mapping
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 from pathlib import Path
 from typing import Any
@@ -74,11 +74,117 @@ def _reasoning_json(assessment: LLMContextAssessment) -> str:
     )
 
 
+class SQLiteCircuitBreaker:
+    """Small persistent breaker shared by independent cron processes."""
+
+    def __init__(
+        self,
+        db_path: Path | str | None,
+        breaker_key: str,
+        failure_threshold: int = 3,
+        cooldown: timedelta = timedelta(minutes=30),
+        *,
+        clock=None,
+    ) -> None:
+        if not isinstance(breaker_key, str) or not breaker_key.strip():
+            raise ValueError("breaker_key must not be empty")
+        if isinstance(failure_threshold, bool) or not isinstance(failure_threshold, int) or failure_threshold < 1:
+            raise ValueError("failure_threshold must be a positive integer")
+        if not isinstance(cooldown, timedelta) or cooldown <= timedelta(0):
+            raise ValueError("cooldown must be positive")
+        self._db_path = db_path
+        self._breaker_key = breaker_key.strip()
+        self._failure_threshold = failure_threshold
+        self._cooldown = cooldown
+        self._clock = clock or (lambda: datetime.now(timezone.utc))
+
+    def _now(self) -> datetime:
+        value = self._clock()
+        if not isinstance(value, datetime) or value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("circuit-breaker clock must be timezone-aware")
+        return value.astimezone(timezone.utc)
+
+    def _row(self):
+        with _db.connect(self._db_path) as connection:
+            return connection.execute(
+                "SELECT consecutive_failures, open_until FROM market_warning_circuit_breakers "
+                "WHERE breaker_key = ?",
+                (self._breaker_key,),
+            ).fetchone()
+
+    @property
+    def consecutive_failures(self) -> int:
+        row = self._row()
+        return int(row["consecutive_failures"]) if row is not None else 0
+
+    def allow_call(self) -> bool:
+        row = self._row()
+        if row is None or row["open_until"] is None:
+            return True
+        return self._now() >= datetime.fromisoformat(row["open_until"])
+
+    def record_success(self) -> None:
+        now = self._now().isoformat()
+        with _db.connect(self._db_path) as connection:
+            connection.execute(
+                "INSERT INTO market_warning_circuit_breakers "
+                "(breaker_key, consecutive_failures, open_until, updated_at) VALUES (?, 0, NULL, ?) "
+                "ON CONFLICT(breaker_key) DO UPDATE SET consecutive_failures = 0, "
+                "open_until = NULL, updated_at = excluded.updated_at",
+                (self._breaker_key, now),
+            )
+
+    def record_failure(self) -> None:
+        now = self._now()
+        with _db.connect(self._db_path) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT consecutive_failures, open_until FROM market_warning_circuit_breakers "
+                "WHERE breaker_key = ?",
+                (self._breaker_key,),
+            ).fetchone()
+            failures = int(row["consecutive_failures"]) if row is not None else 0
+            open_until = (
+                datetime.fromisoformat(row["open_until"])
+                if row is not None and row["open_until"] is not None
+                else None
+            )
+            if open_until is not None and now >= open_until:
+                failures = self._failure_threshold - 1
+            failures += 1
+            next_open_until = (
+                (now + self._cooldown).isoformat()
+                if failures >= self._failure_threshold
+                else None
+            )
+            connection.execute(
+                "INSERT INTO market_warning_circuit_breakers "
+                "(breaker_key, consecutive_failures, open_until, updated_at) VALUES (?, ?, ?, ?) "
+                "ON CONFLICT(breaker_key) DO UPDATE SET "
+                "consecutive_failures = excluded.consecutive_failures, "
+                "open_until = excluded.open_until, updated_at = excluded.updated_at",
+                (self._breaker_key, failures, next_open_until, now.isoformat()),
+            )
+
+
 class SQLiteWarningRepository:
     """Persist warning inputs and conclusions using the harness SQLite lifecycle."""
 
     def __init__(self, db_path: Path | str | None = None) -> None:
         self._db_path = db_path
+
+    def circuit_breaker(
+        self,
+        breaker_key: str,
+        failure_threshold: int = 3,
+        cooldown: timedelta = timedelta(minutes=30),
+    ) -> SQLiteCircuitBreaker:
+        return SQLiteCircuitBreaker(
+            self._db_path,
+            breaker_key,
+            failure_threshold=failure_threshold,
+            cooldown=cooldown,
+        )
 
     def save_feature_snapshot(self, snapshot: FeatureSnapshot) -> int:
         if not snapshot.source_times:
@@ -230,7 +336,14 @@ class SQLiteWarningRepository:
             ).fetchone()
         return self._decision_from_row(row) if row is not None else None
 
-    def claim_alert(self, idempotency_key: str, decision_id: int, payload_hash: str) -> bool:
+    def claim_alert(
+        self,
+        idempotency_key: str,
+        decision_id: int,
+        payload_hash: str,
+        *,
+        retry_failed: bool = False,
+    ) -> bool:
         try:
             with _db.connect(self._db_path) as connection:
                 connection.execute(
@@ -241,6 +354,15 @@ class SQLiteWarningRepository:
                 )
         except sqlite3.IntegrityError as exc:
             if "UNIQUE constraint failed: market_warning_alerts.idempotency_key" in str(exc):
+                if retry_failed:
+                    with _db.connect(self._db_path) as connection:
+                        cursor = connection.execute(
+                            "UPDATE market_warning_alerts SET decision_id = ?, payload_hash = ?, "
+                            "push_status = 'claimed', sent_at = NULL, error_summary = NULL "
+                            "WHERE idempotency_key = ? AND push_status = 'failed'",
+                            (decision_id, payload_hash, idempotency_key),
+                        )
+                    return cursor.rowcount == 1
                 return False
             raise
         return True

@@ -130,12 +130,16 @@ class MarketWarningService:
 
         try:
             raw = self.data_port.load_snapshot(market_value, as_of_time, session_slot)
+            if not isinstance(raw, RawMarketSnapshot):
+                raise TypeError("data port must return RawMarketSnapshot")
         except Exception:
             raw = _synthetic_raw(market_value, as_of_time, session_slot)
             error_class = "data_unavailable"
 
         try:
             quality = self.quality_assessor(raw)
+            if not isinstance(quality, DataQualityAssessment):
+                raise TypeError("quality assessor must return DataQualityAssessment")
         except Exception:
             quality = None
             if error_class is None:
@@ -150,6 +154,8 @@ class MarketWarningService:
             try:
                 history = tuple(self.history_loader(market_value, as_of_time))
                 snapshot = strategy.build(raw, history)
+                if not isinstance(snapshot, FeatureSnapshot):
+                    raise TypeError("feature strategy must return FeatureSnapshot")
             except Exception:
                 snapshot = _synthetic_feature(raw, "feature_build_error")
                 if error_class is None:
@@ -182,6 +188,8 @@ class MarketWarningService:
 
         try:
             quant = self.probability_model.predict(snapshot)
+            if not isinstance(quant, QuantRiskAssessment):
+                raise TypeError("probability model must return QuantRiskAssessment")
         except Exception:
             quant = _unavailable_quant(snapshot, "model_error")
             if error_class is None:
@@ -202,22 +210,32 @@ class MarketWarningService:
                 if error_class is None:
                     error_class = "repository_error"
 
+        previous_state_available = True
         try:
             previous = self.repository.load_previous_decision(market_value, as_of_time)
+            if previous is not None and not isinstance(previous, FinalWarningDecision):
+                raise TypeError("repository must return FinalWarningDecision or None")
         except Exception:
             previous = None
+            previous_state_available = False
             if error_class is None:
                 error_class = "repository_error"
 
-        baseline = baseline_level(quant, snapshot)
+        baseline = (
+            baseline_level(quant, snapshot)
+            if previous_state_available
+            else RiskLevel.UNKNOWN
+        )
         context: LLMContextAssessment | None = None
-        if self.reasoning is not None and should_call_reasoning(
+        if previous_state_available and self.reasoning is not None and should_call_reasoning(
             session_slot,
             baseline,
             previous.final_level if previous is not None else None,
         ):
             try:
                 context = self.reasoning.assess(snapshot, quant, previous)
+                if not isinstance(context, LLMContextAssessment):
+                    raise TypeError("reasoning port must return LLMContextAssessment")
             except Exception:
                 context = _reasoning_fallback("invoke_error")
                 if error_class is None:
@@ -232,8 +250,12 @@ class MarketWarningService:
                         getattr(self.reasoning, "model_name", "MiniMax-M3"),
                     )
                 except Exception:
+                    context = _reasoning_fallback("persistence_error")
                     if error_class is None:
                         error_class = "repository_error"
+
+            if feature_snapshot_id is None and context.reasoning_status == "validated":
+                context = _reasoning_fallback("persistence_error")
 
         policy_context = context if reasoning_id is not None else None
         candidate = apply_llm_adjustment(baseline, policy_context, snapshot)
@@ -246,6 +268,8 @@ class MarketWarningService:
             "Calibrated probabilities are estimates, not certainties.",
             f"quant_baseline={baseline.value}",
         ]
+        if not previous_state_available:
+            reasons.append("Previous warning state is unavailable; recovery state cannot be assessed.")
         if context is not None and context.reasoning_status == "validated":
             reasons.append("M3 supplied a validated evidence-bounded context assessment.")
         decision = build_final_decision(

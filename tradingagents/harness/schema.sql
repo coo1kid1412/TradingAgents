@@ -302,3 +302,10 @@ CREATE TABLE IF NOT EXISTS market_warning_model_registry (
 CREATE INDEX IF NOT EXISTS idx_market_warning_model_registry_active
     ON market_warning_model_registry(market, horizon)
     WHERE active = 1;
+
+CREATE TABLE IF NOT EXISTS market_warning_circuit_breakers (
+    breaker_key TEXT PRIMARY KEY,
+    consecutive_failures INTEGER NOT NULL DEFAULT 0,
+    open_until TEXT,
+    updated_at TEXT NOT NULL
+);

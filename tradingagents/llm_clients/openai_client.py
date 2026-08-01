@@ -151,6 +151,16 @@ def _io_logging_suppressed(config) -> bool:
     ) is True
 
 
+def _compliance_retry_suppressed(config) -> bool:
+    """Let bounded callers own the complete provider retry budget."""
+    if not isinstance(config, dict):
+        return False
+    metadata = config.get("metadata")
+    return isinstance(metadata, dict) and metadata.get(
+        "market_warning_disable_compliance_retry"
+    ) is True
+
+
 class NormalizedChatOpenAI(ChatOpenAI):
     """ChatOpenAI with normalized content output.
 
@@ -164,6 +174,7 @@ class NormalizedChatOpenAI(ChatOpenAI):
         _llm_call_seq += 1
         seq = _llm_call_seq
         suppress_io_logging = _io_logging_suppressed(config)
+        suppress_compliance_retry = _compliance_retry_suppressed(config)
 
         # Log input before calling
         if not suppress_io_logging:
@@ -182,6 +193,8 @@ class NormalizedChatOpenAI(ChatOpenAI):
             result = super().invoke(input, config, **kwargs)
         except Exception as e:
             import sys
+            if suppress_compliance_retry:
+                raise
             # 输入层审核(1026)：净化 prompt 敏感措辞后重试（输出补丁对输入审核无效）
             if _is_input_sensitive_error(e):
                 if not suppress_io_logging:

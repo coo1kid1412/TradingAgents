@@ -4,13 +4,11 @@ from __future__ import annotations
 
 import json
 import os
-import queue
 import re
-import threading
 from datetime import timedelta
 from typing import Any, Mapping
 
-from tradingagents.llm_clients.base_client import _strip_think_tags
+from tradingagents.llm_clients.base_client import WallClockTimeoutLLM, _strip_think_tags
 from tradingagents.llm_clients.factory import create_llm_client
 
 from ..domain import (
@@ -26,11 +24,15 @@ from ..reasoning import (
     build_reasoning_prompt,
     validate_context_assessment,
 )
+from ..policy import baseline_level
 
 
 _FENCE_RE = re.compile(r"^```(?:json)?\s*([\s\S]*?)\s*```$", re.IGNORECASE)
 _NO_RAW_LOG_CONFIG = {
-    "metadata": {"market_warning_disable_raw_io_logging": True}
+    "metadata": {
+        "market_warning_disable_raw_io_logging": True,
+        "market_warning_disable_compliance_retry": True,
+    }
 }
 _REPAIR_SCHEMA = {
     "market_scenario": "non-empty string",
@@ -113,21 +115,27 @@ def _fallback(error_class: str) -> LLMContextAssessment:
     )
 
 
-def _repair_prompt(error_class: str, valid_evidence_ids: tuple[str, ...]) -> str:
+def _repair_prompt(
+    original_prompt: str,
+    error_class: str,
+    valid_evidence_ids: tuple[str, ...],
+) -> str:
+    context = json.loads(original_prompt)
+    context["repair_request"] = {
+        "task": "Retry once and return one corrected JSON object only.",
+        "error_class": error_class,
+        "valid_evidence_ids": list(valid_evidence_ids),
+        "output_schema": _REPAIR_SCHEMA,
+        "constraints": [
+            "Use only evidence IDs from the original structured request.",
+            "Do not include markdown, analysis, private reasoning, or prior output.",
+        ],
+    }
     return json.dumps(
-        {
-            "task": "Return one corrected JSON object only.",
-            "error_class": error_class,
-            "valid_evidence_ids": list(valid_evidence_ids),
-            "output_schema": _REPAIR_SCHEMA,
-            "constraints": [
-                "Use only evidence IDs from the original structured request.",
-                "Do not include markdown, analysis, private reasoning, or prior output.",
-            ],
-        },
+        context,
         ensure_ascii=False,
         sort_keys=True,
-        separators=(",", ":"),
+        separators=(",", ": "),
     )
 
 
@@ -151,7 +159,9 @@ class MiniMaxReasoningAdapter:
         )
 
     @classmethod
-    def from_environment(cls) -> "MiniMaxReasoningAdapter":
+    def from_environment(
+        cls, breaker: CircuitBreaker | None = None
+    ) -> "MiniMaxReasoningAdapter":
         timeout = _env_int("MARKET_WARNING_LLM_TIMEOUT", 90, 1, 600)
         max_tokens = _env_int("MARKET_WARNING_LLM_MAX_TOKENS", 4096, 256, 65536)
         base_url = os.environ.get("MINIMAX_BASE_URL") or None
@@ -163,7 +173,7 @@ class MiniMaxReasoningAdapter:
             max_tokens=max_tokens,
             wall_clock_max_retries=0,
         )
-        return cls(client.get_llm_wrapped(), timeout=timeout)
+        return cls(client.get_llm_wrapped(), timeout=timeout, breaker=breaker)
 
     def assess(
         self,
@@ -179,14 +189,20 @@ class MiniMaxReasoningAdapter:
         except Exception:
             self.breaker.record_failure()
             return _fallback("prompt_error")
-        valid_ids = snapshot.evidence_ids
+        valid_ids = tuple(item.evidence_id for item in snapshot.evidence[:16])
+        baseline = baseline_level(quant, snapshot)
         first_error: str | None = None
         request = prompt
         for attempt in range(2):
             try:
                 response = self._invoke(request)
                 payload = _json_payload(_response_text(response))
-                result = validate_context_assessment(payload, valid_ids)
+                result = validate_context_assessment(
+                    payload,
+                    valid_ids,
+                    baseline=baseline,
+                    data_status=snapshot.data_quality,
+                )
                 self.breaker.record_success()
                 return result
             except Exception as error:
@@ -194,29 +210,15 @@ class MiniMaxReasoningAdapter:
                 if first_error is None or error_class == "content_blocked":
                     first_error = error_class
                 if attempt == 0:
-                    request = _repair_prompt(error_class, valid_ids)
+                    request = _repair_prompt(prompt, error_class, valid_ids)
 
         self.breaker.record_failure()
         return _fallback(first_error or "reasoning_unavailable")
 
     def _invoke(self, prompt: str) -> Any:
-        result_queue: queue.Queue[tuple[bool, Any]] = queue.Queue(maxsize=1)
-
-        def worker() -> None:
-            try:
-                result_queue.put(
-                    (True, self.llm.invoke(prompt, config=_NO_RAW_LOG_CONFIG)),
-                    block=False,
-                )
-            except Exception as error:
-                result_queue.put((False, error), block=False)
-
-        thread = threading.Thread(target=worker, daemon=True, name="market-warning-m3")
-        thread.start()
-        try:
-            ok, value = result_queue.get(timeout=self.timeout)
-        except queue.Empty as exc:
-            raise TimeoutError("market warning reasoning timed out") from exc
-        if not ok:
-            raise value
-        return value
+        llm = (
+            self.llm
+            if isinstance(self.llm, WallClockTimeoutLLM)
+            else WallClockTimeoutLLM(self.llm, timeout=self.timeout, max_retries=0)
+        )
+        return llm.invoke(prompt, config=_NO_RAW_LOG_CONFIG)

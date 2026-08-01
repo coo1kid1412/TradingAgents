@@ -11,6 +11,7 @@ from numbers import Real
 from typing import Any, Callable, Iterable, Mapping
 
 from .domain import (
+    DataStatus,
     FeatureSnapshot,
     FinalWarningDecision,
     LLMContextAssessment,
@@ -50,6 +51,10 @@ def _string(value: Any, *, allow_empty: bool = False) -> str:
     if not isinstance(value, str):
         raise ReasoningValidationError()
     normalized = value.strip()
+    try:
+        normalized.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise ReasoningValidationError() from exc
     if not allow_empty and not normalized:
         raise ReasoningValidationError()
     return normalized
@@ -67,7 +72,11 @@ def _string_list(value: Any, *, allow_empty: bool) -> tuple[str, ...]:
 
 
 def validate_context_assessment(
-    payload: Mapping[str, Any], valid_evidence_ids: Iterable[str]
+    payload: Mapping[str, Any],
+    valid_evidence_ids: Iterable[str],
+    *,
+    baseline: RiskLevel | None = None,
+    data_status: DataStatus | None = None,
 ) -> LLMContextAssessment:
     """Validate an exact JSON object without coercing malformed LLM fields."""
 
@@ -95,6 +104,23 @@ def validate_context_assessment(
         raise ReasoningValidationError() from exc
     if recommended not in _OUTPUT_LEVELS:
         raise ReasoningValidationError()
+    if baseline is not None or data_status is not None:
+        try:
+            baseline_value = RiskLevel(baseline)
+            status_value = DataStatus(data_status)
+        except (TypeError, ValueError) as exc:
+            raise ReasoningValidationError("semantic_validation") from exc
+        if baseline_value == RiskLevel.UNKNOWN or status_value in {
+            DataStatus.CONFLICTED,
+            DataStatus.STALE,
+            DataStatus.INSUFFICIENT,
+        }:
+            raise ReasoningValidationError("semantic_validation")
+        ordered = (RiskLevel.GREEN, RiskLevel.YELLOW, RiskLevel.ORANGE, RiskLevel.RED)
+        baseline_index = ordered.index(baseline_value)
+        recommended_index = ordered.index(recommended)
+        if recommended_index not in {baseline_index, min(baseline_index + 1, 3)}:
+            raise ReasoningValidationError("semantic_validation")
     if payload["reasoning_status"] != "validated":
         raise ReasoningValidationError()
 
@@ -183,7 +209,9 @@ def should_call_reasoning(
 
 
 def _json_value(value: Any) -> Any:
-    if value is None or isinstance(value, (str, bool)):
+    if isinstance(value, str):
+        return value.encode("utf-8", errors="replace").decode("utf-8")
+    if value is None or isinstance(value, bool):
         return value
     if isinstance(value, Enum):
         return value.value
@@ -210,7 +238,7 @@ def build_reasoning_prompt(
     evidence = [
         {
             "evidence_id": item.evidence_id,
-            "summary": item.summary[:240],
+            "summary": _json_value(item.summary[:240]),
             "value": _json_value(item.value),
             "as_of_time": item.as_of_time.isoformat() if item.as_of_time else None,
         }

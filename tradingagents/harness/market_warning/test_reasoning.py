@@ -169,6 +169,39 @@ class ContextValidationTests(TestCase):
                 with self.assertRaises(ReasoningValidationError):
                     validate_context_assessment(payload, {"ev-1", "ev-2", "ev-3"})
 
+    def test_semantic_level_must_match_usable_baseline_contract(self) -> None:
+        payload = valid_payload()
+        payload["recommended_risk_level"] = "YELLOW"
+        with self.assertRaises(ReasoningValidationError):
+            validate_context_assessment(
+                payload,
+                {"ev-1", "ev-2", "ev-3"},
+                baseline=RiskLevel.ORANGE,
+                data_status=DataStatus.FRESH,
+            )
+
+        payload["recommended_risk_level"] = "GREEN"
+        for baseline, status in (
+            (RiskLevel.UNKNOWN, DataStatus.FRESH),
+            (RiskLevel.GREEN, DataStatus.STALE),
+        ):
+            with self.subTest(baseline=baseline, status=status), self.assertRaises(
+                ReasoningValidationError
+            ):
+                validate_context_assessment(
+                    payload,
+                    {"ev-1", "ev-2", "ev-3"},
+                    baseline=baseline,
+                    data_status=status,
+                )
+
+    def test_unpaired_unicode_surrogate_is_rejected_before_persistence(self) -> None:
+        payload = valid_payload()
+        payload["market_scenario"] = "\ud800"
+
+        with self.assertRaises(ReasoningValidationError):
+            validate_context_assessment(payload, {"ev-1", "ev-2", "ev-3"})
+
     def test_missing_required_key_is_rejected(self) -> None:
         for key in valid_payload():
             with self.subTest(key=key):
@@ -242,6 +275,32 @@ class AdapterTests(TestCase):
         self.assertIn("ev-1", str(llm.calls[1][0]))
         self.assertNotIn("not-json-private", str(llm.calls[1][0]))
 
+    def test_repair_retains_original_context_and_only_exposed_evidence_ids(self) -> None:
+        snapshot = make_snapshot()
+        evidence = tuple(
+            Evidence(
+                evidence_id=f"ev-{index}",
+                group="feature",
+                summary=f"visible signal {index}",
+                value=index,
+                source="test",
+                as_of_time=NOW,
+            )
+            for index in range(1, 21)
+        )
+        snapshot = replace(snapshot, evidence=evidence)
+        llm = FakeLLM(["invalid-private-output", json.dumps(valid_payload())])
+
+        result = self._adapter(llm).assess(snapshot, make_quant(), make_previous())
+
+        self.assertEqual(result.reasoning_status, "validated")
+        repair = str(llm.calls[1][0])
+        self.assertIn('"current_baseline": "ORANGE"', repair)
+        self.assertIn("visible signal 1", repair)
+        self.assertIn("ev-16", repair)
+        self.assertNotIn("ev-17", repair)
+        self.assertNotIn("invalid-private-output", repair)
+
     def test_timeout_repairs_once_without_waiting_for_worker_shutdown(self) -> None:
         def slow() -> object:
             time.sleep(0.15)
@@ -268,6 +327,33 @@ class AdapterTests(TestCase):
         self.assertEqual(result.error_class, "content_blocked")
         self.assertNotIn(secret, str(llm.calls[1][0]))
         self.assertNotIn(secret, repr(result))
+
+    def test_uppercase_think_tags_cannot_reach_validated_fields(self) -> None:
+        payload = valid_payload()
+        payload["market_scenario"] = "<THINK>PRIVATE_CHAIN</THINK>breadth weak"
+        llm = FakeLLM([json.dumps(payload)])
+
+        result = self._adapter(llm).assess(make_snapshot(), make_quant(), make_previous())
+
+        self.assertEqual(result.reasoning_status, "validated")
+        self.assertEqual(result.market_scenario, "breadth weak")
+        self.assertNotIn("PRIVATE_CHAIN", repr(result))
+
+    def test_provider_compliance_retry_is_disabled_for_exactly_two_adapter_calls(self) -> None:
+        llm = NormalizedChatOpenAI.model_construct(model_name="MiniMax-M3")
+        blocked = RuntimeError("422 1027 output sensitive")
+        with mock.patch.object(
+            ChatOpenAI,
+            "invoke",
+            side_effect=[blocked, blocked, SimpleNamespace(content=json.dumps(valid_payload()))],
+        ) as provider:
+            result = self._adapter(llm).assess(
+                make_snapshot(), make_quant(), make_previous()
+            )
+
+        self.assertEqual(result.reasoning_status, "fallback")
+        self.assertEqual(result.error_class, "content_blocked")
+        self.assertEqual(provider.call_count, 2)
 
     def test_prompt_build_failure_falls_back_without_invoking_llm(self) -> None:
         llm = FakeLLM([json.dumps(valid_payload())])
@@ -386,6 +472,23 @@ class RawLoggingGuardTests(TestCase):
         input_log.assert_not_called()
         output_log.assert_not_called()
         profiling_log.assert_not_called()
+
+    def test_market_warning_metadata_disables_internal_compliance_retry(self) -> None:
+        llm = NormalizedChatOpenAI.model_construct(model_name="MiniMax-M3")
+        config = {
+            "metadata": {
+                "market_warning_disable_raw_io_logging": True,
+                "market_warning_disable_compliance_retry": True,
+            }
+        }
+        with mock.patch.object(
+            ChatOpenAI,
+            "invoke",
+            side_effect=RuntimeError("422 1027 output sensitive"),
+        ) as provider, self.assertRaises(RuntimeError):
+            llm.invoke("prompt", config=config)
+
+        self.assertEqual(provider.call_count, 1)
 
 
 class ReasoningPersistenceTests(TestCase):

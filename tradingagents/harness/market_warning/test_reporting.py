@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import tempfile
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 from unittest import TestCase, main
+from unittest import mock
 
 from tradingagents.harness.market_warning.domain import (
     DataStatus,
@@ -204,6 +206,71 @@ class ReportGoldenTests(TestCase):
             self.assertNotIn(forbidden, report)
         self.assertIn("[内容已脱敏]", report)
 
+    def test_report_lists_conflicting_evidence_and_source_times(self) -> None:
+        report = render_premarket_report(
+            _result(RiskLevel.ORANGE, context=_context()), None
+        )
+
+        self.assertIn("反向证据ID：`ev-3`", report)
+        self.assertIn("fixture:last", report)
+        self.assertIn(NOW.isoformat(), report)
+
+    def test_upgrade_report_contains_only_change_evidence_and_action(self) -> None:
+        result = _result(
+            RiskLevel.RED,
+            transition="UPGRADE_ORANGE_TO_RED",
+            context=_context(),
+        )
+        snapshot = replace(
+            result.feature_snapshot,
+            features={
+                **dict(result.feature_snapshot.features),
+                "breadth_deterioration_transition": True,
+            },
+        )
+        result = replace(result, feature_snapshot=snapshot, session_slot="intraday-0935")
+
+        report = render_upgrade_report(result, _decision(RiskLevel.ORANGE))
+
+        self.assertIn("## 变化", report)
+        self.assertIn("ORANGE -> RED", report)
+        self.assertIn("## 触发证据", report)
+        self.assertIn("breadth_deterioration_transition", report)
+        self.assertNotIn("## 概率判断", report)
+        self.assertNotIn("## 数据与模型", report)
+
+    def test_metadata_and_authorization_shaped_text_are_redacted(self) -> None:
+        unsafe_context = replace(
+            _context(),
+            market_scenario="Authorization: Bearer SECRET",
+            action_reason="system prompt: Return JSON only",
+        )
+        result = _result(RiskLevel.ORANGE, context=unsafe_context)
+        result = replace(
+            result,
+            feature_snapshot=replace(
+                result.feature_snapshot,
+                feature_version="<THINK>private</THINK>",
+                reliability_grade="api_key: TOPSECRET",
+            ),
+            quant_assessment=replace(
+                result.quant_assessment,
+                model_version="token=TOPSECRET",
+            ),
+        )
+
+        report = render_premarket_report(result, None)
+
+        for forbidden in (
+            "Bearer SECRET",
+            "TOPSECRET",
+            "Return JSON only",
+            "<THINK>",
+            "private",
+        ):
+            self.assertNotIn(forbidden, report)
+        self.assertIn("[内容已脱敏]", report)
+
     def test_write_report_uses_market_local_date_and_stable_path(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             result = _result(RiskLevel.GREEN)
@@ -215,6 +282,22 @@ class ReportGoldenTests(TestCase):
             self.assertTrue(path.is_file())
             self.assertEqual(path.read_text(encoding="utf-8"), render_premarket_report(result, None))
             self.assertEqual(list(expected.parent.glob("*.tmp")), [])
+
+    def test_atomic_replace_failure_preserves_previous_report_and_cleans_temp(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            result = _result(RiskLevel.GREEN)
+            target = Path(directory) / "a_share" / "2026-08-03" / "0830-premarket.md"
+            target.parent.mkdir(parents=True)
+            target.write_text("previous-report", encoding="utf-8")
+
+            with mock.patch(
+                "tradingagents.harness.market_warning.reporting.os.replace",
+                side_effect=OSError("replace failed"),
+            ), self.assertRaises(OSError):
+                write_report(result, None, Path(directory))
+
+            self.assertEqual(target.read_text(encoding="utf-8"), "previous-report")
+            self.assertEqual(list(target.parent.glob("*.tmp")), [])
 
 
 if __name__ == "__main__":

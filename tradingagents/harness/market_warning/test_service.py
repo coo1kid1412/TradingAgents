@@ -169,6 +169,8 @@ class Repository:
 
     def load_previous_decision(self, market, before_time):
         self.events.append("load_previous")
+        if self.fail_stage == "load_previous":
+            raise RuntimeError("private previous-state failure")
         return self.previous
 
 
@@ -313,6 +315,43 @@ class MarketWarningServiceTests(TestCase):
             self.assertEqual(result.decision.baseline_level, RiskLevel.ORANGE)
             self.assertEqual(result.decision.final_level, RiskLevel.ORANGE)
             self.assertEqual(result.error_class, "repository_error")
+            self.assertEqual(result.context_assessment.reasoning_status, "fallback")
+
+    def test_previous_state_read_failure_produces_unknown_not_initial_green(self) -> None:
+        events: list[str] = []
+        repository = Repository(events, fail_stage="load_previous")
+        with tempfile.TemporaryDirectory() as directory:
+            service, _ = self._service(events, directory, repository=repository)
+
+            result = service.evaluate(Market.A_SHARE, NOW, "premarket")
+
+            self.assertEqual(result.decision.final_level, RiskLevel.UNKNOWN)
+            self.assertEqual(result.decision.state_transition, "TO_UNKNOWN")
+            self.assertEqual(result.error_class, "repository_error")
+            self.assertNotIn("reason", events)
+
+    def test_none_from_external_ports_fails_closed_and_writes_report(self) -> None:
+        cases = ("data", "model", "reasoning")
+        for stage in cases:
+            events: list[str] = []
+            with self.subTest(stage=stage), tempfile.TemporaryDirectory() as directory:
+                service, _ = self._service(events, directory)
+                if stage == "data":
+                    service.data_port.load_snapshot = lambda *_args: None
+                    service.quality_assessor = quality_assessor(events, DataStatus.INSUFFICIENT)
+                elif stage == "model":
+                    service.probability_model.predict = lambda _snapshot: None
+                else:
+                    service.reasoning.assess = lambda *_args: None
+
+                result = service.evaluate(Market.A_SHARE, NOW, "premarket")
+
+                if stage in {"data", "model"}:
+                    self.assertEqual(result.decision.final_level, RiskLevel.UNKNOWN)
+                else:
+                    self.assertEqual(result.decision.final_level, RiskLevel.ORANGE)
+                    self.assertEqual(result.context_assessment.reasoning_status, "fallback")
+                self.assertTrue(Path(result.report_path).is_file())
 
     def test_notifier_failure_keeps_persisted_decision_and_report(self) -> None:
         events: list[str] = []

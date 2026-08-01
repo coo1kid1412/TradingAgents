@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import re
 import tempfile
+from collections.abc import Mapping
 from datetime import datetime
 from math import isfinite
 from numbers import Real
@@ -48,8 +49,11 @@ _PHASES = {
 }
 _THINK_RE = re.compile(r"<think>[\s\S]*?</think>", re.IGNORECASE)
 _SENSITIVE_RE = re.compile(
-    r"traceback|api\s*error|provider\s+error|(?:api[_ -]?key\s*=)|"
-    r"minimax_api_key|\bsk-[A-Za-z0-9_-]+|\{\s*[\"']",
+    r"traceback|api\s*error|provider\s+error|authorization\s*:|bearer\s+\S+|"
+    r"api[_ -]?key\s*[:=]|minimax_api_key|(?:access_)?token\s*[:=]|"
+    r"password\s*[:=]|private[_ -]?key|\bsecret\b|\bsk-[A-Za-z0-9_-]+|"
+    r"system\s+(?:prompt|message)|internal\s+prompt|return\s+json\s+only|"
+    r"strict_json_output|output_schema|提示词|密钥|令牌|\{\s*[\"']",
     re.IGNORECASE,
 )
 
@@ -67,6 +71,13 @@ def _safe_text(value: Any, fallback: str = "[内容已脱敏]") -> str:
     if not cleaned or _SENSITIVE_RE.search(cleaned) or "<think>" in cleaned.lower():
         return fallback
     return cleaned.replace("\r", " ").replace("\n", " ")[:500]
+
+
+def _safe_code(value: Any) -> str:
+    cleaned = _safe_text(value)
+    if cleaned == "[内容已脱敏]" or not re.fullmatch(r"[A-Za-z0-9._:/+@=-]{1,200}", cleaned):
+        return "[内容已脱敏]"
+    return cleaned
 
 
 def _percentage(value: Any) -> str:
@@ -139,7 +150,7 @@ def _contributor_section(result: RunnerResult) -> str:
         return "## 主要驱动\n暂无可审计的模型驱动项。"
     rendered = []
     for index, item in enumerate(rows, start=1):
-        if isinstance(item, dict):
+        if isinstance(item, Mapping):
             feature = _safe_text(str(item.get("feature", "未命名特征")), "未命名特征")
             contribution = item.get("contribution")
             numeric = (
@@ -161,15 +172,17 @@ def _context_section(context: LLMContextAssessment | None) -> str:
     if context.reasoning_status != "validated":
         return "## M3 情景校验\nM3 本次不可用；未改变代码基线。"
     causal = " -> ".join(_safe_text(item) for item in context.causal_chain)
-    conflicts = "；".join(_safe_text(item) for item in context.overlooked_risks)
-    if not conflicts:
-        conflicts = "已引用反向证据，但没有额外风险摘要。"
+    conflicting_ids = "；".join(
+        f"`{_safe_code(item)}`" for item in context.conflicting_evidence_ids
+    ) or "无"
+    overlooked = "；".join(_safe_text(item) for item in context.overlooked_risks) or "无"
     return "\n".join(
         (
             "## M3 情景校验",
             f"- 场景：{_safe_text(context.market_scenario)}",
             f"- 因果链：{causal or '[内容已脱敏]'}",
-            f"- 反向证据/遗漏风险：{conflicts}",
+            f"- 反向证据ID：{conflicting_ids}",
+            f"- 遗漏风险：{overlooked}",
             f"- 建议：{context.recommended_risk_level.value}，置信度 {_percentage(context.confidence)}；"
             f"{_safe_text(context.action_reason)}",
         )
@@ -180,10 +193,17 @@ def _metadata_section(result: RunnerResult) -> str:
     snapshot = result.feature_snapshot
     quant = result.quant_assessment
     status = snapshot.data_quality.value if snapshot is not None else "insufficient"
-    reliability = snapshot.reliability_grade if snapshot is not None else "UNAVAILABLE"
-    feature_version = snapshot.feature_version if snapshot is not None else "unavailable"
-    model_version = quant.model_version if quant is not None else "unavailable"
-    calibration = quant.calibration_version if quant is not None else "unavailable"
+    reliability = _safe_code(snapshot.reliability_grade) if snapshot is not None else "UNAVAILABLE"
+    feature_version = _safe_code(snapshot.feature_version) if snapshot is not None else "unavailable"
+    model_version = _safe_code(quant.model_version) if quant is not None else "unavailable"
+    calibration = _safe_code(quant.calibration_version) if quant is not None else "unavailable"
+    source_times = []
+    if snapshot is not None:
+        source_times = [
+            f"  - `{_safe_code(str(source))}`：`{timestamp.isoformat()}`"
+            for source, timestamp in sorted(snapshot.source_times.items())
+        ]
+    source_block = "\n- 源数据时间：\n" + "\n".join(source_times) if source_times else "\n- 源数据时间：不可用"
     shadow = (
         "\n- 运行限制：影子运行，仅供观察，不联动个股生产硬门控。"
         if status == DataStatus.SHADOW.value
@@ -199,8 +219,49 @@ def _metadata_section(result: RunnerResult) -> str:
         f"- 数据状态：`{status}`；可靠度：`{reliability}`\n"
         f"- 特征版本：`{feature_version}`\n"
         f"- 模型版本：`{model_version}`；校准版本：`{calibration}`"
+        f"{source_block}"
         f"{shadow}{unknown}"
     )
+
+
+def _trigger_section(result: RunnerResult) -> str:
+    snapshot = result.feature_snapshot
+    transition_fields = (
+        "pressure_transition_signal",
+        "volatility_acceleration_transition",
+        "abnormal_range_weak_close_transition",
+        "breadth_deterioration_transition",
+        "credit_volatility_transition",
+        "equity_dispersion_transition",
+    )
+    rows = []
+    if snapshot is not None:
+        rows.extend(
+            f"- 代码信号：`{name}`"
+            for name in transition_fields
+            if snapshot.features.get(name) is True
+        )
+    quant = result.quant_assessment
+    if quant is not None:
+        for item in quant.top_contributors[:3]:
+            if isinstance(item, Mapping):
+                feature = _safe_code(str(item.get("feature", "unavailable")))
+                contribution = item.get("contribution")
+                numeric = (
+                    f"{float(contribution):+.3f}"
+                    if isinstance(contribution, Real)
+                    and not isinstance(contribution, bool)
+                    and isfinite(float(contribution))
+                    else "不可用"
+                )
+                rows.append(f"- 模型驱动：`{feature}`（贡献 {numeric}）")
+    context = result.context_assessment
+    if context is not None and context.reasoning_status == "validated":
+        rows.append(
+            "- M3 支持证据："
+            + "；".join(f"`{_safe_code(item)}`" for item in context.supporting_evidence_ids)
+        )
+    return "## 触发证据\n" + ("\n".join(rows) if rows else "未形成可展示的具体触发证据。")
 
 
 def render_premarket_report(
@@ -230,9 +291,15 @@ def render_upgrade_report(
     """Render an intraday alert with the same first-screen action contract."""
 
     decision = _require_complete(result)
-    report = render_premarket_report(result, previous)
-    marker = "# " + _MARKET_NAMES[result.market] + "大盘骤跌概率预警"
-    return report.replace(marker, marker + "（盘中升级）", 1)
+    local_time = result.as_of_time.astimezone(_MARKET_ZONES[result.market])
+    sections = (
+        _first_block(decision),
+        f"# {_MARKET_NAMES[result.market]}大盘骤跌概率预警（盘中升级）\n\n"
+        f"评估时间：`{local_time.isoformat(timespec='minutes')}`",
+        _previous_section(decision, previous).replace("## 相比上一份", "## 变化", 1),
+        _trigger_section(result),
+    )
+    return "\n\n".join(sections) + "\n"
 
 
 def report_path(result: RunnerResult, root: Path | str) -> Path:
