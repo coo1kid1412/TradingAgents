@@ -103,7 +103,11 @@ class SourceCombinationTests(TestCase):
 
     def test_price_deviation_at_boundary_is_allowed(self):
         primary = point("index_price", 100, source="primary")
-        secondary = point("index_price", 100.5, source="secondary")
+        secondary = point(
+            "index_price",
+            100 / (1 - QUALITY_POLICY_V1.cross_source_price_tolerance),
+            source="secondary",
+        )
 
         combined = combine_source_quotes(primary, secondary, QUALITY_POLICY_V1.cross_source_price_tolerance)
 
@@ -111,11 +115,27 @@ class SourceCombinationTests(TestCase):
 
     def test_price_deviation_just_over_boundary_is_conflicted(self):
         primary = point("index_price", 100, source="primary")
-        secondary = point("index_price", 100.501, source="secondary")
+        secondary = point("index_price", 100 / (1 - QUALITY_POLICY_V1.cross_source_price_tolerance) + 0.001, source="secondary")
 
         combined = combine_source_quotes(primary, secondary, QUALITY_POLICY_V1.cross_source_price_tolerance)
 
         self.assertEqual(combined.quality_status, DataStatus.CONFLICTED)
+
+    def test_price_conflict_result_is_independent_of_source_argument_order(self):
+        over_boundary = 100 / (1 - QUALITY_POLICY_V1.cross_source_price_tolerance) + 0.001
+        forward = combine_source_quotes(
+            point("index_price", 100, source="primary"),
+            point("index_price", over_boundary, source="secondary"),
+            QUALITY_POLICY_V1.cross_source_price_tolerance,
+        )
+        reverse = combine_source_quotes(
+            point("index_price", over_boundary, source="secondary"),
+            point("index_price", 100, source="primary"),
+            QUALITY_POLICY_V1.cross_source_price_tolerance,
+        )
+
+        self.assertEqual(forward.quality_status, DataStatus.CONFLICTED)
+        self.assertEqual(reverse.quality_status, DataStatus.CONFLICTED)
 
     def test_combined_lineage_is_still_dual_source_to_quality_layer(self):
         combined_price = combine_source_quotes(
@@ -304,6 +324,49 @@ class QualityEvaluationTests(TestCase):
                 point("index_change_pct", -0.4, source="secondary"),
                 point("volume", 100, source="primary"),
                 point("volume", 110, source="secondary"),
+            ),
+            QUALITY_POLICY_V1,
+            NOW,
+        )
+
+        self.assertNotEqual(assessment.status, DataStatus.CONFLICTED)
+
+    def test_timestamp_skew_applies_to_same_named_non_price_core_field(self):
+        at_boundary = evaluate_data_quality(
+            snapshot(
+                point("index_price", 100, source="primary"),
+                point("index_price", 100, source="secondary"),
+                point("index_change_pct", -0.4, source="primary", data_time=NOW - timedelta(seconds=300)),
+                point("index_change_pct", -0.4, source="secondary", data_time=NOW - timedelta(seconds=180)),
+            ),
+            QUALITY_POLICY_V1,
+            NOW,
+        )
+        over_boundary = evaluate_data_quality(
+            snapshot(
+                point("index_price", 100, source="primary"),
+                point("index_price", 100, source="secondary"),
+                point("index_change_pct", -0.4, source="primary", data_time=NOW - timedelta(seconds=300)),
+                point("index_change_pct", -0.4, source="secondary", data_time=NOW - timedelta(seconds=179)),
+            ),
+            QUALITY_POLICY_V1,
+            NOW,
+        )
+
+        self.assertNotEqual(at_boundary.status, DataStatus.CONFLICTED)
+        self.assertEqual(over_boundary.status, DataStatus.CONFLICTED)
+
+    def test_large_breadth_and_volatility_differences_with_same_time_do_not_conflict(self):
+        assessment = evaluate_data_quality(
+            snapshot(
+                point("index_price", 100, source="primary"),
+                point("index_change_pct", -0.4, source="primary"),
+                point("index_price", 100, source="secondary"),
+                point("index_change_pct", -0.4, source="secondary"),
+                point("breadth_up_pct", 1, source="primary"),
+                point("breadth_up_pct", 99, source="secondary"),
+                point("volatility", 1, source="primary"),
+                point("volatility", 1000, source="secondary"),
             ),
             QUALITY_POLICY_V1,
             NOW,

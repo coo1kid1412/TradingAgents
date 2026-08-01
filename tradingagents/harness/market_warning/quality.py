@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime, time, timedelta
-from math import isfinite
+from math import isclose, isfinite
 from typing import Any, Mapping
 from zoneinfo import ZoneInfo
 
@@ -177,10 +177,14 @@ def _numeric(value: Any) -> float | None:
 
 
 def _relative_deviation(left: float, right: float) -> float:
-    denominator = abs(left) or max(abs(left), abs(right))
+    denominator = max(abs(left), abs(right))
     if denominator == 0:
         return 0.0
     return abs(left - right) / denominator
+
+
+def _exceeds_tolerance(value: float, tolerance: float) -> bool:
+    return value > tolerance and not isclose(value, tolerance, rel_tol=0.0, abs_tol=1e-12)
 
 
 def combine_source_quotes(
@@ -202,7 +206,7 @@ def combine_source_quotes(
     price_field = _is_price_field(primary.field)
     timestamp_conflicted = abs(primary.data_time - secondary.data_time) > QUALITY_POLICY_V1.cross_source_timestamp_skew
     value_conflicted = price_field and (
-        left is None or right is None or _relative_deviation(left, right) > float(tolerance)
+        left is None or right is None or _exceeds_tolerance(_relative_deviation(left, right), float(tolerance))
     )
     conflicted = (
         primary.quality_status == DataStatus.CONFLICTED
@@ -249,8 +253,6 @@ def _source_conflict(
     for point in points:
         grouped.setdefault((point.symbol, _canonical_field(point.field)), []).append(point)
     for quotes in grouped.values():
-        if not _is_price_field(quotes[0].field):
-            continue
         sources = {quote.source for quote in quotes}
         if len(sources) < 2:
             continue
@@ -258,13 +260,17 @@ def _source_conflict(
             for right in quotes[index + 1 :]:
                 if left.source == right.source:
                     continue
+                if abs(left.data_time - right.data_time) > policy.cross_source_timestamp_skew:
+                    return True
+                if not _is_price_field(left.field):
+                    continue
                 left_value = _numeric(left.value)
                 right_value = _numeric(right.value)
                 if left_value is None or right_value is None:
                     return True
-                if _relative_deviation(left_value, right_value) > policy.cross_source_price_tolerance:
-                    return True
-                if abs(left.data_time - right.data_time) > policy.cross_source_timestamp_skew:
+                if _exceeds_tolerance(
+                    _relative_deviation(left_value, right_value), policy.cross_source_price_tolerance
+                ):
                     return True
     return False
 
