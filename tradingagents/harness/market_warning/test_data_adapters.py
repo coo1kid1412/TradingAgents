@@ -386,6 +386,40 @@ class TushareDataAdapterTests(unittest.TestCase):
 
         self.assertGreater(len(pro.calls), first_count)
 
+    def test_unusable_nonempty_core_index_rows_are_not_cached_and_retry(self):
+        class InvalidCorePro(MockTusharePro):
+            def __init__(self, invalid_shape: str) -> None:
+                super().__init__()
+                self.invalid_shape = invalid_shape
+
+            def index_daily(self, **kwargs):
+                frame = super().index_daily(**kwargs)
+                if self.invalid_shape == "missing":
+                    return frame.drop(columns=["close", "pct_chg"])
+                if self.invalid_shape == "null":
+                    frame.loc[:, ["close", "pct_chg"]] = None
+                elif self.invalid_shape == "non_finite_derived":
+                    frame.loc[:, "close"] = 1e308
+                    frame.loc[:, "pre_close"] = 1e-308
+                    frame.loc[:, "pct_chg"] = float("nan")
+                else:
+                    frame.loc[:, "close"] = float("inf")
+                    frame.loc[:, "pct_chg"] = float("nan")
+                return frame
+
+        for invalid_shape in ("missing", "null", "non_finite", "non_finite_derived"):
+            with self.subTest(invalid_shape=invalid_shape), tempfile.TemporaryDirectory() as temp_dir:
+                pro = InvalidCorePro(invalid_shape)
+                root = Path(temp_dir)
+                adapter = TushareAShareDataAdapter(pro=pro, cache=RawDataCache(root))
+
+                tuple(adapter.backfill(date(2026, 7, 20), date(2026, 7, 20)))
+                first_count = len(pro.calls)
+                tuple(adapter.backfill(date(2026, 7, 20), date(2026, 7, 20)))
+
+                self.assertGreater(len(pro.calls), first_count)
+                self.assertEqual(list(root.rglob("*.manifest.json")), [])
+
     def test_historical_backfill_does_not_apply_current_stock_basic_industry(self):
         pro = MockTusharePro()
         adapter = TushareAShareDataAdapter(
@@ -833,6 +867,47 @@ class RawDataCacheTests(unittest.TestCase):
             )
 
         self.assertIsNone(result)
+
+    def test_manifest_complete_accepts_only_exact_json_boolean_true(self):
+        query = {"trade_date": "20260731"}
+        with tempfile.TemporaryDirectory() as temp_dir:
+            cache = RawDataCache(Path(temp_dir))
+            data_path = cache.write_rows(
+                market=Market.US,
+                dataset="quotes",
+                year=2026,
+                cache_key="daily",
+                rows=[],
+                query=query,
+                source="yahoo_finance",
+                fetched_at=datetime(2026, 8, 1, tzinfo=UTC),
+            )
+            manifest_path = data_path.with_suffix(".manifest.json")
+            pristine = json.loads(manifest_path.read_text(encoding="utf-8"))
+
+            self.assertIsNotNone(
+                cache.read_rows(
+                    market=Market.US,
+                    dataset="quotes",
+                    year=2026,
+                    cache_key="daily",
+                    query=query,
+                )
+            )
+            for malformed in ("false", 1, {"complete": True}, []):
+                with self.subTest(complete=malformed):
+                    manifest = json.loads(json.dumps(pristine))
+                    manifest["complete"] = malformed
+                    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+                    self.assertIsNone(
+                        cache.read_rows(
+                            market=Market.US,
+                            dataset="quotes",
+                            year=2026,
+                            cache_key="daily",
+                            query=query,
+                        )
+                    )
 
     def test_json_valid_but_structurally_invalid_snapshot_is_a_cache_miss(self):
         query = {"trade_date": "20260731"}

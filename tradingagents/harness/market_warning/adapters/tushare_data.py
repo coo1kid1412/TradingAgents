@@ -77,6 +77,21 @@ def _available_at(source: str, on_date: date, next_trading_day: Callable[[date],
     return datetime.combine(on_date, time(18), tzinfo=_SHANGHAI)
 
 
+def _core_index_values(row: pd.Series) -> tuple[float, float] | None:
+    close = _number(row.get("close"))
+    if close is None:
+        return None
+    pct_chg = _number(row.get("pct_chg"))
+    if pct_chg is None:
+        pre_close = _number(row.get("pre_close"))
+        if pre_close in (None, 0):
+            return None
+        pct_chg = _number((close / pre_close - 1.0) * 100.0)
+        if pct_chg is None:
+            return None
+    return close, pct_chg
+
+
 @dataclass(frozen=True)
 class _FetchResult:
     frame: pd.DataFrame
@@ -227,6 +242,7 @@ class TushareAShareDataAdapter:
                 result.frame, "trade_date", as_of_time, "tushare_index_daily"
             )) is not None
             and selected[1] == expected_observation_date
+            and any(_core_index_values(row) is not None for _, row in selected[0].iterrows())
             for result in index_results
         )
         complete = daily_complete and stock_basic.complete and index_complete
@@ -290,13 +306,17 @@ class TushareAShareDataAdapter:
             if selected is None or selected[1] != expected_observation_date:
                 continue
             rows, trade_date = selected
-            row = rows.iloc[0]
+            row = next(
+                (row for _, row in rows.iterrows() if _core_index_values(row) is not None),
+                None,
+            )
+            if row is None:
+                continue
+            core_values = _core_index_values(row)
+            if core_values is None:
+                continue
             symbol = str(row.get("ts_code") or "")
-            close = _number(row.get("close"))
-            pre_close = _number(row.get("pre_close"))
-            pct_chg = _number(row.get("pct_chg"))
-            if pct_chg is None and close is not None and pre_close not in (None, 0):
-                pct_chg = (close / pre_close - 1.0) * 100.0
+            close, pct_chg = core_values
             values = {
                 "open": _number(row.get("open")), "high": _number(row.get("high")),
                 "low": _number(row.get("low")), "index_price": close,

@@ -125,7 +125,7 @@ class RawDataCache:
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
             if not isinstance(manifest, dict):
                 return None
-            if manifest.get("schema_version") != SCHEMA_VERSION or not manifest.get("complete"):
+            if manifest.get("schema_version") != SCHEMA_VERSION or manifest.get("complete") is not True:
                 return None
             if not isinstance(manifest.get("generation"), str) or not manifest["generation"]:
                 return None
