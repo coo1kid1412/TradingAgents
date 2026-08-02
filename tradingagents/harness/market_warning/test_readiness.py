@@ -179,9 +179,10 @@ class ProductionReadinessTests(TestCase):
     def test_rule_gate_adds_crisis_concentration_and_ten_session_soak(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
+            repository = SQLiteWarningRepository(root / "warning.db")
             evaluation, smoke, benchmark = self._rule_artifacts(root, concentration=0.51)
             blocked = check_production_readiness(
-                SQLiteWarningRepository(root / "warning.db"),
+                repository,
                 mode="rule_v1/gate",
                 rule_manifest=RULE_MANIFEST,
                 rule_evaluation_path=evaluation,
@@ -189,9 +190,18 @@ class ProductionReadinessTests(TestCase):
                 runtime_benchmark_path=benchmark,
                 soak_sessions=9,
             )
+            repository.register_rule_engine(
+                {
+                    "engine_version": "rule-v1.0.0",
+                    "market": Market.A_SHARE,
+                    "manifest_sha256": manifest_sha256(RULE_MANIFEST),
+                    "metrics": {},
+                }
+            )
+            repository.activate_rule_engine("rule-v1.0.0", "notify")
             evaluation, smoke, benchmark = self._rule_artifacts(root, concentration=0.50)
             ready = check_production_readiness(
-                SQLiteWarningRepository(root / "warning.db"),
+                repository,
                 mode="rule_v1/gate",
                 rule_manifest=RULE_MANIFEST,
                 rule_evaluation_path=evaluation,
@@ -203,7 +213,36 @@ class ProductionReadinessTests(TestCase):
         self.assertFalse(blocked["ready"])
         self.assertTrue(any("crisis concentration" in item for item in blocked["failures"]))
         self.assertTrue(any("soak" in item for item in blocked["failures"]))
+        self.assertTrue(any("active notify" in item for item in blocked["failures"]))
         self.assertTrue(ready["ready"])
+
+    def test_rule_gate_requires_active_notify_checksum_to_match_manifest(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repository = SQLiteWarningRepository(root / "warning.db")
+            repository.register_rule_engine(
+                {
+                    "engine_version": "rule-v1.0.0",
+                    "market": Market.A_SHARE,
+                    "manifest_sha256": "f" * 64,
+                    "metrics": {},
+                }
+            )
+            repository.activate_rule_engine("rule-v1.0.0", "notify")
+            evaluation, smoke, benchmark = self._rule_artifacts(root, concentration=0.50)
+
+            result = check_production_readiness(
+                repository,
+                mode="rule_v1/gate",
+                rule_manifest=RULE_MANIFEST,
+                rule_evaluation_path=evaluation,
+                data_smoke_path=smoke,
+                runtime_benchmark_path=benchmark,
+                soak_sessions=10,
+            )
+
+        self.assertFalse(result["ready"])
+        self.assertTrue(any("active notify" in item for item in result["failures"]))
 
 
 if __name__ == "__main__":

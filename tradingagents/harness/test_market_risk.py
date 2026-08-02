@@ -27,11 +27,13 @@ from tradingagents.harness.market_risk import (
 from tradingagents.harness.market_warning.adapters.sqlite_repository import SQLiteWarningRepository
 from tradingagents.harness.market_warning.domain import (
     DataStatus,
+    DecisionSource,
     FeatureSnapshot,
     FinalWarningDecision,
     Market,
     MarketPhase,
     QuantRiskAssessment,
+    RuleRiskAssessment,
 )
 from tradingagents.harness import market_risk_daily
 from tradingagents.harness.market_risk_daily import is_market_trading_day, run_market_risk_daily, _send_feishu_message
@@ -389,6 +391,84 @@ def _persist_warning(
     repository.save_decision(snapshot_id, prediction_ids, None, decision)
 
 
+def _persist_rule_warning(
+    db_path,
+    *,
+    at="2026-08-03T01:35:00+00:00",
+    level="ORANGE",
+    reliability="A",
+    status="fresh",
+    activation="notify",
+    assessment_digest="a" * 64,
+    registry_digest="a" * 64,
+):
+    repository = SQLiteWarningRepository(db_path)
+    repository.register_rule_engine(
+        {
+            "engine_version": "rule-v1.0.0",
+            "market": Market.A_SHARE,
+            "manifest_sha256": registry_digest,
+            "metrics": {},
+        }
+    )
+    repository.activate_rule_engine("rule-v1.0.0", "notify")
+    if activation == "gate":
+        repository.activate_rule_engine("rule-v1.0.0", "gate")
+    timestamp = _dt.datetime.fromisoformat(at)
+    snapshot = FeatureSnapshot(
+        market=Market.A_SHARE,
+        as_of_time=timestamp,
+        session_slot="intraday-0935",
+        feature_version="market-warning-v2",
+        features={"market_phase": "FIRST_SHOCK"},
+        evidence=(),
+        data_quality=status,
+        reliability_grade=reliability,
+        source_times={"fixture": timestamp},
+    )
+    actions = {
+        "GREEN": ("OPEN", 100.0),
+        "YELLOW": ("OPEN", 100.0),
+        "ORANGE": ("CONDITIONAL", 3.0),
+        "RED": ("WAIT", 0.0),
+    }
+    gate, cap = actions[level]
+    assessment = RuleRiskAssessment(
+        market=Market.A_SHARE,
+        as_of_time=timestamp,
+        engine_version="rule-v1.0.0",
+        manifest_sha256=assessment_digest,
+        risk_level=level,
+        risk_score=5.0 if level in {"ORANGE", "RED"} else 1.0,
+        market_phase=MarketPhase.FIRST_SHOCK,
+        triggered_rules=(),
+        missing_optional_groups=(),
+        reliability_grade=reliability,
+        evaluation_latency_ms=5.0,
+    )
+    decision = FinalWarningDecision(
+        baseline_level=level,
+        final_level=level,
+        state_transition=f"INITIAL_{level}",
+        entry_gate=gate,
+        new_position_cap_pct=cap,
+        holding_action="REDUCE" if level == "RED" else "HOLD_OR_REDUCE",
+        push_required=level in {"ORANGE", "RED"},
+        decision_reasons=("rule warning",),
+        data_status=status,
+        decision_source=DecisionSource.RULE_V1,
+    )
+    snapshot_id = repository.save_feature_snapshot(snapshot)
+    assessment_id = repository.save_rule_assessment(snapshot_id, assessment)
+    repository.save_decision(
+        snapshot_id,
+        (),
+        None,
+        decision,
+        rule_assessment_id=assessment_id,
+    )
+
+
 def test_warning_loader_ignores_decisions_from_inactive_model_sets():
     with _tmp_dir() as tmp_path:
         db_path = tmp_path / "risk.db"
@@ -407,6 +487,86 @@ def test_warning_loader_ignores_decisions_from_inactive_model_sets():
         )
 
         assert warning is None
+
+
+def test_rule_notify_activation_is_visible_but_never_changes_hard_gate():
+    with _tmp_dir() as tmp_path:
+        db_path = tmp_path / "risk.db"
+        _persist_rule_warning(db_path, activation="notify", level="RED")
+
+        warning = load_market_warning_for_ticker(
+            "300308",
+            "2026-08-03",
+            db_path,
+            analysis_time="2026-08-03T09:40:00+08:00",
+        )
+        effective = compose_effective_market_gate(
+            {"market": "a_share", "entry_gate": "OPEN", "position_cap_pct": 20},
+            warning,
+            "a_share",
+        )
+
+        assert warning["decision_source"] == "rule_v1"
+        assert warning["engine_version"] == "rule-v1.0.0"
+        assert warning["notification_only"] is True
+        assert warning["gate_applicable"] is False
+        assert warning.get("probabilities") is None
+        assert effective["entry_gate"] == "OPEN"
+        assert effective["position_cap_pct"] == 20
+        assert effective["warning_level"] == "RED"
+
+
+def test_rule_gate_activation_constrains_only_fresh_reliable_orange_or_red():
+    for level, expected_gate, expected_cap in (
+        ("ORANGE", "CONDITIONAL", 3.0),
+        ("RED", "WAIT", 0.0),
+    ):
+        with _tmp_dir() as tmp_path:
+            db_path = tmp_path / "risk.db"
+            _persist_rule_warning(db_path, activation="gate", level=level)
+
+            warning = load_market_warning_for_ticker(
+                "300308",
+                "2026-08-03",
+                db_path,
+                analysis_time="2026-08-03T09:40:00+08:00",
+            )
+            effective = compose_effective_market_gate(
+                {"market": "a_share", "entry_gate": "OPEN", "position_cap_pct": 20},
+                warning,
+                "a_share",
+            )
+
+            assert warning["notification_only"] is False
+            assert warning["gate_applicable"] is True
+            assert effective["entry_gate"] == expected_gate
+            assert effective["position_cap_pct"] == expected_cap
+
+
+def test_rule_gate_ignores_green_low_reliability_stale_and_checksum_mismatch():
+    cases = (
+        {"level": "GREEN"},
+        {"level": "ORANGE", "reliability": "C"},
+        {"level": "ORANGE", "status": "stale"},
+        {"level": "ORANGE", "assessment_digest": "b" * 64},
+    )
+    for changes in cases:
+        with _tmp_dir() as tmp_path:
+            db_path = tmp_path / "risk.db"
+            _persist_rule_warning(db_path, activation="gate", **changes)
+
+            warning = load_market_warning_for_ticker(
+                "300308",
+                "2026-08-03",
+                db_path,
+                analysis_time="2026-08-03T09:40:00+08:00",
+            )
+
+            if changes.get("assessment_digest"):
+                assert warning is None
+            else:
+                assert warning["gate_applicable"] is False
+                assert warning["notification_only"] is True
 
 
 def test_stale_a_share_warning_fails_closed_but_shadow_us_does_not():

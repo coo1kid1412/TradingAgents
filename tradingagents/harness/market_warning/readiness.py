@@ -100,6 +100,7 @@ def _finite_number(value: object) -> float | None:
 
 
 def _check_rule_readiness(
+    repository: SQLiteWarningRepository,
     *,
     mode: str,
     rule_manifest: Path | str,
@@ -149,11 +150,20 @@ def _check_rule_readiness(
             failures.append("runtime benchmark must include at least 100 runs")
 
     concentration = _finite_number(gates.get("max_crisis_contribution"))
+    active_notify = None
     if mode == "rule_v1/gate":
         if concentration is None or concentration > 0.50:
             failures.append("crisis concentration must not exceed 50%")
         if isinstance(soak_sessions, bool) or not isinstance(soak_sessions, int) or soak_sessions < 10:
             failures.append("gate mode requires at least 10 soak sessions")
+        active_notify = repository.load_active_rule_engine(Market.A_SHARE, "notify")
+        if (
+            manifest is None
+            or active_notify is None
+            or active_notify.get("engine_version") != manifest.engine_version
+            or active_notify.get("manifest_sha256") != manifest.manifest_sha256
+        ):
+            failures.append("active notify rule must match the gate manifest")
 
     return {
         "ready": not failures,
@@ -162,6 +172,9 @@ def _check_rule_readiness(
         "manifest_sha256": manifest.manifest_sha256 if manifest is not None else None,
         "feature_version": FEATURE_VERSION,
         "soak_sessions": soak_sessions,
+        "active_notify_version": (
+            active_notify.get("engine_version") if active_notify is not None else None
+        ),
         "failures": failures,
     }
 
@@ -184,6 +197,7 @@ def check_production_readiness(
     if mode not in {"rule_v1/notify", "rule_v1/gate"}:
         raise ValueError("mode must be model, rule_v1/notify, or rule_v1/gate")
     return _check_rule_readiness(
+        repository,
         mode=mode,
         rule_manifest=rule_manifest,
         rule_evaluation_path=rule_evaluation_path,
