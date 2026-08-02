@@ -955,6 +955,15 @@ class SQLiteWarningRepository:
             raise ValueError("rule engine activation was not persisted")
         return record
 
+    def deactivate_rule_engine(self, market: Market, mode: str) -> None:
+        column = self._rule_activation_column(mode)
+        with _db.connect(self._db_path) as connection:
+            connection.execute(
+                f"UPDATE market_warning_rule_registry SET {column} = 0, "
+                "updated_at = CURRENT_TIMESTAMP WHERE market = ?",
+                (Market(market).value,),
+            )
+
     def load_active_rule_engine(self, market: Market, mode: str) -> dict[str, Any] | None:
         column = self._rule_activation_column(mode)
         with _db.connect(self._db_path) as connection:

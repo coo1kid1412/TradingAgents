@@ -318,6 +318,29 @@ class SQLiteWarningRepositoryTests(TestCase):
             self.assertIsNone(loaded.quant_assessment)
             self.assertIsNone(loaded.shadow_quant_assessment)
 
+    def test_deactivate_rule_engine_only_changes_requested_mode(self):
+        with temporary_database() as db_path:
+            repository = SQLiteWarningRepository(db_path)
+            repository.register_rule_engine(
+                {
+                    "engine_version": "rule-v1.0.0",
+                    "market": Market.A_SHARE,
+                    "manifest_sha256": "a" * 64,
+                    "metrics": {},
+                }
+            )
+            repository.activate_rule_engine("rule-v1.0.0", "notify")
+            repository.activate_rule_engine("rule-v1.0.0", "gate")
+
+            repository.deactivate_rule_engine(Market.A_SHARE, "notify")
+
+            self.assertIsNone(
+                repository.load_active_rule_engine(Market.A_SHARE, "notify")
+            )
+            gate = repository.load_active_rule_engine(Market.A_SHARE, "gate")
+            self.assertIsNotNone(gate)
+            self.assertTrue(gate["gate_active"])
+
     def test_rule_registry_switches_notify_and_gate_versions_atomically(self):
         with temporary_database() as db_path:
             repository = SQLiteWarningRepository(db_path)
