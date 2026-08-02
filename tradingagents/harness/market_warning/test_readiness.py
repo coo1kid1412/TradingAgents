@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import tempfile
 from pathlib import Path
 from unittest import TestCase, main
@@ -11,6 +12,10 @@ from tradingagents.harness.market_warning.adapters.sqlite_repository import (
 from tradingagents.harness.market_warning.domain import Market
 from tradingagents.harness.market_warning.features import FEATURE_VERSION
 from tradingagents.harness.market_warning.readiness import check_production_readiness
+from tradingagents.harness.market_warning.rule_policy import manifest_sha256
+
+
+RULE_MANIFEST = Path(__file__).with_name("rule_manifest_v1.json")
 
 
 class ProductionReadinessTests(TestCase):
@@ -89,6 +94,116 @@ class ProductionReadinessTests(TestCase):
         self.assertFalse(result["ready"])
         self.assertTrue(any("one model version" in item for item in result["failures"]))
         self.assertTrue(any("checksum mismatch" in item for item in result["failures"]))
+
+    @staticmethod
+    def _rule_artifacts(
+        root: Path,
+        *,
+        lift: float = 2.4,
+        alerts_per_month: float = 4.0,
+        concentration: float = 0.75,
+        data_ready: bool = True,
+        p95_seconds: float = 12.0,
+        llm_calls: int = 0,
+    ) -> tuple[Path, Path, Path]:
+        evaluation = root / "evaluation.json"
+        smoke = root / "data-smoke.json"
+        benchmark = root / "benchmark.json"
+        evaluation.write_text(
+            json.dumps(
+                {
+                    "engine_version": "rule-v1.0.0",
+                    "manifest_sha256": manifest_sha256(RULE_MANIFEST),
+                    "production_gates": {
+                        "lift": lift,
+                        "alerts_per_month": alerts_per_month,
+                        "max_crisis_contribution": concentration,
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        smoke.write_text(json.dumps({"ready": data_ready}), encoding="utf-8")
+        benchmark.write_text(
+            json.dumps({"p95_seconds": p95_seconds, "llm_calls": llm_calls, "runs": 100}),
+            encoding="utf-8",
+        )
+        return evaluation, smoke, benchmark
+
+    def test_rule_notify_mode_does_not_require_gate_concentration_or_soak(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            evaluation, smoke, benchmark = self._rule_artifacts(root, concentration=0.75)
+
+            result = check_production_readiness(
+                SQLiteWarningRepository(root / "warning.db"),
+                mode="rule_v1/notify",
+                rule_manifest=RULE_MANIFEST,
+                rule_evaluation_path=evaluation,
+                data_smoke_path=smoke,
+                runtime_benchmark_path=benchmark,
+                soak_sessions=0,
+            )
+
+        self.assertTrue(result["ready"])
+        self.assertEqual(result["mode"], "rule_v1/notify")
+
+    def test_rule_notify_mode_enforces_lift_budget_data_and_runtime(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            evaluation, smoke, benchmark = self._rule_artifacts(
+                root,
+                lift=2.0,
+                alerts_per_month=6.1,
+                data_ready=False,
+                p95_seconds=30.0,
+                llm_calls=1,
+            )
+
+            result = check_production_readiness(
+                SQLiteWarningRepository(root / "warning.db"),
+                mode="rule_v1/notify",
+                rule_manifest=RULE_MANIFEST,
+                rule_evaluation_path=evaluation,
+                data_smoke_path=smoke,
+                runtime_benchmark_path=benchmark,
+            )
+
+        self.assertFalse(result["ready"])
+        self.assertTrue(any("lift" in item for item in result["failures"]))
+        self.assertTrue(any("alert budget" in item for item in result["failures"]))
+        self.assertTrue(any("data smoke" in item for item in result["failures"]))
+        self.assertTrue(any("P95" in item for item in result["failures"]))
+        self.assertTrue(any("LLM" in item for item in result["failures"]))
+
+    def test_rule_gate_adds_crisis_concentration_and_ten_session_soak(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            evaluation, smoke, benchmark = self._rule_artifacts(root, concentration=0.51)
+            blocked = check_production_readiness(
+                SQLiteWarningRepository(root / "warning.db"),
+                mode="rule_v1/gate",
+                rule_manifest=RULE_MANIFEST,
+                rule_evaluation_path=evaluation,
+                data_smoke_path=smoke,
+                runtime_benchmark_path=benchmark,
+                soak_sessions=9,
+            )
+            evaluation, smoke, benchmark = self._rule_artifacts(root, concentration=0.50)
+            ready = check_production_readiness(
+                SQLiteWarningRepository(root / "warning.db"),
+                mode="rule_v1/gate",
+                rule_manifest=RULE_MANIFEST,
+                rule_evaluation_path=evaluation,
+                data_smoke_path=smoke,
+                runtime_benchmark_path=benchmark,
+                soak_sessions=10,
+            )
+
+        self.assertFalse(blocked["ready"])
+        self.assertTrue(any("crisis concentration" in item for item in blocked["failures"]))
+        self.assertTrue(any("soak" in item for item in blocked["failures"]))
+        self.assertTrue(ready["ready"])
 
 
 if __name__ == "__main__":
