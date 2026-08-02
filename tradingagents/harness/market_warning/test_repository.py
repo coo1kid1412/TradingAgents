@@ -366,6 +366,79 @@ class SQLiteWarningRepositoryTests(TestCase):
                 "pressure.volatility_acceleration",
             )
 
+    def test_post_alert_reasoning_attaches_to_rule_decision_and_replays(self):
+        with temporary_database() as db_path:
+            repository = SQLiteWarningRepository(db_path)
+            snapshot_id = repository.save_feature_snapshot(make_snapshot())
+            rule_id = repository.save_rule_assessment(snapshot_id, make_rule_assessment())
+            decision_id = repository.save_decision(
+                snapshot_id,
+                (),
+                None,
+                make_decision(decision_source="rule_v1"),
+                rule_assessment_id=rule_id,
+            )
+            context = make_reasoning()
+            reasoning_id = repository.save_reasoning(snapshot_id, context, "MiniMax-M3")
+
+            repository.attach_reasoning(decision_id, reasoning_id)
+
+            loaded = repository.load_evaluation(Market.A_SHARE, AS_OF)
+            latest = repository.load_latest_reasoning(
+                Market.A_SHARE,
+                AS_OF + timedelta(minutes=1),
+            )
+            self.assertEqual(loaded.context_assessment, context)
+            self.assertEqual(latest, context)
+
+    def test_reasoning_cannot_attach_to_decision_from_another_snapshot(self):
+        with temporary_database() as db_path:
+            repository = SQLiteWarningRepository(db_path)
+            first_id = repository.save_feature_snapshot(make_snapshot())
+            first_rule_id = repository.save_rule_assessment(first_id, make_rule_assessment())
+            decision_id = repository.save_decision(
+                first_id,
+                (),
+                None,
+                make_decision(decision_source="rule_v1"),
+                rule_assessment_id=first_rule_id,
+            )
+            later = AS_OF + timedelta(minutes=10)
+            second_id = repository.save_feature_snapshot(
+                make_snapshot(as_of_time=later, source_times={"exchange": later})
+            )
+            reasoning_id = repository.save_reasoning(
+                second_id,
+                make_reasoning(),
+                "MiniMax-M3",
+            )
+
+            with self.assertRaises(ValueError):
+                repository.attach_reasoning(decision_id, reasoning_id)
+
+    def test_recovery_can_save_reasoning_directly_for_an_existing_decision(self):
+        with temporary_database() as db_path:
+            repository = SQLiteWarningRepository(db_path)
+            snapshot_id = repository.save_feature_snapshot(make_snapshot())
+            rule_id = repository.save_rule_assessment(snapshot_id, make_rule_assessment())
+            decision_id = repository.save_decision(
+                snapshot_id,
+                (),
+                None,
+                make_decision(decision_source="rule_v1"),
+                rule_assessment_id=rule_id,
+            )
+
+            reasoning_id = repository.save_reasoning_for_decision(
+                decision_id,
+                make_reasoning(),
+                "MiniMax-M3",
+            )
+
+            loaded = repository.load_evaluation(Market.A_SHARE, AS_OF)
+            self.assertIsInstance(reasoning_id, int)
+            self.assertEqual(loaded.context_assessment, make_reasoning())
+
     def test_activate_model_set_switches_all_four_horizons_in_one_commit(self):
         with temporary_database() as db_path:
             repository = SQLiteWarningRepository(db_path)

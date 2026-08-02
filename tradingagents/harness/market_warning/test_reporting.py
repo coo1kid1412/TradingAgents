@@ -255,6 +255,23 @@ class ReportGoldenTests(TestCase):
         self.assertNotIn("A-FOURTH-RULE", report)
         self.assertNotIn("概率", report)
 
+    def test_rule_m3_section_is_explanation_only(self) -> None:
+        context = replace(
+            _context(),
+            recommended_risk_level=RiskLevel.RED,
+            confidence=0.99,
+            action_reason="this field must not become a recommendation",
+        )
+        result = replace(_rule_result(), context_assessment=context)
+
+        report = render_premarket_report(result, None)
+
+        self.assertIn("M3 情景解释", report)
+        self.assertIn("不改变规则灯号和操作约束", report)
+        self.assertNotIn("建议：", report)
+        self.assertNotIn("99.00%", report)
+        self.assertNotIn("this field must not become a recommendation", report)
+
     def test_green_premarket_has_action_block_first_and_stable_section_order(self) -> None:
         report = render_premarket_report(_result(RiskLevel.GREEN), None)
         lines = report.splitlines()

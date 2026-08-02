@@ -23,13 +23,18 @@ from tradingagents.harness.market_warning.domain import (
     MarketPhase,
     QuantRiskAssessment,
     RiskLevel,
+    RuleRiskAssessment,
+    RunnerResult,
+    TriggeredRule,
 )
 from tradingagents.harness.market_warning.reasoning import (
     CircuitBreaker,
     ReasoningValidationError,
     build_reasoning_prompt,
+    build_rule_reasoning_prompt,
     should_call_reasoning,
     validate_context_assessment,
+    validate_rule_context_assessment,
 )
 from tradingagents.harness.market_warning.adapters.minimax_reasoning import (
     MiniMaxReasoningAdapter,
@@ -117,6 +122,56 @@ def valid_payload() -> dict[str, object]:
         "confidence": 0.78,
         "action_reason": "reduce new risk while confirmation develops",
         "reasoning_status": "validated",
+    }
+
+
+def make_rule_result(level: RiskLevel = RiskLevel.ORANGE) -> RunnerResult:
+    snapshot = make_snapshot(slot="intraday-0935")
+    assessment = RuleRiskAssessment(
+        market=Market.A_SHARE,
+        as_of_time=NOW,
+        engine_version="rule-v1.0.0",
+        manifest_sha256="a" * 64,
+        risk_level=level,
+        risk_score=5.0,
+        market_phase=MarketPhase.FIRST_SHOCK,
+        triggered_rules=(
+            TriggeredRule(
+                rule_id="pressure.breadth_deterioration",
+                layer="PRESSURE",
+                severity_points=2,
+                observed_value=True,
+                threshold_description="transition confirmed",
+                evidence_ids=("ev-1", "ev-2"),
+            ),
+        ),
+        missing_optional_groups=(),
+        reliability_grade="A",
+        evaluation_latency_ms=5.0,
+    )
+    decision = replace(
+        make_previous(level),
+        state_transition="INITIAL_ORANGE" if level == RiskLevel.ORANGE else "INITIAL_RED",
+        push_required=True,
+        decision_source="rule_v1",
+    )
+    return RunnerResult(
+        market=Market.A_SHARE,
+        as_of_time=NOW,
+        session_slot="intraday-0935",
+        feature_snapshot=snapshot,
+        rule_assessment=assessment,
+        decision=decision,
+        decision_id=7,
+    )
+
+
+def valid_rule_payload() -> dict[str, object]:
+    return {
+        "market_scenario": "breadth pressure is spreading",
+        "causal_chain": ["breadth weakens", "risk appetite contracts"],
+        "conflicting_evidence_ids": ["ev-3"],
+        "overlooked_risks": ["policy support may interrupt the chain"],
     }
 
 
@@ -213,6 +268,31 @@ class ContextValidationTests(TestCase):
 
 
 class PromptAndCallPolicyTests(TestCase):
+    def test_rule_prompt_contains_only_structured_explanation_inputs(self) -> None:
+        prompt = json.loads(build_rule_reasoning_prompt(make_rule_result(), None))
+
+        self.assertEqual(prompt["immutable_rule_decision"]["level"], "ORANGE")
+        self.assertEqual(prompt["triggered_rules"][0]["rule_id"], "pressure.breadth_deterioration")
+        self.assertIn("features", prompt)
+        self.assertIn("evidence", prompt)
+        self.assertNotIn("probabilities", prompt)
+        self.assertNotIn("recommended_risk_level", json.dumps(prompt))
+        self.assertNotIn("confidence", json.dumps(prompt))
+        self.assertNotIn("<think>", json.dumps(prompt).lower())
+
+    def test_rule_context_uses_deterministic_support_and_cannot_recommend_a_level(self) -> None:
+        result = validate_rule_context_assessment(
+            valid_rule_payload(),
+            valid_evidence_ids={"ev-1", "ev-2", "ev-3", "ev-4"},
+            supporting_evidence_ids=("ev-1", "ev-2"),
+            decision_level=RiskLevel.ORANGE,
+        )
+
+        self.assertEqual(result.supporting_evidence_ids, ("ev-1", "ev-2"))
+        self.assertEqual(result.recommended_risk_level, RiskLevel.ORANGE)
+        self.assertEqual(result.confidence, 0.0)
+        self.assertIn("不改变规则决策", result.action_reason)
+
     def test_prompt_is_compact_structured_and_contains_no_think_request(self) -> None:
         prompt = build_reasoning_prompt(make_snapshot(), make_quant(), make_previous())
 
@@ -262,6 +342,39 @@ class PromptAndCallPolicyTests(TestCase):
 
 
 class AdapterTests(TestCase):
+    def test_rule_alert_discards_level_override_and_records_contract_warning(self) -> None:
+        payload = valid_rule_payload()
+        payload.update(
+            {
+                "recommended_risk_level": "GREEN",
+                "confidence": 0.99,
+                "action_reason": "buy everything",
+            }
+        )
+        llm = FakeLLM([
+            f"<think>PRIVATE RULE THINK</think>{json.dumps(payload)}",
+        ])
+
+        result = self._adapter(llm).assess_rule_alert(make_rule_result(), None)
+
+        self.assertEqual(result.reasoning_status, "validated")
+        self.assertEqual(result.recommended_risk_level, RiskLevel.ORANGE)
+        self.assertEqual(result.error_class, "decision_override_ignored")
+        self.assertNotIn("PRIVATE RULE THINK", repr(result))
+        self.assertNotIn("buy everything", repr(result))
+        self.assertEqual(len(llm.calls), 1)
+
+    def test_rule_alert_rejects_unrecognized_output_fields(self) -> None:
+        payload = valid_rule_payload()
+        payload["raw_internal_log"] = "private"
+        llm = FakeLLM([json.dumps(payload), json.dumps(payload)])
+
+        result = self._adapter(llm).assess_rule_alert(make_rule_result(), None)
+
+        self.assertEqual(result.reasoning_status, "fallback")
+        self.assertEqual(result.error_class, "contract_violation")
+        self.assertNotIn("private", repr(result))
+
     def _adapter(self, llm: FakeLLM, **changes: object) -> MiniMaxReasoningAdapter:
         options = {"timeout": 0.05, **changes}
         return MiniMaxReasoningAdapter(llm, **options)
@@ -501,12 +614,17 @@ class AdapterTests(TestCase):
         for name, value in (
             ("MARKET_WARNING_LLM_TIMEOUT", "0"),
             ("MARKET_WARNING_LLM_TIMEOUT", "abc"),
+            ("MARKET_WARNING_LLM_TIMEOUT", "91"),
             ("MARKET_WARNING_LLM_MAX_TOKENS", "999999"),
         ):
             with self.subTest(name=name, value=value), mock.patch.dict(
                 os.environ, {name: value}, clear=False
             ), self.assertRaises(ValueError):
                 MiniMaxReasoningAdapter.from_environment()
+
+    def test_constructor_rejects_timeout_above_rule_slow_path_budget(self) -> None:
+        with self.assertRaises(ValueError):
+            MiniMaxReasoningAdapter(FakeLLM([]), timeout=90.1)
 
 
 class RawLoggingGuardTests(TestCase):

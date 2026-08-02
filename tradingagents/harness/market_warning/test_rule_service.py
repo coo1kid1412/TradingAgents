@@ -13,6 +13,7 @@ from tradingagents.harness.market_warning.domain import (
     Evidence,
     FeatureSnapshot,
     FinalWarningDecision,
+    LLMContextAssessment,
     Market,
     MarketDataPoint,
     MarketPhase,
@@ -20,6 +21,7 @@ from tradingagents.harness.market_warning.domain import (
     RawMarketSnapshot,
     RiskLevel,
     RuleRiskAssessment,
+    RunnerResult,
     TriggeredRule,
 )
 from tradingagents.harness.market_warning.quality import DataQualityAssessment
@@ -122,10 +124,19 @@ class RuleEvaluator:
 
 
 class Repository:
-    def __init__(self, events, fail_stage=None, previous=None):
+    def __init__(
+        self,
+        events,
+        fail_stage=None,
+        previous=None,
+        existing=None,
+        latest_context=None,
+    ):
         self.events = events
         self.fail_stage = fail_stage
         self.previous = previous
+        self.existing = existing
+        self.latest_context = latest_context
         self.decision = None
 
     def _stage(self, name, value):
@@ -135,7 +146,7 @@ class Repository:
         return value
 
     def load_evaluation(self, *_):
-        return None
+        return self.existing
 
     def save_feature_snapshot(self, _snapshot):
         return self._stage("save_snapshot", 11)
@@ -149,11 +160,26 @@ class Repository:
     def load_previous_decision(self, *_):
         return self._stage("load_previous", self.previous)
 
+    def load_latest_reasoning(self, *_):
+        return self._stage("load_latest_reasoning", self.latest_context)
+
     def save_decision(self, _snapshot_id, prediction_ids, _reasoning_id, decision, **kwargs):
         self.decision = decision
         self.saved_prediction_ids = prediction_ids
         self.saved_kwargs = kwargs
         return self._stage("save_decision", 31)
+
+    def save_reasoning(self, snapshot_id, assessment, model_name):
+        self.saved_reasoning = (snapshot_id, assessment, model_name)
+        return self._stage("save_reasoning", 41)
+
+    def attach_reasoning(self, decision_id, reasoning_id):
+        self.attached_reasoning = (decision_id, reasoning_id)
+        return self._stage("attach_reasoning", None)
+
+    def save_reasoning_for_decision(self, decision_id, assessment, model_name):
+        self.saved_reasoning = (decision_id, assessment, model_name)
+        return self._stage("save_decision_reasoning", 41)
 
 
 class Notifier:
@@ -165,6 +191,16 @@ class Notifier:
         self.events.append("notify")
         if self.error:
             raise self.error
+        return True
+
+
+class AlreadySentNotifier(Notifier):
+    def notify(self, _result):
+        self.events.append("notify")
+        return False
+
+    def was_sent(self, _result):
+        self.events.append("check_sent")
         return True
 
 
@@ -191,15 +227,28 @@ class ShadowModel:
 
 
 class PostAlertReasoning:
-    def __init__(self, events, error=None):
+    model_name = "MiniMax-M3"
+
+    def __init__(self, events, error=None, assessment=None):
         self.events = events
         self.error = error
+        self.assessment = assessment or LLMContextAssessment(
+            market_scenario="breadth pressure is spreading",
+            causal_chain=("breadth weakens", "risk appetite contracts"),
+            supporting_evidence_ids=("ev-rule",),
+            conflicting_evidence_ids=(),
+            overlooked_risks=("policy support",),
+            recommended_risk_level=RiskLevel.ORANGE,
+            confidence=0.0,
+            action_reason="仅作情景解释，不改变规则决策。",
+            reasoning_status="validated",
+        )
 
     def assess_rule_alert(self, *_):
         self.events.append("post_alert_reasoning")
         if self.error:
             raise self.error
-        return None
+        return self.assessment
 
 
 def quality_assessor(events):
@@ -279,14 +328,19 @@ class RuleMarketWarningServiceTests(TestCase):
                 "notify",
                 "shadow_model",
                 "post_alert_reasoning",
+                "save_reasoning",
+                "attach_reasoning",
             ],
         )
         self.assertEqual(result.decision.final_level, RiskLevel.ORANGE)
         self.assertEqual(result.decision.decision_source, DecisionSource.RULE_V1)
         self.assertEqual(result.rule_assessment.evaluation_latency_ms, 8.5)
         self.assertIsNotNone(result.shadow_quant_assessment)
+        self.assertEqual(result.context_assessment.reasoning_status, "validated")
         self.assertEqual(repository.saved_prediction_ids, ())
         self.assertEqual(repository.saved_kwargs["rule_assessment_id"], 21)
+        self.assertEqual(repository.saved_reasoning[0], 11)
+        self.assertEqual(repository.attached_reasoning, (31, 41))
 
     def test_intraday_yellow_is_silent_and_skips_all_slow_paths(self):
         events = []
@@ -353,6 +407,121 @@ class RuleMarketWarningServiceTests(TestCase):
         self.assertIsNone(result.shadow_quant_assessment)
         self.assertIn("shadow_model", events)
         self.assertIn("post_alert_reasoning", events)
+
+    def test_notification_failure_prevents_m3_call(self):
+        events = []
+        with tempfile.TemporaryDirectory() as directory:
+            service, repository = self._service(
+                events,
+                directory,
+                notifier=Notifier(events, RuntimeError("send failed")),
+            )
+
+            result = service.evaluate(Market.A_SHARE, NOW, "intraday-0935")
+
+        self.assertEqual(result.error_class, "notifier_error")
+        self.assertNotIn("post_alert_reasoning", events)
+        self.assertEqual(result.decision, repository.decision)
+
+    def test_same_orange_level_does_not_notify_or_call_m3(self):
+        events = []
+        previous = FinalWarningDecision(
+            baseline_level=RiskLevel.ORANGE,
+            final_level=RiskLevel.ORANGE,
+            state_transition="INITIAL_ORANGE",
+            entry_gate="CONDITIONAL",
+            new_position_cap_pct=3.0,
+            holding_action="HOLD_OR_REDUCE",
+            push_required=True,
+            decision_reasons=("earlier alert",),
+            data_status=DataStatus.FRESH,
+            decision_source=DecisionSource.RULE_V1,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            service, _ = self._service(
+                events,
+                directory,
+                repository=Repository(events, previous=previous),
+            )
+
+            result = service.evaluate(Market.A_SHARE, NOW, "intraday-0945")
+
+        self.assertEqual(result.decision.final_level, RiskLevel.ORANGE)
+        self.assertFalse(result.decision.push_required)
+        self.assertNotIn("notify", events)
+        self.assertNotIn("post_alert_reasoning", events)
+
+    def test_existing_sent_alert_can_resume_missing_m3_context_once(self):
+        events = []
+        snapshot = FeatureStrategy(events).build(
+            DataPort(events).load_snapshot(Market.A_SHARE, NOW, "intraday-0935"),
+            (),
+        )
+        existing = RunnerResult(
+            market=Market.A_SHARE,
+            as_of_time=NOW,
+            session_slot="intraday-0935",
+            feature_snapshot=snapshot,
+            rule_assessment=rule_assessment(RiskLevel.ORANGE),
+            decision=FinalWarningDecision(
+                baseline_level=RiskLevel.ORANGE,
+                final_level=RiskLevel.ORANGE,
+                state_transition="INITIAL_ORANGE",
+                entry_gate="CONDITIONAL",
+                new_position_cap_pct=3.0,
+                holding_action="HOLD_OR_REDUCE",
+                push_required=True,
+                decision_reasons=("alert",),
+                data_status=DataStatus.FRESH,
+                decision_source=DecisionSource.RULE_V1,
+            ),
+            decision_id=31,
+        )
+        events.clear()
+        repository = Repository(events, existing=existing)
+        with tempfile.TemporaryDirectory() as directory:
+            service, _ = self._service(
+                events,
+                directory,
+                repository=repository,
+                notifier=AlreadySentNotifier(events),
+                shadow_model=None,
+            )
+
+            result = service.evaluate(Market.A_SHARE, NOW, "intraday-0935")
+
+        self.assertEqual(
+            events,
+            [
+                "load_previous",
+                "write_report",
+                "notify",
+                "check_sent",
+                "post_alert_reasoning",
+                "save_decision_reasoning",
+            ],
+        )
+        self.assertEqual(result.context_assessment.reasoning_status, "validated")
+
+    def test_next_premarket_report_reuses_latest_post_alert_context(self):
+        events = []
+        context = PostAlertReasoning(events).assessment
+        repository = Repository(events, latest_context=context)
+        with tempfile.TemporaryDirectory() as directory:
+            service, _ = self._service(
+                events,
+                directory,
+                repository=repository,
+                rule_evaluator=RuleEvaluator(events, RiskLevel.GREEN),
+                shadow_model=None,
+                post_alert_reasoning=None,
+            )
+
+            result = service.evaluate(Market.A_SHARE, NOW, "premarket")
+
+        self.assertEqual(result.context_assessment, context)
+        self.assertLess(events.index("load_latest_reasoning"), events.index("write_report"))
+        self.assertNotIn("post_alert_reasoning", events)
 
 
 if __name__ == "__main__":

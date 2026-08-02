@@ -97,6 +97,22 @@ def _triggered_rules_json(assessment: RuleRiskAssessment) -> str:
     )
 
 
+def _context_from_row(row) -> LLMContextAssessment:
+    payload = json.loads(row["structured_json"])
+    return LLMContextAssessment(
+        market_scenario=payload["market_scenario"],
+        causal_chain=tuple(payload["causal_chain"]),
+        supporting_evidence_ids=tuple(payload["supporting_evidence_ids"]),
+        conflicting_evidence_ids=tuple(payload["conflicting_evidence_ids"]),
+        overlooked_risks=tuple(payload["overlooked_risks"]),
+        recommended_risk_level=RiskLevel(payload["recommended_risk_level"]),
+        confidence=payload["confidence"],
+        action_reason=payload["action_reason"],
+        reasoning_status=row["reasoning_status"],
+        error_class=row["error_class"],
+    )
+
+
 class SQLiteCircuitBreaker:
     """Small persistent breaker shared by independent cron processes."""
 
@@ -500,6 +516,75 @@ class SQLiteWarningRepository:
             )
             return int(cursor.lastrowid)
 
+    def save_reasoning_for_decision(
+        self,
+        decision_id: int,
+        assessment: LLMContextAssessment,
+        model_name: str,
+    ) -> int:
+        with _db.connect(self._db_path) as connection:
+            decision = connection.execute(
+                "SELECT feature_snapshot_id FROM market_warning_decisions WHERE id = ?",
+                (decision_id,),
+            ).fetchone()
+            if decision is None:
+                raise ValueError("decision_id does not exist")
+            cursor = connection.execute(
+                "INSERT INTO market_warning_reasoning "
+                "(feature_snapshot_id, model_name, reasoning_status, structured_json, error_class) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (
+                    decision["feature_snapshot_id"],
+                    model_name,
+                    assessment.reasoning_status,
+                    _reasoning_json(assessment),
+                    assessment.error_class,
+                ),
+            )
+            reasoning_id = int(cursor.lastrowid)
+            connection.execute(
+                "UPDATE market_warning_decisions SET reasoning_id = ? WHERE id = ?",
+                (reasoning_id, decision_id),
+            )
+            return reasoning_id
+
+    def attach_reasoning(self, decision_id: int, reasoning_id: int) -> None:
+        with _db.connect(self._db_path) as connection:
+            row = connection.execute(
+                "SELECT d.feature_snapshot_id AS decision_snapshot_id, "
+                "r.feature_snapshot_id AS reasoning_snapshot_id "
+                "FROM market_warning_decisions AS d "
+                "INNER JOIN market_warning_reasoning AS r ON r.id = ? "
+                "WHERE d.id = ?",
+                (reasoning_id, decision_id),
+            ).fetchone()
+            if row is None:
+                raise ValueError("decision_id and reasoning_id must exist")
+            if row["decision_snapshot_id"] != row["reasoning_snapshot_id"]:
+                raise ValueError("reasoning must belong to the decision feature snapshot")
+            connection.execute(
+                "UPDATE market_warning_decisions SET reasoning_id = ? WHERE id = ?",
+                (reasoning_id, decision_id),
+            )
+
+    def load_latest_reasoning(
+        self,
+        market: Market,
+        before_time: datetime,
+        model_name: str = "MiniMax-M3",
+    ) -> LLMContextAssessment | None:
+        with _db.connect(self._db_path) as connection:
+            row = connection.execute(
+                "SELECT r.reasoning_status, r.structured_json, r.error_class "
+                "FROM market_warning_reasoning AS r "
+                "INNER JOIN market_warning_feature_snapshots AS s "
+                "ON s.id = r.feature_snapshot_id "
+                "WHERE s.market = ? AND s.as_of_time < ? AND r.model_name = ? "
+                "ORDER BY s.as_of_time DESC, r.id DESC LIMIT 1",
+                (Market(market).value, _stored_time(before_time), model_name),
+            ).fetchone()
+        return _context_from_row(row) if row is not None else None
+
     def save_decision(
         self,
         feature_snapshot_id: int,
@@ -727,19 +812,7 @@ class SQLiteWarningRepository:
             )
         context = None
         if reasoning is not None:
-            payload = json.loads(reasoning["structured_json"])
-            context = LLMContextAssessment(
-                market_scenario=payload["market_scenario"],
-                causal_chain=tuple(payload["causal_chain"]),
-                supporting_evidence_ids=tuple(payload["supporting_evidence_ids"]),
-                conflicting_evidence_ids=tuple(payload["conflicting_evidence_ids"]),
-                overlooked_risks=tuple(payload["overlooked_risks"]),
-                recommended_risk_level=RiskLevel(payload["recommended_risk_level"]),
-                confidence=payload["confidence"],
-                action_reason=payload["action_reason"],
-                reasoning_status=reasoning["reasoning_status"],
-                error_class=reasoning["error_class"],
-            )
+            context = _context_from_row(reasoning)
         decision = self._decision_from_row(row)
         return RunnerResult(
             market=Market(row["market"]),
@@ -824,6 +897,14 @@ class SQLiteWarningRepository:
                 "error_summary = ? WHERE idempotency_key = ?",
                 (status, status, error_summary, idempotency_key),
             )
+
+    def load_alert_status(self, idempotency_key: str) -> str | None:
+        with _db.connect(self._db_path) as connection:
+            row = connection.execute(
+                "SELECT push_status FROM market_warning_alerts WHERE idempotency_key = ?",
+                (idempotency_key,),
+            ).fetchone()
+        return str(row["push_status"]) if row is not None else None
 
     def register_rule_engine(self, record: Mapping[str, Any]) -> None:
         values = dict(record)

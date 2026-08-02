@@ -60,6 +60,19 @@ class WarningRepository(Protocol):
         self, feature_snapshot_id: int, assessment: LLMContextAssessment, model_name: str
     ) -> int: ...
 
+    def save_reasoning_for_decision(
+        self,
+        decision_id: int,
+        assessment: LLMContextAssessment,
+        model_name: str,
+    ) -> int: ...
+
+    def attach_reasoning(self, decision_id: int, reasoning_id: int) -> None: ...
+
+    def load_latest_reasoning(
+        self, market: Market, before_time: datetime, model_name: str = "MiniMax-M3"
+    ) -> LLMContextAssessment | None: ...
+
     def save_decision(
         self,
         feature_snapshot_id: int,

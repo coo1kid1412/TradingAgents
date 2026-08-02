@@ -413,6 +413,7 @@ def _default_service_factory(
             rule_evaluator=partial(evaluate_a_share_rules, manifest=manifest),
             repository=repository,
             notifier=FeishuNotifier(repository, retry_failed=force),
+            post_alert_reasoning=_reasoning_adapter(repository),
             report_root=_PROJECT_ROOT / "reports/market_warning",
             history_loader=load_history,
             engine_version=manifest.engine_version,

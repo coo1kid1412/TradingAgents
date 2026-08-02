@@ -106,3 +106,9 @@ class FeishuNotifier:
             raise
         self.repository.finish_alert(key, "sent")
         return True
+
+    def was_sent(self, result: RunnerResult) -> bool:
+        if not should_notify(result):
+            return False
+        loader = getattr(self.repository, "load_alert_status", None)
+        return callable(loader) and loader(_idempotency_key(result)) == "sent"

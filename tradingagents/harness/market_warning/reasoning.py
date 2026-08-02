@@ -17,6 +17,7 @@ from .domain import (
     LLMContextAssessment,
     QuantRiskAssessment,
     RiskLevel,
+    RunnerResult,
 )
 from .policy import baseline_level
 
@@ -36,6 +37,25 @@ _REQUIRED_FIELDS = frozenset(
 )
 _OUTPUT_LEVELS = frozenset(
     {RiskLevel.GREEN, RiskLevel.YELLOW, RiskLevel.ORANGE, RiskLevel.RED}
+)
+_RULE_REQUIRED_FIELDS = frozenset(
+    {
+        "market_scenario",
+        "causal_chain",
+        "conflicting_evidence_ids",
+        "overlooked_risks",
+    }
+)
+_RULE_OVERRIDE_FIELDS = frozenset(
+    {
+        "recommended_risk_level",
+        "confidence",
+        "action_reason",
+        "entry_gate",
+        "position_cap_pct",
+        "holding_action",
+        "buy_sell_action",
+    }
 )
 
 
@@ -135,6 +155,52 @@ def validate_context_assessment(
         action_reason=_string(payload["action_reason"]),
         reasoning_status="validated",
         error_class=None,
+    )
+
+
+def validate_rule_context_assessment(
+    payload: Mapping[str, Any],
+    valid_evidence_ids: Iterable[str],
+    supporting_evidence_ids: Iterable[str],
+    decision_level: RiskLevel,
+) -> LLMContextAssessment:
+    """Validate explanation-only rule output and ignore attempted decision overrides."""
+
+    if not isinstance(payload, Mapping):
+        raise ReasoningValidationError("contract_violation")
+    override_present = bool(set(payload) & _RULE_OVERRIDE_FIELDS)
+    explanation = {
+        key: value for key, value in payload.items() if key not in _RULE_OVERRIDE_FIELDS
+    }
+    if set(explanation) != _RULE_REQUIRED_FIELDS:
+        raise ReasoningValidationError("contract_violation")
+    valid_ids = frozenset(valid_evidence_ids)
+    support = tuple(dict.fromkeys(_string(item) for item in supporting_evidence_ids))
+    if not support or any(item not in valid_ids for item in support):
+        raise ReasoningValidationError("contract_violation")
+    conflicting = _string_list(
+        explanation["conflicting_evidence_ids"],
+        allow_empty=True,
+    )
+    if any(item not in valid_ids for item in conflicting):
+        raise ReasoningValidationError("contract_violation")
+    try:
+        level = RiskLevel(decision_level)
+    except (TypeError, ValueError) as exc:
+        raise ReasoningValidationError("contract_violation") from exc
+    if level not in {RiskLevel.ORANGE, RiskLevel.RED}:
+        raise ReasoningValidationError("contract_violation")
+    return LLMContextAssessment(
+        market_scenario=_string(explanation["market_scenario"]),
+        causal_chain=_string_list(explanation["causal_chain"], allow_empty=False),
+        supporting_evidence_ids=support,
+        conflicting_evidence_ids=conflicting,
+        overlooked_risks=_string_list(explanation["overlooked_risks"], allow_empty=True),
+        recommended_risk_level=level,
+        confidence=0.0,
+        action_reason="M3仅作情景解释，不改变规则决策。",
+        reasoning_status="validated",
+        error_class="decision_override_ignored" if override_present else None,
     )
 
 
@@ -306,6 +372,96 @@ def build_reasoning_prompt(
             "confidence": "number from 0 to 1",
             "action_reason": "non-empty string",
             "reasoning_status": "validated",
+        },
+    }
+    return json.dumps(context, ensure_ascii=False, sort_keys=True, separators=(",", ": "))
+
+
+def build_rule_reasoning_prompt(
+    result: RunnerResult,
+    previous: FinalWarningDecision | None,
+) -> str:
+    """Build an explanation-only prompt from a completed deterministic alert."""
+
+    snapshot = result.feature_snapshot
+    assessment = result.rule_assessment
+    decision = result.decision
+    if snapshot is None or assessment is None or decision is None:
+        raise ReasoningValidationError("prompt_error")
+    if decision.final_level not in {RiskLevel.ORANGE, RiskLevel.RED}:
+        raise ReasoningValidationError("prompt_error")
+    rule_evidence_ids = tuple(
+        dict.fromkeys(
+            evidence_id
+            for rule in assessment.triggered_rules
+            for evidence_id in rule.evidence_ids
+        )
+    )
+    by_id = {item.evidence_id: item for item in snapshot.evidence}
+    ordered_ids = tuple(
+        dict.fromkeys((*rule_evidence_ids, *(item.evidence_id for item in snapshot.evidence)))
+    )[:16]
+    evidence = [
+        {
+            "evidence_id": evidence_id,
+            "summary": _json_value(by_id[evidence_id].summary[:240]),
+            "value": _json_value(by_id[evidence_id].value),
+            "as_of_time": (
+                by_id[evidence_id].as_of_time.isoformat()
+                if by_id[evidence_id].as_of_time
+                else None
+            ),
+        }
+        for evidence_id in ordered_ids
+        if evidence_id in by_id
+    ]
+    exposed_ids = {item["evidence_id"] for item in evidence}
+    triggered_rules = [
+        {
+            "rule_id": rule.rule_id,
+            "layer": rule.layer.value,
+            "severity_points": rule.severity_points,
+            "observed_value": _json_value(rule.observed_value),
+            "threshold_description": rule.threshold_description,
+            "evidence_ids": [
+                item for item in rule.evidence_ids if item in exposed_ids
+            ],
+        }
+        for rule in assessment.triggered_rules
+    ]
+    features = {
+        str(name): _json_value(value)
+        for name, value in sorted(snapshot.features.items())[:64]
+    }
+    context = {
+        "task": "Explain the deterministic market-risk alert using only the supplied evidence.",
+        "strict_json_output": True,
+        "market": result.market.value,
+        "as_of_time": result.as_of_time.isoformat(),
+        "session_slot": result.session_slot,
+        "data_quality": snapshot.data_quality.value,
+        "reliability_grade": assessment.reliability_grade,
+        "immutable_rule_decision": {
+            "level": decision.final_level.value,
+            "transition": decision.state_transition,
+            "previous_level": previous.final_level.value if previous else None,
+            "engine_version": assessment.engine_version,
+            "manifest_sha256": assessment.manifest_sha256,
+        },
+        "features": features,
+        "triggered_rules": triggered_rules,
+        "evidence": evidence,
+        "constraints": [
+            "Use only listed evidence_id values.",
+            "Explain causality and counter-evidence; do not change the immutable rule decision.",
+            "Do not provide a risk level, trade instruction, position cap, or private reasoning.",
+            "Return JSON only.",
+        ],
+        "output_schema": {
+            "market_scenario": "non-empty string",
+            "causal_chain": ["one or more non-empty strings"],
+            "conflicting_evidence_ids": ["zero or more listed evidence_id values"],
+            "overlooked_risks": ["zero or more non-empty strings"],
         },
     }
     return json.dumps(context, ensure_ascii=False, sort_keys=True, separators=(",", ": "))

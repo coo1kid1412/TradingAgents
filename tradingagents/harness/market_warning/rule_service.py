@@ -13,6 +13,7 @@ from .domain import (
     Evidence,
     FeatureSnapshot,
     FinalWarningDecision,
+    LLMContextAssessment,
     Market,
     QuantRiskAssessment,
     RawMarketSnapshot,
@@ -277,12 +278,26 @@ class RuleMarketWarningService:
                 )
                 decision = build_rule_decision(assessment, snapshot, previous=previous)
 
+        prior_context = None
+        if "premarket" in session_slot.lower():
+            try:
+                loader = getattr(self.repository, "load_latest_reasoning", None)
+                if callable(loader):
+                    prior_context = loader(market_value, as_of_time)
+                    if prior_context is not None and not isinstance(
+                        prior_context, LLMContextAssessment
+                    ):
+                        prior_context = None
+            except Exception:
+                prior_context = None
+
         result = RunnerResult(
             market=market_value,
             as_of_time=as_of_time,
             session_slot=session_slot,
             feature_snapshot=snapshot,
             rule_assessment=assessment,
+            context_assessment=prior_context,
             decision=decision,
             decision_id=decision_id,
             error_class=error_class,
@@ -299,12 +314,14 @@ class RuleMarketWarningService:
         notification_confirmed = False
         if self.notifier is not None and should_notify and decision_id is not None:
             try:
-                self.notifier.notify(result)
-                notification_confirmed = True
+                notification_confirmed = bool(self.notifier.notify(result))
+                if not notification_confirmed:
+                    was_sent = getattr(self.notifier, "was_sent", None)
+                    notification_confirmed = callable(was_sent) and bool(was_sent(result))
             except Exception:
                 result = replace(result, error_class="notifier_error")
         if notification_confirmed and decision.push_required:
-            result = self._run_slow_paths(result, previous)
+            result = self._run_slow_paths(result, previous, snapshot_id)
         return result
 
     def _resume_existing(self, result: RunnerResult) -> RunnerResult:
@@ -320,17 +337,29 @@ class RuleMarketWarningService:
         should_notify = "premarket" in result.session_slot.lower() or (
             result.decision is not None and result.decision.push_required
         )
+        notification_confirmed = False
         if self.notifier is not None and should_notify:
             try:
-                self.notifier.notify(result)
+                notification_confirmed = bool(self.notifier.notify(result))
+                if not notification_confirmed:
+                    was_sent = getattr(self.notifier, "was_sent", None)
+                    notification_confirmed = callable(was_sent) and bool(was_sent(result))
             except Exception:
                 result = replace(result, error_class="notifier_error")
+        if (
+            notification_confirmed
+            and result.decision is not None
+            and result.decision.push_required
+            and result.context_assessment is None
+        ):
+            result = self._run_slow_paths(result, previous, None)
         return result
 
     def _run_slow_paths(
         self,
         result: RunnerResult,
         previous: FinalWarningDecision | None,
+        snapshot_id: int | None,
     ) -> RunnerResult:
         if self.shadow_model is not None and result.feature_snapshot is not None:
             try:
@@ -341,7 +370,32 @@ class RuleMarketWarningService:
                 pass
         if self.post_alert_reasoning is not None:
             try:
-                self.post_alert_reasoning.assess_rule_alert(result, previous)
+                context = self.post_alert_reasoning.assess_rule_alert(result, previous)
+                if isinstance(context, LLMContextAssessment):
+                    if result.decision_id is not None and snapshot_id is None:
+                        saver = getattr(
+                            self.repository,
+                            "save_reasoning_for_decision",
+                            None,
+                        )
+                        if callable(saver):
+                            saver(
+                                result.decision_id,
+                                context,
+                                getattr(
+                                    self.post_alert_reasoning,
+                                    "model_name",
+                                    "MiniMax-M3",
+                                ),
+                            )
+                    elif snapshot_id is not None and result.decision_id is not None:
+                        reasoning_id = self.repository.save_reasoning(
+                            snapshot_id,
+                            context,
+                            getattr(self.post_alert_reasoning, "model_name", "MiniMax-M3"),
+                        )
+                        self.repository.attach_reasoning(result.decision_id, reasoning_id)
+                    result = replace(result, context_assessment=context)
             except Exception:
                 pass
         return result
