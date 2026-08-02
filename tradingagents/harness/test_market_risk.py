@@ -317,8 +317,38 @@ def test_us_shadow_warning_is_visible_but_does_not_override_production_gate():
     assert result["effective_gate_source"] == "legacy_market_risk"
 
 
-def _persist_warning(db_path, *, market, at, status="fresh", level="ORANGE"):
+def _register_active_warning_models(repository, version="model-v2"):
+    for registered_market in Market:
+        for horizon in ("1d", "3d"):
+            repository.register_model(
+                {
+                    "model_version": version,
+                    "market": registered_market,
+                    "horizon": horizon,
+                    "feature_version": "market-warning-v2",
+                    "calibration_version": "platt-v2",
+                    "training_cutoff": "2026-07-31",
+                    "artifact_path": f"/tmp/{version}/{registered_market.value}/{horizon}.joblib",
+                    "artifact_sha256": "0" * 64,
+                    "metrics": {},
+                    "base_rate": 0.01,
+                    "active": True,
+                }
+            )
+
+
+def _persist_warning(
+    db_path,
+    *,
+    market,
+    at,
+    status="fresh",
+    level="ORANGE",
+    activate_models=True,
+):
     repository = SQLiteWarningRepository(db_path)
+    if activate_models:
+        _register_active_warning_models(repository)
     snapshot = FeatureSnapshot(
         market=market,
         as_of_time=_dt.datetime.fromisoformat(at),
@@ -357,6 +387,26 @@ def _persist_warning(db_path, *, market, at, status="fresh", level="ORANGE"):
     snapshot_id = repository.save_feature_snapshot(snapshot)
     prediction_ids = repository.save_predictions(snapshot_id, quant)
     repository.save_decision(snapshot_id, prediction_ids, None, decision)
+
+
+def test_warning_loader_ignores_decisions_from_inactive_model_sets():
+    with _tmp_dir() as tmp_path:
+        db_path = tmp_path / "risk.db"
+        _persist_warning(
+            db_path,
+            market=Market.A_SHARE,
+            at="2026-08-03T01:35:00+00:00",
+            activate_models=False,
+        )
+
+        warning = load_market_warning_for_ticker(
+            "300308",
+            "2026-08-03",
+            db_path,
+            analysis_time="2026-08-03T09:40:00+08:00",
+        )
+
+        assert warning is None
 
 
 def test_stale_a_share_warning_fails_closed_but_shadow_us_does_not():

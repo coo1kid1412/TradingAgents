@@ -425,13 +425,25 @@ class FeishuNotifierTests(TestCase):
 
 
 class InstallerTests(TestCase):
-    def test_cron_installer_creates_log_directory_before_installing_redirect(self) -> None:
-        script = (
+    def _script(self) -> str:
+        return (
             Path(__file__).resolve().parents[3] / "scripts/install_market_warning_cron.sh"
         ).read_text(encoding="utf-8")
 
+    def test_cron_installer_creates_log_directory_before_installing_redirect(self) -> None:
+        script = self._script()
+
         self.assertIn('mkdir -p "$LOG_DIR"', script)
         self.assertLess(script.index('mkdir -p "$LOG_DIR"'), script.rindex("| crontab -"))
+
+    def test_cron_installer_checks_production_readiness_before_crontab(self) -> None:
+        script = self._script()
+
+        self.assertIn("tradingagents.harness.market_warning.readiness", script)
+        self.assertLess(
+            script.index("tradingagents.harness.market_warning.readiness"),
+            script.rindex("| crontab -"),
+        )
 
 
 if __name__ == "__main__":

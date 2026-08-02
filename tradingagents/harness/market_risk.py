@@ -324,6 +324,15 @@ def load_market_warning_for_ticker(
                    FROM market_warning_decisions AS d2
                    JOIN market_warning_feature_snapshots AS s2 ON s2.id = d2.feature_snapshot_id
                    WHERE s2.market = ? AND s2.as_of_time <= ?
+                     AND 4 = (
+                         SELECT COUNT(*)
+                         FROM market_warning_model_registry AS r
+                         WHERE r.model_version = d2.model_version
+                           AND r.feature_version = s2.feature_version
+                           AND r.active = 1
+                           AND r.market IN ('a_share', 'us')
+                           AND r.horizon IN ('1d', '3d')
+                     )
                    ORDER BY s2.as_of_time DESC, d2.id DESC LIMIT 1
                )
                ORDER BY p.horizon""",
