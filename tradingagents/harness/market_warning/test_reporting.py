@@ -9,6 +9,7 @@ from unittest import mock
 
 from tradingagents.harness.market_warning.domain import (
     DataStatus,
+    DecisionSource,
     FeatureSnapshot,
     FinalWarningDecision,
     LLMContextAssessment,
@@ -16,7 +17,10 @@ from tradingagents.harness.market_warning.domain import (
     MarketPhase,
     QuantRiskAssessment,
     RiskLevel,
+    RuleLayer,
+    RuleRiskAssessment,
     RunnerResult,
+    TriggeredRule,
 )
 from tradingagents.harness.market_warning.reporting import (
     render_premarket_report,
@@ -139,7 +143,118 @@ def _result(
     )
 
 
+def _rule_result(
+    level: RiskLevel = RiskLevel.ORANGE,
+    *,
+    slot: str = "premarket",
+    transition: str = "INITIAL_ORANGE",
+) -> RunnerResult:
+    snapshot = replace(
+        _snapshot(),
+        session_slot=slot,
+        features={
+            "market_phase": "FIRST_SHOCK",
+            "realtime_breadth_coverage_pct": 0.98,
+            "realtime_breadth_staleness_minutes": 1.5,
+        },
+    )
+    rules = (
+        TriggeredRule(
+            rule_id="A-PRESSURE-BREADTH",
+            layer=RuleLayer.PRESSURE,
+            severity_points=2,
+            observed_value=-0.43,
+            threshold_description="上涨家数占比较20日基线下降至少35个百分点",
+            evidence_ids=("breadth-now", "breadth-baseline"),
+        ),
+        TriggeredRule(
+            rule_id="A-PRESSURE-LIMIT-DOWN",
+            layer=RuleLayer.PRESSURE,
+            severity_points=1,
+            observed_value=0.012,
+            threshold_description="跌停家数占比不低于1%",
+            evidence_ids=("limit-down-now",),
+        ),
+        TriggeredRule(
+            rule_id="A-VULNERABILITY-TREND",
+            layer=RuleLayer.VULNERABILITY,
+            severity_points=1,
+            observed_value=-0.018,
+            threshold_description="指数位于20日均线下方",
+            evidence_ids=("index-daily",),
+        ),
+        TriggeredRule(
+            rule_id="A-FOURTH-RULE",
+            layer=RuleLayer.CONTINUATION,
+            severity_points=1,
+            observed_value=True,
+            threshold_description="第四条证据不应出现在短告警中",
+            evidence_ids=("fourth",),
+        ),
+    )
+    assessment = RuleRiskAssessment(
+        market=Market.A_SHARE,
+        as_of_time=NOW,
+        engine_version="rule-v1.0.0",
+        manifest_sha256="a" * 64,
+        risk_level=level,
+        risk_score=5.0,
+        market_phase=MarketPhase.FIRST_SHOCK,
+        triggered_rules=rules,
+        missing_optional_groups=(),
+        reliability_grade="A",
+        evaluation_latency_ms=18.0,
+    )
+    decision = replace(
+        _decision(level, transition=transition),
+        decision_source=DecisionSource.RULE_V1,
+    )
+    return RunnerResult(
+        market=Market.A_SHARE,
+        as_of_time=NOW,
+        session_slot=slot,
+        feature_snapshot=snapshot,
+        rule_assessment=assessment,
+        decision=decision,
+    )
+
+
 class ReportGoldenTests(TestCase):
+    def test_rule_premarket_puts_action_data_and_score_disclaimer_first(self) -> None:
+        report = render_premarket_report(_rule_result(), None)
+        first_screen = "\n".join(report.splitlines()[:14])
+
+        self.assertTrue(report.startswith("# A股大盘骤跌预警\n\n## 【橙灯：提前防守】"))
+        self.assertIn("**立即操作：", first_screen)
+        self.assertIn("**入场门：", first_screen)
+        self.assertIn("**新增仓位上限：", first_screen)
+        self.assertIn("**持仓动作：", first_screen)
+        self.assertIn("规则生产版", first_screen)
+        self.assertIn("数据截至", first_screen)
+        self.assertIn("可靠度：`A`", first_screen)
+        self.assertIn("规则分数：`5.0/10`（规则分数不是概率）", first_screen)
+        self.assertNotIn("骤跌概率", report)
+        self.assertNotIn("0.00%", report)
+        self.assertNotIn("<think>", report.lower())
+
+    def test_rule_intraday_alert_is_short_and_shows_only_top_three_rules(self) -> None:
+        result = _rule_result(
+            RiskLevel.RED,
+            slot="intraday-0935",
+            transition="UPGRADE_ORANGE_TO_RED",
+        )
+
+        report = render_upgrade_report(result, _decision(RiskLevel.ORANGE))
+
+        self.assertTrue(report.startswith("# 【红灯：风险确认】"))
+        self.assertIn("ORANGE -> RED", report)
+        self.assertIn("**入场门：", report)
+        self.assertIn("**新增仓位上限：", report)
+        self.assertIn("**持仓动作：", report)
+        self.assertEqual(report.count("规则 `A-"), 3)
+        self.assertNotIn("A-FOURTH-RULE", report)
+        self.assertNotIn("概率", report)
+
     def test_green_premarket_has_action_block_first_and_stable_section_order(self) -> None:
         report = render_premarket_report(_result(RiskLevel.GREEN), None)
         lines = report.splitlines()

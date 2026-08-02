@@ -10,7 +10,7 @@ from zoneinfo import ZoneInfo
 
 from tradingagents.harness.market_risk_daily import _send_feishu_message
 
-from ..domain import Market, RiskLevel, RunnerResult
+from ..domain import DecisionSource, Market, RiskLevel, RunnerResult
 from ..reporting import render_premarket_report, render_upgrade_report
 
 
@@ -34,22 +34,33 @@ def should_notify(result: RunnerResult) -> bool:
 
 def _idempotency_key(result: RunnerResult) -> str:
     decision = result.decision
-    if decision is None or result.quant_assessment is None:
-        raise ValueError("notification requires decision and quant assessment")
+    if decision is None:
+        raise ValueError("notification requires decision")
     local = result.as_of_time.astimezone(_MARKET_ZONES[result.market])
     slot = (
         "premarket"
         if "premarket" in result.session_slot.lower()
         else f"bucket-{local:%H%M}"
     )
-    parts = (
+    common_parts = (
         result.market.value,
         local.date().isoformat(),
         slot,
         decision.final_level.value,
         decision.state_transition,
-        result.quant_assessment.model_version,
     )
+    if decision.decision_source == DecisionSource.RULE_V1:
+        assessment = result.rule_assessment
+        if assessment is None:
+            raise ValueError("rule notification requires rule assessment")
+        parts = common_parts + (
+            assessment.engine_version,
+            assessment.manifest_sha256,
+        )
+    else:
+        if result.quant_assessment is None:
+            raise ValueError("model notification requires quant assessment")
+        parts = common_parts + (result.quant_assessment.model_version,)
     return "|".join(parts)
 
 

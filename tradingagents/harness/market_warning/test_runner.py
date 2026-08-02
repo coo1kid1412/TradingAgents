@@ -4,22 +4,28 @@ import json
 import io
 import tempfile
 from contextlib import redirect_stdout
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 from unittest import TestCase, main, mock
 from zoneinfo import ZoneInfo
 
 from tradingagents.harness import db as _db
-from tradingagents.harness.market_warning.adapters.feishu_notifier import FeishuNotifier
+from tradingagents.harness.market_warning.adapters.feishu_notifier import (
+    FeishuNotifier,
+    _idempotency_key,
+)
 from tradingagents.harness.market_warning.adapters.sqlite_repository import SQLiteWarningRepository
 from tradingagents.harness.market_warning.domain import (
     DataStatus,
+    DecisionSource,
     FeatureSnapshot,
     FinalWarningDecision,
     Market,
     MarketPhase,
     QuantRiskAssessment,
     RiskLevel,
+    RuleRiskAssessment,
     RunnerResult,
 )
 from tradingagents.harness.market_warning.runner import (
@@ -288,6 +294,42 @@ def _result(
     )
 
 
+def _rule_result(
+    decision_id: int,
+    level: RiskLevel,
+    *,
+    slot: str,
+    transition: str,
+    push: bool,
+) -> RunnerResult:
+    result = _result(
+        decision_id,
+        level,
+        slot=slot,
+        transition=transition,
+        push=push,
+    )
+    assessment = RuleRiskAssessment(
+        market=Market.A_SHARE,
+        as_of_time=result.as_of_time,
+        engine_version="rule-v1.0.0",
+        manifest_sha256="b" * 64,
+        risk_level=level,
+        risk_score=5.0,
+        market_phase=MarketPhase.FIRST_SHOCK,
+        triggered_rules=(),
+        missing_optional_groups=(),
+        reliability_grade="A",
+        evaluation_latency_ms=12.0,
+    )
+    return replace(
+        result,
+        quant_assessment=None,
+        rule_assessment=assessment,
+        decision=replace(result.decision, decision_source=DecisionSource.RULE_V1),
+    )
+
+
 def _persist_decision(repository: SQLiteWarningRepository) -> int:
     as_of = datetime(2026, 8, 3, 1, 35, tzinfo=UTC)
     snapshot = FeatureSnapshot(
@@ -323,6 +365,44 @@ def _persist_decision(repository: SQLiteWarningRepository) -> int:
 
 
 class FeishuNotifierTests(TestCase):
+    def test_rule_notification_key_uses_engine_and_manifest_without_model(self) -> None:
+        result = _rule_result(
+            1,
+            RiskLevel.ORANGE,
+            slot="intraday-0935",
+            transition="INITIAL_ORANGE",
+            push=True,
+        )
+
+        key = _idempotency_key(result)
+
+        self.assertEqual(
+            key,
+            "a_share|2026-08-03|bucket-0935|ORANGE|INITIAL_ORANGE|"
+            f"rule-v1.0.0|{'b' * 64}",
+        )
+
+    def test_rule_notification_renders_and_sends_without_quant_assessment(self) -> None:
+        class Repository:
+            def claim_alert(self, *_args, **_kwargs):
+                return True
+
+            def finish_alert(self, *_args, **_kwargs):
+                pass
+
+        result = _rule_result(
+            1,
+            RiskLevel.RED,
+            slot="intraday-0935",
+            transition="UPGRADE_ORANGE_TO_RED",
+            push=True,
+        )
+        sent: list[str] = []
+
+        self.assertTrue(FeishuNotifier(Repository(), sender=sent.append).notify(result))
+        self.assertEqual(len(sent), 1)
+        self.assertTrue(sent[0].startswith("# 【红灯：风险确认】"))
+
     def test_notification_policy_is_defensive(self) -> None:
         class Repository:
             def claim_alert(self, *_args, **_kwargs):

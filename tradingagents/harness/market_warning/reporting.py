@@ -15,6 +15,7 @@ from zoneinfo import ZoneInfo
 
 from .domain import (
     DataStatus,
+    DecisionSource,
     FinalWarningDecision,
     LLMContextAssessment,
     Market,
@@ -35,6 +36,13 @@ _LAMPS = {
     RiskLevel.ORANGE: "橙灯 ORANGE",
     RiskLevel.RED: "红灯 RED",
     RiskLevel.UNKNOWN: "未知 UNKNOWN",
+}
+_RULE_LAMPS = {
+    RiskLevel.GREEN: "绿灯：环境稳定",
+    RiskLevel.YELLOW: "黄灯：风险升温",
+    RiskLevel.ORANGE: "橙灯：提前防守",
+    RiskLevel.RED: "红灯：风险确认",
+    RiskLevel.UNKNOWN: "未知：数据不足",
 }
 _IMMEDIATE_ACTIONS = {
     RiskLevel.GREEN: "可按既定计划参与，但仍须执行个股止损。",
@@ -98,6 +106,128 @@ def _first_block(decision: FinalWarningDecision) -> str:
             f"持仓动作：`{decision.holding_action}`",
         )
     )
+
+
+def _latest_data_time(result: RunnerResult) -> datetime:
+    snapshot = result.feature_snapshot
+    if snapshot is None or not snapshot.source_times:
+        return result.as_of_time
+    return max(snapshot.source_times.values())
+
+
+def _rule_action_block(result: RunnerResult) -> str:
+    decision = _require_complete(result)
+    assessment = result.rule_assessment
+    if assessment is None:
+        raise ValueError("rule decision requires rule assessment")
+    local_data_time = _latest_data_time(result).astimezone(_MARKET_ZONES[result.market])
+    return "\n".join(
+        (
+            f"## 【{_RULE_LAMPS[decision.final_level]}】",
+            f"- **立即操作：{_IMMEDIATE_ACTIONS[decision.final_level]}**",
+            f"- **入场门：`{decision.entry_gate}`**",
+            f"- **新增仓位上限：`{_cap(decision.new_position_cap_pct)}`**",
+            f"- **持仓动作：`{decision.holding_action}`**",
+            f"- 运行模式：`{_MARKET_NAMES[result.market]}规则生产版`",
+            f"- 数据截至：`{local_data_time.isoformat(timespec='minutes')}`",
+            f"- 可靠度：`{_safe_code(assessment.reliability_grade)}`",
+            f"- 规则分数：`{assessment.risk_score:.1f}/10`（规则分数不是概率）",
+        )
+    )
+
+
+def _observed_value(value: Any) -> str:
+    if isinstance(value, bool):
+        return "是" if value else "否"
+    if isinstance(value, Real) and not isinstance(value, bool) and isfinite(float(value)):
+        return f"{float(value):.4f}"
+    return _safe_text(value, "不可用")
+
+
+def _rule_trigger_section(result: RunnerResult, *, limit: int | None = None) -> str:
+    assessment = result.rule_assessment
+    if assessment is None:
+        raise ValueError("rule decision requires rule assessment")
+    triggered = assessment.triggered_rules if limit is None else assessment.triggered_rules[:limit]
+    if not triggered:
+        return "## 触发证据\n本次没有规则越过阈值。"
+    rows = [
+        f"{index}. 规则 `{_safe_code(rule.rule_id)}`：观测值 `{_observed_value(rule.observed_value)}`；"
+        f"阈值：{_safe_text(rule.threshold_description)}；分值 `+{rule.severity_points}`"
+        for index, rule in enumerate(triggered, start=1)
+    ]
+    return "## 触发证据\n" + "\n".join(rows)
+
+
+def _rule_layer_section(result: RunnerResult) -> str:
+    assessment = result.rule_assessment
+    if assessment is None:
+        raise ValueError("rule decision requires rule assessment")
+    points: dict[str, int] = {}
+    for rule in assessment.triggered_rules:
+        points[rule.layer.value] = points.get(rule.layer.value, 0) + rule.severity_points
+    rendered = "；".join(f"`{layer}` {score}分" for layer, score in points.items())
+    missing = "、".join(_safe_text(item) for item in assessment.missing_optional_groups)
+    lines = [
+        "## 风险结构",
+        f"- 市场阶段：`{assessment.market_phase.value}`",
+        f"- 分层得分：{rendered or '无触发得分'}",
+        f"- 规则版本：`{_safe_code(assessment.engine_version)}`；清单：`{assessment.manifest_sha256[:12]}`",
+    ]
+    if missing:
+        lines.append(f"- 缺失的可选数据组：{missing}")
+    return "\n".join(lines)
+
+
+def _rule_shadow_section(result: RunnerResult) -> str | None:
+    quant = result.shadow_quant_assessment
+    if quant is None or quant.reliability_grade == "UNAVAILABLE":
+        return None
+    return "\n".join(
+        (
+            "## 影子模型观察",
+            "该模型仅用于对照，不参与本次灯号和操作决策。",
+            f"- 1日估计：{_percentage(quant.crash_1d_probability)}",
+            f"- 3日估计：{_percentage(quant.crash_3d_probability)}",
+            f"- 可靠度：`{_safe_code(quant.reliability_grade)}`",
+        )
+    )
+
+
+def _render_rule_premarket(
+    result: RunnerResult, previous: FinalWarningDecision | None
+) -> str:
+    decision = _require_complete(result)
+    market_name = _MARKET_NAMES[result.market]
+    sections = [
+        f"# {market_name}大盘骤跌预警",
+        _rule_action_block(result),
+        _previous_section(decision, previous),
+        _rule_layer_section(result),
+        _rule_trigger_section(result),
+    ]
+    shadow = _rule_shadow_section(result)
+    if shadow is not None:
+        sections.append(shadow)
+    if result.context_assessment is not None:
+        sections.append(_context_section(result.context_assessment))
+    return "\n\n".join(sections) + "\n"
+
+
+def _render_rule_upgrade(
+    result: RunnerResult, previous: FinalWarningDecision | None
+) -> str:
+    decision = _require_complete(result)
+    local_time = result.as_of_time.astimezone(_MARKET_ZONES[result.market])
+    action_lines = _rule_action_block(result).splitlines()[1:5]
+    sections = (
+        f"# 【{_RULE_LAMPS[decision.final_level]}】",
+        f"{_MARKET_NAMES[result.market]}盘中预警 | `{local_time.isoformat(timespec='minutes')}`",
+        "\n".join(action_lines),
+        _previous_section(decision, previous).replace("## 相比上一份", "## 状态变化", 1),
+        _rule_trigger_section(result, limit=3),
+    )
+    return "\n\n".join(sections) + "\n"
 
 
 def _probability_section(result: RunnerResult) -> str:
@@ -270,6 +400,8 @@ def render_premarket_report(
     """Render the fixed reading order used for every premarket report."""
 
     decision = _require_complete(result)
+    if decision.decision_source == DecisionSource.RULE_V1:
+        return _render_rule_premarket(result, previous)
     market_name = _MARKET_NAMES[result.market]
     local_time = result.as_of_time.astimezone(_MARKET_ZONES[result.market])
     sections = (
@@ -291,6 +423,8 @@ def render_upgrade_report(
     """Render an intraday alert with the same first-screen action contract."""
 
     decision = _require_complete(result)
+    if decision.decision_source == DecisionSource.RULE_V1:
+        return _render_rule_upgrade(result, previous)
     local_time = result.as_of_time.astimezone(_MARKET_ZONES[result.market])
     mode = "盘中升级" if decision.push_required else "盘中评估"
     sections = (
