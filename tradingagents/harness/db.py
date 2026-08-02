@@ -29,10 +29,13 @@ def init_db(db_path: Path | str | None = None) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
 
     schema_sql = _SCHEMA_FILE.read_text(encoding="utf-8")
-    with sqlite3.connect(path) as conn:
+    conn = sqlite3.connect(path)
+    try:
         conn.executescript(schema_sql)
         _migrate_schema(conn)
         conn.commit()
+    finally:
+        conn.close()
     logger.info("Harness DB initialized at %s", path)
     return path
 
@@ -77,6 +80,19 @@ def _migrate_schema(conn: sqlite3.Connection) -> None:
         if col not in pred_cols:
             conn.execute(f"ALTER TABLE predictions ADD COLUMN {col} {typ}")
             logger.info("Migrated: predictions.%s added", col)
+
+    decision_cols = {
+        r[1] for r in conn.execute("PRAGMA table_info(market_warning_decisions)").fetchall()
+    }
+    if "valid_snapshot_count" not in decision_cols:
+        conn.execute(
+            "ALTER TABLE market_warning_decisions "
+            "ADD COLUMN valid_snapshot_count INTEGER NOT NULL DEFAULT 0"
+        )
+        logger.info("Migrated: market_warning_decisions.valid_snapshot_count added")
+    if "retained_risk_level" not in decision_cols:
+        conn.execute("ALTER TABLE market_warning_decisions ADD COLUMN retained_risk_level TEXT")
+        logger.info("Migrated: market_warning_decisions.retained_risk_level added")
 
 
 @contextmanager

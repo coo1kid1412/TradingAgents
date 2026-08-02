@@ -141,6 +141,26 @@ def _patch_input_for_compliance(input):
     return input
 
 
+def _io_logging_suppressed(config) -> bool:
+    """Allow security-sensitive callers to disable raw prompt/response persistence."""
+    if not isinstance(config, dict):
+        return False
+    metadata = config.get("metadata")
+    return isinstance(metadata, dict) and metadata.get(
+        "market_warning_disable_raw_io_logging"
+    ) is True
+
+
+def _compliance_retry_suppressed(config) -> bool:
+    """Let bounded callers own the complete provider retry budget."""
+    if not isinstance(config, dict):
+        return False
+    metadata = config.get("metadata")
+    return isinstance(metadata, dict) and metadata.get(
+        "market_warning_disable_compliance_retry"
+    ) is True
+
+
 class NormalizedChatOpenAI(ChatOpenAI):
     """ChatOpenAI with normalized content output.
 
@@ -153,78 +173,91 @@ class NormalizedChatOpenAI(ChatOpenAI):
         global _llm_call_seq
         _llm_call_seq += 1
         seq = _llm_call_seq
+        suppress_io_logging = _io_logging_suppressed(config)
+        suppress_compliance_retry = _compliance_retry_suppressed(config)
 
         # Log input before calling
-        try:
-            _log_llm_input(seq, self.model, input)
-            import sys
-            sys.stderr.write(f"[LLM #{seq}] Input logged to llm_calls/\n")
-            sys.stderr.flush()
-        except Exception as e:
-            import sys
-            sys.stderr.write(f"[LLM #{seq}] Log input failed: {e}\n")
-            sys.stderr.flush()
+        if not suppress_io_logging:
+            try:
+                _log_llm_input(seq, self.model, input)
+                import sys
+                sys.stderr.write(f"[LLM #{seq}] Input logged to llm_calls/\n")
+                sys.stderr.flush()
+            except Exception as e:
+                import sys
+                sys.stderr.write(f"[LLM #{seq}] Log input failed: {e}\n")
+                sys.stderr.flush()
 
         start = time.time()
         try:
             result = super().invoke(input, config, **kwargs)
         except Exception as e:
             import sys
+            if suppress_compliance_retry:
+                raise
             # 输入层审核(1026)：净化 prompt 敏感措辞后重试（输出补丁对输入审核无效）
             if _is_input_sensitive_error(e):
-                sys.stderr.write(
-                    f"[LLM #{seq}] Input sensitivity rejected ({type(e).__name__}); "
-                    f"retrying once with sanitized input...\n"
-                )
-                sys.stderr.flush()
-                try:
-                    result = super().invoke(_sanitize_input_for_compliance(input), config, **kwargs)
-                    sys.stderr.write(f"[LLM #{seq}] Input-sanitize retry succeeded.\n")
-                    sys.stderr.flush()
-                except Exception as retry_err:
+                if not suppress_io_logging:
                     sys.stderr.write(
-                        f"[LLM #{seq}] Input-sanitize retry also failed: {retry_err}\n"
+                        f"[LLM #{seq}] Input sensitivity rejected ({type(e).__name__}); "
+                        f"retrying once with sanitized input...\n"
                     )
                     sys.stderr.flush()
+                try:
+                    result = super().invoke(_sanitize_input_for_compliance(input), config, **kwargs)
+                    if not suppress_io_logging:
+                        sys.stderr.write(f"[LLM #{seq}] Input-sanitize retry succeeded.\n")
+                        sys.stderr.flush()
+                except Exception as retry_err:
+                    if not suppress_io_logging:
+                        sys.stderr.write(
+                            f"[LLM #{seq}] Input-sanitize retry also failed: {retry_err}\n"
+                        )
+                        sys.stderr.flush()
                     raise
             elif _is_output_sensitive_error(e):
-                sys.stderr.write(
-                    f"[LLM #{seq}] Output sensitivity rejected ({type(e).__name__}); "
-                    f"retrying once with sanitized input and compliance patch...\n"
-                )
-                sys.stderr.flush()
+                if not suppress_io_logging:
+                    sys.stderr.write(
+                        f"[LLM #{seq}] Output sensitivity rejected ({type(e).__name__}); "
+                        f"retrying once with sanitized input and compliance patch...\n"
+                    )
+                    sys.stderr.flush()
                 patched_input = _patch_input_for_compliance(
                     _sanitize_input_for_output_compliance(input)
                 )
                 try:
                     result = super().invoke(patched_input, config, **kwargs)
-                    sys.stderr.write(f"[LLM #{seq}] Compliance-patch retry succeeded.\n")
-                    sys.stderr.flush()
+                    if not suppress_io_logging:
+                        sys.stderr.write(f"[LLM #{seq}] Compliance-patch retry succeeded.\n")
+                        sys.stderr.flush()
                 except Exception as retry_err:
-                    sys.stderr.write(
-                        f"[LLM #{seq}] Compliance-patch retry also failed: {retry_err}\n"
-                    )
-                    sys.stderr.flush()
+                    if not suppress_io_logging:
+                        sys.stderr.write(
+                            f"[LLM #{seq}] Compliance-patch retry also failed: {retry_err}\n"
+                        )
+                        sys.stderr.flush()
                     raise
             else:
                 raise
         elapsed = time.time() - start
 
         # Log output after returning
-        try:
-            _log_llm_output(seq, self.model, result, elapsed)
-        except Exception as e:
-            import sys
-            sys.stderr.write(f"[LLM #{seq}] Log output failed: {e}\n")
-            sys.stderr.flush()
+        if not suppress_io_logging:
+            try:
+                _log_llm_output(seq, self.model, result, elapsed)
+            except Exception as e:
+                import sys
+                sys.stderr.write(f"[LLM #{seq}] Log output failed: {e}\n")
+                sys.stderr.flush()
 
         # 记录到 profiling collector（按 agent 分组耗时）
-        try:
-            from tradingagents.profiling import record_llm
-            prompt_text = input if isinstance(input, str) else str(input)[:3000]
-            record_llm(prompt_text, self.model, elapsed)
-        except Exception:
-            pass
+        if not suppress_io_logging:
+            try:
+                from tradingagents.profiling import record_llm
+                prompt_text = input if isinstance(input, str) else str(input)[:3000]
+                record_llm(prompt_text, self.model, elapsed)
+            except Exception:
+                pass
 
         return normalize_content(result)
 

@@ -14,8 +14,8 @@ logger = logging.getLogger(__name__)
 
 # 匹配推理模型（DeepSeek、QwQ 等）的思考链标签
 # 支持 <think>...</think> 标准闭合，以及 <think>... 未闭合的情况
-_THINK_TAG_RE = re.compile(r"<think>[\s\S]*?</think>\s*", re.DOTALL)
-_THINK_UNCLOSED_RE = re.compile(r"^<think>[\s\S]*", re.DOTALL)
+_THINK_TAG_RE = re.compile(r"<think>[\s\S]*?</think>\s*", re.IGNORECASE)
+_THINK_UNCLOSED_RE = re.compile(r"^\s*<think>[\s\S]*", re.IGNORECASE)
 
 def _can_use_sigalrm() -> bool:
     """判断当前进程能否用 SIGALRM 做 wall-clock 超时。
@@ -31,12 +31,12 @@ def _can_use_sigalrm() -> bool:
 
 def _strip_think_tags(text: str) -> str:
     """移除推理模型输出中的 <think>...</think> 思考链内容。"""
-    if "<think>" not in text:
+    if "<think>" not in text.lower():
         return text
     # 先处理正常闭合的 <think>...</think>
     text = _THINK_TAG_RE.sub("", text)
     # 再处理未闭合的（整段都是 <think> 开头且无 </think>）
-    if text.strip().startswith("<think>"):
+    if text.strip().lower().startswith("<think>"):
         text = _THINK_UNCLOSED_RE.sub("", text)
     return text.strip()
 
@@ -123,7 +123,7 @@ class BaseLLMClient(ABC):
         return WallClockTimeoutLLM(
             self.get_llm(),
             timeout=self._get_timeout(),
-            max_retries=2,
+            max_retries=self.kwargs.get("wall_clock_max_retries", 2),
         )
 
 
@@ -201,17 +201,18 @@ class WallClockTimeoutLLM(Runnable):
             )
 
         old_handler = signal.signal(signal.SIGALRM, _alarm_handler)
-        signal.alarm(self._timeout)
+        old_timer = signal.setitimer(signal.ITIMER_REAL, float(self._timeout))
         try:
             if config is not None:
                 return self._llm.invoke(input, config, **kwargs)
             return self._llm.invoke(input, **kwargs)
         finally:
-            signal.alarm(0)  # 取消 alarm（无论成功失败）
+            signal.setitimer(signal.ITIMER_REAL, 0)
             try:
                 signal.signal(signal.SIGALRM, old_handler)
             except (ValueError, TypeError):
                 pass  # 老 handler 可能已失效
+            signal.setitimer(signal.ITIMER_REAL, *old_timer)
 
     def _invoke_with_thread_join(self, input: Any, config: Optional[RunnableConfig],
                                   **kwargs: Any) -> Any:
