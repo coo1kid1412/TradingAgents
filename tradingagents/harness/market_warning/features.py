@@ -98,6 +98,8 @@ _A_SHARE_METADATA = {
     "valuation_percentile_20d": _metadata("index valuation", "21 disclosed observations visible by as_of", "higher is valuation risk", "percentile"),
     "turnover_percentile_20d": _metadata("index turnover", "21 disclosed observations visible by as_of", "higher is crowding risk", "percentile"),
     "limit_down_pct": _metadata("limit-down cross section", "point-in-time stock universe available", "higher is risk-off", "percent"),
+    "realtime_breadth_coverage_pct": _metadata("realtime stock cross section", "current-session quote universe available", "lower reduces reliability", "percent"),
+    "realtime_breadth_staleness_minutes": _metadata("realtime stock cross section", "current-session quote timestamps available", "higher reduces reliability", "minutes"),
     "shibor_3m": _metadata("Shibor", "disclosed observation visible by as_of", "higher is funding stress", "percent"),
     "shibor_3m_change_20d": _metadata("Shibor", "21 disclosed observations visible by as_of", "higher is funding stress", "percentage points"),
     "breadth_deterioration_transition": _metadata("stock and industry breadth plus broad index", "current breadth and industry decline with 1-day broad-index return", "true is risk-off", "boolean"),
@@ -703,6 +705,7 @@ class _FeatureStrategy:
         }
         current_only = {
             "breadth_up_pct", "breadth_above_ma20_pct", "new_low_20d_pct", "industry_decline_pct",
+            "realtime_breadth_coverage_pct", "realtime_breadth_staleness_minutes",
             "margin_buying", "limit_down_pct", "shibor_3m", "vix", "vix_vix3m_ratio", "range_pct", "close_location",
         }
         if name == "vix_change_5d":
@@ -777,6 +780,8 @@ class AShareFeatureStrategy(_FeatureStrategy):
             "valuation_percentile_20d": _percentile(current_valuation, valuation, 20),
             "turnover_percentile_20d": _percentile(current_turnover, turnover, 20),
             "limit_down_pct": _last(_series(history, "limit_down_pct")),
+            "realtime_breadth_coverage_pct": _last(_series(history, "realtime_breadth_coverage_pct")),
+            "realtime_breadth_staleness_minutes": _last(_series(history, "realtime_breadth_staleness_minutes")),
             "shibor_3m": _last(shibor),
             "shibor_3m_change_20d": None if _last(shibor) is None or len(shibor) < 21 or pd.isna(shibor.iloc[-21]) else _last(shibor) - float(shibor.iloc[-21]),
             "breadth_deterioration_transition": breadth_transition,

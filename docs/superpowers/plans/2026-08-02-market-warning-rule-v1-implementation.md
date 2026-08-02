@@ -15,7 +15,7 @@
 - 规则分数只能进入规则评估表和规则报告，禁止写入 `market_warning_predictions.probability`。
 - 快路径禁止调用任何 LLM；M3 只能在确定性告警发送成功或已幂等确认后调用。
 - A 股生产告警必须使用扫描时点可见的数据；T-1 数据只能作为盘前基线。
-- Tushare 5000 积分不代表已开通 `rt_min`。必须执行权限探针，不能假设可用。
+- Tushare 5000 积分不代表已开通全市场实时日线 `rt_k`。必须执行权限探针，不能假设可用。
 - 横截面实时权限不足、覆盖率低于 80% 或陈旧超过 5 分钟时，禁止触发依赖市场宽度或跌停占比的红灯。
 - `rule_v1/notify` 与 `rule_v1/gate` 分开激活；V1 首次部署只允许通知灰度，完成 10 个 A 股交易日审计后才能评估硬门控。
 - 保留现有模型链路测试；新规则链路不得破坏旧模型回放、训练和报告能力。
@@ -180,14 +180,14 @@
 
 - [ ] **Step 1: 写权限探针失败测试**
 
-  fake Tushare client 覆盖：`rt_min` 成功、接口不存在、权限拒绝、空数据、字段缺失、超时。探针返回结构化状态 `available/permission_denied/unavailable/invalid_payload`，不得把异常吞成“无风险”。
+  fake Tushare client 覆盖：`rt_k` 成功、接口不存在、权限拒绝、空数据、字段缺失、超时。探针返回结构化状态 `available/permission_denied/unavailable/invalid_payload`，不得把异常吞成“无风险”。
 
 - [ ] **Step 2: 写基线与实时横截面失败测试**
 
   覆盖：
   - 盘前基线仅使用最近已完成交易日的 `daily`/`daily_basic`/`stock_basic`。
   - `stk_limit` 在 08:30 后单独加载并缓存；首个盘中扫描前重试一次。
-  - 多代码 `rt_min` 按接口上限分批，合并时每只股票只取不晚于扫描时点的最新记录。
+  - `rt_k` 使用官方通配符一次或少量分片提取全市场，合并时每只股票只取不晚于扫描时点的最新记录。
   - 输出 `last/pre_close/data_time/ma20/low_20d/industry/down_limit/source`。
   - 覆盖率低于 80% 或最大数据时间陈旧超过 5 分钟时标记横截面不可用于红灯。
   - T-1 行情不能进入 `last` 充当盘中现价。
@@ -199,11 +199,11 @@
 - [ ] **Step 4: 实现缓存与批量适配器**
 
   实现：
-  - `probe_rt_min_permission(pro, symbols, as_of_time)`
+  - `probe_rt_k_permission(pro, symbols, as_of_time)`
   - `build_premarket_baseline(pro, trade_date, cache_root)`
   - `load_realtime_cross_section(pro, baseline, as_of_time)`
 
-  适配官方 `rt_min` 多代码请求与 1000 行返回上限；根据可用股票池切批，所有批次记录实际来源与 `data_time`。权限不足时抛出可分类异常 `RealtimePermissionUnavailable`，不回退到 T-1 横截面。
+  适配官方 `rt_k` 通配符全市场请求与 6000 行返回上限；默认使用 `3*.SZ,6*.SH,0*.SZ,9*.BJ`，必要时按交易所分片，所有批次记录实际来源与 `trade_time`。权限不足时抛出可分类异常 `RealtimePermissionUnavailable`，不回退到 T-1 横截面。`rt_min` 仅保留作个股诊断，不进入 V1 全市场快路径。
 
 - [ ] **Step 5: 接入现有 `_cross_section_points`**
 
@@ -424,7 +424,7 @@
 
 - [ ] **Step 3: 实现权限/数据冒烟命令**
 
-  `probe_market_warning_data.py` 输出机器可读 JSON，至少包含：指数实时数据、`rt_min` 权限、横截面覆盖率、`stk_limit` 可用性、最新完成交易日、每个来源的数据时间和是否满足 notify 门槛。日志不得打印 token。
+  `probe_market_warning_data.py` 输出机器可读 JSON，至少包含：指数实时数据、全市场 `rt_k` 权限、横截面覆盖率、`stk_limit` 可用性、最新完成交易日、每个来源的数据时间和是否满足 notify 门槛。日志不得打印 token。
 
 - [ ] **Step 4: 实现安装器**
 
@@ -470,7 +470,7 @@
 
   Run: `.venv/bin/python scripts/probe_market_warning_data.py --market a_share --json`
 
-  验收：明确记录 `rt_min` 是否开通和横截面覆盖率。若权限不足，V1 不得安装成生产 notify；保留已完成代码和历史评估，并在最终结果中给出精确的数据权限缺口。
+  验收：明确记录全市场 `rt_k` 是否开通和横截面覆盖率。若权限不足，V1 不得安装成生产 notify；保留已完成代码和历史评估，并在最终结果中给出精确的数据权限缺口。
 
 - [ ] **Step 6: 运行历史规则评估并检查门槛**
 
