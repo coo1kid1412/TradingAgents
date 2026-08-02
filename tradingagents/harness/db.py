@@ -93,6 +93,21 @@ def _migrate_schema(conn: sqlite3.Connection) -> None:
     if "retained_risk_level" not in decision_cols:
         conn.execute("ALTER TABLE market_warning_decisions ADD COLUMN retained_risk_level TEXT")
         logger.info("Migrated: market_warning_decisions.retained_risk_level added")
+    if "decision_source" not in decision_cols:
+        conn.execute(
+            "ALTER TABLE market_warning_decisions "
+            "ADD COLUMN decision_source TEXT NOT NULL DEFAULT 'model'"
+        )
+        logger.info("Migrated: market_warning_decisions.decision_source added")
+    if "rule_assessment_id" not in decision_cols:
+        conn.execute("ALTER TABLE market_warning_decisions ADD COLUMN rule_assessment_id INTEGER")
+        logger.info("Migrated: market_warning_decisions.rule_assessment_id added")
+    if "shadow_prediction_ids_json" not in decision_cols:
+        conn.execute(
+            "ALTER TABLE market_warning_decisions "
+            "ADD COLUMN shadow_prediction_ids_json TEXT NOT NULL DEFAULT '[]'"
+        )
+        logger.info("Migrated: market_warning_decisions.shadow_prediction_ids_json added")
 
 
 @contextmanager

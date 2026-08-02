@@ -17,12 +17,15 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 
 from tradingagents.harness import db as _db
 from tradingagents.harness.market_warning.domain import (
+    DecisionSource,
     Evidence,
     FeatureSnapshot,
     FinalWarningDecision,
     LLMContextAssessment,
     Market,
     QuantRiskAssessment,
+    RuleRiskAssessment,
+    TriggeredRule,
 )
 from tradingagents.harness.market_warning.adapters.sqlite_repository import (
     SQLiteCircuitBreaker,
@@ -116,6 +119,33 @@ def make_decision(**changes) -> FinalWarningDecision:
     return FinalWarningDecision(**values)
 
 
+def make_rule_assessment(**changes) -> RuleRiskAssessment:
+    values = {
+        "market": Market.A_SHARE,
+        "as_of_time": AS_OF,
+        "engine_version": "rule-v1.0.0",
+        "manifest_sha256": "a" * 64,
+        "risk_level": "ORANGE",
+        "risk_score": 4.0,
+        "market_phase": "FIRST_SHOCK",
+        "triggered_rules": (
+            TriggeredRule(
+                rule_id="pressure.volatility_acceleration",
+                layer="PRESSURE",
+                severity_points=2,
+                observed_value=1.6,
+                threshold_description=">= 1.50",
+                evidence_ids=("breadth-1",),
+            ),
+        ),
+        "missing_optional_groups": ("margin",),
+        "reliability_grade": "B",
+        "evaluation_latency_ms": 7.5,
+    }
+    values.update(changes)
+    return RuleRiskAssessment(**values)
+
+
 def save_complete_decision(
     repository: SQLiteWarningRepository, snapshot: FeatureSnapshot | None = None
 ) -> tuple[int, tuple[int, int]]:
@@ -175,7 +205,7 @@ class SQLiteWarningRepositoryTests(TestCase):
                 opened[0].close()
                 self.fail("init_db left its schema connection open")
 
-    def test_connect_initializes_all_six_warning_tables(self):
+    def test_connect_initializes_warning_tables_and_rule_decision_columns(self):
         with temporary_database() as db_path:
             with _db.connect(db_path) as connection:
                 tables = {
@@ -202,12 +232,17 @@ class SQLiteWarningRepositoryTests(TestCase):
                 "market_warning_decisions",
                 "market_warning_alerts",
                 "market_warning_model_registry",
+                "market_warning_rule_assessments",
+                "market_warning_rule_registry",
             }.issubset(tables)
         )
         self.assertEqual(reliability_not_null, 1)
         self.assertEqual(decision_columns["valid_snapshot_count"]["notnull"], 1)
         self.assertEqual(decision_columns["valid_snapshot_count"]["dflt_value"], "0")
         self.assertIn("retained_risk_level", decision_columns)
+        self.assertEqual(decision_columns["decision_source"]["dflt_value"], "'model'")
+        self.assertIn("rule_assessment_id", decision_columns)
+        self.assertEqual(decision_columns["shadow_prediction_ids_json"]["dflt_value"], "'[]'")
 
     def test_existing_decision_table_migration_is_idempotent(self):
         with temporary_database() as db_path:
@@ -232,6 +267,77 @@ class SQLiteWarningRepositoryTests(TestCase):
             self.assertEqual(columns["valid_snapshot_count"][3], 1)
             self.assertEqual(columns["valid_snapshot_count"][4], "0")
             self.assertIn("retained_risk_level", columns)
+            self.assertEqual(columns["decision_source"][3], 1)
+            self.assertEqual(columns["decision_source"][4], "'model'")
+            self.assertIn("rule_assessment_id", columns)
+            self.assertEqual(columns["shadow_prediction_ids_json"][3], 1)
+            self.assertEqual(columns["shadow_prediction_ids_json"][4], "'[]'")
+
+    def test_rule_decision_round_trip_does_not_create_fake_probabilities(self):
+        with temporary_database() as db_path:
+            repository = SQLiteWarningRepository(db_path)
+            snapshot_id = repository.save_feature_snapshot(make_snapshot())
+            assessment = make_rule_assessment()
+            assessment_id = repository.save_rule_assessment(snapshot_id, assessment)
+            decision = make_decision(
+                decision_reasons=("pressure.volatility_acceleration",),
+                decision_source="rule_v1",
+            )
+
+            decision_id = repository.save_decision(
+                snapshot_id,
+                (),
+                None,
+                decision,
+                rule_assessment_id=assessment_id,
+            )
+            loaded = repository.load_evaluation(Market.A_SHARE, AS_OF)
+
+            with _db.connect(db_path) as connection:
+                prediction_count = connection.execute(
+                    "SELECT COUNT(*) AS count FROM market_warning_predictions"
+                ).fetchone()["count"]
+                decision_row = connection.execute(
+                    "SELECT decision_source, rule_assessment_id, prediction_ids_json, "
+                    "shadow_prediction_ids_json FROM market_warning_decisions WHERE id = ?",
+                    (decision_id,),
+                ).fetchone()
+
+            self.assertEqual(prediction_count, 0)
+            self.assertEqual(decision_row["decision_source"], "rule_v1")
+            self.assertEqual(decision_row["rule_assessment_id"], assessment_id)
+            self.assertEqual(json.loads(decision_row["prediction_ids_json"]), [])
+            self.assertEqual(json.loads(decision_row["shadow_prediction_ids_json"]), [])
+            self.assertIsNotNone(loaded)
+            self.assertEqual(loaded.decision.decision_source, DecisionSource.RULE_V1)
+            self.assertEqual(loaded.rule_assessment, assessment)
+            self.assertIsNone(loaded.quant_assessment)
+            self.assertIsNone(loaded.shadow_quant_assessment)
+
+    def test_rule_registry_switches_notify_and_gate_versions_atomically(self):
+        with temporary_database() as db_path:
+            repository = SQLiteWarningRepository(db_path)
+            for version, digest in (("rule-v1.0.0", "a" * 64), ("rule-v1.0.1", "b" * 64)):
+                repository.register_rule_engine(
+                    {
+                        "engine_version": version,
+                        "market": Market.A_SHARE,
+                        "manifest_sha256": digest,
+                        "metrics": {"lift": 2.4, "alerts_per_month": 4.0},
+                    }
+                )
+
+            repository.activate_rule_engine("rule-v1.0.0", "notify")
+            repository.activate_rule_engine("rule-v1.0.0", "gate")
+            repository.activate_rule_engine("rule-v1.0.1", "notify")
+
+            notify = repository.load_active_rule_engine(Market.A_SHARE, "notify")
+            gate = repository.load_active_rule_engine(Market.A_SHARE, "gate")
+            self.assertEqual(notify["engine_version"], "rule-v1.0.1")
+            self.assertEqual(gate["engine_version"], "rule-v1.0.0")
+            self.assertTrue(notify["notification_active"])
+            self.assertFalse(notify["gate_active"])
+            self.assertTrue(gate["gate_active"])
 
     def test_activate_model_set_switches_all_four_horizons_in_one_commit(self):
         with temporary_database() as db_path:

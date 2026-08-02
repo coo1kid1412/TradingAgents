@@ -6,7 +6,7 @@
 
 **Architecture:** 保留现有模型服务和概率持久化边界，新增独立的规则评估领域对象、纯函数规则引擎、规则服务与激活状态。数据、规则、状态机、持久化和推送组成快路径；影子模型与 M3 组成不影响告警结论的慢路径。规则通知和个股硬门控使用两个独立激活阶段，默认只开启通知灰度。
 
-**Tech Stack:** Python 3.11、dataclasses、SQLite、pandas、Tushare Pro、exchange-calendars、pytest、现有飞书发送适配器、MiniMax M3。
+**Tech Stack:** Python 3.11、dataclasses、SQLite、pandas、Tushare Pro、exchange-calendars、standard-library unittest、现有飞书发送适配器、MiniMax M3。
 
 ## Global Constraints
 
@@ -44,7 +44,7 @@
 
 - [ ] **Step 2: 运行领域测试并确认失败**
 
-  Run: `.venv/bin/python -m pytest tradingagents/harness/market_warning/test_domain.py -q`
+  Run: `.venv/bin/python -m unittest tradingagents/harness/market_warning/test_domain.py -q`
 
 - [ ] **Step 3: 最小实现领域对象**
 
@@ -61,7 +61,7 @@
 
 - [ ] **Step 5: 运行 repository 测试并确认失败**
 
-  Run: `.venv/bin/python -m pytest tradingagents/harness/market_warning/test_repository.py -q`
+  Run: `.venv/bin/python -m unittest tradingagents/harness/market_warning/test_repository.py -q`
 
 - [ ] **Step 6: 实现 schema、migration 与 repository API**
 
@@ -74,7 +74,7 @@
 
 - [ ] **Step 7: 运行领域与 repository 测试**
 
-  Run: `.venv/bin/python -m pytest tradingagents/harness/market_warning/test_domain.py tradingagents/harness/market_warning/test_repository.py -q`
+  Run: `.venv/bin/python -m unittest tradingagents/harness/market_warning/test_domain.py tradingagents/harness/market_warning/test_repository.py -q`
 
 - [ ] **Step 8: 提交**
 
@@ -105,7 +105,7 @@
 
 - [ ] **Step 3: 运行规则测试并确认失败**
 
-  Run: `.venv/bin/python -m pytest tradingagents/harness/market_warning/test_rule_policy.py -q`
+  Run: `.venv/bin/python -m unittest tradingagents/harness/market_warning/test_rule_policy.py -q`
 
 - [ ] **Step 4: 实现纯函数**
 
@@ -118,7 +118,7 @@
 
 - [ ] **Step 5: 运行规则与现有 policy 测试**
 
-  Run: `.venv/bin/python -m pytest tradingagents/harness/market_warning/test_rule_policy.py tradingagents/harness/market_warning/test_policy.py -q`
+  Run: `.venv/bin/python -m unittest tradingagents/harness/market_warning/test_rule_policy.py tradingagents/harness/market_warning/test_policy.py -q`
 
 - [ ] **Step 6: 提交**
 
@@ -145,7 +145,7 @@
 
 - [ ] **Step 2: 运行测试并确认失败**
 
-  Run: `.venv/bin/python -m pytest tradingagents/harness/market_warning/test_rule_evaluation.py tradingagents/harness/market_warning/test_readiness.py -q`
+  Run: `.venv/bin/python -m unittest tradingagents/harness/market_warning/test_rule_evaluation.py tradingagents/harness/market_warning/test_readiness.py -q`
 
 - [ ] **Step 3: 实现评估 CLI 与结构化产物**
 
@@ -162,7 +162,7 @@
 
 - [ ] **Step 5: 运行测试**
 
-  Run: `.venv/bin/python -m pytest tradingagents/harness/market_warning/test_rule_evaluation.py tradingagents/harness/market_warning/test_readiness.py -q`
+  Run: `.venv/bin/python -m unittest tradingagents/harness/market_warning/test_rule_evaluation.py tradingagents/harness/market_warning/test_readiness.py -q`
 
 - [ ] **Step 6: 提交**
 
@@ -194,7 +194,7 @@
 
 - [ ] **Step 3: 运行测试并确认失败**
 
-  Run: `.venv/bin/python -m pytest tradingagents/harness/market_warning/test_realtime_breadth.py tradingagents/harness/market_warning/test_data_adapters.py -q`
+  Run: `.venv/bin/python -m unittest tradingagents/harness/market_warning/test_realtime_breadth.py tradingagents/harness/market_warning/test_data_adapters.py -q`
 
 - [ ] **Step 4: 实现缓存与批量适配器**
 
@@ -211,7 +211,7 @@
 
 - [ ] **Step 6: 运行测试**
 
-  Run: `.venv/bin/python -m pytest tradingagents/harness/market_warning/test_realtime_breadth.py tradingagents/harness/market_warning/test_data_adapters.py -q`
+  Run: `.venv/bin/python -m unittest tradingagents/harness/market_warning/test_realtime_breadth.py tradingagents/harness/market_warning/test_data_adapters.py -q`
 
 - [ ] **Step 7: 提交**
 
@@ -243,7 +243,7 @@
 
 - [ ] **Step 2: 运行测试并确认失败**
 
-  Run: `.venv/bin/python -m pytest tradingagents/harness/market_warning/test_rule_service.py tradingagents/harness/market_warning/test_policy.py -q`
+  Run: `.venv/bin/python -m unittest tradingagents/harness/market_warning/test_rule_service.py tradingagents/harness/market_warning/test_policy.py -q`
 
 - [ ] **Step 3: 复用状态机，新增规则入口**
 
@@ -255,7 +255,7 @@
 
 - [ ] **Step 5: 运行测试**
 
-  Run: `.venv/bin/python -m pytest tradingagents/harness/market_warning/test_rule_service.py tradingagents/harness/market_warning/test_policy.py tradingagents/harness/market_warning/test_service.py -q`
+  Run: `.venv/bin/python -m unittest tradingagents/harness/market_warning/test_rule_service.py tradingagents/harness/market_warning/test_policy.py tradingagents/harness/market_warning/test_service.py -q`
 
 - [ ] **Step 6: 提交**
 
@@ -283,7 +283,7 @@
 
 - [ ] **Step 3: 运行测试并确认失败**
 
-  Run: `.venv/bin/python -m pytest tradingagents/harness/market_warning/test_reporting.py tradingagents/harness/market_warning/test_runner.py -q`
+  Run: `.venv/bin/python -m unittest tradingagents/harness/market_warning/test_reporting.py tradingagents/harness/market_warning/test_runner.py -q`
 
 - [ ] **Step 4: 实现双来源渲染和通知**
 
@@ -291,7 +291,7 @@
 
 - [ ] **Step 5: 运行测试**
 
-  Run: `.venv/bin/python -m pytest tradingagents/harness/market_warning/test_reporting.py tradingagents/harness/market_warning/test_runner.py -q`
+  Run: `.venv/bin/python -m unittest tradingagents/harness/market_warning/test_reporting.py tradingagents/harness/market_warning/test_runner.py -q`
 
 - [ ] **Step 6: 提交**
 
@@ -318,7 +318,7 @@
 
 - [ ] **Step 3: 运行测试并确认失败**
 
-  Run: `.venv/bin/python -m pytest tradingagents/harness/market_warning/test_runner.py tradingagents/harness/market_warning/test_repository.py -q`
+  Run: `.venv/bin/python -m unittest tradingagents/harness/market_warning/test_runner.py tradingagents/harness/market_warning/test_repository.py -q`
 
 - [ ] **Step 4: 实现 runner 模式与租约**
 
@@ -330,7 +330,7 @@
 
 - [ ] **Step 6: 运行测试**
 
-  Run: `.venv/bin/python -m pytest tradingagents/harness/market_warning/test_runner.py tradingagents/harness/market_warning/test_repository.py -q`
+  Run: `.venv/bin/python -m unittest tradingagents/harness/market_warning/test_runner.py tradingagents/harness/market_warning/test_repository.py -q`
 
 - [ ] **Step 7: 提交**
 
@@ -356,7 +356,7 @@
 
 - [ ] **Step 3: 运行测试并确认失败**
 
-  Run: `.venv/bin/python -m pytest tradingagents/harness/market_warning/test_reasoning.py tradingagents/harness/market_warning/test_rule_service.py -q`
+  Run: `.venv/bin/python -m unittest tradingagents/harness/market_warning/test_reasoning.py tradingagents/harness/market_warning/test_rule_service.py -q`
 
 - [ ] **Step 4: 实现规则解释适配**
 
@@ -364,7 +364,7 @@
 
 - [ ] **Step 5: 运行测试**
 
-  Run: `.venv/bin/python -m pytest tradingagents/harness/market_warning/test_reasoning.py tradingagents/harness/market_warning/test_rule_service.py -q`
+  Run: `.venv/bin/python -m unittest tradingagents/harness/market_warning/test_reasoning.py tradingagents/harness/market_warning/test_rule_service.py -q`
 
 - [ ] **Step 6: 提交**
 
@@ -390,7 +390,7 @@
 
 - [ ] **Step 2: 运行测试并确认失败**
 
-  Run: `.venv/bin/python -m pytest tradingagents/harness/test_market_risk.py tradingagents/harness/market_warning/test_readiness.py -q`
+  Run: `.venv/bin/python -m unittest tradingagents/harness/test_market_risk.py tradingagents/harness/market_warning/test_readiness.py -q`
 
 - [ ] **Step 3: 修改市场风险读取逻辑**
 
@@ -398,7 +398,7 @@
 
 - [ ] **Step 4: 运行测试**
 
-  Run: `.venv/bin/python -m pytest tradingagents/harness/test_market_risk.py tradingagents/harness/market_warning/test_readiness.py -q`
+  Run: `.venv/bin/python -m unittest tradingagents/harness/test_market_risk.py tradingagents/harness/market_warning/test_readiness.py -q`
 
 - [ ] **Step 5: 提交**
 
@@ -420,7 +420,7 @@
 
 - [ ] **Step 2: 运行测试并确认失败**
 
-  Run: `.venv/bin/python -m pytest tradingagents/harness/market_warning/test_installation.py -q`
+  Run: `.venv/bin/python -m unittest tradingagents/harness/market_warning/test_installation.py -q`
 
 - [ ] **Step 3: 实现权限/数据冒烟命令**
 
@@ -436,7 +436,7 @@
 
 - [ ] **Step 6: 运行测试**
 
-  Run: `.venv/bin/python -m pytest tradingagents/harness/market_warning/test_installation.py -q`
+  Run: `.venv/bin/python -m unittest tradingagents/harness/market_warning/test_installation.py -q`
 
 - [ ] **Step 7: 提交**
 
@@ -456,15 +456,15 @@
 
 - [ ] **Step 2: 运行性能测试**
 
-  Run: `.venv/bin/python -m pytest tradingagents/harness/market_warning/test_rule_benchmark.py -q`
+  Run: `.venv/bin/python -m unittest tradingagents/harness/market_warning/test_rule_benchmark.py -q`
 
 - [ ] **Step 3: 跑市场预警完整测试集**
 
-  Run: `.venv/bin/python -m pytest tradingagents/harness/market_warning tradingagents/harness/test_market_risk.py -q`
+  Run: `.venv/bin/python -m unittest tradingagents/harness/market_warning tradingagents/harness/test_market_risk.py -q`
 
 - [ ] **Step 4: 跑项目相关回归**
 
-  Run: `.venv/bin/python -m pytest tests/test_model_validation.py tests/test_tushare_rate_limit_wait.py tests/test_ticker_symbol_handling.py -q`
+  Run: `.venv/bin/python -m unittest tests/test_model_validation.py tests/test_tushare_rate_limit_wait.py tests/test_ticker_symbol_handling.py -q`
 
 - [ ] **Step 5: 在真实 `.env` 下执行数据权限探针**
 
@@ -511,7 +511,7 @@
 
 - [ ] **Step 2: 运行最终测试和 readiness**
 
-  Run: `.venv/bin/python -m pytest tradingagents/harness/market_warning tradingagents/harness/test_market_risk.py tests/test_model_validation.py tests/test_tushare_rate_limit_wait.py tests/test_ticker_symbol_handling.py -q`
+  Run: `.venv/bin/python -m unittest tradingagents/harness/market_warning tradingagents/harness/test_market_risk.py tests/test_model_validation.py tests/test_tushare_rate_limit_wait.py tests/test_ticker_symbol_handling.py -q`
 
   Run: `.venv/bin/python -m tradingagents.harness.market_warning.readiness --mode rule_v1/notify`
 

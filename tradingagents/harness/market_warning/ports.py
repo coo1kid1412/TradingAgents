@@ -13,6 +13,7 @@ from .domain import (
     Market,
     QuantRiskAssessment,
     RawMarketSnapshot,
+    RuleRiskAssessment,
     RunnerResult,
 )
 
@@ -47,6 +48,10 @@ class WarningRepository(Protocol):
         self, feature_snapshot_id: int, assessment: QuantRiskAssessment
     ) -> tuple[int, int]: ...
 
+    def save_rule_assessment(
+        self, feature_snapshot_id: int, assessment: RuleRiskAssessment
+    ) -> int: ...
+
     def save_reasoning(
         self, feature_snapshot_id: int, assessment: LLMContextAssessment, model_name: str
     ) -> int: ...
@@ -57,7 +62,16 @@ class WarningRepository(Protocol):
         prediction_ids: tuple[int, ...],
         reasoning_id: int | None,
         decision: FinalWarningDecision,
+        *,
+        rule_assessment_id: int | None = None,
+        shadow_prediction_ids: tuple[int, ...] = (),
     ) -> int: ...
+
+    def register_rule_engine(self, record: dict[str, object]) -> None: ...
+
+    def activate_rule_engine(self, engine_version: str, mode: str) -> dict[str, object]: ...
+
+    def load_active_rule_engine(self, market: Market, mode: str) -> dict[str, object] | None: ...
 
     def load_latest_decision(
         self, market: Market, as_of_time: datetime | None = None

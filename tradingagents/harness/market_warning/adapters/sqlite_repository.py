@@ -14,6 +14,7 @@ from tradingagents.harness import db as _db
 
 from tradingagents.harness.market_warning.domain import (
     DataStatus,
+    DecisionSource,
     Evidence,
     FeatureSnapshot,
     FinalWarningDecision,
@@ -22,7 +23,9 @@ from tradingagents.harness.market_warning.domain import (
     MarketPhase,
     QuantRiskAssessment,
     RiskLevel,
+    RuleRiskAssessment,
     RunnerResult,
+    TriggeredRule,
 )
 
 
@@ -75,6 +78,22 @@ def _reasoning_json(assessment: LLMContextAssessment) -> str:
             "confidence": assessment.confidence,
             "action_reason": assessment.action_reason,
         }
+    )
+
+
+def _triggered_rules_json(assessment: RuleRiskAssessment) -> str:
+    return _json_dump(
+        [
+            {
+                "rule_id": item.rule_id,
+                "layer": item.layer,
+                "severity_points": item.severity_points,
+                "observed_value": item.observed_value,
+                "threshold_description": item.threshold_description,
+                "evidence_ids": item.evidence_ids,
+            }
+            for item in assessment.triggered_rules
+        ]
     )
 
 
@@ -241,6 +260,40 @@ class SQLiteWarningRepository:
                 prediction_ids.append(int(cursor.lastrowid))
             return (prediction_ids[0], prediction_ids[1])
 
+    def save_rule_assessment(
+        self, feature_snapshot_id: int, assessment: RuleRiskAssessment
+    ) -> int:
+        with _db.connect(self._db_path) as connection:
+            snapshot = connection.execute(
+                "SELECT market, as_of_time FROM market_warning_feature_snapshots WHERE id = ?",
+                (feature_snapshot_id,),
+            ).fetchone()
+            if snapshot is None:
+                raise ValueError("feature_snapshot_id does not exist")
+            if snapshot["market"] != assessment.market.value:
+                raise ValueError("rule assessment market must match feature snapshot")
+            if datetime.fromisoformat(snapshot["as_of_time"]) != assessment.as_of_time.astimezone(timezone.utc):
+                raise ValueError("rule assessment as_of_time must match feature snapshot")
+            cursor = connection.execute(
+                "INSERT INTO market_warning_rule_assessments "
+                "(feature_snapshot_id, engine_version, manifest_sha256, risk_level, risk_score, "
+                "market_phase, triggered_rules_json, missing_optional_groups_json, reliability_grade, "
+                "evaluation_latency_ms) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    feature_snapshot_id,
+                    assessment.engine_version,
+                    assessment.manifest_sha256,
+                    assessment.risk_level.value,
+                    assessment.risk_score,
+                    assessment.market_phase.value,
+                    _triggered_rules_json(assessment),
+                    _json_dump(assessment.missing_optional_groups),
+                    assessment.reliability_grade,
+                    assessment.evaluation_latency_ms,
+                ),
+            )
+            return int(cursor.lastrowid)
+
     def save_reasoning(
         self, feature_snapshot_id: int, assessment: LLMContextAssessment, model_name: str
     ) -> int:
@@ -265,30 +318,56 @@ class SQLiteWarningRepository:
         prediction_ids: tuple[int, ...],
         reasoning_id: int | None,
         decision: FinalWarningDecision,
+        *,
+        rule_assessment_id: int | None = None,
+        shadow_prediction_ids: tuple[int, ...] = (),
     ) -> int:
         with _db.connect(self._db_path) as connection:
-            if len(prediction_ids) != 2 or len(set(prediction_ids)) != 2:
-                raise ValueError("prediction_ids must contain distinct 1d and 3d prediction IDs")
-            placeholders = ", ".join("?" for _ in prediction_ids)
-            predictions = connection.execute(
-                "SELECT id, horizon, model_version FROM market_warning_predictions "
-                f"WHERE feature_snapshot_id = ? AND id IN ({placeholders})",
-                (feature_snapshot_id, *prediction_ids),
-            ).fetchall()
-            if len(predictions) != len(prediction_ids):
-                raise ValueError("prediction_ids must all belong to feature_snapshot_id")
-            if {row["horizon"] for row in predictions} != {"1d", "3d"}:
-                raise ValueError("prediction_ids must reference one 1d and one 3d prediction")
-            model_versions = {row["model_version"] for row in predictions}
-            if len(model_versions) != 1:
-                raise ValueError("prediction_ids must share one model_version")
-            model_version = model_versions.pop()
+            def validate_predictions(ids: tuple[int, ...], field_name: str):
+                if len(ids) != 2 or len(set(ids)) != 2:
+                    raise ValueError(f"{field_name} must contain distinct 1d and 3d prediction IDs")
+                placeholders = ", ".join("?" for _ in ids)
+                rows = connection.execute(
+                    "SELECT id, horizon, model_version FROM market_warning_predictions "
+                    f"WHERE feature_snapshot_id = ? AND id IN ({placeholders})",
+                    (feature_snapshot_id, *ids),
+                ).fetchall()
+                if len(rows) != len(ids):
+                    raise ValueError(f"{field_name} must all belong to feature_snapshot_id")
+                if {row["horizon"] for row in rows} != {"1d", "3d"}:
+                    raise ValueError(f"{field_name} must reference one 1d and one 3d prediction")
+                versions = {row["model_version"] for row in rows}
+                if len(versions) != 1:
+                    raise ValueError(f"{field_name} must share one model_version")
+                return versions.pop()
+
+            model_version = None
+            if decision.decision_source == DecisionSource.MODEL:
+                if rule_assessment_id is not None or shadow_prediction_ids:
+                    raise ValueError("model decisions cannot reference rule or shadow assessments")
+                model_version = validate_predictions(tuple(prediction_ids), "prediction_ids")
+            else:
+                if prediction_ids:
+                    raise ValueError("rule decisions cannot store primary model predictions")
+                if rule_assessment_id is None:
+                    raise ValueError("rule decisions require rule_assessment_id")
+                rule_row = connection.execute(
+                    "SELECT engine_version FROM market_warning_rule_assessments "
+                    "WHERE id = ? AND feature_snapshot_id = ?",
+                    (rule_assessment_id, feature_snapshot_id),
+                ).fetchone()
+                if rule_row is None:
+                    raise ValueError("rule_assessment_id must belong to feature_snapshot_id")
+                model_version = rule_row["engine_version"]
+                if shadow_prediction_ids:
+                    validate_predictions(tuple(shadow_prediction_ids), "shadow_prediction_ids")
             cursor = connection.execute(
                 "INSERT INTO market_warning_decisions "
                 "(feature_snapshot_id, prediction_ids_json, reasoning_id, baseline_level, final_level, "
                 "transition, entry_gate, new_position_cap_pct, holding_action, push_required, "
-                "data_status, reasons_json, valid_snapshot_count, retained_risk_level, model_version) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "data_status, reasons_json, valid_snapshot_count, retained_risk_level, decision_source, "
+                "rule_assessment_id, shadow_prediction_ids_json, model_version) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     feature_snapshot_id,
                     _json_dump(list(prediction_ids)),
@@ -304,6 +383,9 @@ class SQLiteWarningRepository:
                     _json_dump(list(decision.decision_reasons)),
                     decision.valid_snapshot_count,
                     decision.retained_risk_level.value if decision.retained_risk_level is not None else None,
+                    decision.decision_source.value,
+                    rule_assessment_id,
+                    _json_dump(list(shadow_prediction_ids)),
                     model_version,
                 ),
             )
@@ -320,7 +402,8 @@ class SQLiteWarningRepository:
                 "d.id AS decision_id, d.prediction_ids_json, d.reasoning_id, d.baseline_level, "
                 "d.final_level, d.transition, d.entry_gate, d.new_position_cap_pct, "
                 "d.holding_action, d.push_required, d.data_status AS data_status, "
-                "d.reasons_json, d.valid_snapshot_count, d.retained_risk_level "
+                "d.reasons_json, d.valid_snapshot_count, d.retained_risk_level, "
+                "d.decision_source, d.rule_assessment_id, d.shadow_prediction_ids_json "
                 "FROM market_warning_feature_snapshots AS s "
                 "INNER JOIN market_warning_decisions AS d ON d.feature_snapshot_id = s.id "
                 "WHERE s.market = ? AND s.as_of_time = ? "
@@ -330,16 +413,32 @@ class SQLiteWarningRepository:
             if row is None:
                 return None
             prediction_ids = tuple(json.loads(row["prediction_ids_json"]))
-            if len(prediction_ids) != 2:
-                return None
-            placeholders = ", ".join("?" for _ in prediction_ids)
-            predictions = connection.execute(
-                "SELECT id, horizon, probability, base_rate, market_phase, reliability_grade, "
-                "model_version, calibration_version, top_contributors_json "
-                f"FROM market_warning_predictions WHERE id IN ({placeholders}) "
-                "ORDER BY horizon",
-                prediction_ids,
-            ).fetchall()
+            source = DecisionSource(row["decision_source"])
+
+            def load_predictions(ids: tuple[int, ...]):
+                if not ids:
+                    return ()
+                placeholders = ", ".join("?" for _ in ids)
+                return connection.execute(
+                    "SELECT id, horizon, probability, base_rate, market_phase, reliability_grade, "
+                    "model_version, calibration_version, top_contributors_json "
+                    f"FROM market_warning_predictions WHERE id IN ({placeholders}) "
+                    "ORDER BY horizon",
+                    ids,
+                ).fetchall()
+
+            predictions = load_predictions(prediction_ids)
+            shadow_prediction_ids = tuple(json.loads(row["shadow_prediction_ids_json"]))
+            shadow_predictions = load_predictions(shadow_prediction_ids)
+            rule_row = None
+            if row["rule_assessment_id"] is not None:
+                rule_row = connection.execute(
+                    "SELECT engine_version, manifest_sha256, risk_level, risk_score, market_phase, "
+                    "triggered_rules_json, missing_optional_groups_json, reliability_grade, "
+                    "evaluation_latency_ms FROM market_warning_rule_assessments "
+                    "WHERE id = ? AND feature_snapshot_id = ?",
+                    (row["rule_assessment_id"], row["snapshot_id"]),
+                ).fetchone()
             reasoning = None
             if row["reasoning_id"] is not None:
                 reasoning = connection.execute(
@@ -347,7 +446,17 @@ class SQLiteWarningRepository:
                     "FROM market_warning_reasoning WHERE id = ?",
                     (row["reasoning_id"],),
                 ).fetchone()
-        if len(predictions) != 2 or {item["horizon"] for item in predictions} != {"1d", "3d"}:
+        if source == DecisionSource.MODEL:
+            if len(predictions) != 2 or {item["horizon"] for item in predictions} != {"1d", "3d"}:
+                return None
+            if rule_row is not None or shadow_predictions:
+                return None
+        elif predictions or rule_row is None:
+            return None
+        if shadow_predictions and (
+            len(shadow_predictions) != 2
+            or {item["horizon"] for item in shadow_predictions} != {"1d", "3d"}
+        ):
             return None
 
         evidence_rows = json.loads(row["evidence_json"])
@@ -379,26 +488,55 @@ class SQLiteWarningRepository:
                 for key, value in json.loads(row["source_times_json"]).items()
             },
         )
-        by_horizon = {item["horizon"]: item for item in predictions}
-        first = by_horizon["1d"]
-        third = by_horizon["3d"]
-        if (
-            first["market_phase"] != third["market_phase"]
-            or first["model_version"] != third["model_version"]
-            or first["calibration_version"] != third["calibration_version"]
-        ):
+        def assessment_from_predictions(rows) -> QuantRiskAssessment | None:
+            if not rows:
+                return None
+            by_horizon = {item["horizon"]: item for item in rows}
+            first = by_horizon["1d"]
+            third = by_horizon["3d"]
+            if (
+                first["market_phase"] != third["market_phase"]
+                or first["model_version"] != third["model_version"]
+                or first["calibration_version"] != third["calibration_version"]
+            ):
+                raise ValueError("persisted prediction pair is inconsistent")
+            return QuantRiskAssessment(
+                crash_1d_probability=first["probability"],
+                crash_3d_probability=third["probability"],
+                market_phase=MarketPhase(first["market_phase"]),
+                base_rate_1d=first["base_rate"],
+                base_rate_3d=third["base_rate"],
+                reliability_grade=first["reliability_grade"],
+                model_version=first["model_version"],
+                calibration_version=first["calibration_version"],
+                top_contributors=tuple(json.loads(first["top_contributors_json"])),
+            )
+
+        try:
+            quant = assessment_from_predictions(predictions)
+            shadow_quant = assessment_from_predictions(shadow_predictions)
+        except ValueError:
             return None
-        quant = QuantRiskAssessment(
-            crash_1d_probability=first["probability"],
-            crash_3d_probability=third["probability"],
-            market_phase=MarketPhase(first["market_phase"]),
-            base_rate_1d=first["base_rate"],
-            base_rate_3d=third["base_rate"],
-            reliability_grade=first["reliability_grade"],
-            model_version=first["model_version"],
-            calibration_version=first["calibration_version"],
-            top_contributors=tuple(json.loads(first["top_contributors_json"])),
-        )
+        rule_assessment = None
+        if rule_row is not None:
+            rule_assessment = RuleRiskAssessment(
+                market=snapshot.market,
+                as_of_time=snapshot.as_of_time,
+                engine_version=rule_row["engine_version"],
+                manifest_sha256=rule_row["manifest_sha256"],
+                risk_level=rule_row["risk_level"],
+                risk_score=rule_row["risk_score"],
+                market_phase=rule_row["market_phase"],
+                triggered_rules=tuple(
+                    TriggeredRule(**item)
+                    for item in json.loads(rule_row["triggered_rules_json"])
+                ),
+                missing_optional_groups=tuple(
+                    json.loads(rule_row["missing_optional_groups_json"])
+                ),
+                reliability_grade=rule_row["reliability_grade"],
+                evaluation_latency_ms=rule_row["evaluation_latency_ms"],
+            )
         context = None
         if reasoning is not None:
             payload = json.loads(reasoning["structured_json"])
@@ -421,6 +559,8 @@ class SQLiteWarningRepository:
             session_slot=row["session_slot"],
             feature_snapshot=snapshot,
             quant_assessment=quant,
+            rule_assessment=rule_assessment,
+            shadow_quant_assessment=shadow_quant,
             context_assessment=context,
             decision=decision,
             decision_id=int(row["decision_id"]),
@@ -434,7 +574,7 @@ class SQLiteWarningRepository:
             row = connection.execute(
                 "SELECT d.baseline_level, d.final_level, d.transition, d.entry_gate, "
                 "d.new_position_cap_pct, d.holding_action, d.push_required, d.data_status, d.reasons_json, "
-                "d.valid_snapshot_count, d.retained_risk_level "
+                "d.valid_snapshot_count, d.retained_risk_level, d.decision_source "
                 "FROM market_warning_decisions AS d "
                 "INNER JOIN market_warning_feature_snapshots AS s ON s.id = d.feature_snapshot_id "
                 "WHERE s.market = ? AND (? IS NULL OR s.as_of_time <= ?) "
@@ -448,7 +588,7 @@ class SQLiteWarningRepository:
             row = connection.execute(
                 "SELECT d.baseline_level, d.final_level, d.transition, d.entry_gate, "
                 "d.new_position_cap_pct, d.holding_action, d.push_required, d.data_status, d.reasons_json, "
-                "d.valid_snapshot_count, d.retained_risk_level "
+                "d.valid_snapshot_count, d.retained_risk_level, d.decision_source "
                 "FROM market_warning_decisions AS d "
                 "INNER JOIN market_warning_feature_snapshots AS s ON s.id = d.feature_snapshot_id "
                 "WHERE s.market = ? AND s.as_of_time < ? "
@@ -496,6 +636,88 @@ class SQLiteWarningRepository:
                 "error_summary = ? WHERE idempotency_key = ?",
                 (status, status, error_summary, idempotency_key),
             )
+
+    def register_rule_engine(self, record: Mapping[str, Any]) -> None:
+        values = dict(record)
+        market = Market(values["market"]).value
+        digest = str(values["manifest_sha256"])
+        if len(digest) != 64:
+            raise ValueError("manifest_sha256 must be a 64-character digest")
+        with _db.connect(self._db_path) as connection:
+            connection.execute(
+                "INSERT INTO market_warning_rule_registry "
+                "(engine_version, market, manifest_sha256, metrics_json) VALUES (?, ?, ?, ?) "
+                "ON CONFLICT(engine_version, market) DO UPDATE SET "
+                "manifest_sha256 = excluded.manifest_sha256, metrics_json = excluded.metrics_json, "
+                "updated_at = CURRENT_TIMESTAMP",
+                (
+                    values["engine_version"],
+                    market,
+                    digest,
+                    _json_dump(values.get("metrics", {})),
+                ),
+            )
+
+    def activate_rule_engine(self, engine_version: str, mode: str) -> dict[str, Any]:
+        column = self._rule_activation_column(mode)
+        with _db.connect(self._db_path) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            target = connection.execute(
+                "SELECT market FROM market_warning_rule_registry WHERE engine_version = ?",
+                (engine_version,),
+            ).fetchall()
+            if len(target) != 1:
+                raise ValueError("rule engine version must identify exactly one registered market")
+            market = target[0]["market"]
+            connection.execute(
+                f"UPDATE market_warning_rule_registry SET {column} = 0, updated_at = CURRENT_TIMESTAMP "
+                "WHERE market = ?",
+                (market,),
+            )
+            cursor = connection.execute(
+                f"UPDATE market_warning_rule_registry SET {column} = 1, updated_at = CURRENT_TIMESTAMP "
+                "WHERE engine_version = ? AND market = ?",
+                (engine_version, market),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("rule engine activation failed")
+        record = self.load_active_rule_engine(Market(market), mode)
+        if record is None:
+            raise ValueError("rule engine activation was not persisted")
+        return record
+
+    def load_active_rule_engine(self, market: Market, mode: str) -> dict[str, Any] | None:
+        column = self._rule_activation_column(mode)
+        with _db.connect(self._db_path) as connection:
+            row = connection.execute(
+                "SELECT engine_version, market, manifest_sha256, metrics_json, "
+                "notification_active, gate_active, created_at, updated_at "
+                f"FROM market_warning_rule_registry WHERE market = ? AND {column} = 1 "
+                "ORDER BY updated_at DESC, engine_version DESC LIMIT 1",
+                (Market(market).value,),
+            ).fetchone()
+        return self._rule_record_from_row(row) if row is not None else None
+
+    @staticmethod
+    def _rule_activation_column(mode: str) -> str:
+        columns = {"notify": "notification_active", "gate": "gate_active"}
+        try:
+            return columns[mode]
+        except KeyError as exc:
+            raise ValueError("mode must be notify or gate") from exc
+
+    @staticmethod
+    def _rule_record_from_row(row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "engine_version": row["engine_version"],
+            "market": Market(row["market"]),
+            "manifest_sha256": row["manifest_sha256"],
+            "metrics": json.loads(row["metrics_json"]),
+            "notification_active": bool(row["notification_active"]),
+            "gate_active": bool(row["gate_active"]),
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+        }
 
     def register_model(self, record: Mapping[str, Any]) -> None:
         values = dict(record)
@@ -632,4 +854,5 @@ class SQLiteWarningRepository:
             data_status=row["data_status"],
             valid_snapshot_count=row["valid_snapshot_count"],
             retained_risk_level=row["retained_risk_level"],
+            decision_source=row["decision_source"],
         )

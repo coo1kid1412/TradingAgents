@@ -229,6 +229,26 @@ CREATE TABLE IF NOT EXISTS market_warning_predictions (
 CREATE INDEX IF NOT EXISTS idx_market_warning_predictions_snapshot
     ON market_warning_predictions(feature_snapshot_id);
 
+CREATE TABLE IF NOT EXISTS market_warning_rule_assessments (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    feature_snapshot_id INTEGER NOT NULL,
+    engine_version TEXT NOT NULL,
+    manifest_sha256 TEXT NOT NULL,
+    risk_level TEXT NOT NULL,
+    risk_score REAL NOT NULL,
+    market_phase TEXT NOT NULL,
+    triggered_rules_json TEXT NOT NULL,
+    missing_optional_groups_json TEXT NOT NULL,
+    reliability_grade TEXT NOT NULL,
+    evaluation_latency_ms REAL NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE (feature_snapshot_id, engine_version),
+    FOREIGN KEY (feature_snapshot_id) REFERENCES market_warning_feature_snapshots(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_market_warning_rule_assessments_snapshot
+    ON market_warning_rule_assessments(feature_snapshot_id);
+
 CREATE TABLE IF NOT EXISTS market_warning_reasoning (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     feature_snapshot_id INTEGER NOT NULL,
@@ -259,10 +279,14 @@ CREATE TABLE IF NOT EXISTS market_warning_decisions (
     reasons_json TEXT NOT NULL,
     valid_snapshot_count INTEGER NOT NULL DEFAULT 0,
     retained_risk_level TEXT,
+    decision_source TEXT NOT NULL DEFAULT 'model',
+    rule_assessment_id INTEGER,
+    shadow_prediction_ids_json TEXT NOT NULL DEFAULT '[]',
     model_version TEXT,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (feature_snapshot_id) REFERENCES market_warning_feature_snapshots(id),
-    FOREIGN KEY (reasoning_id) REFERENCES market_warning_reasoning(id)
+    FOREIGN KEY (reasoning_id) REFERENCES market_warning_reasoning(id),
+    FOREIGN KEY (rule_assessment_id) REFERENCES market_warning_rule_assessments(id)
 );
 
 CREATE INDEX IF NOT EXISTS idx_market_warning_decisions_snapshot
@@ -302,6 +326,26 @@ CREATE TABLE IF NOT EXISTS market_warning_model_registry (
 CREATE INDEX IF NOT EXISTS idx_market_warning_model_registry_active
     ON market_warning_model_registry(market, horizon)
     WHERE active = 1;
+
+CREATE TABLE IF NOT EXISTS market_warning_rule_registry (
+    engine_version TEXT NOT NULL,
+    market TEXT NOT NULL,
+    manifest_sha256 TEXT NOT NULL,
+    metrics_json TEXT NOT NULL,
+    notification_active INTEGER NOT NULL DEFAULT 0,
+    gate_active INTEGER NOT NULL DEFAULT 0,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (engine_version, market)
+);
+
+CREATE INDEX IF NOT EXISTS idx_market_warning_rule_registry_notify
+    ON market_warning_rule_registry(market)
+    WHERE notification_active = 1;
+
+CREATE INDEX IF NOT EXISTS idx_market_warning_rule_registry_gate
+    ON market_warning_rule_registry(market)
+    WHERE gate_active = 1;
 
 CREATE TABLE IF NOT EXISTS market_warning_circuit_breakers (
     breaker_key TEXT PRIMARY KEY,
