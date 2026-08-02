@@ -1,0 +1,63 @@
+{
+  "engine_version": "rule-v1.0.0",
+  "market": "a_share",
+  "score_cap": 10,
+  "layer_caps": {
+    "VULNERABILITY": 2,
+    "PRESSURE": 4,
+    "CONTINUATION": 2,
+    "HARD_TRIGGER": 2
+  },
+  "thresholds": {
+    "return_60d": 0.15,
+    "margin_balance_growth_20d": 0.08,
+    "turnover_percentile_20d": 0.80,
+    "breadth_above_ma20_pct": 50.0,
+    "breadth_up_pct_divergence": 40.0,
+    "volatility_ratio_5d_20d_pressure": 1.50,
+    "drawdown_20d": -0.05,
+    "volatility_ratio_5d_20d_continuation": 1.20,
+    "range_zscore_20d_hard": 3.0,
+    "close_location_hard": 0.15,
+    "audited_ohlc_return_1d_hard": -0.02,
+    "declining_stock_pct_hard": 85.0,
+    "limit_down_pct_hard": 2.0,
+    "realtime_breadth_coverage_pct": 80.0,
+    "realtime_breadth_staleness_minutes": 5.0
+  },
+  "required_core_features": [
+    "return_1d",
+    "return_5d",
+    "return_60d",
+    "drawdown_20d",
+    "ma20_distance",
+    "volatility_ratio_5d_20d",
+    "range_zscore_20d",
+    "close_location",
+    "audited_ohlc_return_1d"
+  ],
+  "optional_groups": {
+    "breadth": [
+      "breadth_up_pct",
+      "breadth_above_ma20_pct",
+      "industry_decline_pct",
+      "limit_down_pct"
+    ],
+    "margin": [
+      "margin_balance_growth_20d",
+      "margin_balance_contracting_from_high"
+    ],
+    "turnover": [
+      "turnover_percentile_20d"
+    ]
+  },
+  "display_only_features": [
+    "new_low_20d_pct"
+  ],
+  "units": {
+    "returns": "ratio",
+    "breadth": "percent_0_100",
+    "percentiles": "ratio_0_1",
+    "staleness": "minutes"
+  }
+}
