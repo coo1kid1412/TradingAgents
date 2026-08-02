@@ -353,3 +353,49 @@ CREATE TABLE IF NOT EXISTS market_warning_circuit_breakers (
     open_until TEXT,
     updated_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS market_warning_leases (
+    lease_key TEXT PRIMARY KEY,
+    owner_id TEXT NOT NULL,
+    acquired_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS market_warning_runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    market TEXT NOT NULL,
+    as_of_time TEXT NOT NULL,
+    session_slot TEXT NOT NULL,
+    mode TEXT NOT NULL,
+    started_at TEXT NOT NULL,
+    finished_at TEXT NOT NULL,
+    latency_ms REAL NOT NULL,
+    status TEXT NOT NULL,
+    error_class TEXT,
+    overlap_skipped INTEGER NOT NULL DEFAULT 0,
+    llm_calls INTEGER NOT NULL DEFAULT 0,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_market_warning_runs_market_time
+    ON market_warning_runs(market, as_of_time);
+
+CREATE TABLE IF NOT EXISTS market_warning_failure_streaks (
+    market TEXT NOT NULL,
+    mode TEXT NOT NULL,
+    consecutive_failures INTEGER NOT NULL DEFAULT 0,
+    incident_started_at TEXT,
+    last_outcome_at TEXT NOT NULL,
+    PRIMARY KEY (market, mode)
+);
+
+CREATE TABLE IF NOT EXISTS market_warning_system_alerts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    idempotency_key TEXT NOT NULL UNIQUE,
+    payload_hash TEXT NOT NULL,
+    push_status TEXT NOT NULL DEFAULT 'claimed',
+    sent_at TIMESTAMP,
+    error_summary TEXT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);

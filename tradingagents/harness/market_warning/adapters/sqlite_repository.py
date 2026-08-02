@@ -209,6 +209,178 @@ class SQLiteWarningRepository:
             cooldown=cooldown,
         )
 
+    def acquire_lease(
+        self,
+        lease_key: str,
+        owner_id: str,
+        now: datetime,
+        duration: timedelta,
+    ) -> bool:
+        if not lease_key.strip() or not owner_id.strip():
+            raise ValueError("lease_key and owner_id must not be empty")
+        if now.tzinfo is None or now.utcoffset() is None:
+            raise ValueError("now must be timezone-aware")
+        if duration <= timedelta(0):
+            raise ValueError("duration must be positive")
+        acquired_at = _stored_time(now)
+        expires_at = _stored_time(now + duration)
+        with _db.connect(self._db_path) as connection:
+            cursor = connection.execute(
+                "INSERT INTO market_warning_leases "
+                "(lease_key, owner_id, acquired_at, expires_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?) "
+                "ON CONFLICT(lease_key) DO UPDATE SET "
+                "owner_id = excluded.owner_id, acquired_at = excluded.acquired_at, "
+                "expires_at = excluded.expires_at, updated_at = excluded.updated_at "
+                "WHERE market_warning_leases.expires_at <= excluded.acquired_at",
+                (lease_key, owner_id, acquired_at, expires_at, acquired_at),
+            )
+        return cursor.rowcount == 1
+
+    def release_lease(self, lease_key: str, owner_id: str) -> bool:
+        with _db.connect(self._db_path) as connection:
+            cursor = connection.execute(
+                "DELETE FROM market_warning_leases WHERE lease_key = ? AND owner_id = ?",
+                (lease_key, owner_id),
+            )
+        return cursor.rowcount == 1
+
+    def record_run(
+        self,
+        *,
+        market: Market,
+        as_of_time: datetime,
+        session_slot: str,
+        mode: str,
+        started_at: datetime,
+        finished_at: datetime,
+        status: str,
+        error_class: str | None,
+        overlap_skipped: bool,
+        llm_calls: int,
+    ) -> int:
+        for name, value in (("as_of_time", as_of_time), ("started_at", started_at), ("finished_at", finished_at)):
+            if value.tzinfo is None or value.utcoffset() is None:
+                raise ValueError(f"{name} must be timezone-aware")
+        if finished_at < started_at:
+            raise ValueError("finished_at must not precede started_at")
+        if isinstance(llm_calls, bool) or not isinstance(llm_calls, int) or llm_calls < 0:
+            raise ValueError("llm_calls must be a non-negative integer")
+        latency_ms = (finished_at - started_at).total_seconds() * 1000.0
+        with _db.connect(self._db_path) as connection:
+            cursor = connection.execute(
+                "INSERT INTO market_warning_runs "
+                "(market, as_of_time, session_slot, mode, started_at, finished_at, latency_ms, "
+                "status, error_class, overlap_skipped, llm_calls) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    Market(market).value,
+                    _stored_time(as_of_time),
+                    session_slot,
+                    mode,
+                    _stored_time(started_at),
+                    _stored_time(finished_at),
+                    latency_ms,
+                    status,
+                    error_class,
+                    int(overlap_skipped),
+                    llm_calls,
+                ),
+            )
+            return int(cursor.lastrowid)
+
+    def record_schedule_outcome(
+        self,
+        market: Market,
+        mode: str,
+        as_of_time: datetime,
+        *,
+        succeeded: bool,
+        failure_threshold: int = 3,
+    ) -> dict[str, Any]:
+        if as_of_time.tzinfo is None or as_of_time.utcoffset() is None:
+            raise ValueError("as_of_time must be timezone-aware")
+        if failure_threshold < 1:
+            raise ValueError("failure_threshold must be positive")
+        market_value = Market(market).value
+        outcome_at = _stored_time(as_of_time)
+        with _db.connect(self._db_path) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT consecutive_failures, incident_started_at "
+                "FROM market_warning_failure_streaks WHERE market = ? AND mode = ?",
+                (market_value, mode),
+            ).fetchone()
+            if succeeded:
+                failures = 0
+                incident_started_at = None
+            else:
+                failures = (int(row["consecutive_failures"]) if row is not None else 0) + 1
+                incident_started_at = (
+                    row["incident_started_at"]
+                    if row is not None and row["incident_started_at"]
+                    else outcome_at
+                )
+            connection.execute(
+                "INSERT INTO market_warning_failure_streaks "
+                "(market, mode, consecutive_failures, incident_started_at, last_outcome_at) "
+                "VALUES (?, ?, ?, ?, ?) "
+                "ON CONFLICT(market, mode) DO UPDATE SET "
+                "consecutive_failures = excluded.consecutive_failures, "
+                "incident_started_at = excluded.incident_started_at, "
+                "last_outcome_at = excluded.last_outcome_at",
+                (market_value, mode, failures, incident_started_at, outcome_at),
+            )
+        return {
+            "consecutive_failures": failures,
+            "incident_started_at": incident_started_at,
+            "alert_due": not succeeded and failures >= failure_threshold,
+        }
+
+    def claim_system_alert(
+        self,
+        idempotency_key: str,
+        payload_hash: str,
+        *,
+        retry_failed: bool = False,
+    ) -> bool:
+        try:
+            with _db.connect(self._db_path) as connection:
+                connection.execute(
+                    "INSERT INTO market_warning_system_alerts "
+                    "(idempotency_key, payload_hash, push_status, sent_at, error_summary) "
+                    "VALUES (?, ?, 'claimed', NULL, NULL)",
+                    (idempotency_key, payload_hash),
+                )
+        except sqlite3.IntegrityError as exc:
+            if "UNIQUE constraint failed: market_warning_system_alerts.idempotency_key" not in str(exc):
+                raise
+            if not retry_failed:
+                return False
+            with _db.connect(self._db_path) as connection:
+                cursor = connection.execute(
+                    "UPDATE market_warning_system_alerts SET payload_hash = ?, "
+                    "push_status = 'claimed', sent_at = NULL, error_summary = NULL "
+                    "WHERE idempotency_key = ? AND push_status = 'failed'",
+                    (payload_hash, idempotency_key),
+                )
+            return cursor.rowcount == 1
+        return True
+
+    def finish_system_alert(
+        self,
+        idempotency_key: str,
+        status: str,
+        error_summary: str | None = None,
+    ) -> None:
+        with _db.connect(self._db_path) as connection:
+            connection.execute(
+                "UPDATE market_warning_system_alerts SET push_status = ?, "
+                "sent_at = CASE WHEN ? = 'sent' THEN CURRENT_TIMESTAMP ELSE sent_at END, "
+                "error_summary = ? WHERE idempotency_key = ?",
+                (status, status, error_summary, idempotency_key),
+            )
+
     def save_feature_snapshot(self, snapshot: FeatureSnapshot) -> int:
         if not snapshot.source_times:
             raise ValueError("source_times must not be empty when saving a feature snapshot")

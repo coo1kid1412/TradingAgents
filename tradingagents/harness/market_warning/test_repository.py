@@ -234,6 +234,10 @@ class SQLiteWarningRepositoryTests(TestCase):
                 "market_warning_model_registry",
                 "market_warning_rule_assessments",
                 "market_warning_rule_registry",
+                "market_warning_leases",
+                "market_warning_runs",
+                "market_warning_failure_streaks",
+                "market_warning_system_alerts",
             }.issubset(tables)
         )
         self.assertEqual(reliability_not_null, 1)
@@ -564,6 +568,74 @@ class SQLiteWarningRepositoryTests(TestCase):
             self.assertEqual(alert["push_status"], "sent")
             self.assertIsNotNone(alert["sent_at"])
             self.assertIsNone(alert["error_summary"])
+
+    def test_lease_is_atomic_and_only_expires_for_the_current_owner(self):
+        with temporary_database() as db_path:
+            first = SQLiteWarningRepository(db_path)
+            second = SQLiteWarningRepository(db_path)
+            now = datetime(2026, 8, 3, 1, 35, tzinfo=timezone.utc)
+            ttl = timedelta(minutes=8)
+
+            self.assertTrue(first.acquire_lease("fast:a_share", "owner-1", now, ttl))
+            self.assertFalse(second.acquire_lease("fast:a_share", "owner-2", now, ttl))
+            self.assertTrue(
+                second.acquire_lease(
+                    "fast:a_share",
+                    "owner-2",
+                    now + timedelta(minutes=9),
+                    ttl,
+                )
+            )
+            self.assertFalse(first.release_lease("fast:a_share", "owner-1"))
+            self.assertTrue(second.release_lease("fast:a_share", "owner-2"))
+
+    def test_failure_streak_alerts_once_and_success_resets_the_incident(self):
+        with temporary_database() as db_path:
+            repository = SQLiteWarningRepository(db_path)
+            now = datetime(2026, 8, 3, 1, 35, tzinfo=timezone.utc)
+
+            first = repository.record_schedule_outcome(
+                Market.A_SHARE, "rule_v1", now, succeeded=False
+            )
+            second = repository.record_schedule_outcome(
+                Market.A_SHARE, "rule_v1", now + timedelta(minutes=10), succeeded=False
+            )
+            third = repository.record_schedule_outcome(
+                Market.A_SHARE, "rule_v1", now + timedelta(minutes=20), succeeded=False
+            )
+            fourth = repository.record_schedule_outcome(
+                Market.A_SHARE, "rule_v1", now + timedelta(minutes=30), succeeded=False
+            )
+
+            self.assertEqual([item["consecutive_failures"] for item in (first, second, third, fourth)], [1, 2, 3, 4])
+            self.assertFalse(first["alert_due"])
+            self.assertFalse(second["alert_due"])
+            self.assertTrue(third["alert_due"])
+            self.assertTrue(fourth["alert_due"])
+            self.assertEqual(third["incident_started_at"], first["incident_started_at"])
+
+            reset = repository.record_schedule_outcome(
+                Market.A_SHARE, "rule_v1", now + timedelta(minutes=40), succeeded=True
+            )
+            restarted = repository.record_schedule_outcome(
+                Market.A_SHARE, "rule_v1", now + timedelta(minutes=50), succeeded=False
+            )
+            self.assertEqual(reset["consecutive_failures"], 0)
+            self.assertEqual(restarted["consecutive_failures"], 1)
+            self.assertNotEqual(restarted["incident_started_at"], first["incident_started_at"])
+
+    def test_system_alert_claim_is_atomic_and_failed_send_can_retry(self):
+        with temporary_database() as db_path:
+            first = SQLiteWarningRepository(db_path)
+            second = SQLiteWarningRepository(db_path)
+
+            self.assertTrue(first.claim_system_alert("system:incident", "sha"))
+            self.assertFalse(second.claim_system_alert("system:incident", "sha"))
+            first.finish_system_alert("system:incident", "failed", "send_error")
+            self.assertTrue(
+                second.claim_system_alert("system:incident", "sha", retry_failed=True)
+            )
+            second.finish_system_alert("system:incident", "sent")
 
     def test_circuit_breaker_state_survives_new_process_instances(self):
         with temporary_database() as db_path:

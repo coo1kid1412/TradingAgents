@@ -5,7 +5,7 @@ import io
 import tempfile
 from contextlib import redirect_stdout
 from dataclasses import replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import TestCase, main, mock
 from zoneinfo import ZoneInfo
@@ -29,6 +29,8 @@ from tradingagents.harness.market_warning.domain import (
     RunnerResult,
 )
 from tradingagents.harness.market_warning.runner import (
+    EvaluationSlot,
+    FastScanCoordinator,
     _load_history_incrementally,
     _reasoning_adapter,
     due_evaluations,
@@ -47,10 +49,11 @@ class CalendarSchedulingTests(TestCase):
     def test_a_share_premarket_and_both_intraday_windows(self) -> None:
         cases = (
             ("2026-08-03T08:30:00+08:00", "premarket"),
-            ("2026-08-03T08:35:00+08:00", "premarket"),
             ("2026-08-03T09:35:00+08:00", "intraday-0935"),
+            ("2026-08-03T09:45:00+08:00", "intraday-0945"),
             ("2026-08-03T11:25:00+08:00", "intraday-1125"),
             ("2026-08-03T13:05:00+08:00", "intraday-1305"),
+            ("2026-08-03T13:15:00+08:00", "intraday-1315"),
             ("2026-08-03T14:55:00+08:00", "intraday-1455"),
         )
         for timestamp, expected in cases:
@@ -58,8 +61,11 @@ class CalendarSchedulingTests(TestCase):
                 slots = self._slots(timestamp, Market.A_SHARE)
                 self.assertEqual(tuple(item.session_slot for item in slots), (expected,))
         for timestamp in (
+            "2026-08-03T08:35:00+08:00",
             "2026-08-03T09:30:00+08:00",
+            "2026-08-03T09:40:00+08:00",
             "2026-08-03T11:30:00+08:00",
+            "2026-08-03T12:00:00+08:00",
             "2026-08-03T12:55:00+08:00",
             "2026-08-03T15:00:00+08:00",
         ):
@@ -77,24 +83,17 @@ class CalendarSchedulingTests(TestCase):
             with self.subTest(timestamp=timestamp, market=market):
                 self.assertEqual(self._slots(timestamp, market), ())
 
-    def test_us_summer_and_winter_time_use_exchange_local_clock(self) -> None:
+    def test_us_shadow_runs_only_once_premarket_in_exchange_local_clock(self) -> None:
         cases = (
             ("2026-07-06T12:30:00+00:00", "premarket"),
-            ("2026-07-06T13:35:00+00:00", "intraday-0935"),
             ("2026-12-28T13:30:00+00:00", "premarket"),
-            ("2026-12-28T14:35:00+00:00", "intraday-0935"),
         )
         for timestamp, expected in cases:
             with self.subTest(timestamp=timestamp):
                 slots = self._slots(timestamp, Market.US)
                 self.assertEqual(tuple(item.session_slot for item in slots), (expected,))
-
-    def test_us_early_close_stops_before_actual_close(self) -> None:
-        before_close = self._slots("2026-11-27T17:55:00+00:00", Market.US)
-        at_close = self._slots("2026-11-27T18:00:00+00:00", Market.US)
-
-        self.assertEqual(tuple(item.session_slot for item in before_close), ("intraday-1255",))
-        self.assertEqual(at_close, ())
+        self.assertEqual(self._slots("2026-07-06T13:35:00+00:00", Market.US), ())
+        self.assertEqual(self._slots("2026-12-28T14:35:00+00:00", Market.US), ())
 
 
 class FakeService:
@@ -107,6 +106,101 @@ class FakeService:
 
 
 class RunnerTests(TestCase):
+    def test_fast_scan_coordinator_skips_overlap_and_records_zero_llm_calls(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            db_path = Path(directory) / "warning.db"
+            repository = SQLiteWarningRepository(db_path)
+            now = datetime.fromisoformat("2026-08-03T09:35:00+08:00")
+            slot = due_evaluations(now, markets=(Market.A_SHARE,))[0]
+            self.assertTrue(
+                repository.acquire_lease(
+                    "market_warning_fast_scan:a_share",
+                    "existing-owner",
+                    now,
+                    timedelta(minutes=8),
+                )
+            )
+            coordinator = FastScanCoordinator(
+                repository,
+                mode="rule_v1",
+                owner_id="second-owner",
+                clock=lambda: now,
+            )
+
+            result = coordinator.execute(slot, lambda: self.fail("overlap must skip work"))
+
+            self.assertEqual(result.error_class, "overlap_skipped")
+            with _db.connect(db_path) as connection:
+                row = connection.execute(
+                    "SELECT status, overlap_skipped, llm_calls "
+                    "FROM market_warning_runs ORDER BY id DESC LIMIT 1"
+                ).fetchone()
+            self.assertEqual(tuple(row), ("overlap_skipped", 1, 0))
+
+    def test_fast_scan_coordinator_releases_lease_after_exception(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            db_path = Path(directory) / "warning.db"
+            repository = SQLiteWarningRepository(db_path)
+            now = datetime.fromisoformat("2026-08-03T09:35:00+08:00")
+            slot = due_evaluations(now, markets=(Market.A_SHARE,))[0]
+            coordinator = FastScanCoordinator(
+                repository,
+                mode="rule_v1",
+                owner_id="failed-owner",
+                clock=lambda: now,
+            )
+
+            result = coordinator.execute(
+                slot,
+                lambda: (_ for _ in ()).throw(RuntimeError("private failure detail")),
+            )
+
+            self.assertEqual(result.error_class, "runtime_error")
+            self.assertTrue(
+                repository.acquire_lease(
+                    "market_warning_fast_scan:a_share",
+                    "next-owner",
+                    now,
+                    timedelta(minutes=8),
+                )
+            )
+
+    def test_three_consecutive_failed_slots_send_one_distinct_system_alert(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repository = SQLiteWarningRepository(Path(directory) / "warning.db")
+            now = datetime.fromisoformat("2026-08-03T09:35:00+08:00")
+            sent: list[str] = []
+            current = [now]
+            coordinator = FastScanCoordinator(
+                repository,
+                mode="rule_v1",
+                owner_id="worker",
+                clock=lambda: current[0],
+                alert_sender=sent.append,
+            )
+
+            for offset in range(4):
+                current[0] = now + timedelta(minutes=offset * 10)
+                slot = EvaluationSlot(
+                    Market.A_SHARE,
+                    current[0],
+                    f"intraday-{current[0]:%H%M}",
+                    current[0].date(),
+                )
+                coordinator.execute(
+                    slot,
+                    lambda: RunnerResult(
+                        market=Market.A_SHARE,
+                        as_of_time=current[0],
+                        session_slot=slot.session_slot,
+                        error_class="data_unavailable",
+                    ),
+                )
+
+            self.assertEqual(len(sent), 1)
+            self.assertIn("预警系统数据故障", sent[0])
+            self.assertIn("不代表市场红灯", sent[0])
+
     def test_runner_evaluates_each_due_slot_once(self) -> None:
         calls: list[tuple] = []
         factories: list[tuple] = []
