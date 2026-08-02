@@ -626,6 +626,21 @@ class AdapterTests(TestCase):
         with self.assertRaises(ValueError):
             MiniMaxReasoningAdapter(FakeLLM([]), timeout=90.1)
 
+    def test_rule_repair_attempts_share_one_total_timeout_budget(self) -> None:
+        timeouts: list[float | None] = []
+
+        class RecordingAdapter(MiniMaxReasoningAdapter):
+            def _invoke(self, prompt: str, *, timeout: float | None = None):
+                timeouts.append(timeout)
+                raise TimeoutError("slow provider")
+
+        adapter = RecordingAdapter(FakeLLM([]), timeout=90)
+
+        result = adapter.assess_rule_alert(make_rule_result(), None)
+
+        self.assertEqual(result.reasoning_status, "fallback")
+        self.assertEqual(timeouts, [45.0, 45.0])
+
 
 class RawLoggingGuardTests(TestCase):
     def test_market_warning_metadata_disables_raw_io_logging_only_for_that_call(self) -> None:

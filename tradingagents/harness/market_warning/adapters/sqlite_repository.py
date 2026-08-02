@@ -4,11 +4,16 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from collections.abc import Mapping
-from datetime import datetime, timedelta, timezone
+import uuid
+from collections.abc import Iterable, Mapping
+from datetime import date, datetime, time, timedelta, timezone
 from enum import Enum
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
+
+import exchange_calendars as xcals
+import pandas as pd
 
 from tradingagents.harness import db as _db
 
@@ -25,6 +30,7 @@ from tradingagents.harness.market_warning.domain import (
     RiskLevel,
     RuleRiskAssessment,
     RunnerResult,
+    SessionRiskSummary,
     TriggeredRule,
 )
 
@@ -48,6 +54,18 @@ def _json_dump(value: Any) -> str:
 
 def _stored_time(value: datetime) -> str:
     return value.astimezone(timezone.utc).isoformat()
+
+
+_A_SHARE_RULE_SLOTS = (
+    "premarket",
+    *(f"intraday-{hour:02d}{minute:02d}" for hour, minute in (
+        *((9, minute) for minute in range(35, 60, 10)),
+        *((10, minute) for minute in range(5, 60, 10)),
+        *((11, minute) for minute in range(5, 26, 10)),
+        *((13, minute) for minute in range(5, 60, 10)),
+        *((14, minute) for minute in range(5, 56, 10)),
+    )),
+)
 
 
 def _evidence_json(evidence: tuple[Evidence, ...]) -> str:
@@ -231,7 +249,7 @@ class SQLiteWarningRepository:
         owner_id: str,
         now: datetime,
         duration: timedelta,
-    ) -> bool:
+    ) -> str | None:
         if not lease_key.strip() or not owner_id.strip():
             raise ValueError("lease_key and owner_id must not be empty")
         if now.tzinfo is None or now.utcoffset() is None:
@@ -304,6 +322,96 @@ class SQLiteWarningRepository:
                 ),
             )
             return int(cursor.lastrowid)
+
+    def load_rule_soak_audit(
+        self,
+        market: Market,
+        session_dates: Iterable[date],
+    ) -> dict[str, Any]:
+        """Audit every expected V1 slot for a fixed set of completed sessions."""
+
+        dates = tuple(sorted(set(session_dates)))
+        if any(not isinstance(item, date) for item in dates):
+            raise TypeError("session_dates must contain date values")
+        expected_scans = len(dates) * len(_A_SHARE_RULE_SLOTS)
+        if not dates:
+            return {
+                "expected_sessions": 0,
+                "soak_sessions": 0,
+                "expected_scans": 0,
+                "successful_scans": 0,
+                "missing_scans": 0,
+                "scan_success_rate": 0.0,
+                "duplicate_runs": 0,
+                "overlap_skipped": 0,
+                "stale_misjudgments": 0,
+            }
+
+        zone = ZoneInfo("Asia/Shanghai")
+        start = datetime.combine(dates[0], time.min, zone)
+        end = datetime.combine(dates[-1] + timedelta(days=1), time.min, zone)
+        with _db.connect(self._db_path) as connection:
+            rows = connection.execute(
+                "SELECT r.as_of_time, r.session_slot, r.status, r.overlap_skipped, "
+                "(SELECT s.data_status FROM market_warning_feature_snapshots AS s "
+                " WHERE s.market = r.market AND s.as_of_time = r.as_of_time "
+                " ORDER BY s.id DESC LIMIT 1) AS snapshot_status, "
+                "(SELECT d.final_level FROM market_warning_decisions AS d "
+                " INNER JOIN market_warning_feature_snapshots AS s ON s.id = d.feature_snapshot_id "
+                " WHERE s.market = r.market AND s.as_of_time = r.as_of_time "
+                " ORDER BY d.id DESC LIMIT 1) AS final_level "
+                "FROM market_warning_runs AS r "
+                "WHERE r.market = ? AND r.mode = 'rule_v1' "
+                "AND r.as_of_time >= ? AND r.as_of_time < ? ORDER BY r.as_of_time, r.id",
+                (Market(market).value, _stored_time(start), _stored_time(end)),
+            ).fetchall()
+
+        expected_keys = {
+            (session_date, slot)
+            for session_date in dates
+            for slot in _A_SHARE_RULE_SLOTS
+        }
+        grouped: dict[tuple[date, str], list[Any]] = {}
+        stale_misjudgments = 0
+        overlap_skipped = 0
+        for row in rows:
+            local_date = datetime.fromisoformat(row["as_of_time"]).astimezone(zone).date()
+            key = (local_date, str(row["session_slot"]))
+            if key not in expected_keys:
+                continue
+            grouped.setdefault(key, []).append(row)
+            overlap_skipped += int(bool(row["overlap_skipped"]))
+            if (
+                row["status"] == "success"
+                and row["snapshot_status"] == DataStatus.STALE.value
+                and row["final_level"] not in (None, RiskLevel.UNKNOWN.value)
+            ):
+                stale_misjudgments += 1
+
+        successful_keys = {
+            key
+            for key, records in grouped.items()
+            if any(row["status"] == "success" for row in records)
+        }
+        duplicate_runs = sum(max(0, len(records) - 1) for records in grouped.values())
+        complete_sessions = sum(
+            all((session_date, slot) in successful_keys for slot in _A_SHARE_RULE_SLOTS)
+            for session_date in dates
+        )
+        successful_scans = len(successful_keys)
+        return {
+            "expected_sessions": len(dates),
+            "soak_sessions": complete_sessions,
+            "expected_scans": expected_scans,
+            "successful_scans": successful_scans,
+            "missing_scans": expected_scans - successful_scans,
+            "scan_success_rate": (
+                successful_scans / expected_scans if expected_scans else 0.0
+            ),
+            "duplicate_runs": duplicate_runs,
+            "overlap_skipped": overlap_skipped,
+            "stale_misjudgments": stale_misjudgments,
+        }
 
     def record_schedule_outcome(
         self,
@@ -400,25 +508,84 @@ class SQLiteWarningRepository:
     def save_feature_snapshot(self, snapshot: FeatureSnapshot) -> int:
         if not snapshot.source_times:
             raise ValueError("source_times must not be empty when saving a feature snapshot")
+        values = (
+            snapshot.market.value,
+            _stored_time(snapshot.as_of_time),
+            snapshot.session_slot,
+            snapshot.feature_version,
+            snapshot.data_quality.value,
+            snapshot.reliability_grade,
+            _json_dump(dict(snapshot.features)),
+            _evidence_json(snapshot.evidence),
+            _json_dump(dict(snapshot.source_times)),
+        )
         with _db.connect(self._db_path) as connection:
             cursor = connection.execute(
                 "INSERT INTO market_warning_feature_snapshots "
                 "(market, as_of_time, session_slot, feature_version, data_status, reliability_grade, "
                 "features_json, evidence_json, source_times_json) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    snapshot.market.value,
-                    _stored_time(snapshot.as_of_time),
-                    snapshot.session_slot,
-                    snapshot.feature_version,
-                    snapshot.data_quality.value,
-                    snapshot.reliability_grade,
-                    _json_dump(dict(snapshot.features)),
-                    _evidence_json(snapshot.evidence),
-                    _json_dump(dict(snapshot.source_times)),
-                ),
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(market, as_of_time, feature_version) DO NOTHING",
+                values,
             )
-            return int(cursor.lastrowid)
+            if cursor.rowcount == 1:
+                return int(cursor.lastrowid)
+            row = connection.execute(
+                "SELECT id, market, as_of_time, session_slot, feature_version, data_status, "
+                "reliability_grade, features_json, evidence_json, source_times_json "
+                "FROM market_warning_feature_snapshots "
+                "WHERE market = ? AND as_of_time = ? AND feature_version = ?",
+                (values[0], values[1], values[3]),
+            ).fetchone()
+            if row is None or tuple(row[key] for key in row.keys()[1:]) != values:
+                raise ValueError("conflicting feature snapshot already exists")
+            return int(row["id"])
+
+    def load_feature_snapshot(
+        self,
+        market: Market,
+        as_of_time: datetime,
+        feature_version: str,
+    ) -> FeatureSnapshot | None:
+        with _db.connect(self._db_path) as connection:
+            row = connection.execute(
+                "SELECT market, as_of_time, session_slot, feature_version, data_status, "
+                "reliability_grade, features_json, evidence_json, source_times_json "
+                "FROM market_warning_feature_snapshots "
+                "WHERE market = ? AND as_of_time = ? AND feature_version = ?",
+                (Market(market).value, _stored_time(as_of_time), feature_version),
+            ).fetchone()
+        if row is None:
+            return None
+        evidence_rows = json.loads(row["evidence_json"])
+        return FeatureSnapshot(
+            market=row["market"],
+            as_of_time=datetime.fromisoformat(row["as_of_time"]),
+            session_slot=row["session_slot"],
+            feature_version=row["feature_version"],
+            features=json.loads(row["features_json"]),
+            evidence=tuple(
+                Evidence(
+                    evidence_id=item["evidence_id"],
+                    group=item["group"],
+                    summary=item["summary"],
+                    value=item.get("value"),
+                    source=item.get("source"),
+                    as_of_time=(
+                        datetime.fromisoformat(item["as_of_time"])
+                        if item.get("as_of_time")
+                        else None
+                    ),
+                )
+                for item in evidence_rows
+            ),
+            data_quality=row["data_status"],
+            reliability_grade=row["reliability_grade"],
+            source_times={
+                key: datetime.fromisoformat(value)
+                for key, value in json.loads(row["source_times_json"]).items()
+            },
+        )
 
     def save_predictions(self, feature_snapshot_id: int, assessment: QuantRiskAssessment) -> tuple[int, int]:
         rows = (
@@ -462,25 +629,40 @@ class SQLiteWarningRepository:
                 raise ValueError("rule assessment market must match feature snapshot")
             if datetime.fromisoformat(snapshot["as_of_time"]) != assessment.as_of_time.astimezone(timezone.utc):
                 raise ValueError("rule assessment as_of_time must match feature snapshot")
+            values = (
+                feature_snapshot_id,
+                assessment.engine_version,
+                assessment.manifest_sha256,
+                assessment.risk_level.value,
+                assessment.risk_score,
+                assessment.market_phase.value,
+                _triggered_rules_json(assessment),
+                _json_dump(assessment.missing_optional_groups),
+                assessment.reliability_grade,
+                assessment.evaluation_latency_ms,
+            )
             cursor = connection.execute(
                 "INSERT INTO market_warning_rule_assessments "
                 "(feature_snapshot_id, engine_version, manifest_sha256, risk_level, risk_score, "
                 "market_phase, triggered_rules_json, missing_optional_groups_json, reliability_grade, "
-                "evaluation_latency_ms) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    feature_snapshot_id,
-                    assessment.engine_version,
-                    assessment.manifest_sha256,
-                    assessment.risk_level.value,
-                    assessment.risk_score,
-                    assessment.market_phase.value,
-                    _triggered_rules_json(assessment),
-                    _json_dump(assessment.missing_optional_groups),
-                    assessment.reliability_grade,
-                    assessment.evaluation_latency_ms,
-                ),
+                "evaluation_latency_ms) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(feature_snapshot_id, engine_version) DO NOTHING",
+                values,
             )
-            return int(cursor.lastrowid)
+            if cursor.rowcount == 1:
+                return int(cursor.lastrowid)
+            row = connection.execute(
+                "SELECT id, feature_snapshot_id, engine_version, manifest_sha256, risk_level, "
+                "risk_score, market_phase, triggered_rules_json, missing_optional_groups_json, "
+                "reliability_grade, evaluation_latency_ms "
+                "FROM market_warning_rule_assessments "
+                "WHERE feature_snapshot_id = ? AND engine_version = ?",
+                (feature_snapshot_id, assessment.engine_version),
+            ).fetchone()
+            persisted = tuple(row[key] for key in row.keys()[1:]) if row is not None else ()
+            if not persisted or persisted[:-1] != values[:-1]:
+                raise ValueError("conflicting rule assessment already exists")
+            return int(row["id"])
 
     def load_previous_rule_assessment(
         self, market: Market, before_time: datetime
@@ -824,6 +1006,7 @@ class SQLiteWarningRepository:
             shadow_quant_assessment=shadow_quant,
             context_assessment=context,
             decision=decision,
+            snapshot_id=int(row["snapshot_id"]),
             decision_id=int(row["decision_id"]),
         )
 
@@ -858,6 +1041,69 @@ class SQLiteWarningRepository:
             ).fetchone()
         return self._decision_from_row(row) if row is not None else None
 
+    def load_previous_intraday_summary(
+        self,
+        market: Market,
+        before_time: datetime,
+    ) -> SessionRiskSummary | None:
+        if before_time.tzinfo is None or before_time.utcoffset() is None:
+            raise ValueError("before_time must be timezone-aware")
+        zone = ZoneInfo(
+            "Asia/Shanghai" if Market(market) == Market.A_SHARE else "America/New_York"
+        )
+        local_date = before_time.astimezone(zone).date()
+        calendar = xcals.get_calendar(
+            "XSHG" if Market(market) == Market.A_SHARE else "XNYS"
+        )
+        current_label = pd.Timestamp(local_date)
+        previous_label = (
+            calendar.previous_session(current_label)
+            if calendar.is_session(current_label)
+            else calendar.date_to_session(current_label, direction="previous")
+        )
+        previous_date = previous_label.date()
+        session_start = datetime.combine(previous_date, time.min, zone)
+        session_end = session_start + timedelta(days=1)
+        with _db.connect(self._db_path) as connection:
+            rows = connection.execute(
+                "SELECT s.as_of_time, d.final_level, d.transition "
+                "FROM market_warning_decisions AS d "
+                "INNER JOIN market_warning_feature_snapshots AS s "
+                "ON s.id = d.feature_snapshot_id "
+                "WHERE s.market = ? AND s.as_of_time >= ? AND s.as_of_time < ? "
+                "AND s.session_slot LIKE 'intraday-%' "
+                "ORDER BY s.as_of_time ASC, d.id ASC",
+                (
+                    Market(market).value,
+                    _stored_time(session_start),
+                    _stored_time(session_end),
+                ),
+            ).fetchall()
+        if not rows:
+            return None
+        session_rows = list(rows)
+        rank = {
+            RiskLevel.UNKNOWN: -1,
+            RiskLevel.GREEN: 0,
+            RiskLevel.YELLOW: 1,
+            RiskLevel.ORANGE: 2,
+            RiskLevel.RED: 3,
+        }
+        levels = [RiskLevel(row["final_level"]) for row in session_rows]
+        highest = max(levels, key=rank.__getitem__)
+        changes: list[str] = []
+        for row in session_rows:
+            transition = str(row["transition"])
+            if transition != "UNCHANGED" and (
+                not changes or transition != changes[-1]
+            ):
+                changes.append(transition)
+        return SessionRiskSummary(
+            trade_date=previous_date,
+            highest_level=highest,
+            state_changes=tuple(changes),
+        )
+
     def claim_alert(
         self,
         idempotency_key: str,
@@ -865,38 +1111,77 @@ class SQLiteWarningRepository:
         payload_hash: str,
         *,
         retry_failed: bool = False,
+        now: datetime | None = None,
+        claim_timeout: timedelta = timedelta(minutes=10),
     ) -> bool:
+        claimed_at = now or datetime.now(timezone.utc)
+        if claimed_at.tzinfo is None or claimed_at.utcoffset() is None:
+            raise ValueError("now must be timezone-aware")
+        if claim_timeout <= timedelta(0):
+            raise ValueError("claim_timeout must be positive")
+        claimed_at = claimed_at.astimezone(timezone.utc)
+        claim_token = uuid.uuid4().hex
         try:
             with _db.connect(self._db_path) as connection:
                 connection.execute(
                     "INSERT INTO market_warning_alerts "
-                    "(idempotency_key, decision_id, payload_hash, push_status, sent_at, error_summary) "
-                    "VALUES (?, ?, ?, ?, ?, ?)",
-                    (idempotency_key, decision_id, payload_hash, "claimed", None, None),
+                    "(idempotency_key, decision_id, payload_hash, push_status, claimed_at, "
+                    "claim_token, sent_at, error_summary) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        idempotency_key,
+                        decision_id,
+                        payload_hash,
+                        "claimed",
+                        claimed_at.isoformat(),
+                        claim_token,
+                        None,
+                        None,
+                    ),
                 )
         except sqlite3.IntegrityError as exc:
             if "UNIQUE constraint failed: market_warning_alerts.idempotency_key" in str(exc):
-                if retry_failed:
-                    with _db.connect(self._db_path) as connection:
-                        cursor = connection.execute(
-                            "UPDATE market_warning_alerts SET decision_id = ?, payload_hash = ?, "
-                            "push_status = 'claimed', sent_at = NULL, error_summary = NULL "
-                            "WHERE idempotency_key = ? AND push_status = 'failed'",
-                            (decision_id, payload_hash, idempotency_key),
-                        )
-                    return cursor.rowcount == 1
-                return False
+                failed_clause = "push_status = 'failed' OR " if retry_failed else ""
+                with _db.connect(self._db_path) as connection:
+                    cursor = connection.execute(
+                        "UPDATE market_warning_alerts SET decision_id = ?, payload_hash = ?, "
+                        "push_status = 'claimed', claimed_at = ?, claim_token = ?, "
+                        "sent_at = NULL, error_summary = NULL "
+                        f"WHERE idempotency_key = ? AND ({failed_clause}"
+                        "(push_status = 'claimed' AND (claimed_at IS NULL OR claimed_at <= ?)))",
+                        (
+                            decision_id,
+                            payload_hash,
+                            claimed_at.isoformat(),
+                            claim_token,
+                            idempotency_key,
+                            (claimed_at - claim_timeout).isoformat(),
+                        ),
+                    )
+                return claim_token if cursor.rowcount == 1 else None
             raise
-        return True
+        return claim_token
 
-    def finish_alert(self, idempotency_key: str, status: str, error_summary: str | None = None) -> None:
+    def finish_alert(
+        self,
+        idempotency_key: str,
+        status: str,
+        error_summary: str | None = None,
+        *,
+        claim_token: str,
+    ) -> bool:
+        if status not in {"sent", "failed"}:
+            raise ValueError("status must be sent or failed")
+        if not isinstance(claim_token, str) or not claim_token:
+            raise ValueError("claim_token must be a non-empty string")
         with _db.connect(self._db_path) as connection:
-            connection.execute(
+            cursor = connection.execute(
                 "UPDATE market_warning_alerts "
                 "SET push_status = ?, sent_at = CASE WHEN ? = 'sent' THEN CURRENT_TIMESTAMP ELSE sent_at END, "
-                "error_summary = ? WHERE idempotency_key = ?",
-                (status, status, error_summary, idempotency_key),
+                "error_summary = ? WHERE idempotency_key = ? "
+                "AND claim_token = ? AND push_status = 'claimed'",
+                (status, status, error_summary, idempotency_key, claim_token),
             )
+        return cursor.rowcount == 1
 
     def load_alert_status(self, idempotency_key: str) -> str | None:
         with _db.connect(self._db_path) as connection:
@@ -929,27 +1214,32 @@ class SQLiteWarningRepository:
 
     def activate_rule_engine(self, engine_version: str, mode: str) -> dict[str, Any]:
         column = self._rule_activation_column(mode)
+        activated_column = f"{column.removesuffix('_active')}_activated_at"
         with _db.connect(self._db_path) as connection:
             connection.execute("BEGIN IMMEDIATE")
             target = connection.execute(
-                "SELECT market FROM market_warning_rule_registry WHERE engine_version = ?",
+                f"SELECT market, {column} AS already_active "
+                "FROM market_warning_rule_registry WHERE engine_version = ?",
                 (engine_version,),
             ).fetchall()
             if len(target) != 1:
                 raise ValueError("rule engine version must identify exactly one registered market")
             market = target[0]["market"]
-            connection.execute(
-                f"UPDATE market_warning_rule_registry SET {column} = 0, updated_at = CURRENT_TIMESTAMP "
-                "WHERE market = ?",
-                (market,),
-            )
-            cursor = connection.execute(
-                f"UPDATE market_warning_rule_registry SET {column} = 1, updated_at = CURRENT_TIMESTAMP "
-                "WHERE engine_version = ? AND market = ?",
-                (engine_version, market),
-            )
-            if cursor.rowcount != 1:
-                raise ValueError("rule engine activation failed")
+            if not bool(target[0]["already_active"]):
+                connection.execute(
+                    f"UPDATE market_warning_rule_registry SET {column} = 0, "
+                    f"{activated_column} = NULL, updated_at = CURRENT_TIMESTAMP "
+                    "WHERE market = ?",
+                    (market,),
+                )
+                cursor = connection.execute(
+                    f"UPDATE market_warning_rule_registry SET {column} = 1, "
+                    f"{activated_column} = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP "
+                    "WHERE engine_version = ? AND market = ?",
+                    (engine_version, market),
+                )
+                if cursor.rowcount != 1:
+                    raise ValueError("rule engine activation failed")
         record = self.load_active_rule_engine(Market(market), mode)
         if record is None:
             raise ValueError("rule engine activation was not persisted")
@@ -957,9 +1247,11 @@ class SQLiteWarningRepository:
 
     def deactivate_rule_engine(self, market: Market, mode: str) -> None:
         column = self._rule_activation_column(mode)
+        activated_column = f"{column.removesuffix('_active')}_activated_at"
         with _db.connect(self._db_path) as connection:
             connection.execute(
                 f"UPDATE market_warning_rule_registry SET {column} = 0, "
+                f"{activated_column} = NULL, "
                 "updated_at = CURRENT_TIMESTAMP WHERE market = ?",
                 (Market(market).value,),
             )
@@ -969,7 +1261,8 @@ class SQLiteWarningRepository:
         with _db.connect(self._db_path) as connection:
             row = connection.execute(
                 "SELECT engine_version, market, manifest_sha256, metrics_json, "
-                "notification_active, gate_active, created_at, updated_at "
+                "notification_active, gate_active, notification_activated_at, "
+                "gate_activated_at, created_at, updated_at "
                 f"FROM market_warning_rule_registry WHERE market = ? AND {column} = 1 "
                 "ORDER BY updated_at DESC, engine_version DESC LIMIT 1",
                 (Market(market).value,),
@@ -993,6 +1286,8 @@ class SQLiteWarningRepository:
             "metrics": json.loads(row["metrics_json"]),
             "notification_active": bool(row["notification_active"]),
             "gate_active": bool(row["gate_active"]),
+            "notification_activated_at": row["notification_activated_at"],
+            "gate_activated_at": row["gate_activated_at"],
             "created_at": row["created_at"],
             "updated_at": row["updated_at"],
         }

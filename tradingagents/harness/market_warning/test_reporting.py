@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import tempfile
 from dataclasses import replace
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 from unittest import TestCase, main
 from unittest import mock
@@ -20,6 +20,7 @@ from tradingagents.harness.market_warning.domain import (
     RuleLayer,
     RuleRiskAssessment,
     RunnerResult,
+    SessionRiskSummary,
     TriggeredRule,
 )
 from tradingagents.harness.market_warning.reporting import (
@@ -221,7 +222,15 @@ def _rule_result(
 
 class ReportGoldenTests(TestCase):
     def test_rule_premarket_puts_action_data_and_score_disclaimer_first(self) -> None:
-        report = render_premarket_report(_rule_result(), None)
+        result = replace(
+            _rule_result(),
+            previous_session_summary=SessionRiskSummary(
+                trade_date=date(2026, 7, 31),
+                highest_level=RiskLevel.RED,
+                state_changes=("INITIAL_ORANGE", "UPGRADE_ORANGE_TO_RED"),
+            ),
+        )
+        report = render_premarket_report(result, None)
         first_screen = "\n".join(report.splitlines()[:14])
 
         self.assertTrue(report.startswith("# A股大盘骤跌预警\n\n## 【橙灯：提前防守】"))
@@ -236,6 +245,9 @@ class ReportGoldenTests(TestCase):
         self.assertNotIn("骤跌概率", report)
         self.assertNotIn("0.00%", report)
         self.assertNotIn("<think>", report.lower())
+        self.assertIn("上一交易日盘中轨迹", report)
+        self.assertIn("最高灯号：`RED`", report)
+        self.assertIn("INITIAL_ORANGE -> UPGRADE_ORANGE_TO_RED", report)
 
     def test_rule_intraday_alert_is_short_and_shows_only_top_three_rules(self) -> None:
         result = _rule_result(

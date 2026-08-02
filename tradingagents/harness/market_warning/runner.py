@@ -110,7 +110,7 @@ class FastScanCoordinator:
         *,
         mode: str,
         owner_id: str | None = None,
-        lease_duration: timedelta = timedelta(minutes=8),
+        lease_duration: timedelta = timedelta(minutes=12),
         failure_threshold: int = 3,
         clock: Callable[[], datetime] | None = None,
         alert_sender: Callable[[str], None] | None = None,
@@ -233,15 +233,20 @@ def run_due_evaluations(
     results = []
     for slot in slots:
         service = service_factory(slot, force)
-        callback = lambda service=service, slot=slot: service.evaluate(
-            slot.market,
-            slot.as_of_time,
-            slot.session_slot,
+        evaluate_fast = getattr(service, "evaluate_fast", None)
+        complete_after_alert = getattr(service, "complete_after_alert", None)
+        split_path = callable(evaluate_fast) and callable(complete_after_alert)
+        evaluator = evaluate_fast if split_path else service.evaluate
+        callback = lambda evaluator=evaluator, slot=slot: evaluator(
+            slot.market, slot.as_of_time, slot.session_slot
         )
         if coordinator_factory is None:
-            results.append(callback())
+            result = callback()
         else:
-            results.append(coordinator_factory(slot).execute(slot, callback))
+            result = coordinator_factory(slot).execute(slot, callback)
+        if split_path:
+            result = complete_after_alert(result)
+        results.append(result)
     return tuple(results)
 
 

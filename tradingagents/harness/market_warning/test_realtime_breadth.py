@@ -169,6 +169,26 @@ class RealtimeCrossSectionTests(TestCase):
 
         self.assertTrue(result.empty)
 
+    def test_rows_older_than_five_minutes_are_excluded_individually(self):
+        class MixedFreshness:
+            def rt_k(self, **_):
+                return pd.DataFrame(
+                    [
+                        {"ts_code": "600000.SH", "pre_close": 10.0, "close": 9.0, "trade_time": "2026-08-03 09:29:59"},
+                        {"ts_code": "000001.SZ", "pre_close": 20.0, "close": 20.2, "trade_time": "2026-08-03 09:35:00"},
+                        {"ts_code": "300001.SZ", "pre_close": 30.0, "close": 29.0, "trade_time": "2026-08-03 09:20:00"},
+                    ]
+                )
+
+        result = load_realtime_cross_section(
+            MixedFreshness(), self.baseline(), AS_OF
+        )
+
+        self.assertEqual(result["ts_code"].tolist(), ["000001.SZ"])
+        self.assertTrue(
+            ((AS_OF - result["data_time"]).dt.total_seconds() <= 300).all()
+        )
+
 
 if __name__ == "__main__":
     main()

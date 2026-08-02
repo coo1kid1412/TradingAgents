@@ -157,7 +157,7 @@
 
   `check_production_readiness(..., mode)` 支持：
   - `model`：保持四模型校验不变。
-  - `rule_v1/notify`：要求冻结期 lift > 2、月均新橙/红 <= 6、清单 checksum 匹配、数据冒烟通过、运行时基准通过。
+  - `rule_v1/notify`：要求冻结期 lift > 2、月均新橙/红进入次数及包含橙转红的实际推送次数均 <= 6、清单 checksum 匹配、数据冒烟通过、运行时基准通过。
   - `rule_v1/gate`：在 notify 基础上要求危机贡献 <= 50%、10 个 A 股交易日 soak 完成且无严重数据故障。
 
 - [ ] **Step 5: 运行测试**
@@ -322,7 +322,7 @@
 
 - [ ] **Step 4: 实现 runner 模式与租约**
 
-  增加 CLI `--mode model|rule_v1`，默认读取激活配置；规则模式只组合 `RuleMarketWarningService`。租约键为 `market_warning_fast_scan:a_share`，租期 8 分钟；cron 可每 5 分钟唤醒，但非 10 分钟格点立即退出，不访问行情。
+  增加 CLI `--mode model|rule_v1`，默认读取激活配置；规则模式只组合 `RuleMarketWarningService`。租约键为 `market_warning_fast_scan:a_share`，租期 12 分钟，确保一次运行超过 10 分钟时下一个格点跳过；cron 可每 5 分钟唤醒，但非 10 分钟格点立即退出，不访问行情。
 
 - [ ] **Step 5: 实现运行指标**
 
@@ -352,7 +352,7 @@
 
 - [ ] **Step 2: 写触发与超时测试**
 
-  首次 ORANGE、首次 RED、ORANGE->RED 才触发；同级 30 分钟内不触发。通知失败时不运行 M3；通知已由幂等记录确认 sent 时允许运行。90 秒超时只记录 `reasoning_unavailable`。
+  首次 ORANGE、首次 RED、ORANGE->RED 才触发；同级 30 分钟内不触发。通知失败时不运行 M3；通知已由幂等记录确认 sent 时允许运行。告警发送并释放快路径租约后，首轮与一次格式修复重试共享 90 秒总预算；超时只记录 `reasoning_unavailable`。
 
 - [ ] **Step 3: 运行测试并确认失败**
 
@@ -428,7 +428,7 @@
 
 - [ ] **Step 4: 实现安装器**
 
-  安装器写入现有调度机制，08:30 固定盘前运行，盘中 cron 每 5 分钟唤醒，由 runner 自己判断 10 分钟格点。重复执行必须幂等；卸载选项只删除该 V1 生成的调度项。
+  安装器写入现有调度机制，08:30 固定盘前运行，盘中 cron 每 5 分钟唤醒，由 runner 自己判断 10 分钟格点。重复执行必须幂等；卸载选项删除该 V1 生成的调度项，并同时撤销 notify 与 gate 激活状态。
 
 - [ ] **Step 5: 写运维文档**
 

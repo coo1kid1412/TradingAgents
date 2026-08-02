@@ -135,7 +135,9 @@ def _metrics(frame: pd.DataFrame) -> dict[str, Any]:
     observations = len(frame)
     positives = int(frame["_positive"].sum()) if observations else 0
     entries = frame.loc[frame["_alert_entry"]]
+    pushes = frame.loc[frame["_push_event"]]
     alert_entries = len(entries)
+    push_events = len(pushes)
     true_positives = int(entries["_positive"].sum()) if alert_entries else 0
     precision = _ratio(true_positives, alert_entries)
     recall = _ratio(true_positives, positives)
@@ -150,6 +152,7 @@ def _metrics(frame: pd.DataFrame) -> dict[str, Any]:
     else:
         months = 0
     alerts_per_month = alert_entries / months if months else 0.0
+    push_events_per_month = push_events / months if months else 0.0
 
     crisis_counts = (
         entries.loc[entries["_positive"] & entries["crisis_period"].notna(), "crisis_period"]
@@ -196,12 +199,14 @@ def _metrics(frame: pd.DataFrame) -> dict[str, Any]:
         "observations": observations,
         "positives": positives,
         "alert_entries": alert_entries,
+        "push_events": push_events,
         "true_positives": true_positives,
         "precision": precision,
         "recall": recall,
         "base_rate": base_rate,
         "lift": lift,
         "alerts_per_month": alerts_per_month,
+        "push_events_per_month": push_events_per_month,
         "phase_breakdown": phase_breakdown,
         "crisis_contribution": crisis_contribution,
         "max_crisis_contribution": max_crisis_contribution,
@@ -241,6 +246,11 @@ def evaluate_rule_frame(frame: pd.DataFrame, manifest: RuleManifest) -> dict[str
     )
     high = values["_risk_level"].isin((RiskLevel.ORANGE.value, RiskLevel.RED.value))
     values["_alert_entry"] = high & ~high.shift(1, fill_value=False)
+    previous_level = values["_risk_level"].shift(1)
+    values["_push_event"] = values["_alert_entry"] | (
+        previous_level.eq(RiskLevel.ORANGE.value)
+        & values["_risk_level"].eq(RiskLevel.RED.value)
+    )
     values["_positive"] = (
         values["label_1d"].fillna(False).astype(bool)
         | values["label_3d"].fillna(False).astype(bool)
@@ -260,6 +270,7 @@ def evaluate_rule_frame(frame: pd.DataFrame, manifest: RuleManifest) -> dict[str
         "production_gates": {
             "lift": frozen["lift"],
             "alerts_per_month": frozen["alerts_per_month"],
+            "push_events_per_month": frozen["push_events_per_month"],
             "max_crisis_contribution": frozen["max_crisis_contribution"],
         },
     }

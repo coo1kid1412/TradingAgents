@@ -5,8 +5,12 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Sequence
+from zoneinfo import ZoneInfo
+
+import exchange_calendars as xcals
 
 from .adapters.sqlite_repository import SQLiteWarningRepository
 from .domain import Market
@@ -107,7 +111,7 @@ def _check_rule_readiness(
     rule_evaluation_path: Path | str,
     data_smoke_path: Path | str,
     runtime_benchmark_path: Path | str,
-    soak_sessions: int,
+    as_of_time: datetime | None,
 ) -> dict[str, object]:
     failures: list[str] = []
     try:
@@ -136,6 +140,9 @@ def _check_rule_readiness(
     alerts_per_month = _finite_number(gates.get("alerts_per_month"))
     if alerts_per_month is None or alerts_per_month > 6.0:
         failures.append("monthly alert budget must not exceed 6")
+    push_events_per_month = _finite_number(gates.get("push_events_per_month"))
+    if push_events_per_month is None or push_events_per_month > 6.0:
+        failures.append("monthly actual-push alert budget must not exceed 6")
     if smoke is not None and smoke.get("ready") is not True:
         failures.append("data smoke is not ready")
     if benchmark is not None:
@@ -151,11 +158,10 @@ def _check_rule_readiness(
 
     concentration = _finite_number(gates.get("max_crisis_contribution"))
     active_notify = None
+    soak_audit = None
     if mode == "rule_v1/gate":
         if concentration is None or concentration > 0.50:
             failures.append("crisis concentration must not exceed 50%")
-        if isinstance(soak_sessions, bool) or not isinstance(soak_sessions, int) or soak_sessions < 10:
-            failures.append("gate mode requires at least 10 soak sessions")
         active_notify = repository.load_active_rule_engine(Market.A_SHARE, "notify")
         if (
             manifest is None
@@ -164,6 +170,48 @@ def _check_rule_readiness(
             or active_notify.get("manifest_sha256") != manifest.manifest_sha256
         ):
             failures.append("active notify rule must match the gate manifest")
+            failures.append("rule soak audit requires a matching active notify rule")
+        else:
+            now = as_of_time or datetime.now(timezone.utc)
+            if now.tzinfo is None or now.utcoffset() is None:
+                raise ValueError("as_of_time must be timezone-aware")
+            activated_raw = active_notify.get("notification_activated_at")
+            if not activated_raw:
+                failures.append("active notify rule is missing its activation timestamp")
+                activated_at = now
+            else:
+                try:
+                    activated_at = datetime.fromisoformat(str(activated_raw))
+                except ValueError:
+                    failures.append("active notify rule has an invalid activation timestamp")
+                    activated_at = now
+            if activated_at.tzinfo is None:
+                activated_at = activated_at.replace(tzinfo=timezone.utc)
+            zone = ZoneInfo("Asia/Shanghai")
+            first_full_date = activated_at.astimezone(zone).date() + timedelta(days=1)
+            last_full_date = now.astimezone(zone).date() - timedelta(days=1)
+            session_dates: tuple = ()
+            if first_full_date <= last_full_date:
+                calendar = xcals.get_calendar("XSHG")
+                session_dates = tuple(
+                    stamp.date()
+                    for stamp in calendar.sessions_in_range(
+                        first_full_date.isoformat(), last_full_date.isoformat()
+                    )
+                )
+            soak_audit = repository.load_rule_soak_audit(
+                Market.A_SHARE, session_dates
+            )
+            if soak_audit["soak_sessions"] < 10:
+                failures.append("gate mode requires 10 completed trading-session audits")
+            if soak_audit["scan_success_rate"] < 0.98:
+                failures.append("rule soak scan success rate must be at least 98%")
+            if soak_audit["duplicate_runs"]:
+                failures.append("rule soak contains duplicate scheduled runs")
+            if soak_audit["overlap_skipped"]:
+                failures.append("rule soak contains overlapping scheduled runs")
+            if soak_audit["stale_misjudgments"]:
+                failures.append("rule soak contains stale-data misjudgments")
 
     return {
         "ready": not failures,
@@ -171,7 +219,8 @@ def _check_rule_readiness(
         "engine_version": manifest.engine_version if manifest is not None else None,
         "manifest_sha256": manifest.manifest_sha256 if manifest is not None else None,
         "feature_version": FEATURE_VERSION,
-        "soak_sessions": soak_sessions,
+        "soak_sessions": soak_audit["soak_sessions"] if soak_audit else 0,
+        "soak_audit": soak_audit,
         "active_notify_version": (
             active_notify.get("engine_version") if active_notify is not None else None
         ),
@@ -188,7 +237,7 @@ def check_production_readiness(
     rule_evaluation_path: Path | str = _DEFAULT_RULE_EVALUATION,
     data_smoke_path: Path | str = _DEFAULT_DATA_SMOKE,
     runtime_benchmark_path: Path | str = _DEFAULT_RUNTIME_BENCHMARK,
-    soak_sessions: int = 0,
+    as_of_time: datetime | None = None,
 ) -> dict[str, object]:
     """Check either the existing model set or the frozen rule V1 artifacts."""
 
@@ -203,7 +252,7 @@ def check_production_readiness(
         rule_evaluation_path=rule_evaluation_path,
         data_smoke_path=data_smoke_path,
         runtime_benchmark_path=runtime_benchmark_path,
-        soak_sessions=soak_sessions,
+        as_of_time=as_of_time,
     )
 
 
@@ -220,7 +269,6 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--rule-evaluation", default=str(_DEFAULT_RULE_EVALUATION))
     parser.add_argument("--data-smoke", default=str(_DEFAULT_DATA_SMOKE))
     parser.add_argument("--runtime-benchmark", default=str(_DEFAULT_RUNTIME_BENCHMARK))
-    parser.add_argument("--soak-sessions", type=int, default=0)
     args = parser.parse_args(argv)
     result = check_production_readiness(
         SQLiteWarningRepository(args.db),
@@ -230,7 +278,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         rule_evaluation_path=args.rule_evaluation,
         data_smoke_path=args.data_smoke,
         runtime_benchmark_path=args.runtime_benchmark,
-        soak_sessions=args.soak_sessions,
     )
     print(json.dumps(result, ensure_ascii=False, sort_keys=True))
     return 0 if result["ready"] else 2

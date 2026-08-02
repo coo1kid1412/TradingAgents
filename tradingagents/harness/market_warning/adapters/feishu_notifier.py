@@ -92,19 +92,25 @@ class FeishuNotifier:
             )
         payload_hash = hashlib.sha256(message.encode("utf-8")).hexdigest()
         key = _idempotency_key(result)
-        if not self.repository.claim_alert(
+        claim_token = self.repository.claim_alert(
             key,
             result.decision_id,
             payload_hash,
             retry_failed=self.retry_failed,
-        ):
+        )
+        if not claim_token:
             return False
         try:
             self.sender(message)
         except Exception:
-            self.repository.finish_alert(key, "failed", "send_error")
+            self.repository.finish_alert(
+                key,
+                "failed",
+                "send_error",
+                claim_token=claim_token,
+            )
             raise
-        self.repository.finish_alert(key, "sent")
+        self.repository.finish_alert(key, "sent", claim_token=claim_token)
         return True
 
     def was_sent(self, result: RunnerResult) -> bool:

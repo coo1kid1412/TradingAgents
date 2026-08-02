@@ -298,6 +298,8 @@ CREATE TABLE IF NOT EXISTS market_warning_alerts (
     decision_id INTEGER NOT NULL,
     payload_hash TEXT NOT NULL,
     push_status TEXT NOT NULL DEFAULT 'claimed',
+    claimed_at TEXT,
+    claim_token TEXT,
     sent_at TIMESTAMP,
     error_summary TEXT,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -334,6 +336,8 @@ CREATE TABLE IF NOT EXISTS market_warning_rule_registry (
     metrics_json TEXT NOT NULL,
     notification_active INTEGER NOT NULL DEFAULT 0,
     gate_active INTEGER NOT NULL DEFAULT 0,
+    notification_activated_at TEXT,
+    gate_activated_at TEXT,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (engine_version, market)

@@ -172,13 +172,16 @@ class InstallerGuardTests(TestCase):
         self.assertEqual(repository.calls[-1], ("activate", "rule-v1.0.0", "notify"))
         self.assertFalse(any(call[-1] == "gate" for call in repository.calls))
 
-    def test_uninstall_deactivates_notify_without_touching_gate(self) -> None:
+    def test_uninstall_deactivates_notify_and_gate(self) -> None:
         repository = mock.Mock()
 
         deactivate_notify_engine(repository)
 
-        repository.deactivate_rule_engine.assert_called_once_with(
-            Market.A_SHARE, "notify"
+        repository.deactivate_rule_engine.assert_has_calls(
+            (
+                mock.call(Market.A_SHARE, "notify"),
+                mock.call(Market.A_SHARE, "gate"),
+            )
         )
 
     def test_gate_activation_requires_explicit_gate_mode_and_ten_session_readiness(
@@ -190,6 +193,12 @@ class InstallerGuardTests(TestCase):
                 "mode": "rule_v1/gate",
                 "ready": True,
                 "soak_sessions": 10,
+                "soak_audit": {
+                    "scan_success_rate": 1.0,
+                    "duplicate_runs": 0,
+                    "overlap_skipped": 0,
+                    "stale_misjudgments": 0,
+                },
             }
         )
 
@@ -214,7 +223,17 @@ class InstallerGuardTests(TestCase):
     def test_gate_cli_dry_run_never_writes_crontab_or_activates(self) -> None:
         readiness = _ready_result()
         readiness.update(
-            {"mode": "rule_v1/gate", "ready": True, "soak_sessions": 10}
+            {
+                "mode": "rule_v1/gate",
+                "ready": True,
+                "soak_sessions": 10,
+                "soak_audit": {
+                    "scan_success_rate": 1.0,
+                    "duplicate_runs": 0,
+                    "overlap_skipped": 0,
+                    "stale_misjudgments": 0,
+                },
+            }
         )
         repository = mock.Mock()
         with mock.patch(
@@ -233,8 +252,6 @@ class InstallerGuardTests(TestCase):
                     "--mode",
                     "rule_v1/gate",
                     "--activate-gate",
-                    "--soak-sessions",
-                    "10",
                     "--dry-run",
                 ]
             )

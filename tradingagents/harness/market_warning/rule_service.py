@@ -20,6 +20,7 @@ from .domain import (
     RiskLevel,
     RuleRiskAssessment,
     RunnerResult,
+    SessionRiskSummary,
 )
 from .policy import build_rule_decision
 from .quality import DataQualityAssessment, evaluate_data_quality
@@ -121,6 +122,20 @@ class RuleMarketWarningService:
         self.manifest_sha256 = manifest_sha256
 
     def evaluate(self, market: Market, as_of_time: datetime, session_slot: str) -> RunnerResult:
+        """Run both phases for direct callers that do not own a scan coordinator."""
+
+        return self.complete_after_alert(
+            self.evaluate_fast(market, as_of_time, session_slot)
+        )
+
+    def evaluate_fast(
+        self,
+        market: Market,
+        as_of_time: datetime,
+        session_slot: str,
+    ) -> RunnerResult:
+        """Complete deterministic persistence and delivery without optional LLM work."""
+
         market_value = Market(market)
         if market_value != Market.A_SHARE:
             raise ValueError("rule V1 service only supports A shares")
@@ -178,6 +193,26 @@ class RuleMarketWarningService:
                 data_quality=quality.status,
                 reliability_grade=quality.reliability_grade,
             )
+
+        partial_loader = getattr(self.repository, "load_feature_snapshot", None)
+        if callable(partial_loader):
+            try:
+                persisted_snapshot = partial_loader(
+                    market_value,
+                    as_of_time,
+                    snapshot.feature_version,
+                )
+                if isinstance(persisted_snapshot, FeatureSnapshot):
+                    snapshot = persisted_snapshot
+                    if error_class in {
+                        "data_unavailable",
+                        "quality_error",
+                        "feature_error",
+                    }:
+                        error_class = None
+            except Exception:
+                if error_class is None:
+                    error_class = "repository_error"
 
         snapshot_id = None
         rule_assessment_id = None
@@ -279,6 +314,7 @@ class RuleMarketWarningService:
                 decision = build_rule_decision(assessment, snapshot, previous=previous)
 
         prior_context = None
+        previous_session_summary = None
         if "premarket" in session_slot.lower():
             try:
                 loader = getattr(self.repository, "load_latest_reasoning", None)
@@ -290,6 +326,20 @@ class RuleMarketWarningService:
                         prior_context = None
             except Exception:
                 prior_context = None
+            try:
+                summary_loader = getattr(
+                    self.repository, "load_previous_intraday_summary", None
+                )
+                if callable(summary_loader):
+                    previous_session_summary = summary_loader(
+                        market_value, as_of_time
+                    )
+                    if previous_session_summary is not None and not isinstance(
+                        previous_session_summary, SessionRiskSummary
+                    ):
+                        previous_session_summary = None
+            except Exception:
+                previous_session_summary = None
 
         result = RunnerResult(
             market=market_value,
@@ -298,7 +348,10 @@ class RuleMarketWarningService:
             feature_snapshot=snapshot,
             rule_assessment=assessment,
             context_assessment=prior_context,
+            previous_decision=previous,
+            previous_session_summary=previous_session_summary,
             decision=decision,
+            snapshot_id=snapshot_id,
             decision_id=decision_id,
             error_class=error_class,
         )
@@ -320,15 +373,34 @@ class RuleMarketWarningService:
                     notification_confirmed = callable(was_sent) and bool(was_sent(result))
             except Exception:
                 result = replace(result, error_class="notifier_error")
-        if notification_confirmed and decision.push_required:
-            result = self._run_slow_paths(result, previous, snapshot_id)
-        return result
+        return replace(
+            result,
+            previous_decision=previous,
+            notification_confirmed=notification_confirmed,
+        )
 
     def _resume_existing(self, result: RunnerResult) -> RunnerResult:
         try:
             previous = self.repository.load_previous_decision(result.market, result.as_of_time)
         except Exception:
             previous = None
+        previous_session_summary = result.previous_session_summary
+        if "premarket" in result.session_slot.lower():
+            try:
+                loader = getattr(
+                    self.repository, "load_previous_intraday_summary", None
+                )
+                if callable(loader):
+                    loaded_summary = loader(result.market, result.as_of_time)
+                    if isinstance(loaded_summary, SessionRiskSummary):
+                        previous_session_summary = loaded_summary
+            except Exception:
+                pass
+        result = replace(
+            result,
+            previous_decision=previous,
+            previous_session_summary=previous_session_summary,
+        )
         try:
             path = self.reporter(result, previous, self.report_root)
             result = replace(result, report_path=str(path))
@@ -346,14 +418,28 @@ class RuleMarketWarningService:
                     notification_confirmed = callable(was_sent) and bool(was_sent(result))
             except Exception:
                 result = replace(result, error_class="notifier_error")
+        return replace(
+            result,
+            previous_decision=previous,
+            notification_confirmed=notification_confirmed,
+        )
+
+    def complete_after_alert(self, result: RunnerResult) -> RunnerResult:
+        """Run optional shadow and M3 work after the fast-scan lease is released."""
+
         if (
-            notification_confirmed
-            and result.decision is not None
-            and result.decision.push_required
-            and result.context_assessment is None
+            not isinstance(result, RunnerResult)
+            or not result.notification_confirmed
+            or result.decision is None
+            or not result.decision.push_required
+            or result.context_assessment is not None
         ):
-            result = self._run_slow_paths(result, previous, None)
-        return result
+            return result
+        return self._run_slow_paths(
+            result,
+            result.previous_decision,
+            result.snapshot_id,
+        )
 
     def _run_slow_paths(
         self,

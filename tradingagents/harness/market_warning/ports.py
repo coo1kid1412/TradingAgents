@@ -15,6 +15,7 @@ from .domain import (
     RawMarketSnapshot,
     RuleRiskAssessment,
     RunnerResult,
+    SessionRiskSummary,
 )
 
 
@@ -43,6 +44,10 @@ class ReasoningPort(Protocol):
 
 class WarningRepository(Protocol):
     def save_feature_snapshot(self, snapshot: FeatureSnapshot) -> int: ...
+
+    def load_feature_snapshot(
+        self, market: Market, as_of_time: datetime, feature_version: str
+    ) -> FeatureSnapshot | None: ...
 
     def save_predictions(
         self, feature_snapshot_id: int, assessment: QuantRiskAssessment
@@ -99,6 +104,14 @@ class WarningRepository(Protocol):
     def load_previous_decision(
         self, market: Market, before_time: datetime
     ) -> FinalWarningDecision | None: ...
+
+    def load_previous_intraday_summary(
+        self, market: Market, before_time: datetime
+    ) -> SessionRiskSummary | None: ...
+
+    def load_rule_soak_audit(
+        self, market: Market, session_dates: tuple[date, ...]
+    ) -> dict[str, object]: ...
 
 
 class WarningNotifier(Protocol):

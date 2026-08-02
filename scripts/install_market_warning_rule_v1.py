@@ -104,6 +104,26 @@ def validate_gate_activation_preconditions(
         or soak_sessions < 10
     ):
         failures.append("gate activation requires at least 10 soak sessions")
+    audit = readiness.get("soak_audit")
+    if not isinstance(audit, Mapping):
+        failures.append("gate activation requires a persisted soak audit")
+    else:
+        success_rate = audit.get("scan_success_rate")
+        counts = tuple(
+            audit.get(name)
+            for name in ("duplicate_runs", "overlap_skipped", "stale_misjudgments")
+        )
+        valid_rate = (
+            not isinstance(success_rate, bool)
+            and isinstance(success_rate, (int, float))
+            and success_rate >= 0.98
+        )
+        valid_counts = all(
+            not isinstance(value, bool) and isinstance(value, int) and value == 0
+            for value in counts
+        )
+        if not valid_rate or not valid_counts:
+            failures.append("persisted soak audit does not meet activation gates")
     try:
         manifest = load_rule_manifest(manifest_path)
     except Exception:
@@ -182,6 +202,7 @@ def activate_gate_engine(repository, manifest_path: Path, readiness: Mapping[str
 
 def deactivate_notify_engine(repository) -> None:
     repository.deactivate_rule_engine(Market.A_SHARE, "notify")
+    repository.deactivate_rule_engine(Market.A_SHARE, "gate")
 
 
 def _read_crontab() -> str:
@@ -223,7 +244,6 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--uninstall", action="store_true")
     parser.add_argument("--activate-gate", action="store_true")
-    parser.add_argument("--soak-sessions", type=int, default=0)
     args = parser.parse_args(argv)
 
     if args.uninstall and args.activate_gate:
@@ -257,7 +277,6 @@ def main(argv: Sequence[str] | None = None) -> int:
     readiness_options = {
         "mode": readiness_mode,
         "rule_manifest": args.manifest,
-        "soak_sessions": args.soak_sessions,
     }
     if args.rule_evaluation:
         readiness_options["rule_evaluation_path"] = args.rule_evaluation
@@ -329,12 +348,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     except Exception:
         _write_crontab(existing)
         raise
+    active_gate = repository.load_active_rule_engine(Market.A_SHARE, "gate")
     print(
         json.dumps(
             {
                 "status": "installed",
                 "mode": "rule_v1/notify",
-                "gate_active": False,
+                "gate_active": active_gate is not None,
             },
             ensure_ascii=False,
         )

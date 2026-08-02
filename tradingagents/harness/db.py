@@ -109,6 +109,36 @@ def _migrate_schema(conn: sqlite3.Connection) -> None:
         )
         logger.info("Migrated: market_warning_decisions.shadow_prediction_ids_json added")
 
+    registry_cols = {
+        r[1] for r in conn.execute("PRAGMA table_info(market_warning_rule_registry)").fetchall()
+    }
+    if "notification_activated_at" not in registry_cols:
+        conn.execute(
+            "ALTER TABLE market_warning_rule_registry ADD COLUMN notification_activated_at TEXT"
+        )
+        logger.info("Migrated: market_warning_rule_registry.notification_activated_at added")
+    if "gate_activated_at" not in registry_cols:
+        conn.execute("ALTER TABLE market_warning_rule_registry ADD COLUMN gate_activated_at TEXT")
+        logger.info("Migrated: market_warning_rule_registry.gate_activated_at added")
+    conn.execute(
+        "UPDATE market_warning_rule_registry SET notification_activated_at = updated_at "
+        "WHERE notification_active = 1 AND notification_activated_at IS NULL"
+    )
+    conn.execute(
+        "UPDATE market_warning_rule_registry SET gate_activated_at = updated_at "
+        "WHERE gate_active = 1 AND gate_activated_at IS NULL"
+    )
+
+    alert_cols = {
+        r[1] for r in conn.execute("PRAGMA table_info(market_warning_alerts)").fetchall()
+    }
+    if "claimed_at" not in alert_cols:
+        conn.execute("ALTER TABLE market_warning_alerts ADD COLUMN claimed_at TEXT")
+        logger.info("Migrated: market_warning_alerts.claimed_at added")
+    if "claim_token" not in alert_cols:
+        conn.execute("ALTER TABLE market_warning_alerts ADD COLUMN claim_token TEXT")
+        logger.info("Migrated: market_warning_alerts.claim_token added")
+
 
 @contextmanager
 def connect(db_path: Path | str | None = None) -> Iterator[sqlite3.Connection]:

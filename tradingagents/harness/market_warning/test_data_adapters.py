@@ -784,6 +784,33 @@ class RealtimeAShareAdapterTests(unittest.TestCase):
         self.assertEqual(values["realtime_breadth_staleness_minutes"], 1.0)
         self.assertEqual(values["limit_down_pct"], 50.0)
 
+    def test_cross_section_drops_each_stale_row_before_breadth_and_coverage(self):
+        now = datetime(2026, 7, 20, 10, 0, tzinfo=SHANGHAI)
+        stocks = pd.DataFrame(
+            [
+                {"ts_code": "600000.SH", "last": 9.0, "pre_close": 10.0, "down_limit": 9.0, "data_time": now - timedelta(minutes=6), "source": "tushare_rt_k"},
+                {"ts_code": "000001.SZ", "last": 10.5, "pre_close": 10.0, "down_limit": 9.0, "data_time": now - timedelta(minutes=1), "source": "tushare_rt_k"},
+                {"ts_code": "300001.SZ", "last": 8.0, "pre_close": 10.0, "down_limit": 8.0, "data_time": now - timedelta(minutes=30), "source": "tushare_rt_k"},
+                {"ts_code": "000002.SZ", "last": 7.0, "pre_close": 10.0, "down_limit": 7.0, "data_time": now - timedelta(minutes=30), "source": "tushare_rt_k"},
+            ]
+        )
+        stocks.attrs["universe_size"] = 4
+
+        snapshot = RealtimeAShareDataAdapter(
+            quote_loader=lambda **_: _quote("primary", 100.0, now),
+            cross_section_loader=lambda _: stocks,
+        ).load_snapshot(Market.A_SHARE, now, "intraday")
+        values = {
+            point.field: point.value
+            for point in snapshot.points
+            if point.symbol == "MARKET"
+        }
+
+        self.assertEqual(values["realtime_breadth_coverage_pct"], 25.0)
+        self.assertEqual(values["breadth_up_pct"], 100.0)
+        self.assertEqual(values["limit_down_pct"], 0.0)
+        self.assertEqual(values["realtime_breadth_staleness_minutes"], 1.0)
+
 
 class YahooDataAdapterTests(unittest.TestCase):
     def _download(self, *, order: str = "price_ticker", ticker_map: dict[str, str] | None = None):

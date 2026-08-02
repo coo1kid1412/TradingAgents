@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import date, datetime
 from enum import Enum
 from math import isfinite
 from numbers import Real
@@ -341,6 +341,26 @@ class FinalWarningDecision:
 
 
 @dataclass(frozen=True)
+class SessionRiskSummary:
+    trade_date: date
+    highest_level: RiskLevel
+    state_changes: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.trade_date, date) or isinstance(self.trade_date, datetime):
+            raise TypeError("trade_date must be a date")
+        object.__setattr__(
+            self,
+            "highest_level",
+            _coerce_enum(self.highest_level, RiskLevel, "highest_level"),
+        )
+        changes = tuple(self.state_changes)
+        if any(not isinstance(item, str) or not item.strip() for item in changes):
+            raise ValueError("state_changes must contain non-empty strings")
+        object.__setattr__(self, "state_changes", changes)
+
+
+@dataclass(frozen=True)
 class RunnerResult:
     market: Market
     as_of_time: datetime
@@ -350,11 +370,17 @@ class RunnerResult:
     rule_assessment: RuleRiskAssessment | None = None
     shadow_quant_assessment: QuantRiskAssessment | None = None
     context_assessment: LLMContextAssessment | None = None
+    previous_decision: FinalWarningDecision | None = None
+    previous_session_summary: SessionRiskSummary | None = None
     decision: FinalWarningDecision | None = None
+    snapshot_id: int | None = None
     decision_id: int | None = None
     report_path: str | None = None
+    notification_confirmed: bool = False
     error_class: str | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "market", _coerce_enum(self.market, Market, "market"))
         _require_aware(self.as_of_time, "as_of_time")
+        if not isinstance(self.notification_confirmed, bool):
+            raise TypeError("notification_confirmed must be a bool")

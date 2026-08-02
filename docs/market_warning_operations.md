@@ -29,7 +29,7 @@
 - A 股盘中：`09:35` 起每 10 分钟至 `11:25`；`13:05` 起每 10 分钟至 `14:55`。
 - cron 每 5 分钟唤醒一次，runner 只在上述格点执行，避免错过边界时间。
 - 美股 V1：仅按纽约当地时间 `08:30` 盘前影子运行，不启用规则生产通知，也不进入个股硬门控。
-- 规则快路径不调用 LLM。发生有效橙/红推送后，M3 才在慢路径补充解释，最长等待 90 秒。
+- 规则快路径不调用 LLM。发生有效橙/红推送并释放快路径租约后，M3 才在慢路径补充解释；首轮和一次修复重试共享 90 秒总预算。
 
 ## 3. 数据与权限
 
@@ -106,7 +106,7 @@ sqlite3 harness_data/tradingagents.db \
 
 ### 解除过期租约
 
-租约默认 8 分钟自动失效。只有确认对应分析进程已经结束、且租约时间确实过期后，才手工清理：
+租约默认 12 分钟自动失效，以保证超过 10 分钟的运行会让下一个格点跳过。只有确认对应分析进程已经结束、且租约时间确实过期后，才手工清理：
 
 ```bash
 sqlite3 harness_data/tradingagents.db \
@@ -121,7 +121,7 @@ sqlite3 harness_data/tradingagents.db \
 .venv/bin/python scripts/install_market_warning_rule_v1.py --uninstall
 ```
 
-该命令只删除本 V1 生成的 cron 区块并停用 A 股 `notify`，不删除其他周期任务，也不改动 `gate` 状态。
+该命令只删除本 V1 生成的 cron 区块，并同时停用 A 股 `notify` 与 `gate`，确保调度和个股硬门控一起回滚；不会删除其他周期任务。
 
 如果 cron 已删除但数据库停用失败，命令会返回 `partially_uninstalled` 和非零退出码。此时自动调度已经停止，不要恢复 cron；修复数据库访问后重复执行同一卸载命令，直到返回 `uninstalled`。
 
@@ -140,8 +140,7 @@ V1 首次部署只运行通知灰度，个股分析硬门控保持关闭。至�
 
 ```bash
 .venv/bin/python -m tradingagents.harness.market_warning.readiness \
-  --mode rule_v1/gate \
-  --soak-sessions 10
+  --mode rule_v1/gate
 ```
 
 `ready: true` 只代表具备评估激活资格，不会自动打开硬门控。应在人工复核 10 日审计记录后再单独激活；安装器始终禁止自动启用 `gate`。
@@ -152,7 +151,6 @@ V1 首次部署只运行通知灰度，个股分析硬门控保持关闭。至�
 .venv/bin/python scripts/install_market_warning_rule_v1.py \
   --mode rule_v1/gate \
   --activate-gate \
-  --soak-sessions 10 \
   --dry-run
 ```
 
@@ -162,11 +160,10 @@ V1 首次部署只运行通知灰度，个股分析硬门控保持关闭。至�
 .venv/bin/python scripts/install_market_warning_rule_v1.py \
   --mode rule_v1/gate \
   --activate-gate \
-  --soak-sessions 10 \
   --yes
 ```
 
-该命令再次执行 `rule_v1/gate` readiness，且只修改规则注册表中的 gate 状态，不安装或改写周期任务。普通 `rule_v1/notify` 安装路径仍然不能开启 gate。
+该命令再次从数据库计算通知启用后的真实交易日审计，不接受人工填写天数；且只修改规则注册表中的 gate 状态，不安装或改写周期任务。普通 `rule_v1/notify` 安装路径仍然不能开启 gate。
 
 ## 7. 当前 V1 边界
 
@@ -190,6 +187,7 @@ V1 首次部署只运行通知灰度，个股分析硬门控保持关闭。至�
 | 召回率 | 23.53% |
 | 相对基础率 lift | 3.24 |
 | 月均新橙/红 | 1.45 |
+| 月均实际推送（含橙转红） | 1.50 |
 | 最大单一危机真阳性贡献 | 50% |
 
 规则达到了当前 notify 门槛（lift 大于 2、月均告警不超过 6），但精确率和召回率说明它是低基础率环境下的“风险收缩提醒”，不能解读为确定性暴跌预测。

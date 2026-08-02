@@ -17,7 +17,7 @@ class QualityPolicy:
     """Versioned thresholds and field contract for a quality evaluation."""
 
     version: str = "quality-v1"
-    intraday_core_quote_max_age: timedelta = timedelta(minutes=10)
+    intraday_core_quote_max_age: timedelta = timedelta(minutes=5)
     complete_daily_max_age: timedelta = timedelta(days=14)
     previous_session: Callable[[Market, date], date] | None = None
     cross_source_price_tolerance: float = 0.005

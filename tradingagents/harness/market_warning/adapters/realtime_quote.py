@@ -67,7 +67,18 @@ def _cross_section_points(frame: pd.DataFrame | None, as_of_time: datetime, fetc
         )
 
     rows["_data_time"] = rows["data_time"].map(normalize_time)
-    rows = rows[rows["_data_time"].notna() & (rows["_data_time"] <= as_of_time)].copy()
+    local_as_of = as_of_time.astimezone(_SHANGHAI)
+    rows = rows[
+        rows["_data_time"].notna()
+        & (rows["_data_time"] <= local_as_of)
+        & rows["_data_time"].map(
+            lambda value: (
+                value is not None
+                and value.date() == local_as_of.date()
+                and (local_as_of - value).total_seconds() <= 5 * 60
+            )
+        )
+    ].copy()
     if rows.empty:
         return ()
     rows["last"] = pd.to_numeric(rows["last"], errors="coerce")

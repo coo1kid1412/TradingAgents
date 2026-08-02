@@ -105,6 +105,30 @@ class FakeService:
         return {"market": market.value, "slot": session_slot}
 
 
+class SplitPathService:
+    def __init__(self, events: list[str]) -> None:
+        self.events = events
+
+    def evaluate_fast(self, market, as_of_time, session_slot):
+        self.events.append("fast")
+        return {"market": market.value, "slot": session_slot}
+
+    def complete_after_alert(self, result):
+        self.events.append("slow")
+        return {**result, "completed": True}
+
+
+class TracingCoordinator:
+    def __init__(self, events: list[str]) -> None:
+        self.events = events
+
+    def execute(self, _slot, callback):
+        self.events.append("lease_acquired")
+        result = callback()
+        self.events.append("lease_released")
+        return result
+
+
 class RunnerTests(TestCase):
     def test_fast_scan_coordinator_skips_overlap_and_records_zero_llm_calls(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -117,7 +141,7 @@ class RunnerTests(TestCase):
                     "market_warning_fast_scan:a_share",
                     "existing-owner",
                     now,
-                    timedelta(minutes=8),
+                    timedelta(minutes=12),
                 )
             )
             coordinator = FastScanCoordinator(
@@ -136,6 +160,34 @@ class RunnerTests(TestCase):
                     "FROM market_warning_runs ORDER BY id DESC LIMIT 1"
                 ).fetchone()
             self.assertEqual(tuple(row), ("overlap_skipped", 1, 0))
+
+    def test_default_lease_blocks_the_next_ten_minute_scan(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            repository = SQLiteWarningRepository(Path(directory) / "warning.db")
+            started = datetime.fromisoformat("2026-08-03T09:35:00+08:00")
+            coordinator = FastScanCoordinator(
+                repository,
+                mode="rule_v1",
+                owner_id="first-owner",
+            )
+
+            self.assertEqual(coordinator.lease_duration, timedelta(minutes=12))
+            self.assertTrue(
+                repository.acquire_lease(
+                    "market_warning_fast_scan:a_share",
+                    coordinator.owner_id,
+                    started,
+                    coordinator.lease_duration,
+                )
+            )
+            self.assertFalse(
+                repository.acquire_lease(
+                    "market_warning_fast_scan:a_share",
+                    "next-owner",
+                    started + timedelta(minutes=10),
+                    coordinator.lease_duration,
+                )
+            )
 
     def test_fast_scan_coordinator_releases_lease_after_exception(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -219,6 +271,19 @@ class RunnerTests(TestCase):
         self.assertEqual(factories, [(Market.A_SHARE, "intraday-0935", False)])
         self.assertEqual(calls[0][0], Market.A_SHARE)
         self.assertEqual(calls[0][2], "intraday-0935")
+
+    def test_rule_slow_path_runs_only_after_coordinator_releases_fast_lease(self) -> None:
+        events: list[str] = []
+
+        results = run_due_evaluations(
+            datetime.fromisoformat("2026-08-03T09:35:00+08:00"),
+            service_factory=lambda _slot, _force: SplitPathService(events),
+            markets=(Market.A_SHARE,),
+            coordinator_factory=lambda _slot: TracingCoordinator(events),
+        )
+
+        self.assertEqual(events, ["lease_acquired", "fast", "lease_released", "slow"])
+        self.assertTrue(results[0]["completed"])
 
     def test_dry_run_never_builds_or_invokes_service(self) -> None:
         def forbidden(*_args):

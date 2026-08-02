@@ -219,6 +219,21 @@ def _rule_context_section(context: LLMContextAssessment) -> str:
     )
 
 
+def _previous_session_section(result: RunnerResult) -> str:
+    summary = result.previous_session_summary
+    if summary is None:
+        return "## 上一交易日盘中轨迹\n暂无可用的上一交易日盘中规则记录。"
+    changes = " -> ".join(_safe_code(item) for item in summary.state_changes) or "无跨级变化"
+    return "\n".join(
+        (
+            "## 上一交易日盘中轨迹",
+            f"- 交易日：`{summary.trade_date.isoformat()}`",
+            f"- 最高灯号：`{summary.highest_level.value}`",
+            f"- 状态变化：{changes}",
+        )
+    )
+
+
 def _render_rule_premarket(
     result: RunnerResult, previous: FinalWarningDecision | None
 ) -> str:
@@ -228,6 +243,7 @@ def _render_rule_premarket(
         f"# {market_name}大盘骤跌预警",
         _rule_action_block(result),
         _previous_section(decision, previous),
+        _previous_session_section(result),
         _rule_layer_section(result),
         _rule_trigger_section(result),
     ]

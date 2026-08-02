@@ -240,6 +240,9 @@ def _normalize_rt_k(frame: pd.DataFrame, as_of_time: datetime) -> pd.DataFrame:
     rows = rows.loc[
         rows["data_time"].map(lambda value: value.date() == local_as_of.date())
         & rows["data_time"].map(lambda value: value <= local_as_of)
+        & rows["data_time"].map(
+            lambda value: (local_as_of - value).total_seconds() <= 5 * 60
+        )
         & rows["last"].gt(0)
     ].copy()
     if rows.empty:

@@ -306,9 +306,10 @@ class MiniMaxReasoningAdapter:
 
         first_error: str | None = None
         request = prompt
+        attempt_timeout = self.timeout / 2.0
         for attempt in range(2):
             try:
-                response = self._invoke(request)
+                response = self._invoke(request, timeout=attempt_timeout)
                 payload = _json_payload(_response_text(response))
                 assessment = validate_rule_context_assessment(
                     payload,
@@ -328,10 +329,14 @@ class MiniMaxReasoningAdapter:
         self.breaker.record_failure()
         return _fallback(first_error or "reasoning_unavailable")
 
-    def _invoke(self, prompt: str) -> Any:
-        llm = (
-            self.llm
-            if isinstance(self.llm, WallClockTimeoutLLM)
-            else WallClockTimeoutLLM(self.llm, timeout=self.timeout, max_retries=0)
-        )
+    def _invoke(self, prompt: str, *, timeout: float | None = None) -> Any:
+        if timeout is None and isinstance(self.llm, WallClockTimeoutLLM):
+            llm = self.llm
+        else:
+            raw_llm = self.llm._llm if isinstance(self.llm, WallClockTimeoutLLM) else self.llm
+            llm = WallClockTimeoutLLM(
+                raw_llm,
+                timeout=self.timeout if timeout is None else timeout,
+                max_retries=0,
+            )
         return llm.invoke(prompt, config=_NO_RAW_LOG_CONFIG)

@@ -105,6 +105,21 @@ class RuleEvaluationTests(TestCase):
         self.assertEqual(test["crisis_contribution"], {"crisis-a": 1.0})
         self.assertEqual(test["max_crisis_contribution"], 1.0)
 
+    def test_orange_to_red_upgrade_is_counted_as_an_actual_push_event(self):
+        frame = make_frame(["2021-01-04", "2021-01-05", "2021-01-06"])
+        frame.loc[1, "abnormal_range_weak_close_transition"] = True
+        frame.loc[2, ["range_zscore_20d", "close_location", "audited_ohlc_return_1d"]] = [
+            3.0,
+            0.15,
+            -0.02,
+        ]
+
+        test = evaluate_rule_frame(frame, self.manifest)["partitions"]["test"]
+
+        self.assertEqual(test["alert_entries"], 1)
+        self.assertEqual(test["push_events"], 2)
+        self.assertGreater(test["push_events_per_month"], test["alerts_per_month"])
+
     def test_first_shock_and_continuation_metrics_are_not_blended(self):
         frame = make_frame(["2021-02-01", "2021-02-02", "2021-02-03", "2021-02-04"])
         frame.loc[:, "abnormal_range_weak_close_transition"] = [False, True, False, True]
@@ -137,6 +152,10 @@ class RuleEvaluationTests(TestCase):
         self.assertEqual(
             result["production_gates"]["alerts_per_month"],
             result["partitions"]["test"]["alerts_per_month"],
+        )
+        self.assertEqual(
+            result["production_gates"]["push_events_per_month"],
+            result["partitions"]["test"]["push_events_per_month"],
         )
 
 

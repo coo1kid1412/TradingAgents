@@ -131,12 +131,14 @@ class Repository:
         previous=None,
         existing=None,
         latest_context=None,
+        partial_snapshot=None,
     ):
         self.events = events
         self.fail_stage = fail_stage
         self.previous = previous
         self.existing = existing
         self.latest_context = latest_context
+        self.partial_snapshot = partial_snapshot
         self.decision = None
 
     def _stage(self, name, value):
@@ -147,6 +149,9 @@ class Repository:
 
     def load_evaluation(self, *_):
         return self.existing
+
+    def load_feature_snapshot(self, *_):
+        return self.partial_snapshot
 
     def save_feature_snapshot(self, _snapshot):
         return self._stage("save_snapshot", 11)
@@ -341,6 +346,53 @@ class RuleMarketWarningServiceTests(TestCase):
         self.assertEqual(repository.saved_kwargs["rule_assessment_id"], 21)
         self.assertEqual(repository.saved_reasoning[0], 11)
         self.assertEqual(repository.attached_reasoning, (31, 41))
+
+    def test_explicit_fast_path_returns_before_optional_slow_work(self):
+        events = []
+        with tempfile.TemporaryDirectory() as directory:
+            service, _ = self._service(events, directory)
+
+            fast_result = service.evaluate_fast(Market.A_SHARE, NOW, "intraday-0935")
+
+            self.assertEqual(events[-1], "notify")
+            self.assertNotIn("shadow_model", events)
+            self.assertNotIn("post_alert_reasoning", events)
+            self.assertTrue(fast_result.notification_confirmed)
+
+            completed = service.complete_after_alert(fast_result)
+
+        self.assertIn("shadow_model", events)
+        self.assertIn("post_alert_reasoning", events)
+        self.assertIsNotNone(completed.context_assessment)
+
+    def test_partial_retry_reuses_the_immutable_persisted_snapshot(self):
+        events = []
+        persisted = FeatureSnapshot(
+            market=Market.A_SHARE,
+            as_of_time=NOW,
+            session_slot="intraday-0935",
+            feature_version="market-warning-v2",
+            features={"market_phase": "CONTINUATION", "persisted": True},
+            evidence=(),
+            data_quality=DataStatus.FRESH,
+            reliability_grade="A",
+            source_times={"persisted": NOW},
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            service, _ = self._service(
+                events,
+                directory,
+                repository=Repository(events, partial_snapshot=persisted),
+                data_port=DataPort(events, RuntimeError("live retry unavailable")),
+                shadow_model=None,
+                post_alert_reasoning=None,
+            )
+
+            result = service.evaluate(Market.A_SHARE, NOW, "intraday-0935")
+
+        self.assertEqual(result.feature_snapshot, persisted)
+        self.assertTrue(result.feature_snapshot.features["persisted"])
+        self.assertIsNone(result.error_class)
 
     def test_intraday_yellow_is_silent_and_skips_all_slow_paths(self):
         events = []
