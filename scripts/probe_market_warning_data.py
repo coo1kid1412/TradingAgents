@@ -128,23 +128,34 @@ def run_data_probe(
             cross_section = pd.DataFrame()
         if isinstance(cross_section, pd.DataFrame) and not cross_section.empty:
             universe = int(cross_section.attrs.get("universe_size") or baseline.universe_size)
+            fresh_mask: list[bool] = []
+            fresh_times: list[datetime] = []
+            for item in cross_section.get(
+                "data_time", pd.Series(dtype=object)
+            ).tolist():
+                normalized = _normalized_time(item)
+                is_fresh = (
+                    normalized is not None
+                    and normalized <= local
+                    and normalized.date() == local.date()
+                    and (local - normalized).total_seconds() <= 5 * 60
+                )
+                fresh_mask.append(is_fresh)
+                if is_fresh:
+                    fresh_times.append(normalized)
+            current = cross_section.loc[fresh_mask]
             observed = (
-                int(cross_section["ts_code"].nunique())
-                if "ts_code" in cross_section
-                else len(cross_section)
+                int(current["ts_code"].nunique())
+                if "ts_code" in current
+                else len(current)
             )
             coverage = observed / universe * 100.0 if universe > 0 else 0.0
-            times = tuple(
-                value
-                for value in (
-                    _normalized_time(item)
-                    for item in cross_section.get("data_time", pd.Series(dtype=object))
+            if fresh_times:
+                latest = max(fresh_times)
+                oldest = min(fresh_times)
+                breadth_staleness = max(
+                    0.0, (local - oldest).total_seconds() / 60.0
                 )
-                if value is not None and value <= local
-            )
-            if times:
-                latest = max(times)
-                breadth_staleness = max(0.0, (local - latest).total_seconds() / 60.0)
                 source_times["realtime_cross_section"] = latest.isoformat()
     if coverage < 80.0:
         failures.append("realtime_breadth_coverage")

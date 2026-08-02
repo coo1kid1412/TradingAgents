@@ -244,7 +244,7 @@ def _render_rule_upgrade(
 ) -> str:
     decision = _require_complete(result)
     local_time = result.as_of_time.astimezone(_MARKET_ZONES[result.market])
-    action_lines = _rule_action_block(result).splitlines()[1:5]
+    action_lines = _rule_action_block(result).splitlines()[1:]
     sections = (
         f"# 【{_RULE_LAMPS[decision.final_level]}】",
         f"{_MARKET_NAMES[result.market]}盘中预警 | `{local_time.isoformat(timespec='minutes')}`",

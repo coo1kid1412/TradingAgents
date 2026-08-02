@@ -251,9 +251,12 @@ class ReportGoldenTests(TestCase):
         self.assertIn("**入场门：", report)
         self.assertIn("**新增仓位上限：", report)
         self.assertIn("**持仓动作：", report)
+        self.assertIn("数据截至", report)
+        self.assertIn("可靠度：`A`", report)
+        self.assertIn("规则分数不是概率", report)
         self.assertEqual(report.count("规则 `A-"), 3)
         self.assertNotIn("A-FOURTH-RULE", report)
-        self.assertNotIn("概率", report)
+        self.assertNotIn("骤跌概率", report)
 
     def test_rule_m3_section_is_explanation_only(self) -> None:
         context = replace(

@@ -87,6 +87,36 @@ def validate_install_preconditions(
     return failures
 
 
+def validate_gate_activation_preconditions(
+    mode: str | None,
+    readiness: Mapping[str, object],
+    manifest_path: Path,
+) -> list[str]:
+    failures: list[str] = []
+    if mode != "rule_v1/gate":
+        failures.append("mode must be explicitly set to rule_v1/gate")
+    if readiness.get("ready") is not True or readiness.get("mode") != "rule_v1/gate":
+        failures.append("rule_v1/gate readiness did not pass")
+    soak_sessions = readiness.get("soak_sessions")
+    if (
+        isinstance(soak_sessions, bool)
+        or not isinstance(soak_sessions, int)
+        or soak_sessions < 10
+    ):
+        failures.append("gate activation requires at least 10 soak sessions")
+    try:
+        manifest = load_rule_manifest(manifest_path)
+    except Exception:
+        manifest = None
+        failures.append("rule manifest is invalid")
+    if manifest is not None and (
+        readiness.get("engine_version") != manifest.engine_version
+        or readiness.get("manifest_sha256") != manifest.manifest_sha256
+    ):
+        failures.append("readiness checksum or engine version does not match the manifest")
+    return failures
+
+
 def _cron_block(project_root: Path) -> tuple[str, ...]:
     root = shlex.quote(str(project_root.resolve()))
     command = (
@@ -102,13 +132,19 @@ def render_crontab(existing: str, project_root: Path, *, uninstall: bool) -> str
     inside = False
     for line in existing.splitlines():
         if line.strip() == MARKER_START:
+            if inside:
+                raise ValueError("invalid nested market-warning V1 cron marker")
             inside = True
             continue
-        if inside and line.strip() == MARKER_END:
+        if line.strip() == MARKER_END:
+            if not inside:
+                raise ValueError("unbalanced market-warning V1 cron marker")
             inside = False
             continue
         if not inside:
             output.append(line)
+    if inside:
+        raise ValueError("unbalanced market-warning V1 cron marker")
     while output and not output[-1].strip():
         output.pop()
     if not uninstall:
@@ -134,18 +170,36 @@ def activate_notify_engine(repository, manifest_path: Path, readiness: Mapping[s
     repository.activate_rule_engine(manifest.engine_version, "notify")
 
 
+def activate_gate_engine(repository, manifest_path: Path, readiness: Mapping[str, object]) -> None:
+    failures = validate_gate_activation_preconditions(
+        "rule_v1/gate", readiness, manifest_path
+    )
+    if failures:
+        raise ValueError("; ".join(failures))
+    manifest = load_rule_manifest(manifest_path)
+    repository.activate_rule_engine(manifest.engine_version, "gate")
+
+
 def deactivate_notify_engine(repository) -> None:
     repository.deactivate_rule_engine(Market.A_SHARE, "notify")
 
 
 def _read_crontab() -> str:
-    result = subprocess.run(
-        ("crontab", "-l"),
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    return result.stdout if result.returncode == 0 else ""
+    try:
+        result = subprocess.run(
+            ("crontab", "-l"),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except OSError as error:
+        raise RuntimeError(f"unable to read crontab: {error}") from error
+    if result.returncode == 0:
+        return result.stdout
+    detail = (result.stderr or result.stdout or "crontab read failed").strip()
+    if result.returncode == 1 and "no crontab for" in detail.lower():
+        return ""
+    raise RuntimeError(f"unable to read crontab: {detail}")
 
 
 def _write_crontab(content: str) -> None:
@@ -168,22 +222,42 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--yes", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--uninstall", action="store_true")
+    parser.add_argument("--activate-gate", action="store_true")
+    parser.add_argument("--soak-sessions", type=int, default=0)
     args = parser.parse_args(argv)
 
+    if args.uninstall and args.activate_gate:
+        parser.error("--uninstall and --activate-gate are mutually exclusive")
     existing = _read_crontab()
     if args.uninstall:
         updated = render_crontab(existing, PROJECT_ROOT, uninstall=True)
         if not args.dry_run:
             _write_crontab(updated)
-            deactivate_notify_engine(SQLiteWarningRepository(args.db))
+            try:
+                deactivate_notify_engine(SQLiteWarningRepository(args.db))
+            except Exception:
+                print(
+                    json.dumps(
+                        {
+                            "status": "partially_uninstalled",
+                            "schedule_removed": True,
+                            "notify_deactivation": "failed",
+                            "next_action": "rerun --uninstall",
+                        },
+                        ensure_ascii=False,
+                    )
+                )
+                return 3
         print(json.dumps({"status": "uninstalled" if not args.dry_run else "dry_run"}))
         return 0
 
     _load_environment()
     repository = SQLiteWarningRepository(args.db)
+    readiness_mode = "rule_v1/gate" if args.activate_gate else "rule_v1/notify"
     readiness_options = {
-        "mode": "rule_v1/notify",
+        "mode": readiness_mode,
         "rule_manifest": args.manifest,
+        "soak_sessions": args.soak_sessions,
     }
     if args.rule_evaluation:
         readiness_options["rule_evaluation_path"] = args.rule_evaluation
@@ -192,6 +266,45 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.runtime_benchmark:
         readiness_options["runtime_benchmark_path"] = args.runtime_benchmark
     readiness = check_production_readiness(repository, **readiness_options)
+    if args.activate_gate:
+        failures = validate_gate_activation_preconditions(
+            args.mode,
+            readiness,
+            Path(args.manifest),
+        )
+        if failures:
+            print(
+                json.dumps(
+                    {"status": "blocked", "failures": failures}, ensure_ascii=False
+                )
+            )
+            return 2
+        if not args.yes and not args.dry_run:
+            parser.error("--yes is required for gate activation")
+        if args.dry_run:
+            print(
+                json.dumps(
+                    {
+                        "status": "dry_run",
+                        "mode": "rule_v1/gate",
+                        "cron_changed": False,
+                    },
+                    ensure_ascii=False,
+                )
+            )
+            return 0
+        activate_gate_engine(repository, Path(args.manifest), readiness)
+        print(
+            json.dumps(
+                {
+                    "status": "gate_activated",
+                    "mode": "rule_v1/gate",
+                    "cron_changed": False,
+                },
+                ensure_ascii=False,
+            )
+        )
+        return 0
     failures = validate_install_preconditions(
         args.mode,
         readiness,
