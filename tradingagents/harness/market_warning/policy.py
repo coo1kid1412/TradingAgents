@@ -2,19 +2,21 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from math import isfinite
 from numbers import Real
 from typing import Iterable
 
 from .domain import (
     DataStatus,
+    DecisionSource,
     FeatureSnapshot,
     FinalWarningDecision,
     LLMContextAssessment,
     Market,
     QuantRiskAssessment,
     RiskLevel,
+    RuleRiskAssessment,
 )
 
 
@@ -399,3 +401,42 @@ def build_final_decision(
         valid_snapshot_count=result.next_valid_snapshot_count,
         retained_risk_level=result.retained_risk_level,
     )
+
+
+def build_rule_decision(
+    assessment: RuleRiskAssessment,
+    snapshot: FeatureSnapshot,
+    *,
+    previous: FinalWarningDecision | None,
+) -> FinalWarningDecision:
+    """Apply the shared state machine without converting a rule score to probability."""
+
+    if not isinstance(assessment, RuleRiskAssessment):
+        raise ValueError("assessment must be a RuleRiskAssessment")
+    if assessment.market != snapshot.market or assessment.as_of_time != snapshot.as_of_time:
+        raise ValueError("rule assessment must match the feature snapshot")
+    level = (
+        assessment.risk_level
+        if assessment.reliability_grade != "UNAVAILABLE"
+        else RiskLevel.UNKNOWN
+    )
+    valid_snapshot_count = (
+        0
+        if level == RiskLevel.UNKNOWN
+        else (previous.valid_snapshot_count if previous is not None else 0) + 1
+    )
+    reasons = (
+        "Rule score is an audit score, not a crash probability.",
+        f"rule_engine={assessment.engine_version}",
+        *(f"triggered_rule={item.rule_id}" for item in assessment.triggered_rules),
+    )
+    decision = build_final_decision(
+        baseline=level,
+        candidate=level,
+        snapshot=snapshot,
+        previous=previous.final_level if previous is not None else None,
+        valid_snapshot_count=valid_snapshot_count,
+        retained_risk_level=previous.retained_risk_level if previous is not None else None,
+        decision_reasons=reasons,
+    )
+    return replace(decision, decision_source=DecisionSource.RULE_V1)

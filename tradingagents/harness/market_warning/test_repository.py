@@ -339,6 +339,29 @@ class SQLiteWarningRepositoryTests(TestCase):
             self.assertFalse(notify["gate_active"])
             self.assertTrue(gate["gate_active"])
 
+    def test_previous_rule_assessment_is_loaded_with_triggered_evidence(self):
+        with temporary_database() as db_path:
+            repository = SQLiteWarningRepository(db_path)
+            first_snapshot_id = repository.save_feature_snapshot(make_snapshot())
+            first = make_rule_assessment()
+            repository.save_rule_assessment(first_snapshot_id, first)
+            later = AS_OF + timedelta(minutes=10)
+            second_snapshot_id = repository.save_feature_snapshot(
+                make_snapshot(as_of_time=later, source_times={"exchange": later})
+            )
+            repository.save_rule_assessment(
+                second_snapshot_id,
+                make_rule_assessment(as_of_time=later, risk_level="RED"),
+            )
+
+            loaded = repository.load_previous_rule_assessment(Market.A_SHARE, later)
+
+            self.assertEqual(loaded, first)
+            self.assertEqual(
+                loaded.triggered_rules[0].rule_id,
+                "pressure.volatility_acceleration",
+            )
+
     def test_activate_model_set_switches_all_four_horizons_in_one_commit(self):
         with temporary_database() as db_path:
             repository = SQLiteWarningRepository(db_path)

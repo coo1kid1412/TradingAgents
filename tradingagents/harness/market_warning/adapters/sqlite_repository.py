@@ -294,6 +294,22 @@ class SQLiteWarningRepository:
             )
             return int(cursor.lastrowid)
 
+    def load_previous_rule_assessment(
+        self, market: Market, before_time: datetime
+    ) -> RuleRiskAssessment | None:
+        with _db.connect(self._db_path) as connection:
+            row = connection.execute(
+                "SELECT s.market, s.as_of_time, r.engine_version, r.manifest_sha256, "
+                "r.risk_level, r.risk_score, r.market_phase, r.triggered_rules_json, "
+                "r.missing_optional_groups_json, r.reliability_grade, r.evaluation_latency_ms "
+                "FROM market_warning_rule_assessments AS r "
+                "INNER JOIN market_warning_feature_snapshots AS s ON s.id = r.feature_snapshot_id "
+                "WHERE s.market = ? AND s.as_of_time < ? "
+                "ORDER BY s.as_of_time DESC, r.id DESC LIMIT 1",
+                (Market(market).value, _stored_time(before_time)),
+            ).fetchone()
+        return self._rule_assessment_from_row(row) if row is not None else None
+
     def save_reasoning(
         self, feature_snapshot_id: int, assessment: LLMContextAssessment, model_name: str
     ) -> int:
@@ -718,6 +734,27 @@ class SQLiteWarningRepository:
             "created_at": row["created_at"],
             "updated_at": row["updated_at"],
         }
+
+    @staticmethod
+    def _rule_assessment_from_row(row: sqlite3.Row) -> RuleRiskAssessment:
+        return RuleRiskAssessment(
+            market=row["market"],
+            as_of_time=datetime.fromisoformat(row["as_of_time"]),
+            engine_version=row["engine_version"],
+            manifest_sha256=row["manifest_sha256"],
+            risk_level=row["risk_level"],
+            risk_score=row["risk_score"],
+            market_phase=row["market_phase"],
+            triggered_rules=tuple(
+                TriggeredRule(**item)
+                for item in json.loads(row["triggered_rules_json"])
+            ),
+            missing_optional_groups=tuple(
+                json.loads(row["missing_optional_groups_json"])
+            ),
+            reliability_grade=row["reliability_grade"],
+            evaluation_latency_ms=row["evaluation_latency_ms"],
+        )
 
     def register_model(self, record: Mapping[str, Any]) -> None:
         values = dict(record)

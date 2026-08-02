@@ -52,6 +52,10 @@ class WarningRepository(Protocol):
         self, feature_snapshot_id: int, assessment: RuleRiskAssessment
     ) -> int: ...
 
+    def load_previous_rule_assessment(
+        self, market: Market, before_time: datetime
+    ) -> RuleRiskAssessment | None: ...
+
     def save_reasoning(
         self, feature_snapshot_id: int, assessment: LLMContextAssessment, model_name: str
     ) -> int: ...
