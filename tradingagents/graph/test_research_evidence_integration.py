@@ -56,6 +56,7 @@ def test_progress_logging_and_report_persistence_include_ic_packet():
     assert '"research_evidence_ledger": final_state.get(' in graph_source
     assert '"ic_packet": final_state.get(' in graph_source
     assert '("ic_packet", "ic_packet.md", "Research Evidence Officer")' in main_source
+    assert '"Research Evidence Officer": "研究证据官"' in main_source
 
 
 if __name__ == "__main__":

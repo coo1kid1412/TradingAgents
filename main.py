@@ -168,6 +168,7 @@ _AGENT_CN = {
     "Conservative Analyst": "事件风控分析师",
     "Neutral Analyst": "尾部风控分析师",
     "Portfolio Manager": "投资组合经理",
+    "Research Evidence Officer": "研究证据官",
 }
 
 

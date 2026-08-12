@@ -21,6 +21,8 @@ _DIRECTION = {
     "上行": "bullish",
     "强": "bullish",
     "合理": "neutral",
+    "低估": "bullish",
+    "高估": "bearish",
     "中性": "neutral",
     "分歧": "neutral",
     "HOLD": "neutral",
@@ -137,6 +139,8 @@ def _market_cards(summary: Mapping[str, Any], trade_date: str) -> list[dict[str,
     quality = "valid"
     if price_status in {"unknown", "t_minus_1"} or price_date is None:
         quality = "partial"
+    elif trade_day and price_date > trade_day:
+        quality = "invalid"
     elif trade_day and price_date < trade_day:
         quality = "stale"
     direction = _direction(summary.get("data_implied_direction"), summary.get("trend_daily"))
@@ -218,7 +222,10 @@ def _news_cards(summary: Mapping[str, Any], trade_date: str) -> list[dict[str, A
             continue
         seen.add(identity)
         source_date = _as_date(event.get("source_date"))
+        trade_day = _as_date(trade_date)
         quality = "valid" if source_date else "partial"
+        if source_date and trade_day and source_date > trade_day:
+            quality = "invalid"
         impact = str(event.get("impact") or "0")
         cards.append(_card(
             f"NEWS-CAT-{len(cards) + 1:02d}", "news", "long_term_rating",

@@ -142,6 +142,43 @@ def test_unknown_news_date_and_t_minus_one_price_are_partial():
     assert by_id["NEWS-CAT-01"]["quality_status"] == "partial"
 
 
+def test_future_dated_evidence_is_invalid_to_prevent_lookahead():
+    state = _complete_state()
+    state["market_report"] = state["market_report"].replace(
+        "price_data_date: 2026-08-12", "price_data_date: 2026-08-13"
+    )
+    state["news_report"] = state["news_report"].replace(
+        "source_date: 2026-08-11", "source_date: 2026-08-13"
+    )
+
+    ledger = compile_research_evidence(state)
+    by_id = {card["claim_id"]: card for card in ledger["cards"]}
+
+    assert by_id["MKT-TREND-01"]["quality_status"] == "invalid"
+    assert by_id["NEWS-CAT-01"]["quality_status"] == "invalid"
+
+
+def test_valuation_zone_maps_low_to_bullish_and_high_to_bearish():
+    low = compile_research_evidence(_complete_state())
+    low_card = next(card for card in low["cards"] if card["claim_id"] == "FUND-VAL-01")
+    assert low_card["direction"] == "neutral"
+
+    state = _complete_state()
+    state["fundamentals_report"] = state["fundamentals_report"].replace(
+        "pe_zone: 合理", "pe_zone: 低估"
+    )
+    cheap = compile_research_evidence(state)
+    cheap_card = next(card for card in cheap["cards"] if card["claim_id"] == "FUND-VAL-01")
+    assert cheap_card["direction"] == "bullish"
+
+    state["fundamentals_report"] = state["fundamentals_report"].replace(
+        "pe_zone: 低估", "pe_zone: 高估"
+    )
+    expensive = compile_research_evidence(state)
+    expensive_card = next(card for card in expensive["cards"] if card["claim_id"] == "FUND-VAL-01")
+    assert expensive_card["direction"] == "bearish"
+
+
 def test_invalid_yaml_degrades_one_domain_without_aborting():
     state = _complete_state()
     state["sentiment_report"] = "```yaml\nSUMMARY:\n  broken: [\n```"
