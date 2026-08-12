@@ -21,6 +21,7 @@ def create_bull_researcher(llm):
         fundamentals_report = state["fundamentals_report"]
         consensus_snapshot = state.get("consensus_snapshot", "")
         stock_profile = state.get("stock_profile", "")
+        ic_packet = state.get("ic_packet", "")
 
         prompt = f"""【语言要求】你必须使用中文撰写以下所有分析内容和回复。股票代码和技术指标名称可保留英文。
 
@@ -48,6 +49,16 @@ def create_bull_researcher(llm):
 
 ---
 
+## IC 决策包（首要证据索引）
+
+{ic_packet if ic_packet else "（IC 决策包缺失；不得编造证据 ID，论据按未归因处理）"}
+
+**证据 ID 规则**：每条有效论据必须引用至少一个本包存在的证据 ID，并在“依据”末尾写
+`证据 ID：XXX`。原始报告只用于下钻核对，禁止编造证据 ID；质量为无效或过期的卡不得作为
+唯一依据。
+
+---
+
 ## 论据格式要求（强制）
 
 **论据数量硬上限：8 条**。如果论据超过 8 条，必须自行合并/筛选最强的 8 条，并在末尾列出"已合并/剔除的论据"。
@@ -59,6 +70,7 @@ def create_bull_researcher(llm):
 > - **证据类型**：Hard fact / Catalyst / 估值类比 / 情绪叙事
 > - **Hard Data**：[yes / no]（yes = 引用了具体可验证的数值/事件，no = 只有定性描述）
 > - **依据**：<引用具体数据源，如"fundamentals SUMMARY 中 pe_ttm=19.5"或"news 中 Q2 业绩预告增 80%"或"market SUMMARY 中 rsi_pct_1y=87"等>
+> - **证据 ID**：<IC 决策包中存在的 ID；可用多个，逗号分隔>
 
 **立场相对共识 判定标准**：
 - 共识：你的论据方向与"市场共识方向"一致（多头共识下，你说"看多"就是共识方向）
@@ -71,6 +83,7 @@ def create_bull_researcher(llm):
 
 **禁止**：
 - 每条论据若没有给出"依据"段落，视为无效论据，下游 RM 评分会按 0 处理
+- 每条论据若没有引用有效证据 ID，视为未归因论据，只能作为辅助，不得主导评级
 - 不准刷论据数量；如果你只能找出 5 条强论据，就输出 5 条，不要凑数
 
 ---

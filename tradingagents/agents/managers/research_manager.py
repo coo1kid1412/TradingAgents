@@ -229,6 +229,7 @@ def create_research_manager(llm):
         quant_score = state.get("quant_score", "")
         sector_comparison = state.get("sector_comparison", "")
         capital_flow_yaml = state.get("capital_flow_yaml", "")
+        ic_packet = state.get("ic_packet", "")
         market_risk_snapshot = state.get("market_risk_snapshot") or {}
         market_mode = derive_market_mode(market_risk_snapshot)
         entry_timing = _derive_entry_timing_from_profile(stock_profile, market_mode)
@@ -249,6 +250,16 @@ def create_research_manager(llm):
 **真实 RM 不是"多空辩论的裁判员"，而是"独立研究员"**：
 - 裁判员看双方哪边说得更有理 → 评级是公式产出
 - 研究员自己看数据、建估值模型、判断业绩拐点 → 评级是综合判断产出
+
+**决策权边界**：RM 只能决定长期 thesis、12 个月评级、目标价和证伪条件；未来三日入场、
+仓位、止损和最终交易动作由市场分析、风险团队与 PM 决定。短线结构不得改变长期评级。
+
+## IC 决策包（首要证据索引）
+
+{ic_packet if ic_packet else "（IC 决策包缺失；不得编造证据 ID，所有归因字段填 null）"}
+
+**证据 ID 规则**：评级、目标价、盈利拐点和关键冲突必须引用本包存在的证据 ID。原始报告仅用于
+冲突下钻和数值复核；引用无效、过期或不存在的 ID 等同于未引用。关键论据正文也应标注证据 ID。
 
 你的工作是：**走完整 8 步 COT 思考链路，最后给出主观但 COT 透明的评级**。多空辩论是"已识别的争议点清单"，给 PM 做仓位参考，**不主导评级方向**。
 
@@ -935,11 +946,16 @@ RM_SUMMARY:
   overlay_style_adj: <int>               # 工具返回 overlay_components.style（-1/0/+1）
   overlay_vote_adj: <int>                # 工具返回 overlay_components.vote
   overlay_catalyst_adj: <int>            # 工具返回 overlay_components.catalyst
+  rating_evidence_ids: "<ID1|ID2 或 null>"       # 长期评级的主要证据
+  target_price_evidence_ids: "<ID1|ID2 或 null>" # 目标价的主要证据
+  earnings_evidence_ids: "<ID1|ID2 或 null>"     # 盈利展望/拐点证据
+  key_conflict_ids: "<CONFLICT-01|... 或 null>"  # 已处理的 IC 冲突
 ```
 
 **约束**：
 - 缺数据填 `null`（如某只股 momentum_score 缺失）
 - 不要嵌套、不要加注释行；本节是供 Python 解析的固定格式
+- 证据字段只允许填写 IC 决策包中存在的 ID，多个 ID 用 `|` 分隔；缺失填 null
 - 该 YAML 必须是报告最后一段，前后用 `---` 分隔，方便提取器定位
 """
         # 绑定 RM 计算工具，让 LLM 在 Step 4 / 辅助分析等数值步骤显式调用工具

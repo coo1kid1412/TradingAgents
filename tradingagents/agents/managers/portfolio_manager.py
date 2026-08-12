@@ -452,15 +452,13 @@ def create_portfolio_manager(llm, memory):
         risk_debate_state = state["risk_debate_state"]
         research_plan = state["investment_plan"]
 
-        # PM 直接读 4 个 analyst 原始报告 + consensus + RM thesis + quant_score
-        market_report = state.get("market_report", "")
-        sentiment_report = state.get("sentiment_report", "")
-        news_report = state.get("news_report", "")
-        fundamentals_report = state.get("fundamentals_report", "")
+        # PM reads the compact IC packet instead of four repeated long reports.
+        ic_packet = state.get("ic_packet", "")
         consensus_snapshot = state.get("consensus_snapshot", "")
         stock_profile = state.get("stock_profile", "")
         quant_score = state.get("quant_score", "")
         sector_comparison = state.get("sector_comparison", "")
+        capital_flow_yaml = state.get("capital_flow_yaml", "")
         market_risk_snapshot = state.get("market_risk_snapshot") or {}
         market_mode = derive_market_mode(market_risk_snapshot)
         rm_rating = _extract_rm_rating(research_plan)
@@ -478,8 +476,8 @@ def create_portfolio_manager(llm, memory):
         pm_company_name = state.get("company_name", "")
         pm_trade_date = state.get("trade_date", "")
 
-        # 基于 RM 方案 + analyst 综合做 memory 检索
-        curr_situation = f"{research_plan}\n\n{fundamentals_report}\n\n{market_report}"
+        # 基于 RM thesis + IC evidence packet 做 memory 检索
+        curr_situation = f"{research_plan}\n\n{ic_packet}"
         past_memories = memory.get_memories(curr_situation, n_matches=3)
 
         past_memory_str = ""
@@ -489,6 +487,12 @@ def create_portfolio_manager(llm, memory):
         prompt = fr"""【语言要求】你必须使用中文撰写以下所有分析内容和回复。评级关键词（Buy/Overweight/Hold/Underweight/Sell）、股票代码、专业交易术语（Action/Size/R/TP/SL/Time Stop）可保留英文，但需带中文注释。
 
 你是**投资组合经理（Portfolio Manager）**，对标头部对冲基金 PM 角色，输出**专业交易票（Trade Ticket）**风格的决策。
+
+## 决策权与问责
+
+PM 是最终交易决策人，独占最终动作、仓位、入场、止损和是否采纳 RM 的决定权。长期评级和目标价
+必须优先尊重基本面/RM，短期入场必须优先尊重市场/风险，仓位必须优先尊重风险门控。不得让舆情单独决定目标价，
+也不得让基本面单独决定未来三日入场。可以否决 RM，但必须引用有效反向证据 ID。
 
 ## ⚠️ 数值计算必须调用工具（强制约束）
 
@@ -615,7 +619,7 @@ def create_portfolio_manager(llm, memory):
 - "板块 RS 30d +12% 跑赢大盘 + 主题内排名第 2/5，板块β 仍正向，CONDITIONAL（等回调）"
 - "板块 RS 30d -8% 跑输 + 主题内倒数 → 板块走弱强化卖出信号，DON'T BUY"
 
-**从 CAPITAL_FLOW YAML 提取（资金流官的 Python 确定性输出，market_report 内）——填"资金面快照"行**：
+**从 CAPITAL_FLOW YAML 提取（资金流官的 Python 确定性输出）——填"资金面快照"行**：
 
 | 字段 | 用途 |
 |------|------|
@@ -942,6 +946,9 @@ PM 必须明确推荐其中之一，并解释理由。
 ### Research Manager 的 thesis（核心输入）
 {research_plan}
 
+### IC 决策包（首要证据索引；不得编造证据 ID）
+{ic_packet if ic_packet else "（IC 决策包缺失；四个证据归因字段必须填 null）"}
+
 ### 股票画像（决定决策风格 + 报告使用权重 + Time Stop / Entry 节奏）
 {stock_profile if stock_profile else "（未提供）"}
 
@@ -954,19 +961,8 @@ PM 必须明确推荐其中之一，并解释理由。
 ### 共识快照（用于 entry timing 判断）
 {consensus_snapshot if consensus_snapshot else "（未提供）"}
 
-### 4 个 analyst 原始报告（PM 独享，用于校验 RM thesis + 操作细节）
-
-[置信度:高] Company fundamentals report:
-{fundamentals_report}
-
-[置信度:中高] Market research report:
-{market_report}
-
-[置信度:中] Latest world affairs news:
-{news_report}
-
-[置信度:中低] Social media sentiment report:
-{sentiment_report}
+### 资金流确定性 YAML（用于主力/筹码快照，不是模型观点）
+{capital_flow_yaml if capital_flow_yaml else "（资金流数据缺失）"}
 
 ### 风险团队辩论记录
 {history}
@@ -1017,11 +1013,16 @@ PM_SUMMARY:
   short_term_trend: <上涨 / 震荡 / 下跌>
   short_term_confidence: <高 / 中 / 低>
   theme_outlook_12m: <扩张 / 兑现 / 降速 / 破裂>
+  short_term_evidence_ids: "<ID1|ID2 或 null>"
+  long_term_evidence_ids: "<ID1|ID2 或 null>"
+  position_evidence_ids: "<ID1|ID2 或 null>"
+  target_price_evidence_ids: "<ID1|ID2 或 null>"
 ```
 
 **约束**：
 - 缺数据填 `null`，禁止编造
 - 不要嵌套、不要加注释行；本节是供 Python 解析的固定格式
+- 字段值只能引用 IC 决策包中存在的证据 ID，多个 ID 用 `|` 分隔；缺失填 null
 - 该 YAML 必须是报告最后一段，前后用 `---` 分隔，方便提取器定位
 
 Be decisive and ground every conclusion in specific evidence from the analysts.{get_language_instruction()}"""
