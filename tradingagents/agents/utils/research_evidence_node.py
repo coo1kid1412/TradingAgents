@@ -103,6 +103,23 @@ def _confidence(value: Any) -> str:
     return "medium"
 
 
+def _impact_direction(value: Any) -> str:
+    impact = str(value).strip()
+    for prefix, direction in _IMPACT_DIRECTION.items():
+        if impact.startswith(prefix):
+            return direction
+    return "neutral"
+
+
+def _market_direction(summary: Mapping[str, Any]) -> str:
+    """Derive direction from structured trend fields, not model prose."""
+    score = 0
+    for field in ("trend_weekly", "trend_daily", "momentum"):
+        direction = _direction(summary.get(field))
+        score += 1 if direction == "bullish" else -1 if direction == "bearish" else 0
+    return "bullish" if score > 0 else "bearish" if score < 0 else "neutral"
+
+
 def _card(
     claim_id: str,
     owner: str,
@@ -143,7 +160,7 @@ def _market_cards(summary: Mapping[str, Any], trade_date: str) -> list[dict[str,
         quality = "invalid"
     elif trade_day and price_date < trade_day:
         quality = "stale"
-    direction = _direction(summary.get("data_implied_direction"), summary.get("trend_daily"))
+    direction = _market_direction(summary)
     as_of = price_date.isoformat() if price_date else None
     cards = [
         _card(
@@ -230,7 +247,7 @@ def _news_cards(summary: Mapping[str, Any], trade_date: str) -> list[dict[str, A
         cards.append(_card(
             f"NEWS-CAT-{len(cards) + 1:02d}", "news", "long_term_rating",
             f"{event.get('title', '未命名事件')}；影响={impact}；已定价={event.get('priced_in_p', '未知')}%",
-            _IMPACT_DIRECTION.get(impact, "neutral"), str(event.get("horizon") or "event"),
+            _impact_direction(impact), str(event.get("horizon") or "event"),
             source_date.isoformat() if source_date else None, "news_report.SUMMARY.key_events",
             confidence={"高": "high", "中": "medium", "低": "low"}.get(str(event.get("credibility")), "medium"),
             falsifier=f"事件未在 {event.get('event_date', '约定窗口')} 落地或出现反向公告",
@@ -287,9 +304,39 @@ def _sector_cards(report: str, trade_date: str) -> list[dict[str, Any]]:
     )]
 
 
+def _stock_structure_cards(profile: str, trade_date: str) -> list[dict[str, Any]]:
+    match = re.search(r"(?m)^SYS_SHORT_TERM_STRUCTURE:\s*class=([a-z_]+)", profile or "")
+    if not match:
+        return []
+    structure = match.group(1)
+    direction = {
+        "trend_pullback": "bullish",
+        "breakout_ready": "bullish",
+        "healthy_trend": "bullish",
+        "exhaustion": "bearish",
+        "broken": "bearish",
+        "neutral": "neutral",
+        "insufficient_data": "neutral",
+    }.get(structure, "neutral")
+    quality = "valid" if structure in {
+        "trend_pullback", "breakout_ready", "healthy_trend", "exhaustion", "broken", "neutral",
+    } else "partial"
+    return [_card(
+        "MKT-STRUCT-01", "market", "entry_timing", f"确定性短线结构={structure}",
+        direction, "3d", trade_date, "stock_profile.SYS_SHORT_TERM_STRUCTURE",
+        falsifier="短线结构分类在下一交易日发生变化", quality_status=quality,
+    )]
+
+
 def _risk_cards(snapshot: Mapping[str, Any], trade_date: str) -> list[dict[str, Any]]:
     if not snapshot:
-        return []
+        return [_card(
+            "RISK-GATE-01", "risk", "position",
+            "市场风险快照缺失，按 WAIT / 新仓上限 0% 处理",
+            "bearish", "intraday", trade_date, "market_risk_snapshot",
+            falsifier="取得有效市场风险快照且入场门不再为 WAIT",
+            quality_status="partial",
+        )]
     status = str(snapshot.get("data_status") or "missing")
     quality = "valid" if status == "fresh" else "stale" if status == "stale" else "partial"
     gate = str(snapshot.get("entry_gate") or "WAIT")
@@ -339,11 +386,23 @@ def compile_research_evidence(state: Mapping[str, Any]) -> dict[str, Any]:
     )
     for domain, label, report, key, builder in specs:
         summary, status = _extract_yaml_mapping(str(report or ""), key)
-        coverage[domain] = status
         if summary is None:
+            coverage[domain] = status
             warnings.append(f"{label}摘要{status}，该领域证据未进入归因")
             continue
-        cards.extend(builder(summary, trade_date))
+        domain_cards = builder(summary, trade_date)
+        cards.extend(domain_cards)
+        qualities = {str(card["quality_status"]) for card in domain_cards}
+        coverage[domain] = next(
+            (quality for quality in ("invalid", "stale", "partial") if quality in qualities),
+            "valid" if domain_cards else "missing",
+        )
+
+    structure_cards = _stock_structure_cards(str(state.get("stock_profile") or ""), trade_date)
+    coverage["structure"] = structure_cards[0]["quality_status"] if structure_cards else "missing"
+    cards.extend(structure_cards)
+    if not structure_cards:
+        warnings.append("确定性短线结构缺失，入场时机归因不完整")
 
     sector_cards = _sector_cards(str(state.get("sector_comparison") or ""), trade_date)
     coverage["sector"] = "valid" if sector_cards else "missing"
@@ -352,10 +411,10 @@ def compile_research_evidence(state: Mapping[str, Any]) -> dict[str, Any]:
         warnings.append("板块相对强弱缺失，该领域证据未进入归因")
 
     risk_cards = _risk_cards(state.get("market_risk_snapshot") or {}, trade_date)
-    coverage["risk"] = risk_cards[0]["quality_status"] if risk_cards else "missing"
+    coverage["risk"] = risk_cards[0]["quality_status"]
     cards.extend(risk_cards)
-    if not risk_cards:
-        warnings.append("市场风险快照缺失，仓位归因不完整")
+    if not state.get("market_risk_snapshot"):
+        warnings.append("市场风险快照缺失，已按 WAIT / 新仓上限 0% 进行归因")
 
     ids = [card["claim_id"] for card in cards]
     if len(ids) != len(set(ids)):
@@ -470,22 +529,33 @@ def _validate_references(
         return "-", "缺失：PM 未完成证据归因"
     by_id = {str(card.get("claim_id")): card for card in ledger.get("cards") or []}
     missing = [claim_id for claim_id in ids if claim_id not in by_id]
-    if missing:
-        return ", ".join(ids), f"缺失：证据 ID 不存在 {', '.join(missing)}"
     allowed = ATTRIBUTION_OWNER_POLICY[policy_key]
     unauthorized = [
-        claim_id for claim_id in ids if str(by_id[claim_id].get("owner")) not in allowed
+        claim_id for claim_id in ids
+        if claim_id in by_id and str(by_id[claim_id].get("owner")) not in allowed
     ]
+    accepted = [
+        claim_id for claim_id in ids
+        if claim_id in by_id and str(by_id[claim_id].get("owner")) in allowed
+    ]
+    if not accepted:
+        if unauthorized:
+            return ", ".join(ids), f"权限不匹配：{', '.join(unauthorized)}"
+        return ", ".join(ids), f"缺失：证据 ID 不存在 {', '.join(missing)}"
+
+    issues = []
+    if missing:
+        issues.append(f"剔除不存在的证据 {', '.join(missing)}")
     if unauthorized:
-        return ", ".join(ids), f"权限不匹配：{', '.join(unauthorized)}"
-    qualities = [str(by_id[claim_id].get("quality_status") or "invalid") for claim_id in ids]
+        issues.append(f"剔除权限不匹配的证据 {', '.join(unauthorized)}")
+    qualities = [str(by_id[claim_id].get("quality_status") or "invalid") for claim_id in accepted]
     if "invalid" in qualities:
-        return ", ".join(ids), "无效：证据解析失败"
-    if "stale" in qualities:
-        return ", ".join(ids), "过期：证据时点不可用"
-    if "partial" in qualities:
-        return ", ".join(ids), "部分：证据不完整"
-    return ", ".join(ids), "完整"
+        issues.append("有效证据解析失败")
+    elif "stale" in qualities:
+        issues.append("有效证据时点过期")
+    elif "partial" in qualities:
+        issues.append("证据不完整")
+    return ", ".join(accepted), f"部分：{'；'.join(issues)}" if issues else "完整"
 
 
 def render_decision_attribution(
@@ -519,6 +589,13 @@ def render_decision_attribution(
     ]
     for label, conclusion, team, field, policy in rows:
         ids = _reference_ids(pm_content, field)
+        deterministic_ids = {
+            "short_term_evidence_ids": ("MKT-STRUCT-01", "RISK-GATE-01"),
+            "position_evidence_ids": ("RISK-GATE-01",),
+        }.get(field, ())
+        available = {str(card.get("claim_id")) for card in ledger.get("cards") or []}
+        ids = [claim_id for claim_id in deterministic_ids if claim_id in available] + ids
+        ids = list(dict.fromkeys(ids))
         evidence, status = _validate_references(ids, ledger, policy)
         lines.append(f"| {label} | {conclusion} | {team} | {evidence} | {status} |")
     lines.extend([

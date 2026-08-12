@@ -99,6 +99,10 @@ def _complete_state() -> dict:
     growth: 81""",
         ),
         "sector_comparison": "- vs 沪深300（30d）：✓ 跑赢大盘（RS = +12.4%）",
+        "stock_profile": (
+            "SYS_SHORT_TERM_STRUCTURE: class=healthy_trend | ma10_slope_5d_pct=1.2 "
+            "| price_vs_ma10_pct=2.1 | breakout_confirmed=false"
+        ),
         "market_risk_snapshot": {
             "as_of_date": "2026-08-12",
             "risk_level": "中",
@@ -115,6 +119,8 @@ def test_compiler_builds_stable_cards_and_deduplicates_events():
 
     assert by_id["MKT-TREND-01"]["decision_variable"] == "short_term_trend"
     assert by_id["MKT-TREND-01"]["direction"] == "bullish"
+    assert by_id["MKT-STRUCT-01"]["decision_variable"] == "entry_timing"
+    assert by_id["MKT-STRUCT-01"]["direction"] == "bullish"
     assert by_id["FUND-GROWTH-01"]["decision_variable"] == "earnings_outlook_12m"
     assert by_id["FUND-VAL-01"]["decision_variable"] == "target_price"
     assert by_id["NEWS-CAT-01"]["direction"] == "bullish"
@@ -156,6 +162,19 @@ def test_future_dated_evidence_is_invalid_to_prevent_lookahead():
 
     assert by_id["MKT-TREND-01"]["quality_status"] == "invalid"
     assert by_id["NEWS-CAT-01"]["quality_status"] == "invalid"
+
+
+def test_missing_market_risk_still_emits_fail_closed_position_evidence():
+    state = _complete_state()
+    state["market_risk_snapshot"] = {}
+
+    ledger = compile_research_evidence(state)
+    by_id = {card["claim_id"]: card for card in ledger["cards"]}
+
+    assert by_id["RISK-GATE-01"]["decision_variable"] == "position"
+    assert by_id["RISK-GATE-01"]["quality_status"] == "partial"
+    assert "WAIT" in by_id["RISK-GATE-01"]["claim"]
+    assert ledger["coverage"]["risk"] == "partial"
 
 
 def test_valuation_zone_maps_low_to_bullish_and_high_to_bearish():
@@ -268,13 +287,42 @@ def test_attribution_renderer_marks_valid_partial_missing_and_unauthorized_refs(
     )
 
     assert "| 未来三日 | 等回踩 | 市场分析/风险 |" in table
-    assert "缺失：证据 ID 不存在 DOES-NOT-EXIST" in table
+    assert (
+        "| 未来三日 | 等回踩 | 市场分析/风险 | "
+        "MKT-STRUCT-01, RISK-GATE-01, MKT-TREND-01 |" in table
+    )
+    assert "部分：剔除不存在的证据 DOES-NOT-EXIST" in table
     assert "| 一年期评级 | OVERWEIGHT | 基本面/RM |" in table
     assert "部分：证据不完整" in table
     assert "| 新建仓位 | 2-3% | 风险/PM |" in table
-    assert "权限不匹配：FUND-GROWTH-01" in table
+    assert "部分：剔除权限不匹配的证据 FUND-GROWTH-01" in table
     assert "| 目标价/止盈位 | 96 / 104 / 112 | 基本面/RM |" in table
     assert "缺失：PM 未完成证据归因" in table
+
+
+def test_market_direction_uses_trend_and_momentum_instead_of_llm_wording_drift():
+    state = _complete_state()
+    state["market_report"] = state["market_report"].replace(
+        "trend_daily: 上行\n  momentum: 强",
+        "trend_daily: 震荡\n  momentum: 弱",
+    )
+    # Keep the analyst's prose-style direction bullish to reproduce the real drift.
+    assert "data_implied_direction: 偏多" in state["market_report"]
+
+    ledger = compile_research_evidence(state)
+    trend = next(card for card in ledger["cards"] if card["claim_id"] == "MKT-TREND-01")
+
+    assert trend["direction"] == "bearish"
+
+
+def test_news_impact_direction_accepts_audited_suffixes():
+    state = _complete_state()
+    state["news_report"] = state["news_report"].replace("impact: +中", "impact: -中（已修复）")
+
+    ledger = compile_research_evidence(state)
+    news = next(card for card in ledger["cards"] if card["claim_id"] == "NEWS-CAT-01")
+
+    assert news["direction"] == "bearish"
 
 
 def test_attribution_renderer_accepts_valid_authorized_references():
@@ -285,7 +333,7 @@ def test_attribution_renderer_accepts_valid_authorized_references():
         ledger,
     )
 
-    assert "MKT-TREND-01, RISK-GATE-01" in table
+    assert "MKT-STRUCT-01, RISK-GATE-01, MKT-TREND-01" in table
     assert "| 新建仓位 | 2-3% | 风险/PM | RISK-GATE-01 | 完整 |" in table
     assert "| 一年期评级 | OVERWEIGHT | 基本面/RM | FUND-GROWTH-01, NEWS-CAT-01 | 部分：证据不完整 |" in table
 

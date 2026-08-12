@@ -58,6 +58,9 @@ def test_pm_summary_has_four_auditable_reference_fields():
     ):
         assert field in source
     assert "字段值只能引用 IC 决策包中存在的证据 ID" in source
+    for invalid_prefix in ("SYS_*", "CAPITAL_FLOW", "字段名", "compute_*"):
+        assert invalid_prefix in source
+    assert "都不是证据 ID" in source
 
 
 if __name__ == "__main__":

@@ -14,6 +14,7 @@ from tradingagents.agents.managers.research_manager import (
     _derive_entry_timing_from_profile,
     _enforce_entry_timing_truth,
     _extract_rm_rating,
+    _normalize_summary_yaml_fence,
     _run_tool_calling_loop,
 )
 from tradingagents.agents.utils.research_evidence_node import render_decision_attribution
@@ -341,7 +342,7 @@ def _format_pm_decision(
 ) -> str:
     """Remove model working text and prepend a deterministic action summary."""
     original = (content or "").strip()
-    summary_block, summary_start, summary_was_fenced = _extract_pm_summary_block(original)
+    summary_block, summary_start, _summary_was_fenced = _extract_pm_summary_block(original)
     user_source = original[:summary_start].rstrip() if summary_block else original
     trade_ticket = re.search(r"(?m)^#{1,2}\s+Trade Ticket\b.*$", user_source)
     if trade_ticket:
@@ -433,7 +434,7 @@ def _format_pm_decision(
     )
     rendered = f"{summary}\n\n{report_body}".rstrip()
     if summary_block:
-        archive = f"```yaml\n{summary_block}\n```" if summary_was_fenced else summary_block
+        archive = f"```yaml\n{summary_block}\n```"
         rendered += f"\n\n---\n\n{archive}"
     return rendered.rstrip() + "\n"
 
@@ -957,6 +958,9 @@ PM 必须明确推荐其中之一，并解释理由。
 ### IC 决策包（首要证据索引；不得编造证据 ID）
 {ic_packet if ic_packet else "（IC 决策包缺失；四个证据归因字段必须填 null）"}
 
+**证据 ID 边界**：只允许填写上方 IC 决策包明确列出的 ID；`SYS_*`、`CAPITAL_FLOW`、
+字段名、`compute_*` 都不是证据 ID。工具结果可用于计算，但不能冒充归因证据。
+
 ### 股票画像（决定决策风格 + 报告使用权重 + Time Stop / Entry 节奏）
 {stock_profile if stock_profile else "（未提供）"}
 
@@ -1031,6 +1035,7 @@ PM_SUMMARY:
 - 缺数据填 `null`，禁止编造
 - 不要嵌套、不要加注释行；本节是供 Python 解析的固定格式
 - 字段值只能引用 IC 决策包中存在的证据 ID，多个 ID 用 `|` 分隔；缺失填 null
+- `SYS_*`、`CAPITAL_FLOW`、字段名、`compute_*` 都不是证据 ID，禁止填入证据字段
 - 该 YAML 必须是报告最后一段，前后用 `---` 分隔，方便提取器定位
 
 Be decisive and ground every conclusion in specific evidence from the analysts.{get_language_instruction()}"""
@@ -1038,15 +1043,16 @@ Be decisive and ground every conclusion in specific evidence from the analysts.{
         # 绑定 PM 计算工具，让 LLM 调工具算 R-multiple / Conviction / 4 情景 E
         llm_with_tools = llm.bind_tools(PM_TOOLS)
         response = _pm_tool_loop(llm_with_tools, [HumanMessage(content=prompt)])
+        normalized_content = _normalize_summary_yaml_fence(response.content, "PM_SUMMARY")
         pm_rating_match = re.findall(
             r"(?m)^\s*pm_rating:\s*(BUY|OVERWEIGHT|HOLD|UNDERWEIGHT|SELL)\s*$",
-            response.content or "",
+            normalized_content,
         )
         final_rating = pm_rating_match[-1] if pm_rating_match else rm_rating
         final_entry_timing = _derive_entry_timing_from_profile(
             stock_profile, market_mode, long_term_rating=final_rating,
         )
-        enforced_content = _enforce_entry_timing_truth(response.content, final_entry_timing)
+        enforced_content = _enforce_entry_timing_truth(normalized_content, final_entry_timing)
         response = AIMessage(content=_format_pm_decision(
             enforced_content, final_entry_timing, market_risk_snapshot=market_risk_snapshot,
             research_evidence_ledger=state.get("research_evidence_ledger", {}),

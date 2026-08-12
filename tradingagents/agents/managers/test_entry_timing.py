@@ -8,11 +8,15 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+from langchain_core.messages import AIMessage, HumanMessage
+
 from tradingagents.agents.managers.rm_tools import compute_entry_timing
 from tradingagents.agents.managers.research_manager import (
     _derive_entry_timing_from_profile,
     _enforce_entry_timing_truth,
     _extract_rm_rating,
+    _normalize_summary_yaml_fence,
+    _run_tool_calling_loop,
 )
 from tradingagents.agents.managers.portfolio_manager import (
     AIMessage as PortfolioAIMessage,
@@ -196,7 +200,8 @@ PM_SUMMARY:
     assert "**当前动作：WAIT｜新建仓位：0%｜长期评级：OVERWEIGHT**" in result
     assert "## Trade Ticket 交易票" in result
     assert "我需要重新核算" not in result
-    assert result.rstrip().endswith("entry_timing: 暂不介入")
+    assert result.rstrip().endswith("```")
+    assert _find_yaml_block(result, "PM_SUMMARY")["entry_timing"] == "暂不介入"
 
 
 def test_pm_decision_inserts_attribution_before_trade_ticket_and_preserves_yaml():
@@ -238,10 +243,94 @@ PM_SUMMARY:
     )
 
     assert result.index("## 为什么这样决定") < result.index("## Trade Ticket")
-    assert "| 未来三日 | 等回踩 | 市场分析/风险 | MKT-TREND-01 | 完整 |" in result
+    assert "| 未来三日 | 等回踩 | 市场分析/风险 | RISK-GATE-01, MKT-TREND-01 | 完整 |" in result
     summary = _find_yaml_block(result, "PM_SUMMARY")
     assert summary["pm_rating"] == "OVERWEIGHT"
     assert summary["short_term_evidence_ids"] == "MKT-TREND-01"
+
+
+def test_summary_normalizer_wraps_bare_yaml_and_removes_orphan_fence():
+    content = """## 正式报告
+
+正文
+
+---
+
+```
+
+---
+
+RM_SUMMARY:
+  ticker: "300308"
+  current_price: 921.0
+  rm_rating: HOLD
+```"""
+
+    normalized = _normalize_summary_yaml_fence(content, "RM_SUMMARY")
+
+    assert normalized.count("```yaml") == 1
+    assert normalized.rstrip().endswith("```")
+    assert "\n```\n\n---\n\n```yaml" not in normalized
+    assert _find_yaml_block(normalized, "RM_SUMMARY")["current_price"] == 921.0
+
+
+def test_tool_loop_retries_when_summary_token_exists_but_yaml_is_truncated():
+    class SequenceLLM:
+        def __init__(self):
+            self.calls = 0
+
+        def invoke(self, _messages):
+            outputs = (
+                AIMessage(content='正文\nRM_SUMMARY:\n  rm_rating: HOLD\n  rating_evidence_ids: "FUND-GROW'),
+                AIMessage(content="""RM_SUMMARY:
+  current_price: 921.0
+  rm_rating: HOLD
+  target_price_mid: 1400.7
+  entry_timing: 退出观察
+  rating_evidence_ids: "FUND-GROWTH-01"
+  target_price_evidence_ids: "FUND-VAL-01"
+  earnings_evidence_ids: "FUND-GROWTH-01"
+  key_conflict_ids: null"""),
+            )
+            response = outputs[self.calls]
+            self.calls += 1
+            return response
+
+    llm = SequenceLLM()
+    result = _run_tool_calling_loop(
+        llm,
+        [HumanMessage(content="生成报告")],
+        tools_by_name={},
+        role="RM-test",
+        completion_token="RM_SUMMARY",
+        max_iterations=1,
+        max_continuations=1,
+    )
+
+    assert llm.calls == 2
+    normalized = _normalize_summary_yaml_fence(result.content, "RM_SUMMARY")
+    assert _find_yaml_block(normalized, "RM_SUMMARY")["key_conflict_ids"] is None
+
+
+def test_pm_formatter_always_fences_plain_summary_for_archive():
+    content = """## Trade Ticket 交易票
+
+正文
+
+---
+PM_SUMMARY:
+  current_price: 921.0
+  pm_rating: HOLD
+  pm_action_keyword: WAIT
+  entry_timing: 继续观察
+"""
+    result = _format_pm_decision(
+        content,
+        {"structure_class": "neutral", "effective_action": "继续观察"},
+    )
+
+    assert "```yaml\nPM_SUMMARY:" in result
+    assert _find_yaml_block(result, "PM_SUMMARY")["current_price"] == 921.0
 
 
 def test_pm_decision_without_trade_ticket_preserves_original_content():
