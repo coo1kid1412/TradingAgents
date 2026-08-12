@@ -199,6 +199,51 @@ PM_SUMMARY:
     assert result.rstrip().endswith("entry_timing: 暂不介入")
 
 
+def test_pm_decision_inserts_attribution_before_trade_ticket_and_preserves_yaml():
+    content = """## Trade Ticket 交易票
+
+| **Action** 当前动作 | WAIT |
+
+---
+```yaml
+PM_SUMMARY:
+  current_price: 88
+  pm_rating: OVERWEIGHT
+  pm_action_keyword: WAIT
+  pm_size_low_pct: 0
+  pm_size_high_pct: 0
+  pm_tp1: 96
+  pm_tp2: 104
+  pm_tp3: 112
+  short_term_evidence_ids: MKT-TREND-01
+  long_term_evidence_ids: FUND-GROWTH-01
+  position_evidence_ids: RISK-GATE-01
+  target_price_evidence_ids: FUND-VAL-01
+  short_term_structure: healthy_trend
+  entry_timing: 等回踩
+```
+"""
+    ledger = {
+        "cards": [
+            {"claim_id": "MKT-TREND-01", "owner": "market", "quality_status": "valid"},
+            {"claim_id": "FUND-GROWTH-01", "owner": "fundamentals", "quality_status": "partial"},
+            {"claim_id": "RISK-GATE-01", "owner": "risk", "quality_status": "valid"},
+            {"claim_id": "FUND-VAL-01", "owner": "fundamentals", "quality_status": "partial"},
+        ]
+    }
+    result = _format_pm_decision(
+        content,
+        {"structure_class": "healthy_trend", "effective_action": "等回踩"},
+        research_evidence_ledger=ledger,
+    )
+
+    assert result.index("## 为什么这样决定") < result.index("## Trade Ticket")
+    assert "| 未来三日 | 等回踩 | 市场分析/风险 | MKT-TREND-01 | 完整 |" in result
+    summary = _find_yaml_block(result, "PM_SUMMARY")
+    assert summary["pm_rating"] == "OVERWEIGHT"
+    assert summary["short_term_evidence_ids"] == "MKT-TREND-01"
+
+
 def test_pm_decision_without_trade_ticket_preserves_original_content():
     content = "PM_SUMMARY:\n  pm_rating: HOLD\n  entry_timing: 继续观察\n"
     result = _format_pm_decision(

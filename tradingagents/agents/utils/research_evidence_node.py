@@ -421,6 +421,107 @@ def render_ic_packet(
     return "\n".join(lines).rstrip() + "\n"
 
 
+def _summary_value(content: str, key: str) -> str | None:
+    matches = re.findall(rf"(?m)^\s*{re.escape(key)}:\s*([^#\r\n]+?)\s*$", content or "")
+    if not matches:
+        return None
+    value = matches[-1].strip().strip('"\'')
+    return None if value.lower() in {"null", "none", ""} else value
+
+
+def _reference_ids(content: str, key: str) -> list[str]:
+    raw = _summary_value(content, key)
+    if not raw:
+        return []
+    return [item.strip() for item in re.split(r"[|,，]", raw) if item.strip()]
+
+
+def _display_number(value: str | None) -> str:
+    if value is None:
+        return "数据不足"
+    try:
+        number = float(value)
+    except ValueError:
+        return value
+    return str(int(number)) if number.is_integer() else f"{number:.2f}".rstrip("0").rstrip(".")
+
+
+def _display_position(content: str) -> str:
+    low = _summary_value(content, "pm_size_low_pct")
+    high = _summary_value(content, "pm_size_high_pct")
+    if low is None and high is None:
+        return "数据不足"
+    low_text = _display_number(low or "0")
+    high_text = _display_number(high or low or "0")
+    return f"{low_text}%" if low_text == high_text else f"{low_text}-{high_text}%"
+
+
+def _validate_references(
+    ids: list[str], ledger: Mapping[str, Any], policy_key: str
+) -> tuple[str, str]:
+    if not ids:
+        return "-", "缺失：PM 未完成证据归因"
+    by_id = {str(card.get("claim_id")): card for card in ledger.get("cards") or []}
+    missing = [claim_id for claim_id in ids if claim_id not in by_id]
+    if missing:
+        return ", ".join(ids), f"缺失：证据 ID 不存在 {', '.join(missing)}"
+    allowed = ATTRIBUTION_OWNER_POLICY[policy_key]
+    unauthorized = [
+        claim_id for claim_id in ids if str(by_id[claim_id].get("owner")) not in allowed
+    ]
+    if unauthorized:
+        return ", ".join(ids), f"权限不匹配：{', '.join(unauthorized)}"
+    qualities = [str(by_id[claim_id].get("quality_status") or "invalid") for claim_id in ids]
+    if "invalid" in qualities:
+        return ", ".join(ids), "无效：证据解析失败"
+    if "stale" in qualities:
+        return ", ".join(ids), "过期：证据时点不可用"
+    if "partial" in qualities:
+        return ", ".join(ids), "部分：证据不完整"
+    return ", ".join(ids), "完整"
+
+
+def render_decision_attribution(
+    pm_content: str, timing: Mapping[str, Any], ledger: Mapping[str, Any]
+) -> str:
+    """Render four PM decisions with validated evidence ownership and quality."""
+    rating = _summary_value(pm_content, "pm_rating") or "数据不足"
+    short_term = str(timing.get("effective_action") or "数据不足")
+    tp_values = [
+        _display_number(_summary_value(pm_content, key)) for key in ("pm_tp1", "pm_tp2", "pm_tp3")
+    ]
+    target_display = " / ".join(tp_values)
+    rows = (
+        (
+            "未来三日", short_term, "市场分析/风险", "short_term_evidence_ids", "short_term",
+        ),
+        (
+            "一年期评级", rating, "基本面/RM", "long_term_evidence_ids", "long_term",
+        ),
+        (
+            "新建仓位", _display_position(pm_content), "风险/PM", "position_evidence_ids", "position",
+        ),
+        (
+            "目标价/止盈位", target_display, "基本面/RM", "target_price_evidence_ids", "target_price",
+        ),
+    )
+    lines = [
+        "## 为什么这样决定", "",
+        "| 决策项 | 最终结论 | 主责团队 | 关键证据 | 归因状态 |",
+        "|---|---|---|---|---|",
+    ]
+    for label, conclusion, team, field, policy in rows:
+        ids = _reference_ids(pm_content, field)
+        evidence, status = _validate_references(ids, ledger, policy)
+        lines.append(f"| {label} | {conclusion} | {team} | {evidence} | {status} |")
+    lines.extend([
+        "",
+        "> 归因状态由代码核验。它只说明证据是否可追踪、时效可用且角色有权支撑该决策，"
+        "不自动改写评级或仓位。",
+    ])
+    return "\n".join(lines)
+
+
 def create_research_evidence_node():
     """Return a LangGraph-compatible deterministic evidence compiler node."""
 

@@ -16,6 +16,7 @@ from tradingagents.agents.managers.research_manager import (
     _extract_rm_rating,
     _run_tool_calling_loop,
 )
+from tradingagents.agents.utils.research_evidence_node import render_decision_attribution
 from tradingagents.agents.managers.rm_tools import derive_market_mode
 
 logger = logging.getLogger(__name__)
@@ -336,6 +337,7 @@ def _format_pm_decision(
     content: str,
     timing: dict,
     market_risk_snapshot: dict | None = None,
+    research_evidence_ledger: dict | None = None,
 ) -> str:
     """Remove model working text and prepend a deterministic action summary."""
     original = (content or "").strip()
@@ -415,13 +417,19 @@ def _format_pm_decision(
     position_actions = _position_action_rows(
         summary_block or original, entry_timing, size, rating,
     )
+    attribution = ""
+    if research_evidence_ledger is not None:
+        attribution = render_decision_attribution(
+            summary_block or original, timing, research_evidence_ledger,
+        )
 
     summary = (
         f"# 短期操作结论：{entry_timing}\n\n"
         f"> **当前动作：{action}｜新建仓位：{size}｜长期评级：{rating}**\n>\n"
         f"> **核心原因：{reason}**\n>\n"
         f"> **重新评估条件：{trigger}**\n\n"
-        f"{position_actions}\n\n---"
+        f"{position_actions}"
+        f"{f'{chr(10)}{chr(10)}{attribution}' if attribution else ''}\n\n---"
     )
     rendered = f"{summary}\n\n{report_body}".rstrip()
     if summary_block:
@@ -1041,6 +1049,7 @@ Be decisive and ground every conclusion in specific evidence from the analysts.{
         enforced_content = _enforce_entry_timing_truth(response.content, final_entry_timing)
         response = AIMessage(content=_format_pm_decision(
             enforced_content, final_entry_timing, market_risk_snapshot=market_risk_snapshot,
+            research_evidence_ledger=state.get("research_evidence_ledger", {}),
         ))
         logger.info("PM entry_timing 出口真值: %s", final_entry_timing)
 

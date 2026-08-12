@@ -4,6 +4,7 @@ import sys
 
 from tradingagents.agents.utils.research_evidence_node import (
     compile_research_evidence,
+    render_decision_attribution,
     render_ic_packet,
 )
 
@@ -195,6 +196,61 @@ def test_ic_packet_lists_quality_conflicts_and_evidence_index():
     assert "MKT-TREND-01" in packet
     assert "FUND-GROWTH-01" in packet
     assert "模型不得编造证据 ID" in packet
+
+
+def _pm_summary(**overrides) -> str:
+    values = {
+        "pm_rating": "OVERWEIGHT",
+        "pm_size_low_pct": "2",
+        "pm_size_high_pct": "3",
+        "pm_tp1": "96",
+        "pm_tp2": "104",
+        "pm_tp3": "112",
+        "short_term_evidence_ids": "MKT-TREND-01|RISK-GATE-01",
+        "long_term_evidence_ids": "FUND-GROWTH-01|NEWS-CAT-01",
+        "position_evidence_ids": "RISK-GATE-01",
+        "target_price_evidence_ids": "FUND-VAL-01|NEWS-TP-01",
+    }
+    values.update(overrides)
+    body = "\n".join(f"  {key}: {value}" for key, value in values.items())
+    return f"```yaml\nPM_SUMMARY:\n{body}\n```"
+
+
+def test_attribution_renderer_marks_valid_partial_missing_and_unauthorized_refs():
+    ledger = compile_research_evidence(_complete_state())
+    content = _pm_summary(
+        short_term_evidence_ids="MKT-TREND-01|DOES-NOT-EXIST",
+        position_evidence_ids="FUND-GROWTH-01",
+        target_price_evidence_ids="null",
+    )
+
+    table = render_decision_attribution(
+        content,
+        {"effective_action": "等回踩"},
+        ledger,
+    )
+
+    assert "| 未来三日 | 等回踩 | 市场分析/风险 |" in table
+    assert "缺失：证据 ID 不存在 DOES-NOT-EXIST" in table
+    assert "| 一年期评级 | OVERWEIGHT | 基本面/RM |" in table
+    assert "部分：证据不完整" in table
+    assert "| 新建仓位 | 2-3% | 风险/PM |" in table
+    assert "权限不匹配：FUND-GROWTH-01" in table
+    assert "| 目标价/止盈位 | 96 / 104 / 112 | 基本面/RM |" in table
+    assert "缺失：PM 未完成证据归因" in table
+
+
+def test_attribution_renderer_accepts_valid_authorized_references():
+    ledger = compile_research_evidence(_complete_state())
+    table = render_decision_attribution(
+        _pm_summary(short_term_evidence_ids="MKT-TREND-01|RISK-GATE-01"),
+        {"effective_action": "小仓试探"},
+        ledger,
+    )
+
+    assert "MKT-TREND-01, RISK-GATE-01" in table
+    assert "| 新建仓位 | 2-3% | 风险/PM | RISK-GATE-01 | 完整 |" in table
+    assert "| 一年期评级 | OVERWEIGHT | 基本面/RM | FUND-GROWTH-01, NEWS-CAT-01 | 部分：证据不完整 |" in table
 
 
 if __name__ == "__main__":
