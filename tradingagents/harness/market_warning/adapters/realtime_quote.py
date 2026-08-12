@@ -50,6 +50,7 @@ def _cross_section_points(frame: pd.DataFrame | None, as_of_time: datetime, fetc
     required = {"last", "pre_close", "data_time"}
     if not required.issubset(frame.columns):
         return ()
+    universe_size = frame.attrs.get("universe_size")
     rows = frame.copy()
 
     def normalize_time(value: object) -> datetime | None:
@@ -66,7 +67,18 @@ def _cross_section_points(frame: pd.DataFrame | None, as_of_time: datetime, fetc
         )
 
     rows["_data_time"] = rows["data_time"].map(normalize_time)
-    rows = rows[rows["_data_time"].notna() & (rows["_data_time"] <= as_of_time)].copy()
+    local_as_of = as_of_time.astimezone(_SHANGHAI)
+    rows = rows[
+        rows["_data_time"].notna()
+        & (rows["_data_time"] <= local_as_of)
+        & rows["_data_time"].map(
+            lambda value: (
+                value is not None
+                and value.date() == local_as_of.date()
+                and (local_as_of - value).total_seconds() <= 5 * 60
+            )
+        )
+    ].copy()
     if rows.empty:
         return ()
     rows["last"] = pd.to_numeric(rows["last"], errors="coerce")
@@ -84,6 +96,19 @@ def _cross_section_points(frame: pd.DataFrame | None, as_of_time: datetime, fetc
             source = "+".join(sources)
     rows["return"] = rows["last"] / rows["pre_close"] - 1.0
     values: dict[str, float] = {"breadth_up_pct": float((rows["return"] > 0).mean() * 100.0)}
+    if (
+        isinstance(universe_size, int)
+        and not isinstance(universe_size, bool)
+        and universe_size > 0
+        and "ts_code" in rows
+    ):
+        values["realtime_breadth_coverage_pct"] = float(
+            rows["ts_code"].nunique() / universe_size * 100.0
+        )
+    values["realtime_breadth_staleness_minutes"] = max(
+        0.0,
+        float((as_of_time - data_time).total_seconds() / 60.0),
+    )
     if "ma20" in rows:
         ma20 = pd.to_numeric(rows["ma20"], errors="coerce")
         valid = ma20.notna() & (ma20 > 0)
@@ -98,6 +123,13 @@ def _cross_section_points(frame: pd.DataFrame | None, as_of_time: datetime, fetc
         industry_returns = rows.dropna(subset=["industry"]).groupby("industry")["return"].mean()
         if not industry_returns.empty:
             values["industry_decline_pct"] = float((industry_returns < 0).mean() * 100.0)
+    if "down_limit" in rows:
+        down_limit = pd.to_numeric(rows["down_limit"], errors="coerce")
+        valid = down_limit.notna() & (down_limit > 0)
+        if valid.any():
+            values["limit_down_pct"] = float(
+                (rows.loc[valid, "last"] <= down_limit[valid]).mean() * 100.0
+            )
     return tuple(
         MarketDataPoint(
             market=Market.A_SHARE,

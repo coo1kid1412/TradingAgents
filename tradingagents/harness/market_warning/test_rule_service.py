@@ -1,0 +1,580 @@
+"""Application-service tests for the deterministic rule fast path."""
+
+from __future__ import annotations
+
+import tempfile
+from datetime import datetime, timezone
+from pathlib import Path
+from unittest import TestCase, main
+
+from tradingagents.harness.market_warning.domain import (
+    DataStatus,
+    DecisionSource,
+    Evidence,
+    FeatureSnapshot,
+    FinalWarningDecision,
+    LLMContextAssessment,
+    Market,
+    MarketDataPoint,
+    MarketPhase,
+    QuantRiskAssessment,
+    RawMarketSnapshot,
+    RiskLevel,
+    RuleRiskAssessment,
+    RunnerResult,
+    TriggeredRule,
+)
+from tradingagents.harness.market_warning.quality import DataQualityAssessment
+from tradingagents.harness.market_warning.rule_service import RuleMarketWarningService
+
+
+NOW = datetime(2026, 8, 3, 1, 35, tzinfo=timezone.utc)
+
+
+def rule_assessment(level: RiskLevel, latency: float = 0.0) -> RuleRiskAssessment:
+    return RuleRiskAssessment(
+        market=Market.A_SHARE,
+        as_of_time=NOW,
+        engine_version="rule-v1.0.0",
+        manifest_sha256="a" * 64,
+        risk_level=level,
+        risk_score=4.0 if level in {RiskLevel.ORANGE, RiskLevel.RED} else 0.0,
+        market_phase=MarketPhase.FIRST_SHOCK,
+        triggered_rules=(
+            TriggeredRule(
+                rule_id="pressure.volatility_acceleration",
+                layer="PRESSURE",
+                severity_points=2,
+                observed_value=1.6,
+                threshold_description=">= 1.50",
+                evidence_ids=("ev-rule",),
+            ),
+        ) if level in {RiskLevel.ORANGE, RiskLevel.RED} else (),
+        missing_optional_groups=(),
+        reliability_grade="A" if level != RiskLevel.UNKNOWN else "UNAVAILABLE",
+        evaluation_latency_ms=latency,
+    )
+
+
+class DataPort:
+    def __init__(self, events, error=None):
+        self.events = events
+        self.error = error
+
+    def load_snapshot(self, market, as_of_time, session_slot):
+        self.events.append("load_data")
+        if self.error:
+            raise self.error
+        point = MarketDataPoint(
+            market=market,
+            symbol="000001.SH",
+            field="index_price",
+            value=3000.0,
+            data_time=as_of_time,
+            fetched_at=as_of_time,
+            source="fixture",
+        )
+        return RawMarketSnapshot(
+            market=market,
+            as_of_time=as_of_time,
+            session_slot=session_slot,
+            points=(point,),
+            source_times={"fixture": as_of_time},
+        )
+
+
+class FeatureStrategy:
+    def __init__(self, events):
+        self.events = events
+
+    def build(self, raw, _history):
+        self.events.append("build_features")
+        return FeatureSnapshot(
+            market=raw.market,
+            as_of_time=raw.as_of_time,
+            session_slot=raw.session_slot,
+            feature_version="market-warning-v2",
+            features={"market_phase": "FIRST_SHOCK"},
+            evidence=(
+                Evidence(
+                    evidence_id="ev-rule",
+                    group="rule",
+                    summary="rule evidence",
+                    source="fixture",
+                    as_of_time=raw.as_of_time,
+                ),
+            ),
+            data_quality=DataStatus.FRESH,
+            reliability_grade="A",
+            source_times={"fixture": raw.as_of_time},
+        )
+
+
+class RuleEvaluator:
+    def __init__(self, events, level=RiskLevel.ORANGE, error=None):
+        self.events = events
+        self.level = level
+        self.error = error
+
+    def __call__(self, snapshot, previous_assessment=None):
+        self.events.append("evaluate_rules")
+        if self.error:
+            raise self.error
+        return rule_assessment(self.level)
+
+
+class Repository:
+    def __init__(
+        self,
+        events,
+        fail_stage=None,
+        previous=None,
+        existing=None,
+        latest_context=None,
+        partial_snapshot=None,
+    ):
+        self.events = events
+        self.fail_stage = fail_stage
+        self.previous = previous
+        self.existing = existing
+        self.latest_context = latest_context
+        self.partial_snapshot = partial_snapshot
+        self.decision = None
+
+    def _stage(self, name, value):
+        self.events.append(name)
+        if self.fail_stage == name:
+            raise RuntimeError(name)
+        return value
+
+    def load_evaluation(self, *_):
+        return self.existing
+
+    def load_feature_snapshot(self, *_):
+        return self.partial_snapshot
+
+    def save_feature_snapshot(self, _snapshot):
+        return self._stage("save_snapshot", 11)
+
+    def load_previous_rule_assessment(self, *_):
+        return self._stage("load_previous_rule", None)
+
+    def save_rule_assessment(self, _snapshot_id, _assessment):
+        return self._stage("save_rule", 21)
+
+    def load_previous_decision(self, *_):
+        return self._stage("load_previous", self.previous)
+
+    def load_latest_reasoning(self, *_):
+        return self._stage("load_latest_reasoning", self.latest_context)
+
+    def save_decision(self, _snapshot_id, prediction_ids, _reasoning_id, decision, **kwargs):
+        self.decision = decision
+        self.saved_prediction_ids = prediction_ids
+        self.saved_kwargs = kwargs
+        return self._stage("save_decision", 31)
+
+    def save_reasoning(self, snapshot_id, assessment, model_name):
+        self.saved_reasoning = (snapshot_id, assessment, model_name)
+        return self._stage("save_reasoning", 41)
+
+    def attach_reasoning(self, decision_id, reasoning_id):
+        self.attached_reasoning = (decision_id, reasoning_id)
+        return self._stage("attach_reasoning", None)
+
+    def save_reasoning_for_decision(self, decision_id, assessment, model_name):
+        self.saved_reasoning = (decision_id, assessment, model_name)
+        return self._stage("save_decision_reasoning", 41)
+
+
+class Notifier:
+    def __init__(self, events, error=None):
+        self.events = events
+        self.error = error
+
+    def notify(self, _result):
+        self.events.append("notify")
+        if self.error:
+            raise self.error
+        return True
+
+
+class AlreadySentNotifier(Notifier):
+    def notify(self, _result):
+        self.events.append("notify")
+        return False
+
+    def was_sent(self, _result):
+        self.events.append("check_sent")
+        return True
+
+
+class ShadowModel:
+    def __init__(self, events, error=None):
+        self.events = events
+        self.error = error
+
+    def predict(self, _snapshot):
+        self.events.append("shadow_model")
+        if self.error:
+            raise self.error
+        return QuantRiskAssessment(
+            crash_1d_probability=0.02,
+            crash_3d_probability=0.03,
+            market_phase="FIRST_SHOCK",
+            base_rate_1d=0.01,
+            base_rate_3d=0.02,
+            reliability_grade="B",
+            model_version="shadow-v1",
+            calibration_version="shadow-cal-v1",
+            top_contributors=(),
+        )
+
+
+class PostAlertReasoning:
+    model_name = "MiniMax-M3"
+
+    def __init__(self, events, error=None, assessment=None):
+        self.events = events
+        self.error = error
+        self.assessment = assessment or LLMContextAssessment(
+            market_scenario="breadth pressure is spreading",
+            causal_chain=("breadth weakens", "risk appetite contracts"),
+            supporting_evidence_ids=("ev-rule",),
+            conflicting_evidence_ids=(),
+            overlooked_risks=("policy support",),
+            recommended_risk_level=RiskLevel.ORANGE,
+            confidence=0.0,
+            action_reason="仅作情景解释，不改变规则决策。",
+            reasoning_status="validated",
+        )
+
+    def assess_rule_alert(self, *_):
+        self.events.append("post_alert_reasoning")
+        if self.error:
+            raise self.error
+        return self.assessment
+
+
+def quality_assessor(events):
+    def assess(raw):
+        events.append("assess_quality")
+        return DataQualityAssessment(
+            market=raw.market,
+            as_of_time=raw.as_of_time,
+            session_slot=raw.session_slot,
+            status=DataStatus.FRESH,
+            reliability_grade="A",
+            selected_points=raw.points,
+            core_fields=("index_price",),
+            optional_fields=(),
+            covered_core_fields=frozenset({"index_price"}) if raw.points else frozenset(),
+            covered_optional_fields=frozenset(),
+            core_coverage=1.0 if raw.points else 0.0,
+            optional_coverage=1.0,
+            source_count=1 if raw.points else 0,
+            core_source_count=1 if raw.points else 0,
+        )
+
+    return assess
+
+
+def reporter(events):
+    def write(result, _previous, root):
+        events.append("write_report")
+        path = Path(root) / "rule-report.md"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(result.decision.final_level.value, encoding="utf-8")
+        return path
+
+    return write
+
+
+class RuleMarketWarningServiceTests(TestCase):
+    def _service(self, events, directory, **changes):
+        repository = changes.pop("repository", Repository(events))
+        values = {
+            "data_port": DataPort(events),
+            "feature_strategy": FeatureStrategy(events),
+            "rule_evaluator": RuleEvaluator(events),
+            "repository": repository,
+            "quality_assessor": quality_assessor(events),
+            "history_loader": lambda _market, _time: (),
+            "report_root": Path(directory),
+            "reporter": reporter(events),
+            "notifier": Notifier(events),
+            "shadow_model": ShadowModel(events),
+            "post_alert_reasoning": PostAlertReasoning(events),
+            "monotonic_ns": iter((1_000_000, 9_500_000)).__next__,
+        }
+        values.update(changes)
+        return RuleMarketWarningService(**values), repository
+
+    def test_fast_path_persists_and_notifies_before_shadow_and_reasoning(self):
+        events = []
+        with tempfile.TemporaryDirectory() as directory:
+            service, repository = self._service(events, directory)
+
+            result = service.evaluate(Market.A_SHARE, NOW, "intraday-0935")
+
+        self.assertEqual(
+            events,
+            [
+                "load_data",
+                "assess_quality",
+                "build_features",
+                "save_snapshot",
+                "load_previous_rule",
+                "evaluate_rules",
+                "save_rule",
+                "load_previous",
+                "save_decision",
+                "write_report",
+                "notify",
+                "shadow_model",
+                "post_alert_reasoning",
+                "save_reasoning",
+                "attach_reasoning",
+            ],
+        )
+        self.assertEqual(result.decision.final_level, RiskLevel.ORANGE)
+        self.assertEqual(result.decision.decision_source, DecisionSource.RULE_V1)
+        self.assertEqual(result.rule_assessment.evaluation_latency_ms, 8.5)
+        self.assertIsNotNone(result.shadow_quant_assessment)
+        self.assertEqual(result.context_assessment.reasoning_status, "validated")
+        self.assertEqual(repository.saved_prediction_ids, ())
+        self.assertEqual(repository.saved_kwargs["rule_assessment_id"], 21)
+        self.assertEqual(repository.saved_reasoning[0], 11)
+        self.assertEqual(repository.attached_reasoning, (31, 41))
+
+    def test_explicit_fast_path_returns_before_optional_slow_work(self):
+        events = []
+        with tempfile.TemporaryDirectory() as directory:
+            service, _ = self._service(events, directory)
+
+            fast_result = service.evaluate_fast(Market.A_SHARE, NOW, "intraday-0935")
+
+            self.assertEqual(events[-1], "notify")
+            self.assertNotIn("shadow_model", events)
+            self.assertNotIn("post_alert_reasoning", events)
+            self.assertTrue(fast_result.notification_confirmed)
+
+            completed = service.complete_after_alert(fast_result)
+
+        self.assertIn("shadow_model", events)
+        self.assertIn("post_alert_reasoning", events)
+        self.assertIsNotNone(completed.context_assessment)
+
+    def test_partial_retry_reuses_the_immutable_persisted_snapshot(self):
+        events = []
+        persisted = FeatureSnapshot(
+            market=Market.A_SHARE,
+            as_of_time=NOW,
+            session_slot="intraday-0935",
+            feature_version="market-warning-v2",
+            features={"market_phase": "CONTINUATION", "persisted": True},
+            evidence=(),
+            data_quality=DataStatus.FRESH,
+            reliability_grade="A",
+            source_times={"persisted": NOW},
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            service, _ = self._service(
+                events,
+                directory,
+                repository=Repository(events, partial_snapshot=persisted),
+                data_port=DataPort(events, RuntimeError("live retry unavailable")),
+                shadow_model=None,
+                post_alert_reasoning=None,
+            )
+
+            result = service.evaluate(Market.A_SHARE, NOW, "intraday-0935")
+
+        self.assertEqual(result.feature_snapshot, persisted)
+        self.assertTrue(result.feature_snapshot.features["persisted"])
+        self.assertIsNone(result.error_class)
+
+    def test_intraday_yellow_is_silent_and_skips_all_slow_paths(self):
+        events = []
+        with tempfile.TemporaryDirectory() as directory:
+            service, _ = self._service(
+                events,
+                directory,
+                rule_evaluator=RuleEvaluator(events, RiskLevel.YELLOW),
+            )
+            result = service.evaluate(Market.A_SHARE, NOW, "intraday-0935")
+
+        self.assertEqual(result.decision.final_level, RiskLevel.YELLOW)
+        self.assertNotIn("notify", events)
+        self.assertNotIn("shadow_model", events)
+        self.assertNotIn("post_alert_reasoning", events)
+
+    def test_direct_red_is_pushed_on_the_first_valid_scan(self):
+        events = []
+        with tempfile.TemporaryDirectory() as directory:
+            service, _ = self._service(
+                events,
+                directory,
+                rule_evaluator=RuleEvaluator(events, RiskLevel.RED),
+                shadow_model=None,
+                post_alert_reasoning=None,
+            )
+            result = service.evaluate(Market.A_SHARE, NOW, "intraday-0935")
+
+        self.assertEqual(result.decision.state_transition, "INITIAL_RED")
+        self.assertTrue(result.decision.push_required)
+        self.assertIn("notify", events)
+
+    def test_data_rule_or_repository_failure_fails_closed_without_notification(self):
+        cases = {
+            "data": {"data_port": DataPort([], RuntimeError("data"))},
+            "rule": {"rule_evaluator": RuleEvaluator([], error=RuntimeError("rule"))},
+            "repository": {"repository": Repository([], fail_stage="save_rule")},
+        }
+        for name, changes in cases.items():
+            events = []
+            for value in changes.values():
+                if hasattr(value, "events"):
+                    value.events = events
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
+                service, _ = self._service(events, directory, **changes)
+                result = service.evaluate(Market.A_SHARE, NOW, "intraday-0935")
+
+            self.assertEqual(result.decision.final_level, RiskLevel.UNKNOWN)
+            self.assertNotIn("notify", events)
+
+    def test_shadow_and_post_alert_failures_never_change_persisted_decision(self):
+        events = []
+        with tempfile.TemporaryDirectory() as directory:
+            service, repository = self._service(
+                events,
+                directory,
+                shadow_model=ShadowModel(events, RuntimeError("shadow")),
+                post_alert_reasoning=PostAlertReasoning(events, RuntimeError("reasoning")),
+            )
+            result = service.evaluate(Market.A_SHARE, NOW, "intraday-0935")
+
+        self.assertEqual(repository.decision.final_level, RiskLevel.ORANGE)
+        self.assertEqual(result.decision, repository.decision)
+        self.assertIsNone(result.shadow_quant_assessment)
+        self.assertIn("shadow_model", events)
+        self.assertIn("post_alert_reasoning", events)
+
+    def test_notification_failure_prevents_m3_call(self):
+        events = []
+        with tempfile.TemporaryDirectory() as directory:
+            service, repository = self._service(
+                events,
+                directory,
+                notifier=Notifier(events, RuntimeError("send failed")),
+            )
+
+            result = service.evaluate(Market.A_SHARE, NOW, "intraday-0935")
+
+        self.assertEqual(result.error_class, "notifier_error")
+        self.assertNotIn("post_alert_reasoning", events)
+        self.assertEqual(result.decision, repository.decision)
+
+    def test_same_orange_level_does_not_notify_or_call_m3(self):
+        events = []
+        previous = FinalWarningDecision(
+            baseline_level=RiskLevel.ORANGE,
+            final_level=RiskLevel.ORANGE,
+            state_transition="INITIAL_ORANGE",
+            entry_gate="CONDITIONAL",
+            new_position_cap_pct=3.0,
+            holding_action="HOLD_OR_REDUCE",
+            push_required=True,
+            decision_reasons=("earlier alert",),
+            data_status=DataStatus.FRESH,
+            decision_source=DecisionSource.RULE_V1,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            service, _ = self._service(
+                events,
+                directory,
+                repository=Repository(events, previous=previous),
+            )
+
+            result = service.evaluate(Market.A_SHARE, NOW, "intraday-0945")
+
+        self.assertEqual(result.decision.final_level, RiskLevel.ORANGE)
+        self.assertFalse(result.decision.push_required)
+        self.assertNotIn("notify", events)
+        self.assertNotIn("post_alert_reasoning", events)
+
+    def test_existing_sent_alert_can_resume_missing_m3_context_once(self):
+        events = []
+        snapshot = FeatureStrategy(events).build(
+            DataPort(events).load_snapshot(Market.A_SHARE, NOW, "intraday-0935"),
+            (),
+        )
+        existing = RunnerResult(
+            market=Market.A_SHARE,
+            as_of_time=NOW,
+            session_slot="intraday-0935",
+            feature_snapshot=snapshot,
+            rule_assessment=rule_assessment(RiskLevel.ORANGE),
+            decision=FinalWarningDecision(
+                baseline_level=RiskLevel.ORANGE,
+                final_level=RiskLevel.ORANGE,
+                state_transition="INITIAL_ORANGE",
+                entry_gate="CONDITIONAL",
+                new_position_cap_pct=3.0,
+                holding_action="HOLD_OR_REDUCE",
+                push_required=True,
+                decision_reasons=("alert",),
+                data_status=DataStatus.FRESH,
+                decision_source=DecisionSource.RULE_V1,
+            ),
+            decision_id=31,
+        )
+        events.clear()
+        repository = Repository(events, existing=existing)
+        with tempfile.TemporaryDirectory() as directory:
+            service, _ = self._service(
+                events,
+                directory,
+                repository=repository,
+                notifier=AlreadySentNotifier(events),
+                shadow_model=None,
+            )
+
+            result = service.evaluate(Market.A_SHARE, NOW, "intraday-0935")
+
+        self.assertEqual(
+            events,
+            [
+                "load_previous",
+                "write_report",
+                "notify",
+                "check_sent",
+                "post_alert_reasoning",
+                "save_decision_reasoning",
+            ],
+        )
+        self.assertEqual(result.context_assessment.reasoning_status, "validated")
+
+    def test_next_premarket_report_reuses_latest_post_alert_context(self):
+        events = []
+        context = PostAlertReasoning(events).assessment
+        repository = Repository(events, latest_context=context)
+        with tempfile.TemporaryDirectory() as directory:
+            service, _ = self._service(
+                events,
+                directory,
+                repository=repository,
+                rule_evaluator=RuleEvaluator(events, RiskLevel.GREEN),
+                shadow_model=None,
+                post_alert_reasoning=None,
+            )
+
+            result = service.evaluate(Market.A_SHARE, NOW, "premarket")
+
+        self.assertEqual(result.context_assessment, context)
+        self.assertLess(events.index("load_latest_reasoning"), events.index("write_report"))
+        self.assertNotIn("post_alert_reasoning", events)
+
+
+if __name__ == "__main__":
+    main()

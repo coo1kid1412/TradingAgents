@@ -93,6 +93,51 @@ def _migrate_schema(conn: sqlite3.Connection) -> None:
     if "retained_risk_level" not in decision_cols:
         conn.execute("ALTER TABLE market_warning_decisions ADD COLUMN retained_risk_level TEXT")
         logger.info("Migrated: market_warning_decisions.retained_risk_level added")
+    if "decision_source" not in decision_cols:
+        conn.execute(
+            "ALTER TABLE market_warning_decisions "
+            "ADD COLUMN decision_source TEXT NOT NULL DEFAULT 'model'"
+        )
+        logger.info("Migrated: market_warning_decisions.decision_source added")
+    if "rule_assessment_id" not in decision_cols:
+        conn.execute("ALTER TABLE market_warning_decisions ADD COLUMN rule_assessment_id INTEGER")
+        logger.info("Migrated: market_warning_decisions.rule_assessment_id added")
+    if "shadow_prediction_ids_json" not in decision_cols:
+        conn.execute(
+            "ALTER TABLE market_warning_decisions "
+            "ADD COLUMN shadow_prediction_ids_json TEXT NOT NULL DEFAULT '[]'"
+        )
+        logger.info("Migrated: market_warning_decisions.shadow_prediction_ids_json added")
+
+    registry_cols = {
+        r[1] for r in conn.execute("PRAGMA table_info(market_warning_rule_registry)").fetchall()
+    }
+    if "notification_activated_at" not in registry_cols:
+        conn.execute(
+            "ALTER TABLE market_warning_rule_registry ADD COLUMN notification_activated_at TEXT"
+        )
+        logger.info("Migrated: market_warning_rule_registry.notification_activated_at added")
+    if "gate_activated_at" not in registry_cols:
+        conn.execute("ALTER TABLE market_warning_rule_registry ADD COLUMN gate_activated_at TEXT")
+        logger.info("Migrated: market_warning_rule_registry.gate_activated_at added")
+    conn.execute(
+        "UPDATE market_warning_rule_registry SET notification_activated_at = updated_at "
+        "WHERE notification_active = 1 AND notification_activated_at IS NULL"
+    )
+    conn.execute(
+        "UPDATE market_warning_rule_registry SET gate_activated_at = updated_at "
+        "WHERE gate_active = 1 AND gate_activated_at IS NULL"
+    )
+
+    alert_cols = {
+        r[1] for r in conn.execute("PRAGMA table_info(market_warning_alerts)").fetchall()
+    }
+    if "claimed_at" not in alert_cols:
+        conn.execute("ALTER TABLE market_warning_alerts ADD COLUMN claimed_at TEXT")
+        logger.info("Migrated: market_warning_alerts.claimed_at added")
+    if "claim_token" not in alert_cols:
+        conn.execute("ALTER TABLE market_warning_alerts ADD COLUMN claim_token TEXT")
+        logger.info("Migrated: market_warning_alerts.claim_token added")
 
 
 @contextmanager

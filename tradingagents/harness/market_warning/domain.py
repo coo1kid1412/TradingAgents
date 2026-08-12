@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import date, datetime
 from enum import Enum
 from math import isfinite
 from numbers import Real
@@ -36,6 +36,18 @@ class RiskLevel(str, Enum):
 class MarketPhase(str, Enum):
     FIRST_SHOCK = "FIRST_SHOCK"
     CONTINUATION = "CONTINUATION"
+
+
+class RuleLayer(str, Enum):
+    VULNERABILITY = "VULNERABILITY"
+    PRESSURE = "PRESSURE"
+    CONTINUATION = "CONTINUATION"
+    HARD_TRIGGER = "HARD_TRIGGER"
+
+
+class DecisionSource(str, Enum):
+    MODEL = "model"
+    RULE_V1 = "rule_v1"
 
 
 def _coerce_enum(value: Any, enum_type: type[Enum], field_name: str) -> Enum:
@@ -182,6 +194,84 @@ class QuantRiskAssessment:
 
 
 @dataclass(frozen=True)
+class TriggeredRule:
+    rule_id: str
+    layer: RuleLayer
+    severity_points: int
+    observed_value: Any
+    threshold_description: str
+    evidence_ids: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.rule_id, str) or not self.rule_id.strip():
+            raise ValueError("rule_id must not be empty")
+        object.__setattr__(self, "layer", _coerce_enum(self.layer, RuleLayer, "layer"))
+        if (
+            isinstance(self.severity_points, bool)
+            or not isinstance(self.severity_points, int)
+            or not 0 <= self.severity_points <= 2
+        ):
+            raise ValueError("severity_points must be an integer from 0 to 2")
+        if not isinstance(self.threshold_description, str) or not self.threshold_description.strip():
+            raise ValueError("threshold_description must not be empty")
+        evidence_ids = tuple(self.evidence_ids)
+        if not evidence_ids or any(not isinstance(item, str) or not item.strip() for item in evidence_ids):
+            raise ValueError("evidence_ids must contain non-empty strings")
+        if len(evidence_ids) != len(set(evidence_ids)):
+            raise ValueError("evidence_ids must be unique")
+        object.__setattr__(self, "evidence_ids", evidence_ids)
+
+
+@dataclass(frozen=True)
+class RuleRiskAssessment:
+    market: Market
+    as_of_time: datetime
+    engine_version: str
+    manifest_sha256: str
+    risk_level: RiskLevel
+    risk_score: float
+    market_phase: MarketPhase
+    triggered_rules: tuple[TriggeredRule, ...]
+    missing_optional_groups: tuple[str, ...]
+    reliability_grade: str
+    evaluation_latency_ms: float
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "market", _coerce_enum(self.market, Market, "market"))
+        object.__setattr__(self, "risk_level", _coerce_enum(self.risk_level, RiskLevel, "risk_level"))
+        object.__setattr__(self, "market_phase", _coerce_enum(self.market_phase, MarketPhase, "market_phase"))
+        _require_aware(self.as_of_time, "as_of_time")
+        if not isinstance(self.engine_version, str) or not self.engine_version.strip():
+            raise ValueError("engine_version must not be empty")
+        if not isinstance(self.manifest_sha256, str) or len(self.manifest_sha256) != 64:
+            raise ValueError("manifest_sha256 must be a 64-character digest")
+        if isinstance(self.risk_score, bool) or not isinstance(self.risk_score, Real):
+            raise ValueError("risk_score must be a finite number from 0 to 10")
+        numeric_score = float(self.risk_score)
+        if not isfinite(numeric_score) or not 0 <= numeric_score <= 10:
+            raise ValueError("risk_score must be a finite number from 0 to 10")
+        if isinstance(self.evaluation_latency_ms, bool) or not isinstance(self.evaluation_latency_ms, Real):
+            raise ValueError("evaluation_latency_ms must be a non-negative finite number")
+        numeric_latency = float(self.evaluation_latency_ms)
+        if not isfinite(numeric_latency) or numeric_latency < 0:
+            raise ValueError("evaluation_latency_ms must be a non-negative finite number")
+        triggered_rules = tuple(self.triggered_rules)
+        if any(not isinstance(item, TriggeredRule) for item in triggered_rules):
+            raise ValueError("triggered_rules must contain TriggeredRule values")
+        missing_groups = tuple(self.missing_optional_groups)
+        if any(not isinstance(item, str) or not item.strip() for item in missing_groups):
+            raise ValueError("missing_optional_groups must contain non-empty strings")
+        if len(missing_groups) != len(set(missing_groups)):
+            raise ValueError("missing_optional_groups must be unique")
+        if not isinstance(self.reliability_grade, str) or not self.reliability_grade.strip():
+            raise ValueError("reliability_grade must not be empty")
+        object.__setattr__(self, "risk_score", numeric_score)
+        object.__setattr__(self, "evaluation_latency_ms", numeric_latency)
+        object.__setattr__(self, "triggered_rules", triggered_rules)
+        object.__setattr__(self, "missing_optional_groups", missing_groups)
+
+
+@dataclass(frozen=True)
 class LLMContextAssessment:
     market_scenario: str
     causal_chain: tuple[str, ...]
@@ -224,11 +314,17 @@ class FinalWarningDecision:
     data_status: DataStatus
     valid_snapshot_count: int = 0
     retained_risk_level: RiskLevel | None = None
+    decision_source: DecisionSource = DecisionSource.MODEL
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "baseline_level", _coerce_enum(self.baseline_level, RiskLevel, "baseline_level"))
         object.__setattr__(self, "final_level", _coerce_enum(self.final_level, RiskLevel, "final_level"))
         object.__setattr__(self, "data_status", _coerce_enum(self.data_status, DataStatus, "data_status"))
+        object.__setattr__(
+            self,
+            "decision_source",
+            _coerce_enum(self.decision_source, DecisionSource, "decision_source"),
+        )
         _require_percentage(self.new_position_cap_pct, "new_position_cap_pct")
         if (
             isinstance(self.valid_snapshot_count, bool)
@@ -245,18 +341,46 @@ class FinalWarningDecision:
 
 
 @dataclass(frozen=True)
+class SessionRiskSummary:
+    trade_date: date
+    highest_level: RiskLevel
+    state_changes: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.trade_date, date) or isinstance(self.trade_date, datetime):
+            raise TypeError("trade_date must be a date")
+        object.__setattr__(
+            self,
+            "highest_level",
+            _coerce_enum(self.highest_level, RiskLevel, "highest_level"),
+        )
+        changes = tuple(self.state_changes)
+        if any(not isinstance(item, str) or not item.strip() for item in changes):
+            raise ValueError("state_changes must contain non-empty strings")
+        object.__setattr__(self, "state_changes", changes)
+
+
+@dataclass(frozen=True)
 class RunnerResult:
     market: Market
     as_of_time: datetime
     session_slot: str
     feature_snapshot: FeatureSnapshot | None = None
     quant_assessment: QuantRiskAssessment | None = None
+    rule_assessment: RuleRiskAssessment | None = None
+    shadow_quant_assessment: QuantRiskAssessment | None = None
     context_assessment: LLMContextAssessment | None = None
+    previous_decision: FinalWarningDecision | None = None
+    previous_session_summary: SessionRiskSummary | None = None
     decision: FinalWarningDecision | None = None
+    snapshot_id: int | None = None
     decision_id: int | None = None
     report_path: str | None = None
+    notification_confirmed: bool = False
     error_class: str | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "market", _coerce_enum(self.market, Market, "market"))
         _require_aware(self.as_of_time, "as_of_time")
+        if not isinstance(self.notification_confirmed, bool):
+            raise TypeError("notification_confirmed must be a bool")

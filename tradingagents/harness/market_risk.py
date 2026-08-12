@@ -210,20 +210,32 @@ def enforce_snapshot_freshness(
 
 
 def _warning_expected_time(now: _dt.datetime) -> _dt.datetime | None:
-    """Latest A-share five-minute checkpoint expected at ``now``."""
+    """Latest A-share rule-V1 checkpoint expected at ``now``."""
     current = now.time()
     if current < _dt.time(8, 30):
         return None
     if current < _dt.time(9, 35):
         return now.replace(hour=8, minute=30, second=0, microsecond=0)
     if current <= _dt.time(11, 25):
-        minute = (now.minute // 5) * 5
-        return now.replace(minute=minute, second=0, microsecond=0)
+        elapsed = (now.hour * 60 + now.minute) - (9 * 60 + 35)
+        checkpoint = 9 * 60 + 35 + max(0, elapsed // 10) * 10
+        return now.replace(
+            hour=checkpoint // 60,
+            minute=checkpoint % 60,
+            second=0,
+            microsecond=0,
+        )
     if current < _dt.time(13, 5):
         return now.replace(hour=11, minute=25, second=0, microsecond=0)
     if current <= _dt.time(14, 55):
-        minute = (now.minute // 5) * 5
-        return now.replace(minute=minute, second=0, microsecond=0)
+        elapsed = (now.hour * 60 + now.minute) - (13 * 60 + 5)
+        checkpoint = 13 * 60 + 5 + max(0, elapsed // 10) * 10
+        return now.replace(
+            hour=checkpoint // 60,
+            minute=checkpoint % 60,
+            second=0,
+            microsecond=0,
+        )
     return now.replace(hour=14, minute=55, second=0, microsecond=0)
 
 
@@ -275,7 +287,7 @@ def _enforce_warning_freshness(
     reasons = list(warning.get("reasons") or [])
     if stale_by_clock:
         reasons.append(
-            "市场预警快照陈旧：未达到当前应有的五分钟检查点；仅表示无法可靠判断"
+            "市场预警快照陈旧：未达到当前应有的十分钟检查点；仅表示无法可靠判断"
         )
     else:
         reasons.append(
@@ -283,7 +295,138 @@ def _enforce_warning_freshness(
         )
     result["reasons"] = reasons
     result["required_checkpoint"] = expected.strftime("%H:%M") if expected else None
+    if warning.get("decision_source") == "rule_v1":
+        result["gate_applicable"] = False
+        result["notification_only"] = True
     return result
+
+
+def _load_active_rule_warning(conn, market: str, cutoff_text: str) -> tuple[bool, dict[str, Any] | None]:
+    if market != "a_share":
+        return False, None
+    active_notify = conn.execute(
+        "SELECT engine_version, manifest_sha256 FROM market_warning_rule_registry "
+        "WHERE market = ? AND notification_active = 1 "
+        "ORDER BY updated_at DESC LIMIT 1",
+        (market,),
+    ).fetchone()
+    active_gate = conn.execute(
+        "SELECT engine_version, manifest_sha256 FROM market_warning_rule_registry "
+        "WHERE market = ? AND gate_active = 1 "
+        "ORDER BY updated_at DESC LIMIT 1",
+        (market,),
+    ).fetchone()
+    active = active_notify or active_gate
+    if active is None:
+        return False, None
+    row = conn.execute(
+        "SELECT d.baseline_level, d.final_level, d.transition, d.entry_gate, "
+        "d.new_position_cap_pct, d.holding_action, d.push_required, d.data_status, "
+        "d.reasons_json, s.market, s.as_of_time, s.session_slot, "
+        "r.reliability_grade, r.market_phase, r.engine_version, r.manifest_sha256, "
+        "r.risk_score "
+        "FROM market_warning_decisions AS d "
+        "INNER JOIN market_warning_feature_snapshots AS s ON s.id = d.feature_snapshot_id "
+        "INNER JOIN market_warning_rule_assessments AS r ON r.id = d.rule_assessment_id "
+        "WHERE d.decision_source = 'rule_v1' AND s.market = ? AND s.as_of_time <= ? "
+        "AND s.feature_version = 'market-warning-v2' "
+        "AND r.engine_version = ? AND r.manifest_sha256 = ? "
+        "ORDER BY s.as_of_time DESC, d.id DESC LIMIT 1",
+        (market, cutoff_text, active["engine_version"], active["manifest_sha256"]),
+    ).fetchone()
+    if row is None:
+        return True, None
+    gate_matches = (
+        active_gate is not None
+        and active_gate["engine_version"] == row["engine_version"]
+        and active_gate["manifest_sha256"] == row["manifest_sha256"]
+    )
+    reliable = row["reliability_grade"] in {"A", "B"}
+    fresh = row["data_status"] == "fresh"
+    defensive_level = row["final_level"] in {"ORANGE", "RED"}
+    gate_applicable = bool(gate_matches and reliable and fresh and defensive_level)
+    return True, {
+        "market": row["market"],
+        "as_of_time": row["as_of_time"],
+        "session_slot": row["session_slot"],
+        "warning_level": row["final_level"],
+        "baseline_level": row["baseline_level"],
+        "entry_gate": row["entry_gate"],
+        "position_cap_pct": row["new_position_cap_pct"],
+        "holding_action": row["holding_action"],
+        "transition": row["transition"],
+        "push_required": bool(row["push_required"]),
+        "data_status": row["data_status"],
+        "reliability_grade": row["reliability_grade"],
+        "phase": row["market_phase"],
+        "probabilities": None,
+        "base_rates": None,
+        "decision_source": "rule_v1",
+        "engine_version": row["engine_version"],
+        "manifest_sha256": row["manifest_sha256"],
+        "rule_score": row["risk_score"],
+        "notification_only": not gate_applicable,
+        "gate_applicable": gate_applicable,
+        "reasons": list(json.loads(row["reasons_json"])),
+    }
+
+
+def _load_active_model_warning(conn, market: str, cutoff_text: str) -> dict[str, Any] | None:
+    rows = conn.execute(
+        """SELECT d.baseline_level, d.final_level, d.transition, d.entry_gate,
+                  d.new_position_cap_pct, d.holding_action, d.push_required,
+                  d.data_status, d.reasons_json, d.model_version,
+                  s.market, s.as_of_time, s.session_slot, s.reliability_grade,
+                  p.horizon, p.probability, p.base_rate, p.market_phase,
+                  p.calibration_version
+           FROM market_warning_decisions AS d
+           JOIN market_warning_feature_snapshots AS s ON s.id = d.feature_snapshot_id
+           JOIN market_warning_predictions AS p ON p.feature_snapshot_id = s.id
+           WHERE d.id = (
+               SELECT d2.id
+               FROM market_warning_decisions AS d2
+               JOIN market_warning_feature_snapshots AS s2 ON s2.id = d2.feature_snapshot_id
+               WHERE d2.decision_source = 'model' AND s2.market = ? AND s2.as_of_time <= ?
+                 AND 4 = (
+                     SELECT COUNT(*)
+                     FROM market_warning_model_registry AS r
+                     WHERE r.model_version = d2.model_version
+                       AND r.feature_version = s2.feature_version
+                       AND r.active = 1
+                       AND r.market IN ('a_share', 'us')
+                       AND r.horizon IN ('1d', '3d')
+                 )
+               ORDER BY s2.as_of_time DESC, d2.id DESC LIMIT 1
+           )
+           ORDER BY p.horizon""",
+        (market, cutoff_text),
+    ).fetchall()
+    if len(rows) != 2 or {row["horizon"] for row in rows} != {"1d", "3d"}:
+        return None
+    first = rows[0]
+    return {
+        "market": first["market"],
+        "as_of_time": first["as_of_time"],
+        "session_slot": first["session_slot"],
+        "warning_level": first["final_level"],
+        "baseline_level": first["baseline_level"],
+        "entry_gate": first["entry_gate"],
+        "position_cap_pct": first["new_position_cap_pct"],
+        "holding_action": first["holding_action"],
+        "transition": first["transition"],
+        "push_required": bool(first["push_required"]),
+        "data_status": first["data_status"],
+        "reliability_grade": first["reliability_grade"],
+        "phase": first["market_phase"],
+        "probabilities": {row["horizon"]: row["probability"] for row in rows},
+        "base_rates": {row["horizon"]: row["base_rate"] for row in rows},
+        "decision_source": "model",
+        "model_version": first["model_version"],
+        "calibration_version": first["calibration_version"],
+        "notification_only": False,
+        "gate_applicable": True,
+        "reasons": list(json.loads(first["reasons_json"])),
+    }
 
 
 def load_market_warning_for_ticker(
@@ -292,7 +435,7 @@ def load_market_warning_for_ticker(
     db_path=None,
     analysis_time: str | None = None,
 ) -> dict[str, Any] | None:
-    """Load the latest typed warning and its two calibrated probabilities."""
+    """Load the active model or rule warning without mixing their semantics."""
     market = infer_market(ticker)
     if market not in {"a_share", "us"}:
         return None
@@ -309,60 +452,11 @@ def load_market_warning_for_ticker(
         )
     cutoff_text = cutoff.astimezone(_dt.timezone.utc).isoformat()
     with _db.connect(db_path) as conn:
-        rows = conn.execute(
-            """SELECT d.baseline_level, d.final_level, d.transition, d.entry_gate,
-                      d.new_position_cap_pct, d.holding_action, d.push_required,
-                      d.data_status, d.reasons_json, d.model_version,
-                      s.market, s.as_of_time, s.session_slot, s.reliability_grade,
-                      p.horizon, p.probability, p.base_rate, p.market_phase,
-                      p.calibration_version
-               FROM market_warning_decisions AS d
-               JOIN market_warning_feature_snapshots AS s ON s.id = d.feature_snapshot_id
-               JOIN market_warning_predictions AS p ON p.feature_snapshot_id = s.id
-               WHERE d.id = (
-                   SELECT d2.id
-                   FROM market_warning_decisions AS d2
-                   JOIN market_warning_feature_snapshots AS s2 ON s2.id = d2.feature_snapshot_id
-                   WHERE s2.market = ? AND s2.as_of_time <= ?
-                     AND 4 = (
-                         SELECT COUNT(*)
-                         FROM market_warning_model_registry AS r
-                         WHERE r.model_version = d2.model_version
-                           AND r.feature_version = s2.feature_version
-                           AND r.active = 1
-                           AND r.market IN ('a_share', 'us')
-                           AND r.horizon IN ('1d', '3d')
-                     )
-                   ORDER BY s2.as_of_time DESC, d2.id DESC LIMIT 1
-               )
-               ORDER BY p.horizon""",
-            (market, cutoff_text),
-        ).fetchall()
-    if len(rows) != 2 or {row["horizon"] for row in rows} != {"1d", "3d"}:
+        rule_active, warning = _load_active_rule_warning(conn, market, cutoff_text)
+        if not rule_active:
+            warning = _load_active_model_warning(conn, market, cutoff_text)
+    if warning is None:
         return None
-    first = rows[0]
-    probabilities = {row["horizon"]: row["probability"] for row in rows}
-    base_rates = {row["horizon"]: row["base_rate"] for row in rows}
-    warning = {
-        "market": first["market"],
-        "as_of_time": first["as_of_time"],
-        "session_slot": first["session_slot"],
-        "warning_level": first["final_level"],
-        "baseline_level": first["baseline_level"],
-        "entry_gate": first["entry_gate"],
-        "position_cap_pct": first["new_position_cap_pct"],
-        "holding_action": first["holding_action"],
-        "transition": first["transition"],
-        "push_required": bool(first["push_required"]),
-        "data_status": first["data_status"],
-        "reliability_grade": first["reliability_grade"],
-        "phase": first["market_phase"],
-        "probabilities": probabilities,
-        "base_rates": base_rates,
-        "model_version": first["model_version"],
-        "calibration_version": first["calibration_version"],
-        "reasons": list(json.loads(first["reasons_json"])),
-    }
     return _enforce_warning_freshness(warning, trade_date, analysis_time)
 
 
@@ -392,9 +486,12 @@ def compose_effective_market_gate(
         legacy_cap = 0.0
     result["effective_gate_source"] = "legacy_market_risk" if legacy else "none"
 
-    production_warning = bool(warning) and not (
-        market == "us" and warning.get("data_status") == "shadow"
-    )
+    if warning.get("decision_source") == "rule_v1":
+        production_warning = bool(warning.get("gate_applicable"))
+    else:
+        production_warning = bool(warning) and not (
+            market == "us" and warning.get("data_status") == "shadow"
+        )
     if production_warning:
         warning_gate = str(warning.get("entry_gate") or "WAIT").upper()
         if warning_gate not in _GATE_SEVERITY:

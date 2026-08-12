@@ -17,6 +17,7 @@ from tradingagents.harness.market_warning.domain import (
     MarketPhase,
     QuantRiskAssessment,
     RiskLevel,
+    RuleRiskAssessment,
 )
 from tradingagents.harness.market_warning.policy import (
     POLICY_VERSION,
@@ -24,6 +25,7 @@ from tradingagents.harness.market_warning.policy import (
     baseline_level,
     build_final_decision,
     transition,
+    build_rule_decision,
 )
 
 
@@ -72,6 +74,22 @@ def make_context(*, recommended=RiskLevel.YELLOW, confidence=0.80, supporting=("
         confidence=confidence,
         action_reason="Escalate only when evidence is valid.",
         reasoning_status=status,
+    )
+
+
+def make_rule(level: RiskLevel) -> RuleRiskAssessment:
+    return RuleRiskAssessment(
+        market=Market.A_SHARE,
+        as_of_time=AS_OF,
+        engine_version="rule-v1.0.0",
+        manifest_sha256="a" * 64,
+        risk_level=level,
+        risk_score=4.0,
+        market_phase="FIRST_SHOCK",
+        triggered_rules=(),
+        missing_optional_groups=(),
+        reliability_grade="A",
+        evaluation_latency_ms=1.0,
     )
 
 
@@ -369,6 +387,28 @@ class StateMachineTests(TestCase):
 
 
 class FinalDecisionTests(TestCase):
+    def test_rule_decision_uses_rule_source_and_existing_recovery_hysteresis(self):
+        previous = build_rule_decision(
+            make_rule(RiskLevel.RED),
+            make_snapshot(),
+            previous=None,
+        )
+        pending = build_rule_decision(
+            make_rule(RiskLevel.GREEN),
+            make_snapshot(),
+            previous=previous,
+        )
+        recovered = build_rule_decision(
+            make_rule(RiskLevel.GREEN),
+            make_snapshot(),
+            previous=pending,
+        )
+
+        self.assertEqual(previous.decision_source.value, "rule_v1")
+        self.assertEqual(pending.final_level, RiskLevel.RED)
+        self.assertEqual(pending.state_transition, "RECOVERY_PENDING")
+        self.assertEqual(recovered.final_level, RiskLevel.GREEN)
+
     def test_unusable_snapshot_forces_unknown_wait_even_with_green_inputs(self):
         for status in (DataStatus.CONFLICTED, DataStatus.STALE, DataStatus.INSUFFICIENT):
             with self.subTest(status=status):

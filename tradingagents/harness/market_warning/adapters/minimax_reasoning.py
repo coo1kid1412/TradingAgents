@@ -17,12 +17,15 @@ from ..domain import (
     LLMContextAssessment,
     QuantRiskAssessment,
     RiskLevel,
+    RunnerResult,
 )
 from ..reasoning import (
     CircuitBreaker,
     ReasoningValidationError,
     build_reasoning_prompt,
+    build_rule_reasoning_prompt,
     validate_context_assessment,
+    validate_rule_context_assessment,
 )
 from ..policy import baseline_level
 
@@ -44,6 +47,12 @@ _REPAIR_SCHEMA = {
     "confidence": "number 0..1",
     "action_reason": "non-empty string",
     "reasoning_status": "validated",
+}
+_RULE_REPAIR_SCHEMA = {
+    "market_scenario": "non-empty string",
+    "causal_chain": ["one or more non-empty strings"],
+    "conflicting_evidence_ids": ["zero or more valid evidence IDs"],
+    "overlooked_risks": ["zero or more strings"],
 }
 
 
@@ -126,6 +135,9 @@ class UnavailableReasoningAdapter:
     def assess(self, snapshot, quant, previous) -> LLMContextAssessment:
         return _fallback(self.error_class)
 
+    def assess_rule_alert(self, result, previous) -> LLMContextAssessment:
+        return _fallback(self.error_class)
+
 
 def _repair_prompt(
     original_prompt: str,
@@ -151,6 +163,30 @@ def _repair_prompt(
     )
 
 
+def _rule_repair_prompt(
+    original_prompt: str,
+    error_class: str,
+    valid_evidence_ids: tuple[str, ...],
+) -> str:
+    context = json.loads(original_prompt)
+    context["repair_request"] = {
+        "task": "Retry once with explanation fields only.",
+        "error_class": error_class,
+        "valid_evidence_ids": list(valid_evidence_ids),
+        "output_schema": _RULE_REPAIR_SCHEMA,
+        "constraints": [
+            "Do not return a level, trade action, position cap, markdown, or private reasoning.",
+            "Return one corrected JSON object only.",
+        ],
+    }
+    return json.dumps(
+        context,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ": "),
+    )
+
+
 class MiniMaxReasoningAdapter:
     """ReasoningPort implementation with one repair and a circuit breaker."""
 
@@ -161,8 +197,12 @@ class MiniMaxReasoningAdapter:
         timeout: float = 90,
         breaker: CircuitBreaker | None = None,
     ) -> None:
-        if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or timeout <= 0:
-            raise ValueError("timeout must be positive")
+        if (
+            isinstance(timeout, bool)
+            or not isinstance(timeout, (int, float))
+            or not 0 < timeout <= 90
+        ):
+            raise ValueError("timeout must be between 0 and 90 seconds")
         self.llm = llm
         self.model_name = model_name
         self.timeout = float(timeout)
@@ -174,7 +214,7 @@ class MiniMaxReasoningAdapter:
     def from_environment(
         cls, breaker: CircuitBreaker | None = None
     ) -> "MiniMaxReasoningAdapter":
-        timeout = _env_int("MARKET_WARNING_LLM_TIMEOUT", 90, 1, 600)
+        timeout = _env_int("MARKET_WARNING_LLM_TIMEOUT", 90, 1, 90)
         max_tokens = _env_int("MARKET_WARNING_LLM_MAX_TOKENS", 4096, 256, 65536)
         base_url = os.environ.get("MINIMAX_BASE_URL") or None
         client = create_llm_client(
@@ -233,10 +273,70 @@ class MiniMaxReasoningAdapter:
         self.breaker.record_failure()
         return _fallback(first_error or "reasoning_unavailable")
 
-    def _invoke(self, prompt: str) -> Any:
-        llm = (
-            self.llm
-            if isinstance(self.llm, WallClockTimeoutLLM)
-            else WallClockTimeoutLLM(self.llm, timeout=self.timeout, max_retries=0)
-        )
+    def assess_rule_alert(
+        self,
+        result: RunnerResult,
+        previous: FinalWarningDecision | None,
+    ) -> LLMContextAssessment:
+        if not self.breaker.allow_call():
+            return _fallback("circuit_open")
+        try:
+            prompt = build_rule_reasoning_prompt(result, previous)
+            prompt_context = json.loads(prompt)
+            valid_ids = tuple(
+                str(item["evidence_id"])
+                for item in prompt_context.get("evidence", ())
+                if isinstance(item, Mapping) and item.get("evidence_id")
+            )
+            supporting_ids = tuple(
+                dict.fromkeys(
+                    str(evidence_id)
+                    for rule in prompt_context.get("triggered_rules", ())
+                    if isinstance(rule, Mapping)
+                    for evidence_id in rule.get("evidence_ids", ())
+                    if evidence_id in valid_ids
+                )
+            )
+            decision = result.decision
+            if decision is None:
+                raise ReasoningValidationError("prompt_error")
+        except Exception:
+            self.breaker.record_failure()
+            return _fallback("prompt_error")
+
+        first_error: str | None = None
+        request = prompt
+        attempt_timeout = self.timeout / 2.0
+        for attempt in range(2):
+            try:
+                response = self._invoke(request, timeout=attempt_timeout)
+                payload = _json_payload(_response_text(response))
+                assessment = validate_rule_context_assessment(
+                    payload,
+                    valid_ids,
+                    supporting_ids,
+                    decision.final_level,
+                )
+                self.breaker.record_success()
+                return assessment
+            except Exception as error:
+                error_class = _coarse_exception(error)
+                if first_error is None or error_class == "content_blocked":
+                    first_error = error_class
+                if attempt == 0:
+                    request = _rule_repair_prompt(prompt, error_class, valid_ids)
+
+        self.breaker.record_failure()
+        return _fallback(first_error or "reasoning_unavailable")
+
+    def _invoke(self, prompt: str, *, timeout: float | None = None) -> Any:
+        if timeout is None and isinstance(self.llm, WallClockTimeoutLLM):
+            llm = self.llm
+        else:
+            raw_llm = self.llm._llm if isinstance(self.llm, WallClockTimeoutLLM) else self.llm
+            llm = WallClockTimeoutLLM(
+                raw_llm,
+                timeout=self.timeout if timeout is None else timeout,
+                max_retries=0,
+            )
         return llm.invoke(prompt, config=_NO_RAW_LOG_CONFIG)

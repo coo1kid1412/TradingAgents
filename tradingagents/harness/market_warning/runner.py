@@ -1,11 +1,15 @@
-"""Exchange-aware five-minute runner for dual-market crash warnings."""
+"""Exchange-aware runner for scheduled dual-market crash warnings."""
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import re
+import uuid
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta, timezone
+from functools import partial
 from pathlib import Path
 from typing import Callable, Iterable, Sequence
 from zoneinfo import ZoneInfo
@@ -13,7 +17,7 @@ from zoneinfo import ZoneInfo
 import exchange_calendars as xcals
 import pandas as pd
 
-from .domain import Market
+from .domain import Market, RunnerResult
 
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[3]
@@ -22,6 +26,7 @@ _MARKET_ZONES = {
     Market.US: ZoneInfo("America/New_York"),
 }
 _CALENDAR_NAMES = {Market.A_SHARE: "XSHG", Market.US: "XNYS"}
+_MARKET_NAMES = {Market.A_SHARE: "A股", Market.US: "美股"}
 
 
 @dataclass(frozen=True)
@@ -40,8 +45,10 @@ def _calendar_row(market: Market, local_date: date):
     return calendar.schedule.loc[label]
 
 
-def _on_five_minute_grid(value: datetime) -> bool:
-    return value.minute % 5 == 0
+def _on_ten_minute_grid(value: datetime, start: time) -> bool:
+    current_minutes = value.hour * 60 + value.minute
+    start_minutes = start.hour * 60 + start.minute
+    return current_minutes >= start_minutes and (current_minutes - start_minutes) % 10 == 0
 
 
 def _slot_for_market(market: Market, now: datetime) -> EvaluationSlot | None:
@@ -50,23 +57,20 @@ def _slot_for_market(market: Market, now: datetime) -> EvaluationSlot | None:
     row = _calendar_row(market, local.date())
     if row is None:
         return None
-    if local.time() in {time(8, 30), time(8, 35)}:
+    if local.time() == time(8, 30):
         return EvaluationSlot(market, local, "premarket", local.date())
-    if not _on_five_minute_grid(local):
+    if market == Market.US:
         return None
 
-    if market == Market.A_SHARE:
-        in_morning = time(9, 35) <= local.time() <= time(11, 25)
-        in_afternoon = time(13, 5) <= local.time() <= time(14, 55)
-        if not (in_morning or in_afternoon):
-            return None
-    else:
-        opened = pd.Timestamp(row["open"]).to_pydatetime().astimezone(zone)
-        closed = pd.Timestamp(row["close"]).to_pydatetime().astimezone(zone)
-        if not opened + timedelta(minutes=5) <= local <= closed - timedelta(minutes=5):
-            return None
-        if int((local - opened).total_seconds()) % 300 != 0:
-            return None
+    in_morning = time(9, 35) <= local.time() <= time(11, 25)
+    in_afternoon = time(13, 5) <= local.time() <= time(14, 55)
+    on_grid = (
+        in_morning and _on_ten_minute_grid(local, time(9, 35))
+    ) or (
+        in_afternoon and _on_ten_minute_grid(local, time(13, 5))
+    )
+    if not on_grid:
+        return None
     return EvaluationSlot(
         market=market,
         as_of_time=local,
@@ -80,7 +84,7 @@ def due_evaluations(
     *,
     markets: Iterable[Market] = (Market.A_SHARE, Market.US),
 ) -> tuple[EvaluationSlot, ...]:
-    """Return only evaluations due in the current five-minute exchange bucket."""
+    """Return only evaluations due on the configured exchange-local schedule."""
 
     if not isinstance(now, datetime) or now.tzinfo is None or now.utcoffset() is None:
         raise ValueError("now must be timezone-aware")
@@ -92,6 +96,128 @@ def due_evaluations(
     return tuple(result)
 
 
+def _error_class(error: Exception) -> str:
+    name = re.sub(r"(?<!^)(?=[A-Z])", "_", error.__class__.__name__).lower()
+    return name.removesuffix("_error") + "_error"
+
+
+class FastScanCoordinator:
+    """Serialize one market's scans and persist operational outcomes."""
+
+    def __init__(
+        self,
+        repository,
+        *,
+        mode: str,
+        owner_id: str | None = None,
+        lease_duration: timedelta = timedelta(minutes=12),
+        failure_threshold: int = 3,
+        clock: Callable[[], datetime] | None = None,
+        alert_sender: Callable[[str], None] | None = None,
+    ) -> None:
+        self.repository = repository
+        self.mode = mode
+        self.owner_id = owner_id or uuid.uuid4().hex
+        self.lease_duration = lease_duration
+        self.failure_threshold = failure_threshold
+        self.clock = clock or (lambda: datetime.now(timezone.utc))
+        self.alert_sender = alert_sender
+
+    def execute(self, slot: EvaluationSlot, callback: Callable[[], object]) -> object:
+        lease_key = f"market_warning_fast_scan:{slot.market.value}"
+        started_at = self.clock()
+        if not self.repository.acquire_lease(
+            lease_key,
+            self.owner_id,
+            started_at,
+            self.lease_duration,
+        ):
+            result = RunnerResult(
+                market=slot.market,
+                as_of_time=slot.as_of_time,
+                session_slot=slot.session_slot,
+                error_class="overlap_skipped",
+            )
+            self._record(slot, started_at, self.clock(), result, overlap_skipped=True)
+            return result
+
+        try:
+            try:
+                result = callback()
+            except Exception as error:
+                result = RunnerResult(
+                    market=slot.market,
+                    as_of_time=slot.as_of_time,
+                    session_slot=slot.session_slot,
+                    error_class=_error_class(error),
+                )
+            finished_at = self.clock()
+            self._record(slot, started_at, finished_at, result, overlap_skipped=False)
+            return result
+        finally:
+            self.repository.release_lease(lease_key, self.owner_id)
+
+    def _record(
+        self,
+        slot: EvaluationSlot,
+        started_at: datetime,
+        finished_at: datetime,
+        result: object,
+        *,
+        overlap_skipped: bool,
+    ) -> None:
+        error_class = getattr(result, "error_class", None)
+        succeeded = error_class is None
+        self.repository.record_run(
+            market=slot.market,
+            as_of_time=slot.as_of_time,
+            session_slot=slot.session_slot,
+            mode=self.mode,
+            started_at=started_at,
+            finished_at=finished_at,
+            status="success" if succeeded else ("overlap_skipped" if overlap_skipped else "failed"),
+            error_class=error_class,
+            overlap_skipped=overlap_skipped,
+            llm_calls=0,
+        )
+        streak = self.repository.record_schedule_outcome(
+            slot.market,
+            self.mode,
+            slot.as_of_time,
+            succeeded=succeeded,
+            failure_threshold=self.failure_threshold,
+        )
+        if streak["alert_due"]:
+            self._send_system_alert(slot, streak)
+
+    def _send_system_alert(self, slot: EvaluationSlot, streak: dict[str, object]) -> None:
+        incident = str(streak["incident_started_at"])
+        key = f"market-warning-system|{slot.market.value}|{self.mode}|{incident}"
+        message = "\n".join(
+            (
+                "【预警系统数据故障】",
+                f"{_MARKET_NAMES.get(slot.market, slot.market.value)}预警已连续 "
+                f"{streak['consecutive_failures']} 个应执行时点未完成有效扫描。",
+                f"最近时点：{slot.as_of_time.isoformat(timespec='minutes')}",
+                "这是预警系统运行或数据故障，不代表市场红灯。",
+            )
+        )
+        digest = hashlib.sha256(message.encode("utf-8")).hexdigest()
+        if not self.repository.claim_system_alert(key, digest, retry_failed=True):
+            return
+        try:
+            sender = self.alert_sender
+            if sender is None:
+                from tradingagents.harness.market_risk_daily import _send_feishu_message
+
+                sender = _send_feishu_message
+            sender(message)
+        except Exception:
+            self.repository.finish_system_alert(key, "failed", "send_error")
+            return
+        self.repository.finish_system_alert(key, "sent")
+
+
 def run_due_evaluations(
     now: datetime,
     *,
@@ -99,6 +225,7 @@ def run_due_evaluations(
     markets: Iterable[Market] = (Market.A_SHARE, Market.US),
     dry_run: bool = False,
     force: bool = False,
+    coordinator_factory: Callable[[EvaluationSlot], FastScanCoordinator] | None = None,
 ) -> tuple[object, ...]:
     slots = due_evaluations(now, markets=markets)
     if dry_run:
@@ -106,7 +233,20 @@ def run_due_evaluations(
     results = []
     for slot in slots:
         service = service_factory(slot, force)
-        results.append(service.evaluate(slot.market, slot.as_of_time, slot.session_slot))
+        evaluate_fast = getattr(service, "evaluate_fast", None)
+        complete_after_alert = getattr(service, "complete_after_alert", None)
+        split_path = callable(evaluate_fast) and callable(complete_after_alert)
+        evaluator = evaluate_fast if split_path else service.evaluate
+        callback = lambda evaluator=evaluator, slot=slot: evaluator(
+            slot.market, slot.as_of_time, slot.session_slot
+        )
+        if coordinator_factory is None:
+            result = callback()
+        else:
+            result = coordinator_factory(slot).execute(slot, callback)
+        if split_path:
+            result = complete_after_alert(result)
+        results.append(result)
     return tuple(results)
 
 
@@ -176,7 +316,21 @@ def _load_environment() -> None:
         return
 
 
-def _default_service_factory(slot: EvaluationSlot, force: bool):
+def _resolve_mode(repository, requested_mode: str | None, market: Market) -> str:
+    if market == Market.US:
+        return "model"
+    if requested_mode is not None:
+        return requested_mode
+    active = repository.load_active_rule_engine(market, "notify")
+    return "rule_v1" if active is not None else "model"
+
+
+def _default_service_factory(
+    slot: EvaluationSlot,
+    force: bool,
+    *,
+    requested_mode: str | None = None,
+):
     """Compose production adapters lazily so calendar-only dry runs stay offline."""
 
     _load_environment()
@@ -227,6 +381,50 @@ def _default_service_factory(slot: EvaluationSlot, force: bool):
             previous_session,
         )
 
+    mode = _resolve_mode(repository, requested_mode, slot.market)
+    if mode == "rule_v1":
+        if slot.market != Market.A_SHARE:
+            raise ValueError("rule_v1 is only available for A shares")
+        from tradingagents.harness.market_warning.adapters.tushare_realtime_breadth import (
+            build_premarket_baseline,
+            load_realtime_cross_section,
+        )
+        from tradingagents.harness.market_warning.rule_policy import (
+            evaluate_a_share_rules,
+            load_rule_manifest,
+        )
+        from tradingagents.harness.market_warning.rule_service import RuleMarketWarningService
+
+        manifest = load_rule_manifest(Path(__file__).with_name("rule_manifest_v1.json"))
+        cross_section_loader = None
+        if "intraday" in slot.session_slot.lower():
+            baseline = build_premarket_baseline(
+                pro,
+                trade_date=slot.local_trade_date,
+                previous_session=previous_session,
+                cache_root=_PROJECT_ROOT / "harness_data/market_warning/baselines",
+            )
+            cross_section_loader = partial(load_realtime_cross_section, pro, baseline)
+        data_port = _SessionDataPort(
+            daily,
+            RealtimeAShareDataAdapter(
+                pro=pro,
+                cross_section_loader=cross_section_loader,
+            ),
+        )
+        return RuleMarketWarningService(
+            data_port=data_port,
+            feature_strategy=AShareFeatureStrategy(),
+            rule_evaluator=partial(evaluate_a_share_rules, manifest=manifest),
+            repository=repository,
+            notifier=FeishuNotifier(repository, retry_failed=force),
+            post_alert_reasoning=_reasoning_adapter(repository),
+            report_root=_PROJECT_ROOT / "reports/market_warning",
+            history_loader=load_history,
+            engine_version=manifest.engine_version,
+            manifest_sha256=manifest.manifest_sha256,
+        )
+
     reasoning = _reasoning_adapter(repository)
     return MarketWarningService(
         data_port=data_port,
@@ -240,6 +438,20 @@ def _default_service_factory(slot: EvaluationSlot, force: bool):
         notifier=FeishuNotifier(repository, retry_failed=force),
         report_root=_PROJECT_ROOT / "reports/market_warning",
         history_loader=load_history,
+    )
+
+
+def _default_coordinator_factory(
+    slot: EvaluationSlot,
+    *,
+    requested_mode: str | None = None,
+) -> FastScanCoordinator:
+    from tradingagents.harness.market_warning.adapters.sqlite_repository import SQLiteWarningRepository
+
+    repository = SQLiteWarningRepository()
+    return FastScanCoordinator(
+        repository,
+        mode=_resolve_mode(repository, requested_mode, slot.market),
     )
 
 
@@ -263,6 +475,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Run due dual-market crash warnings.")
     parser.add_argument("--market", choices=("all", "a_share", "us"), default="all")
     parser.add_argument("--at", help="Timezone-aware ISO evaluation time")
+    parser.add_argument("--mode", choices=("model", "rule_v1"))
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--force", action="store_true", help="Retry a matching failed alert")
     args = parser.parse_args(argv)
@@ -270,10 +483,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         now = _parse_time(args.at)
         results = run_due_evaluations(
             now,
-            service_factory=_default_service_factory,
+            service_factory=partial(
+                _default_service_factory,
+                requested_mode=args.mode,
+            ),
             markets=_markets(args.market),
             dry_run=args.dry_run,
             force=args.force,
+            coordinator_factory=partial(
+                _default_coordinator_factory,
+                requested_mode=args.mode,
+            ),
         )
     except (ValueError, RuntimeError) as error:
         parser.error(str(error))

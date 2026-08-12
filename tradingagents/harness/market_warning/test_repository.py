@@ -8,21 +8,27 @@ import sqlite3
 import sys
 import tempfile
 from contextlib import closing, contextmanager
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 from unittest import TestCase, main
+from zoneinfo import ZoneInfo
 
 # Keep the brief's direct-script command rooted at this worktree.
 sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 
 from tradingagents.harness import db as _db
 from tradingagents.harness.market_warning.domain import (
+    DecisionSource,
     Evidence,
     FeatureSnapshot,
     FinalWarningDecision,
     LLMContextAssessment,
     Market,
     QuantRiskAssessment,
+    RiskLevel,
+    RuleRiskAssessment,
+    SessionRiskSummary,
+    TriggeredRule,
 )
 from tradingagents.harness.market_warning.adapters.sqlite_repository import (
     SQLiteCircuitBreaker,
@@ -116,6 +122,33 @@ def make_decision(**changes) -> FinalWarningDecision:
     return FinalWarningDecision(**values)
 
 
+def make_rule_assessment(**changes) -> RuleRiskAssessment:
+    values = {
+        "market": Market.A_SHARE,
+        "as_of_time": AS_OF,
+        "engine_version": "rule-v1.0.0",
+        "manifest_sha256": "a" * 64,
+        "risk_level": "ORANGE",
+        "risk_score": 4.0,
+        "market_phase": "FIRST_SHOCK",
+        "triggered_rules": (
+            TriggeredRule(
+                rule_id="pressure.volatility_acceleration",
+                layer="PRESSURE",
+                severity_points=2,
+                observed_value=1.6,
+                threshold_description=">= 1.50",
+                evidence_ids=("breadth-1",),
+            ),
+        ),
+        "missing_optional_groups": ("margin",),
+        "reliability_grade": "B",
+        "evaluation_latency_ms": 7.5,
+    }
+    values.update(changes)
+    return RuleRiskAssessment(**values)
+
+
 def save_complete_decision(
     repository: SQLiteWarningRepository, snapshot: FeatureSnapshot | None = None
 ) -> tuple[int, tuple[int, int]]:
@@ -175,7 +208,7 @@ class SQLiteWarningRepositoryTests(TestCase):
                 opened[0].close()
                 self.fail("init_db left its schema connection open")
 
-    def test_connect_initializes_all_six_warning_tables(self):
+    def test_connect_initializes_warning_tables_and_rule_decision_columns(self):
         with temporary_database() as db_path:
             with _db.connect(db_path) as connection:
                 tables = {
@@ -202,12 +235,21 @@ class SQLiteWarningRepositoryTests(TestCase):
                 "market_warning_decisions",
                 "market_warning_alerts",
                 "market_warning_model_registry",
+                "market_warning_rule_assessments",
+                "market_warning_rule_registry",
+                "market_warning_leases",
+                "market_warning_runs",
+                "market_warning_failure_streaks",
+                "market_warning_system_alerts",
             }.issubset(tables)
         )
         self.assertEqual(reliability_not_null, 1)
         self.assertEqual(decision_columns["valid_snapshot_count"]["notnull"], 1)
         self.assertEqual(decision_columns["valid_snapshot_count"]["dflt_value"], "0")
         self.assertIn("retained_risk_level", decision_columns)
+        self.assertEqual(decision_columns["decision_source"]["dflt_value"], "'model'")
+        self.assertIn("rule_assessment_id", decision_columns)
+        self.assertEqual(decision_columns["shadow_prediction_ids_json"]["dflt_value"], "'[]'")
 
     def test_existing_decision_table_migration_is_idempotent(self):
         with temporary_database() as db_path:
@@ -232,6 +274,412 @@ class SQLiteWarningRepositoryTests(TestCase):
             self.assertEqual(columns["valid_snapshot_count"][3], 1)
             self.assertEqual(columns["valid_snapshot_count"][4], "0")
             self.assertIn("retained_risk_level", columns)
+            self.assertEqual(columns["decision_source"][3], 1)
+            self.assertEqual(columns["decision_source"][4], "'model'")
+            self.assertIn("rule_assessment_id", columns)
+            self.assertEqual(columns["shadow_prediction_ids_json"][3], 1)
+            self.assertEqual(columns["shadow_prediction_ids_json"][4], "'[]'")
+
+    def test_existing_rule_registry_and_alert_migrations_are_idempotent(self):
+        with temporary_database() as db_path:
+            with closing(sqlite3.connect(db_path)) as connection:
+                connection.execute(
+                    "CREATE TABLE market_warning_rule_registry ("
+                    "engine_version TEXT NOT NULL, market TEXT NOT NULL, "
+                    "manifest_sha256 TEXT NOT NULL, metrics_json TEXT NOT NULL, "
+                    "notification_active INTEGER NOT NULL DEFAULT 0, "
+                    "gate_active INTEGER NOT NULL DEFAULT 0, "
+                    "created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, "
+                    "updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, "
+                    "PRIMARY KEY (engine_version, market))"
+                )
+                connection.execute(
+                    "CREATE TABLE market_warning_alerts ("
+                    "id INTEGER PRIMARY KEY AUTOINCREMENT, idempotency_key TEXT NOT NULL UNIQUE, "
+                    "decision_id INTEGER NOT NULL, payload_hash TEXT NOT NULL, "
+                    "push_status TEXT NOT NULL DEFAULT 'claimed', sent_at TIMESTAMP, "
+                    "error_summary TEXT, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)"
+                )
+                connection.execute(
+                    "INSERT INTO market_warning_rule_registry "
+                    "(engine_version, market, manifest_sha256, metrics_json, notification_active) "
+                    "VALUES ('rule-v1.0.0', 'a_share', ?, '{}', 1)",
+                    ("a" * 64,),
+                )
+                connection.commit()
+
+            _db.init_db(db_path)
+            _db.init_db(db_path)
+
+            with closing(sqlite3.connect(db_path)) as connection:
+                registry_columns = {
+                    row[1]
+                    for row in connection.execute(
+                        "PRAGMA table_info(market_warning_rule_registry)"
+                    )
+                }
+                alert_columns = {
+                    row[1]
+                    for row in connection.execute(
+                        "PRAGMA table_info(market_warning_alerts)"
+                    )
+                }
+                activated_at = connection.execute(
+                    "SELECT notification_activated_at FROM market_warning_rule_registry "
+                    "WHERE engine_version = 'rule-v1.0.0'"
+                ).fetchone()[0]
+
+        self.assertIn("notification_activated_at", registry_columns)
+        self.assertIn("gate_activated_at", registry_columns)
+        self.assertIn("claimed_at", alert_columns)
+        self.assertIn("claim_token", alert_columns)
+        self.assertIsNotNone(activated_at)
+
+    def test_rule_decision_round_trip_does_not_create_fake_probabilities(self):
+        with temporary_database() as db_path:
+            repository = SQLiteWarningRepository(db_path)
+            snapshot_id = repository.save_feature_snapshot(make_snapshot())
+            assessment = make_rule_assessment()
+            assessment_id = repository.save_rule_assessment(snapshot_id, assessment)
+            decision = make_decision(
+                decision_reasons=("pressure.volatility_acceleration",),
+                decision_source="rule_v1",
+            )
+
+            decision_id = repository.save_decision(
+                snapshot_id,
+                (),
+                None,
+                decision,
+                rule_assessment_id=assessment_id,
+            )
+            loaded = repository.load_evaluation(Market.A_SHARE, AS_OF)
+
+            with _db.connect(db_path) as connection:
+                prediction_count = connection.execute(
+                    "SELECT COUNT(*) AS count FROM market_warning_predictions"
+                ).fetchone()["count"]
+                decision_row = connection.execute(
+                    "SELECT decision_source, rule_assessment_id, prediction_ids_json, "
+                    "shadow_prediction_ids_json FROM market_warning_decisions WHERE id = ?",
+                    (decision_id,),
+                ).fetchone()
+
+            self.assertEqual(prediction_count, 0)
+            self.assertEqual(decision_row["decision_source"], "rule_v1")
+            self.assertEqual(decision_row["rule_assessment_id"], assessment_id)
+            self.assertEqual(json.loads(decision_row["prediction_ids_json"]), [])
+            self.assertEqual(json.loads(decision_row["shadow_prediction_ids_json"]), [])
+            self.assertIsNotNone(loaded)
+            self.assertEqual(loaded.decision.decision_source, DecisionSource.RULE_V1)
+            self.assertEqual(loaded.rule_assessment, assessment)
+            self.assertIsNone(loaded.quant_assessment)
+            self.assertIsNone(loaded.shadow_quant_assessment)
+
+    def test_partial_rule_persistence_can_be_retried_idempotently(self):
+        with temporary_database() as db_path:
+            repository = SQLiteWarningRepository(db_path)
+            snapshot = make_snapshot()
+            assessment = make_rule_assessment()
+
+            first_snapshot_id = repository.save_feature_snapshot(snapshot)
+            second_snapshot_id = repository.save_feature_snapshot(snapshot)
+            first_assessment_id = repository.save_rule_assessment(
+                first_snapshot_id, assessment
+            )
+            second_assessment_id = repository.save_rule_assessment(
+                second_snapshot_id,
+                make_rule_assessment(evaluation_latency_ms=assessment.evaluation_latency_ms + 2),
+            )
+            loaded_snapshot = repository.load_feature_snapshot(
+                snapshot.market, snapshot.as_of_time, snapshot.feature_version
+            )
+
+        self.assertEqual(first_snapshot_id, second_snapshot_id)
+        self.assertEqual(first_assessment_id, second_assessment_id)
+        self.assertEqual(loaded_snapshot, snapshot)
+
+    def test_deactivate_rule_engine_only_changes_requested_mode(self):
+        with temporary_database() as db_path:
+            repository = SQLiteWarningRepository(db_path)
+            repository.register_rule_engine(
+                {
+                    "engine_version": "rule-v1.0.0",
+                    "market": Market.A_SHARE,
+                    "manifest_sha256": "a" * 64,
+                    "metrics": {},
+                }
+            )
+            repository.activate_rule_engine("rule-v1.0.0", "notify")
+            repository.activate_rule_engine("rule-v1.0.0", "gate")
+
+            repository.deactivate_rule_engine(Market.A_SHARE, "notify")
+
+            self.assertIsNone(
+                repository.load_active_rule_engine(Market.A_SHARE, "notify")
+            )
+            gate = repository.load_active_rule_engine(Market.A_SHARE, "gate")
+            self.assertIsNotNone(gate)
+            self.assertTrue(gate["gate_active"])
+
+    def test_rule_soak_audit_counts_missing_duplicate_and_overlap_slots(self):
+        with temporary_database() as db_path:
+            repository = SQLiteWarningRepository(db_path)
+            zone = ZoneInfo("Asia/Shanghai")
+            session_date = date(2026, 7, 31)
+            premarket = datetime.combine(session_date, time(8, 30), zone)
+            repository.record_run(
+                market=Market.A_SHARE,
+                as_of_time=premarket,
+                session_slot="premarket",
+                mode="rule_v1",
+                started_at=premarket,
+                finished_at=premarket + timedelta(seconds=1),
+                status="success",
+                error_class=None,
+                overlap_skipped=False,
+                llm_calls=0,
+            )
+            repository.record_run(
+                market=Market.A_SHARE,
+                as_of_time=premarket,
+                session_slot="premarket",
+                mode="rule_v1",
+                started_at=premarket,
+                finished_at=premarket + timedelta(seconds=1),
+                status="overlap_skipped",
+                error_class="overlap_skipped",
+                overlap_skipped=True,
+                llm_calls=0,
+            )
+
+            audit = repository.load_rule_soak_audit(
+                Market.A_SHARE,
+                (session_date,),
+            )
+
+        self.assertEqual(audit["expected_scans"], 25)
+        self.assertEqual(audit["successful_scans"], 1)
+        self.assertEqual(audit["missing_scans"], 24)
+        self.assertEqual(audit["duplicate_runs"], 1)
+        self.assertEqual(audit["overlap_skipped"], 1)
+        self.assertEqual(audit["soak_sessions"], 0)
+
+    def test_rule_registry_switches_notify_and_gate_versions_atomically(self):
+        with temporary_database() as db_path:
+            repository = SQLiteWarningRepository(db_path)
+            for version, digest in (("rule-v1.0.0", "a" * 64), ("rule-v1.0.1", "b" * 64)):
+                repository.register_rule_engine(
+                    {
+                        "engine_version": version,
+                        "market": Market.A_SHARE,
+                        "manifest_sha256": digest,
+                        "metrics": {"lift": 2.4, "alerts_per_month": 4.0},
+                    }
+                )
+
+            repository.activate_rule_engine("rule-v1.0.0", "notify")
+            repository.activate_rule_engine("rule-v1.0.0", "gate")
+            repository.activate_rule_engine("rule-v1.0.1", "notify")
+
+            notify = repository.load_active_rule_engine(Market.A_SHARE, "notify")
+            gate = repository.load_active_rule_engine(Market.A_SHARE, "gate")
+            self.assertEqual(notify["engine_version"], "rule-v1.0.1")
+            self.assertEqual(gate["engine_version"], "rule-v1.0.0")
+            self.assertTrue(notify["notification_active"])
+            self.assertFalse(notify["gate_active"])
+            self.assertTrue(gate["gate_active"])
+
+    def test_reactivating_same_rule_engine_preserves_original_activation_time(self):
+        with temporary_database() as db_path:
+            repository = SQLiteWarningRepository(db_path)
+            repository.register_rule_engine(
+                {
+                    "engine_version": "rule-v1.0.0",
+                    "market": Market.A_SHARE,
+                    "manifest_sha256": "a" * 64,
+                    "metrics": {},
+                }
+            )
+            repository.activate_rule_engine("rule-v1.0.0", "notify")
+            with _db.connect(db_path) as connection:
+                connection.execute(
+                    "UPDATE market_warning_rule_registry "
+                    "SET notification_activated_at = ? WHERE engine_version = ?",
+                    ("2026-07-17T00:00:00+00:00", "rule-v1.0.0"),
+                )
+
+            repository.activate_rule_engine("rule-v1.0.0", "notify")
+            active = repository.load_active_rule_engine(Market.A_SHARE, "notify")
+
+        self.assertEqual(
+            active["notification_activated_at"], "2026-07-17T00:00:00+00:00"
+        )
+
+    def test_previous_rule_assessment_is_loaded_with_triggered_evidence(self):
+        with temporary_database() as db_path:
+            repository = SQLiteWarningRepository(db_path)
+            first_snapshot_id = repository.save_feature_snapshot(make_snapshot())
+            first = make_rule_assessment()
+            repository.save_rule_assessment(first_snapshot_id, first)
+            later = AS_OF + timedelta(minutes=10)
+            second_snapshot_id = repository.save_feature_snapshot(
+                make_snapshot(as_of_time=later, source_times={"exchange": later})
+            )
+            repository.save_rule_assessment(
+                second_snapshot_id,
+                make_rule_assessment(as_of_time=later, risk_level="RED"),
+            )
+
+            loaded = repository.load_previous_rule_assessment(Market.A_SHARE, later)
+
+            self.assertEqual(loaded, first)
+            self.assertEqual(
+                loaded.triggered_rules[0].rule_id,
+                "pressure.volatility_acceleration",
+            )
+
+    def test_previous_intraday_summary_reports_highest_level_and_state_changes(self):
+        with temporary_database() as db_path:
+            repository = SQLiteWarningRepository(db_path)
+            zone = ZoneInfo("Asia/Shanghai")
+            cases = (
+                (
+                    datetime(2026, 7, 31, 9, 35, tzinfo=zone),
+                    RiskLevel.ORANGE,
+                    "INITIAL_ORANGE",
+                ),
+                (
+                    datetime(2026, 7, 31, 10, 5, tzinfo=zone),
+                    RiskLevel.RED,
+                    "UPGRADE_ORANGE_TO_RED",
+                ),
+                (
+                    datetime(2026, 7, 31, 10, 15, tzinfo=zone),
+                    RiskLevel.RED,
+                    "RECOVERY_PENDING",
+                ),
+                (
+                    datetime(2026, 7, 31, 10, 25, tzinfo=zone),
+                    RiskLevel.RED,
+                    "UNCHANGED",
+                ),
+            )
+            for as_of, level, transition in cases:
+                snapshot = make_snapshot(
+                    as_of_time=as_of,
+                    session_slot=f"intraday-{as_of:%H%M}",
+                    evidence=(),
+                    source_times={"exchange": as_of},
+                )
+                snapshot_id = repository.save_feature_snapshot(snapshot)
+                prediction_ids = repository.save_predictions(snapshot_id, make_quant())
+                repository.save_decision(
+                    snapshot_id,
+                    prediction_ids,
+                    None,
+                    make_decision(
+                        baseline_level=level,
+                        final_level=level,
+                        state_transition=transition,
+                    ),
+                )
+
+            summary = repository.load_previous_intraday_summary(
+                Market.A_SHARE,
+                datetime(2026, 8, 3, 8, 30, tzinfo=zone),
+            )
+            missing_immediate_prior = repository.load_previous_intraday_summary(
+                Market.A_SHARE,
+                datetime(2026, 8, 4, 8, 30, tzinfo=zone),
+            )
+
+        self.assertEqual(
+            summary,
+            SessionRiskSummary(
+                trade_date=date(2026, 7, 31),
+                highest_level=RiskLevel.RED,
+                state_changes=(
+                    "INITIAL_ORANGE",
+                    "UPGRADE_ORANGE_TO_RED",
+                    "RECOVERY_PENDING",
+                ),
+            ),
+        )
+        self.assertIsNone(missing_immediate_prior)
+
+    def test_post_alert_reasoning_attaches_to_rule_decision_and_replays(self):
+        with temporary_database() as db_path:
+            repository = SQLiteWarningRepository(db_path)
+            snapshot_id = repository.save_feature_snapshot(make_snapshot())
+            rule_id = repository.save_rule_assessment(snapshot_id, make_rule_assessment())
+            decision_id = repository.save_decision(
+                snapshot_id,
+                (),
+                None,
+                make_decision(decision_source="rule_v1"),
+                rule_assessment_id=rule_id,
+            )
+            context = make_reasoning()
+            reasoning_id = repository.save_reasoning(snapshot_id, context, "MiniMax-M3")
+
+            repository.attach_reasoning(decision_id, reasoning_id)
+
+            loaded = repository.load_evaluation(Market.A_SHARE, AS_OF)
+            latest = repository.load_latest_reasoning(
+                Market.A_SHARE,
+                AS_OF + timedelta(minutes=1),
+            )
+            self.assertEqual(loaded.context_assessment, context)
+            self.assertEqual(latest, context)
+
+    def test_reasoning_cannot_attach_to_decision_from_another_snapshot(self):
+        with temporary_database() as db_path:
+            repository = SQLiteWarningRepository(db_path)
+            first_id = repository.save_feature_snapshot(make_snapshot())
+            first_rule_id = repository.save_rule_assessment(first_id, make_rule_assessment())
+            decision_id = repository.save_decision(
+                first_id,
+                (),
+                None,
+                make_decision(decision_source="rule_v1"),
+                rule_assessment_id=first_rule_id,
+            )
+            later = AS_OF + timedelta(minutes=10)
+            second_id = repository.save_feature_snapshot(
+                make_snapshot(as_of_time=later, source_times={"exchange": later})
+            )
+            reasoning_id = repository.save_reasoning(
+                second_id,
+                make_reasoning(),
+                "MiniMax-M3",
+            )
+
+            with self.assertRaises(ValueError):
+                repository.attach_reasoning(decision_id, reasoning_id)
+
+    def test_recovery_can_save_reasoning_directly_for_an_existing_decision(self):
+        with temporary_database() as db_path:
+            repository = SQLiteWarningRepository(db_path)
+            snapshot_id = repository.save_feature_snapshot(make_snapshot())
+            rule_id = repository.save_rule_assessment(snapshot_id, make_rule_assessment())
+            decision_id = repository.save_decision(
+                snapshot_id,
+                (),
+                None,
+                make_decision(decision_source="rule_v1"),
+                rule_assessment_id=rule_id,
+            )
+
+            reasoning_id = repository.save_reasoning_for_decision(
+                decision_id,
+                make_reasoning(),
+                "MiniMax-M3",
+            )
+
+            loaded = repository.load_evaluation(Market.A_SHARE, AS_OF)
+            self.assertIsInstance(reasoning_id, int)
+            self.assertEqual(loaded.context_assessment, make_reasoning())
 
     def test_activate_model_set_switches_all_four_horizons_in_one_commit(self):
         with temporary_database() as db_path:
@@ -421,10 +869,17 @@ class SQLiteWarningRepositoryTests(TestCase):
             decision_id, _ = save_complete_decision(first_repository)
             second_repository = SQLiteWarningRepository(db_path)
 
-            self.assertTrue(first_repository.claim_alert("a-share:2026-08-01", decision_id, "payload-sha"))
+            claim_token = first_repository.claim_alert(
+                "a-share:2026-08-01", decision_id, "payload-sha"
+            )
+            self.assertTrue(claim_token)
             self.assertFalse(second_repository.claim_alert("a-share:2026-08-01", decision_id, "payload-sha"))
 
-            first_repository.finish_alert("a-share:2026-08-01", "sent")
+            self.assertTrue(
+                first_repository.finish_alert(
+                    "a-share:2026-08-01", "sent", claim_token=claim_token
+                )
+            )
             with _db.connect(db_path) as connection:
                 alert = connection.execute(
                     "SELECT push_status, sent_at, error_summary FROM market_warning_alerts "
@@ -435,6 +890,113 @@ class SQLiteWarningRepositoryTests(TestCase):
             self.assertEqual(alert["push_status"], "sent")
             self.assertIsNotNone(alert["sent_at"])
             self.assertIsNone(alert["error_summary"])
+
+    def test_stale_claim_is_recoverable_but_recent_claim_is_not(self):
+        with temporary_database() as db_path:
+            repository = SQLiteWarningRepository(db_path)
+            decision_id, _ = save_complete_decision(repository)
+            key = "a-share:stale-claim"
+            started = datetime(2026, 8, 3, 1, 35, tzinfo=timezone.utc)
+
+            first_token = repository.claim_alert(
+                key, decision_id, "sha", now=started
+            )
+            self.assertTrue(first_token)
+            self.assertFalse(
+                repository.claim_alert(
+                    key,
+                    decision_id,
+                    "sha",
+                    now=started + timedelta(minutes=9),
+                )
+            )
+            second_token = repository.claim_alert(
+                key,
+                decision_id,
+                "sha",
+                now=started + timedelta(minutes=11),
+            )
+            self.assertTrue(second_token)
+            self.assertNotEqual(first_token, second_token)
+            self.assertFalse(
+                repository.finish_alert(
+                    key,
+                    "failed",
+                    "late old owner",
+                    claim_token=first_token,
+                )
+            )
+            self.assertTrue(
+                repository.finish_alert(key, "sent", claim_token=second_token)
+            )
+
+    def test_lease_is_atomic_and_only_expires_for_the_current_owner(self):
+        with temporary_database() as db_path:
+            first = SQLiteWarningRepository(db_path)
+            second = SQLiteWarningRepository(db_path)
+            now = datetime(2026, 8, 3, 1, 35, tzinfo=timezone.utc)
+            ttl = timedelta(minutes=8)
+
+            self.assertTrue(first.acquire_lease("fast:a_share", "owner-1", now, ttl))
+            self.assertFalse(second.acquire_lease("fast:a_share", "owner-2", now, ttl))
+            self.assertTrue(
+                second.acquire_lease(
+                    "fast:a_share",
+                    "owner-2",
+                    now + timedelta(minutes=9),
+                    ttl,
+                )
+            )
+            self.assertFalse(first.release_lease("fast:a_share", "owner-1"))
+            self.assertTrue(second.release_lease("fast:a_share", "owner-2"))
+
+    def test_failure_streak_alerts_once_and_success_resets_the_incident(self):
+        with temporary_database() as db_path:
+            repository = SQLiteWarningRepository(db_path)
+            now = datetime(2026, 8, 3, 1, 35, tzinfo=timezone.utc)
+
+            first = repository.record_schedule_outcome(
+                Market.A_SHARE, "rule_v1", now, succeeded=False
+            )
+            second = repository.record_schedule_outcome(
+                Market.A_SHARE, "rule_v1", now + timedelta(minutes=10), succeeded=False
+            )
+            third = repository.record_schedule_outcome(
+                Market.A_SHARE, "rule_v1", now + timedelta(minutes=20), succeeded=False
+            )
+            fourth = repository.record_schedule_outcome(
+                Market.A_SHARE, "rule_v1", now + timedelta(minutes=30), succeeded=False
+            )
+
+            self.assertEqual([item["consecutive_failures"] for item in (first, second, third, fourth)], [1, 2, 3, 4])
+            self.assertFalse(first["alert_due"])
+            self.assertFalse(second["alert_due"])
+            self.assertTrue(third["alert_due"])
+            self.assertTrue(fourth["alert_due"])
+            self.assertEqual(third["incident_started_at"], first["incident_started_at"])
+
+            reset = repository.record_schedule_outcome(
+                Market.A_SHARE, "rule_v1", now + timedelta(minutes=40), succeeded=True
+            )
+            restarted = repository.record_schedule_outcome(
+                Market.A_SHARE, "rule_v1", now + timedelta(minutes=50), succeeded=False
+            )
+            self.assertEqual(reset["consecutive_failures"], 0)
+            self.assertEqual(restarted["consecutive_failures"], 1)
+            self.assertNotEqual(restarted["incident_started_at"], first["incident_started_at"])
+
+    def test_system_alert_claim_is_atomic_and_failed_send_can_retry(self):
+        with temporary_database() as db_path:
+            first = SQLiteWarningRepository(db_path)
+            second = SQLiteWarningRepository(db_path)
+
+            self.assertTrue(first.claim_system_alert("system:incident", "sha"))
+            self.assertFalse(second.claim_system_alert("system:incident", "sha"))
+            first.finish_system_alert("system:incident", "failed", "send_error")
+            self.assertTrue(
+                second.claim_system_alert("system:incident", "sha", retry_failed=True)
+            )
+            second.finish_system_alert("system:incident", "sent")
 
     def test_circuit_breaker_state_survives_new_process_instances(self):
         with temporary_database() as db_path:

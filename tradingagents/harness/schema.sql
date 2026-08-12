@@ -229,6 +229,26 @@ CREATE TABLE IF NOT EXISTS market_warning_predictions (
 CREATE INDEX IF NOT EXISTS idx_market_warning_predictions_snapshot
     ON market_warning_predictions(feature_snapshot_id);
 
+CREATE TABLE IF NOT EXISTS market_warning_rule_assessments (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    feature_snapshot_id INTEGER NOT NULL,
+    engine_version TEXT NOT NULL,
+    manifest_sha256 TEXT NOT NULL,
+    risk_level TEXT NOT NULL,
+    risk_score REAL NOT NULL,
+    market_phase TEXT NOT NULL,
+    triggered_rules_json TEXT NOT NULL,
+    missing_optional_groups_json TEXT NOT NULL,
+    reliability_grade TEXT NOT NULL,
+    evaluation_latency_ms REAL NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE (feature_snapshot_id, engine_version),
+    FOREIGN KEY (feature_snapshot_id) REFERENCES market_warning_feature_snapshots(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_market_warning_rule_assessments_snapshot
+    ON market_warning_rule_assessments(feature_snapshot_id);
+
 CREATE TABLE IF NOT EXISTS market_warning_reasoning (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     feature_snapshot_id INTEGER NOT NULL,
@@ -259,10 +279,14 @@ CREATE TABLE IF NOT EXISTS market_warning_decisions (
     reasons_json TEXT NOT NULL,
     valid_snapshot_count INTEGER NOT NULL DEFAULT 0,
     retained_risk_level TEXT,
+    decision_source TEXT NOT NULL DEFAULT 'model',
+    rule_assessment_id INTEGER,
+    shadow_prediction_ids_json TEXT NOT NULL DEFAULT '[]',
     model_version TEXT,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (feature_snapshot_id) REFERENCES market_warning_feature_snapshots(id),
-    FOREIGN KEY (reasoning_id) REFERENCES market_warning_reasoning(id)
+    FOREIGN KEY (reasoning_id) REFERENCES market_warning_reasoning(id),
+    FOREIGN KEY (rule_assessment_id) REFERENCES market_warning_rule_assessments(id)
 );
 
 CREATE INDEX IF NOT EXISTS idx_market_warning_decisions_snapshot
@@ -274,6 +298,8 @@ CREATE TABLE IF NOT EXISTS market_warning_alerts (
     decision_id INTEGER NOT NULL,
     payload_hash TEXT NOT NULL,
     push_status TEXT NOT NULL DEFAULT 'claimed',
+    claimed_at TEXT,
+    claim_token TEXT,
     sent_at TIMESTAMP,
     error_summary TEXT,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -303,9 +329,77 @@ CREATE INDEX IF NOT EXISTS idx_market_warning_model_registry_active
     ON market_warning_model_registry(market, horizon)
     WHERE active = 1;
 
+CREATE TABLE IF NOT EXISTS market_warning_rule_registry (
+    engine_version TEXT NOT NULL,
+    market TEXT NOT NULL,
+    manifest_sha256 TEXT NOT NULL,
+    metrics_json TEXT NOT NULL,
+    notification_active INTEGER NOT NULL DEFAULT 0,
+    gate_active INTEGER NOT NULL DEFAULT 0,
+    notification_activated_at TEXT,
+    gate_activated_at TEXT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (engine_version, market)
+);
+
+CREATE INDEX IF NOT EXISTS idx_market_warning_rule_registry_notify
+    ON market_warning_rule_registry(market)
+    WHERE notification_active = 1;
+
+CREATE INDEX IF NOT EXISTS idx_market_warning_rule_registry_gate
+    ON market_warning_rule_registry(market)
+    WHERE gate_active = 1;
+
 CREATE TABLE IF NOT EXISTS market_warning_circuit_breakers (
     breaker_key TEXT PRIMARY KEY,
     consecutive_failures INTEGER NOT NULL DEFAULT 0,
     open_until TEXT,
     updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS market_warning_leases (
+    lease_key TEXT PRIMARY KEY,
+    owner_id TEXT NOT NULL,
+    acquired_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS market_warning_runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    market TEXT NOT NULL,
+    as_of_time TEXT NOT NULL,
+    session_slot TEXT NOT NULL,
+    mode TEXT NOT NULL,
+    started_at TEXT NOT NULL,
+    finished_at TEXT NOT NULL,
+    latency_ms REAL NOT NULL,
+    status TEXT NOT NULL,
+    error_class TEXT,
+    overlap_skipped INTEGER NOT NULL DEFAULT 0,
+    llm_calls INTEGER NOT NULL DEFAULT 0,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_market_warning_runs_market_time
+    ON market_warning_runs(market, as_of_time);
+
+CREATE TABLE IF NOT EXISTS market_warning_failure_streaks (
+    market TEXT NOT NULL,
+    mode TEXT NOT NULL,
+    consecutive_failures INTEGER NOT NULL DEFAULT 0,
+    incident_started_at TEXT,
+    last_outcome_at TEXT NOT NULL,
+    PRIMARY KEY (market, mode)
+);
+
+CREATE TABLE IF NOT EXISTS market_warning_system_alerts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    idempotency_key TEXT NOT NULL UNIQUE,
+    payload_hash TEXT NOT NULL,
+    push_status TEXT NOT NULL DEFAULT 'claimed',
+    sent_at TIMESTAMP,
+    error_summary TEXT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );

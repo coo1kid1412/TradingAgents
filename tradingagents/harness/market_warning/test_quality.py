@@ -398,16 +398,16 @@ class QualityEvaluationTests(TestCase):
     def test_core_age_at_exact_boundary_is_fresh_but_just_over_is_stale(self):
         exact = evaluate_data_quality(
             snapshot(
-                point("index_price", 100, data_time=NOW - timedelta(seconds=600)),
-                point("index_change_pct", -0.4, data_time=NOW - timedelta(seconds=600)),
+                point("index_price", 100, data_time=NOW - timedelta(seconds=300)),
+                point("index_change_pct", -0.4, data_time=NOW - timedelta(seconds=300)),
             ),
             QUALITY_POLICY_V1,
             NOW,
         )
         over = evaluate_data_quality(
             snapshot(
-                point("index_price", 100, data_time=NOW - timedelta(seconds=600, microseconds=1)),
-                point("index_change_pct", -0.4, data_time=NOW - timedelta(seconds=600, microseconds=1)),
+                point("index_price", 100, data_time=NOW - timedelta(seconds=300, microseconds=1)),
+                point("index_change_pct", -0.4, data_time=NOW - timedelta(seconds=300, microseconds=1)),
             ),
             QUALITY_POLICY_V1,
             NOW,

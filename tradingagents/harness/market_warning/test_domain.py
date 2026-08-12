@@ -8,6 +8,7 @@ from unittest import TestCase, main
 # Keep the brief's direct-script command rooted at this worktree.
 sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 
+from tradingagents.harness.market_warning import domain as domain_models
 from tradingagents.harness.market_warning.domain import (
     Evidence,
     FeatureSnapshot,
@@ -56,6 +57,148 @@ def make_context(**changes):
 
 
 class DomainValidationTests(TestCase):
+    def test_triggered_rule_validates_layer_points_and_evidence_ids(self):
+        rule = domain_models.TriggeredRule(
+            rule_id="pressure.volatility_acceleration",
+            layer="PRESSURE",
+            severity_points=2,
+            observed_value=1.5,
+            threshold_description=">= 1.50",
+            evidence_ids=("volatility-ratio",),
+        )
+
+        self.assertEqual(rule.layer, domain_models.RuleLayer.PRESSURE)
+        self.assertEqual(rule.evidence_ids, ("volatility-ratio",))
+        for invalid_layer in ("MODEL", "", None):
+            with self.subTest(layer=invalid_layer):
+                with self.assertRaises(ValueError):
+                    domain_models.TriggeredRule(
+                        rule_id="invalid",
+                        layer=invalid_layer,
+                        severity_points=1,
+                        observed_value=None,
+                        threshold_description="invalid",
+                        evidence_ids=("e1",),
+                    )
+        for invalid_points in (-1, 3, 1.5, True):
+            with self.subTest(points=invalid_points):
+                with self.assertRaises(ValueError):
+                    domain_models.TriggeredRule(
+                        rule_id="invalid",
+                        layer="VULNERABILITY",
+                        severity_points=invalid_points,
+                        observed_value=None,
+                        threshold_description="invalid",
+                        evidence_ids=("e1",),
+                    )
+        for invalid_ids in ((), ("e1", "e1")):
+            with self.subTest(evidence_ids=invalid_ids):
+                with self.assertRaises(ValueError):
+                    domain_models.TriggeredRule(
+                        rule_id="invalid",
+                        layer="VULNERABILITY",
+                        severity_points=1,
+                        observed_value=None,
+                        threshold_description="invalid",
+                        evidence_ids=invalid_ids,
+                    )
+
+    def test_rule_assessment_is_a_score_not_a_probability(self):
+        rule = domain_models.TriggeredRule(
+            rule_id="pressure.volatility_acceleration",
+            layer="PRESSURE",
+            severity_points=2,
+            observed_value=1.5,
+            threshold_description=">= 1.50",
+            evidence_ids=("volatility-ratio",),
+        )
+        assessment = domain_models.RuleRiskAssessment(
+            market="a_share",
+            as_of_time=AS_OF,
+            engine_version="rule-v1.0.0",
+            manifest_sha256="a" * 64,
+            risk_level="ORANGE",
+            risk_score=4.0,
+            market_phase="FIRST_SHOCK",
+            triggered_rules=(rule,),
+            missing_optional_groups=("margin",),
+            reliability_grade="B",
+            evaluation_latency_ms=8.5,
+        )
+
+        self.assertEqual(assessment.risk_level, RiskLevel.ORANGE)
+        self.assertEqual(assessment.risk_score, 4.0)
+        self.assertFalse(hasattr(assessment, "probability"))
+        for invalid_score in (-0.1, 10.1, float("nan"), True):
+            with self.subTest(score=invalid_score):
+                with self.assertRaises(ValueError):
+                    domain_models.RuleRiskAssessment(
+                        market="a_share",
+                        as_of_time=AS_OF,
+                        engine_version="rule-v1.0.0",
+                        manifest_sha256="a" * 64,
+                        risk_level="ORANGE",
+                        risk_score=invalid_score,
+                        market_phase="FIRST_SHOCK",
+                        triggered_rules=(rule,),
+                        missing_optional_groups=(),
+                        reliability_grade="B",
+                        evaluation_latency_ms=0.0,
+                    )
+
+    def test_decision_source_and_runner_keep_rule_and_shadow_model_separate(self):
+        decision = FinalWarningDecision(
+            baseline_level="ORANGE",
+            final_level="ORANGE",
+            state_transition="GREEN_TO_ORANGE",
+            entry_gate="LIMITED",
+            new_position_cap_pct=5.0,
+            holding_action="reduce",
+            push_required=True,
+            decision_reasons=("pressure confirmed",),
+            data_status="fresh",
+            decision_source="rule_v1",
+        )
+        assessment = domain_models.RuleRiskAssessment(
+            market="a_share",
+            as_of_time=AS_OF,
+            engine_version="rule-v1.0.0",
+            manifest_sha256="a" * 64,
+            risk_level="ORANGE",
+            risk_score=4.0,
+            market_phase="FIRST_SHOCK",
+            triggered_rules=(),
+            missing_optional_groups=(),
+            reliability_grade="A",
+            evaluation_latency_ms=1.0,
+        )
+        runner = domain_models.RunnerResult(
+            market="a_share",
+            as_of_time=AS_OF,
+            session_slot="intraday-0935",
+            rule_assessment=assessment,
+            shadow_quant_assessment=make_quant(),
+            decision=decision,
+        )
+
+        self.assertEqual(decision.decision_source, domain_models.DecisionSource.RULE_V1)
+        self.assertIs(runner.rule_assessment, assessment)
+        self.assertIsNotNone(runner.shadow_quant_assessment)
+        self.assertIsNone(runner.quant_assessment)
+        with self.assertRaises(ValueError):
+            FinalWarningDecision(
+                baseline_level="GREEN",
+                final_level="GREEN",
+                state_transition="UNCHANGED",
+                entry_gate="OPEN",
+                new_position_cap_pct=100.0,
+                holding_action="HOLD",
+                push_required=False,
+                decision_reasons=(),
+                data_status="fresh",
+                decision_source="rules-masquerading-as-model",
+            )
+
     def test_final_decision_recovery_state_has_safe_validated_defaults(self):
         decision = FinalWarningDecision(
             baseline_level="GREEN",

@@ -13,7 +13,9 @@ from .domain import (
     Market,
     QuantRiskAssessment,
     RawMarketSnapshot,
+    RuleRiskAssessment,
     RunnerResult,
+    SessionRiskSummary,
 )
 
 
@@ -43,13 +45,38 @@ class ReasoningPort(Protocol):
 class WarningRepository(Protocol):
     def save_feature_snapshot(self, snapshot: FeatureSnapshot) -> int: ...
 
+    def load_feature_snapshot(
+        self, market: Market, as_of_time: datetime, feature_version: str
+    ) -> FeatureSnapshot | None: ...
+
     def save_predictions(
         self, feature_snapshot_id: int, assessment: QuantRiskAssessment
     ) -> tuple[int, int]: ...
 
+    def save_rule_assessment(
+        self, feature_snapshot_id: int, assessment: RuleRiskAssessment
+    ) -> int: ...
+
+    def load_previous_rule_assessment(
+        self, market: Market, before_time: datetime
+    ) -> RuleRiskAssessment | None: ...
+
     def save_reasoning(
         self, feature_snapshot_id: int, assessment: LLMContextAssessment, model_name: str
     ) -> int: ...
+
+    def save_reasoning_for_decision(
+        self,
+        decision_id: int,
+        assessment: LLMContextAssessment,
+        model_name: str,
+    ) -> int: ...
+
+    def attach_reasoning(self, decision_id: int, reasoning_id: int) -> None: ...
+
+    def load_latest_reasoning(
+        self, market: Market, before_time: datetime, model_name: str = "MiniMax-M3"
+    ) -> LLMContextAssessment | None: ...
 
     def save_decision(
         self,
@@ -57,7 +84,18 @@ class WarningRepository(Protocol):
         prediction_ids: tuple[int, ...],
         reasoning_id: int | None,
         decision: FinalWarningDecision,
+        *,
+        rule_assessment_id: int | None = None,
+        shadow_prediction_ids: tuple[int, ...] = (),
     ) -> int: ...
+
+    def register_rule_engine(self, record: dict[str, object]) -> None: ...
+
+    def activate_rule_engine(self, engine_version: str, mode: str) -> dict[str, object]: ...
+
+    def deactivate_rule_engine(self, market: Market, mode: str) -> None: ...
+
+    def load_active_rule_engine(self, market: Market, mode: str) -> dict[str, object] | None: ...
 
     def load_latest_decision(
         self, market: Market, as_of_time: datetime | None = None
@@ -66,6 +104,14 @@ class WarningRepository(Protocol):
     def load_previous_decision(
         self, market: Market, before_time: datetime
     ) -> FinalWarningDecision | None: ...
+
+    def load_previous_intraday_summary(
+        self, market: Market, before_time: datetime
+    ) -> SessionRiskSummary | None: ...
+
+    def load_rule_soak_audit(
+        self, market: Market, session_dates: tuple[date, ...]
+    ) -> dict[str, object]: ...
 
 
 class WarningNotifier(Protocol):
