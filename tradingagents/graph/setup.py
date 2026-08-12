@@ -12,6 +12,7 @@ from tradingagents.agents.utils.macro_context_node import create_macro_context_n
 from tradingagents.agents.utils.quant_score_node import create_quant_score_node
 from tradingagents.agents.utils.sector_comparison_node import create_sector_comparison_node
 from tradingagents.agents.utils.capital_flow_node import create_capital_flow_node
+from tradingagents.agents.utils.research_evidence_node import create_research_evidence_node
 
 from .conditional_logic import ConditionalLogic
 
@@ -129,6 +130,9 @@ class GraphSetup:
         # Consensus officer: synthesizes market consensus before bull/bear debate
         consensus_officer_node = create_consensus_node(self.quick_thinking_llm)
 
+        # Research Evidence Officer: pure Python evidence cards + IC packet.
+        research_evidence_officer_node = create_research_evidence_node()
+
         # Create researcher and manager nodes
         # 改造 A：去掉 memory 参数（bull/bear/RM 的 memory 实例已删除，永远为空）
         bull_researcher_node = create_bull_researcher(self.bull_researcher_llm)
@@ -163,6 +167,7 @@ class GraphSetup:
         workflow.add_node("Stock Profile Officer", stock_profile_officer_node)
         workflow.add_node("Sector Comparison Officer", sector_comparison_officer_node)
         workflow.add_node("Consensus Officer", consensus_officer_node)
+        workflow.add_node("Research Evidence Officer", research_evidence_officer_node)
         workflow.add_node("Bull Researcher", bull_researcher_node)
         workflow.add_node("Bear Researcher", bear_researcher_node)
         workflow.add_node("Research Manager", research_manager_node)
@@ -204,12 +209,13 @@ class GraphSetup:
             else:
                 workflow.add_edge(current_clear, "Quant Score Officer")
 
-        # Quant Score → Macro → Stock Profile → Sector Comparison → Consensus → Bull Researcher
+        # Quant Score → Macro → Profile → Sector → Consensus → Evidence → Bull
         workflow.add_edge("Quant Score Officer", "Macro Context Officer")
         workflow.add_edge("Macro Context Officer", "Stock Profile Officer")
         workflow.add_edge("Stock Profile Officer", "Sector Comparison Officer")
         workflow.add_edge("Sector Comparison Officer", "Consensus Officer")
-        workflow.add_edge("Consensus Officer", "Bull Researcher")
+        workflow.add_edge("Consensus Officer", "Research Evidence Officer")
+        workflow.add_edge("Research Evidence Officer", "Bull Researcher")
 
         # Add remaining edges
         workflow.add_conditional_edges(

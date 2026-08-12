@@ -97,6 +97,14 @@ class AgentState(MessagesState):
         str, "Market consensus snapshot: priced-in expectations, narrative, unknowns"
     ]
 
+    # deterministic research evidence (after consensus, before bull/bear)
+    research_evidence_ledger: Annotated[
+        dict, "Auditable analyst evidence cards, conflicts, coverage, and warnings"
+    ]
+    ic_packet: Annotated[
+        str, "Compact investment committee evidence packet consumed by researchers, RM, and PM"
+    ]
+
     # researcher team discussion step
     investment_debate_state: Annotated[
         InvestDebateState, "Current state of the debate on if to invest or not"
