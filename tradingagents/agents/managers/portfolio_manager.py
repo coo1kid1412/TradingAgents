@@ -339,6 +339,7 @@ def _format_pm_decision(
     timing: dict,
     market_risk_snapshot: dict | None = None,
     research_evidence_ledger: dict | None = None,
+    research_plan: str = "",
 ) -> str:
     """Remove model working text and prepend a deterministic action summary."""
     original = (content or "").strip()
@@ -421,7 +422,10 @@ def _format_pm_decision(
     attribution = ""
     if research_evidence_ledger is not None:
         attribution = render_decision_attribution(
-            summary_block or original, timing, research_evidence_ledger,
+            summary_block or original,
+            timing,
+            research_evidence_ledger,
+            rm_content=research_plan,
         )
 
     summary = (
@@ -1056,6 +1060,7 @@ Be decisive and ground every conclusion in specific evidence from the analysts.{
         response = AIMessage(content=_format_pm_decision(
             enforced_content, final_entry_timing, market_risk_snapshot=market_risk_snapshot,
             research_evidence_ledger=state.get("research_evidence_ledger", {}),
+            research_plan=research_plan,
         ))
         logger.info("PM entry_timing 出口真值: %s", final_entry_timing)
 

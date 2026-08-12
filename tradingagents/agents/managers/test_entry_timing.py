@@ -230,20 +230,25 @@ PM_SUMMARY:
 """
     ledger = {
         "cards": [
-            {"claim_id": "MKT-TREND-01", "owner": "market", "quality_status": "valid"},
-            {"claim_id": "FUND-GROWTH-01", "owner": "fundamentals", "quality_status": "partial"},
-            {"claim_id": "RISK-GATE-01", "owner": "risk", "quality_status": "valid"},
-            {"claim_id": "FUND-VAL-01", "owner": "fundamentals", "quality_status": "partial"},
+            {"claim_id": "MKT-TREND-01", "owner": "market", "decision_variable": "short_term_trend", "quality_status": "valid"},
+            {"claim_id": "FUND-GROWTH-01", "owner": "fundamentals", "decision_variable": "earnings_outlook_12m", "quality_status": "partial"},
+            {"claim_id": "RISK-GATE-01", "owner": "risk", "decision_variable": "position", "quality_status": "valid"},
+            {"claim_id": "FUND-VAL-01", "owner": "fundamentals", "decision_variable": "target_price", "quality_status": "partial"},
         ]
     }
     result = _format_pm_decision(
         content,
         {"structure_class": "healthy_trend", "effective_action": "等回踩"},
         research_evidence_ledger=ledger,
+        research_plan="""RM_SUMMARY:
+  target_price_low: 86
+  target_price_mid: 101
+  target_price_high: 118""",
     )
 
     assert result.index("## 为什么这样决定") < result.index("## Trade Ticket")
     assert "| 未来三日 | 等回踩 | 市场分析/风险 | RISK-GATE-01, MKT-TREND-01 | 完整 |" in result
+    assert "| 一年期目标价 | 86-118（中位 101） | 基本面/RM | FUND-VAL-01 | 部分：证据不完整 |" in result
     summary = _find_yaml_block(result, "PM_SUMMARY")
     assert summary["pm_rating"] == "OVERWEIGHT"
     assert summary["short_term_evidence_ids"] == "MKT-TREND-01"

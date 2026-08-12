@@ -4,6 +4,7 @@ import sys
 
 from tradingagents.agents.utils.research_evidence_node import (
     compile_research_evidence,
+    create_research_evidence_node,
     render_decision_attribution,
     render_ic_packet,
 )
@@ -209,6 +210,31 @@ def test_invalid_yaml_degrades_one_domain_without_aborting():
     assert any(card["owner"] == "market" for card in ledger["cards"])
 
 
+def test_type_invalid_summary_degrades_one_domain_without_aborting():
+    state = _complete_state()
+    state["news_report"] = _report("SUMMARY", "  key_events: 3")
+
+    ledger = compile_research_evidence(state)
+
+    assert ledger["coverage"]["news"] == "invalid"
+    assert any("新闻摘要字段类型无效" in warning for warning in ledger["warnings"])
+    assert any(card["owner"] == "market" for card in ledger["cards"])
+
+
+def test_node_fails_open_when_compilation_raises(monkeypatch=None):
+    import tradingagents.agents.utils.research_evidence_node as module
+
+    original = module.compile_research_evidence
+    module.compile_research_evidence = lambda _state: (_ for _ in ()).throw(RuntimeError("boom"))
+    try:
+        result = create_research_evidence_node()({"company_of_interest": "688114"})
+    finally:
+        module.compile_research_evidence = original
+
+    assert result["research_evidence_ledger"]["cards"] == []
+    assert "已降级为空账本" in result["ic_packet"]
+
+
 def test_opposite_long_term_directions_create_conflict_without_resolving_it():
     state = _complete_state()
     state["news_report"] = state["news_report"].replace(
@@ -272,6 +298,15 @@ def _pm_summary(**overrides) -> str:
     return f"```yaml\nPM_SUMMARY:\n{body}\n```"
 
 
+def _rm_summary() -> str:
+    return """```yaml
+RM_SUMMARY:
+  target_price_low: 86
+  target_price_mid: 101
+  target_price_high: 118
+```"""
+
+
 def test_attribution_renderer_marks_valid_partial_missing_and_unauthorized_refs():
     ledger = compile_research_evidence(_complete_state())
     content = _pm_summary(
@@ -284,6 +319,7 @@ def test_attribution_renderer_marks_valid_partial_missing_and_unauthorized_refs(
         content,
         {"effective_action": "等回踩"},
         ledger,
+        rm_content=_rm_summary(),
     )
 
     assert "| 未来三日 | 等回踩 | 市场分析/风险 |" in table
@@ -296,7 +332,7 @@ def test_attribution_renderer_marks_valid_partial_missing_and_unauthorized_refs(
     assert "部分：证据不完整" in table
     assert "| 新建仓位 | 2-3% | 风险/PM |" in table
     assert "部分：剔除权限不匹配的证据 FUND-GROWTH-01" in table
-    assert "| 目标价/止盈位 | 96 / 104 / 112 | 基本面/RM |" in table
+    assert "| 一年期目标价 | 86-118（中位 101） | 基本面/RM |" in table
     assert "缺失：PM 未完成证据归因" in table
 
 
@@ -325,12 +361,49 @@ def test_news_impact_direction_accepts_audited_suffixes():
     assert news["direction"] == "bearish"
 
 
+def test_unknown_news_event_date_and_future_quant_date_degrade_quality():
+    state = _complete_state()
+    state["news_report"] = state["news_report"].replace("event_date: 2026Q3", "event_date: 未知")
+    state["quant_score"] = state["quant_score"].replace(
+        "price_data_date: 2026-08-12", "price_data_date: 2026-08-13"
+    )
+
+    ledger = compile_research_evidence(state)
+    by_id = {card["claim_id"]: card for card in ledger["cards"]}
+
+    assert by_id["NEWS-CAT-01"]["quality_status"] == "partial"
+    assert by_id["QUANT-COMP-01"]["quality_status"] == "invalid"
+
+
+def test_attribution_rejects_invalid_and_wrong_variable_cards():
+    state = _complete_state()
+    state["market_report"] = state["market_report"].replace(
+        "price_data_date: 2026-08-12", "price_data_date: 2026-08-13"
+    )
+    ledger = compile_research_evidence(state)
+    content = _pm_summary(
+        short_term_evidence_ids="MKT-TREND-01",
+        target_price_evidence_ids="NEWS-CAT-01",
+    )
+
+    table = render_decision_attribution(
+        content,
+        {"effective_action": "等回踩"},
+        ledger,
+        rm_content=_rm_summary(),
+    )
+
+    assert "剔除无效证据 MKT-TREND-01" in table
+    assert "剔除决策变量不匹配的证据 NEWS-CAT-01" in table
+
+
 def test_attribution_renderer_accepts_valid_authorized_references():
     ledger = compile_research_evidence(_complete_state())
     table = render_decision_attribution(
         _pm_summary(short_term_evidence_ids="MKT-TREND-01|RISK-GATE-01"),
         {"effective_action": "小仓试探"},
         ledger,
+        rm_content=_rm_summary(),
     )
 
     assert "MKT-STRUCT-01, RISK-GATE-01, MKT-TREND-01" in table

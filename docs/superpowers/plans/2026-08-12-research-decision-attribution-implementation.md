@@ -10,7 +10,7 @@
 
 ## Global Constraints
 
-- Do not add an LLM call, network call, or external dependency.
+- Do not add a normal-path LLM stage, network call, or external dependency. Existing bounded RM/PM continuation may retry only when output is empty, truncated, or unparsable.
 - Do not change rating, valuation, market-risk, position-sizing, or entry-timing calculations.
 - Invalid, stale, missing, or unauthorized evidence must be visible and must never be silently replaced.
 - `PM_SUMMARY` remains the final YAML block and existing harness fields retain their semantics.

@@ -51,6 +51,13 @@ ATTRIBUTION_OWNER_POLICY = {
     "target_price": frozenset({"fundamentals", "news", "research_manager"}),
 }
 
+ATTRIBUTION_VARIABLE_POLICY = {
+    "short_term": frozenset({"short_term_trend", "entry_timing", "entry_confidence", "position"}),
+    "long_term": frozenset({"earnings_outlook_12m", "long_term_rating", "target_price"}),
+    "position": frozenset({"position", "entry_timing"}),
+    "target_price": frozenset({"target_price"}),
+}
+
 _CONFLICT_FAMILY = {
     "earnings_outlook_12m": "long_term_rating",
     "long_term_rating": "long_term_rating",
@@ -240,7 +247,8 @@ def _news_cards(summary: Mapping[str, Any], trade_date: str) -> list[dict[str, A
         seen.add(identity)
         source_date = _as_date(event.get("source_date"))
         trade_day = _as_date(trade_date)
-        quality = "valid" if source_date else "partial"
+        event_date = event.get("event_date")
+        quality = "valid" if source_date and event_date not in (None, "", "未知", "null") else "partial"
         if source_date and trade_day and source_date > trade_day:
             quality = "invalid"
         impact = str(event.get("impact") or "0")
@@ -283,10 +291,22 @@ def _quant_cards(summary: Mapping[str, Any], trade_date: str) -> list[dict[str, 
     direction = "bullish" if numeric is not None and numeric >= 65 else (
         "bearish" if numeric is not None and numeric < 35 else "neutral"
     )
-    quality = "valid" if numeric is not None else "invalid"
+    price_date = _as_date(summary.get("price_data_date"))
+    trade_day = _as_date(trade_date)
+    price_status = str(summary.get("price_data_status") or "unknown")
+    if numeric is None:
+        quality = "invalid"
+    elif trade_day and price_date and price_date > trade_day:
+        quality = "invalid"
+    elif price_status in {"unknown", "t_minus_1"} or price_date is None:
+        quality = "partial"
+    elif trade_day and price_date < trade_day:
+        quality = "stale"
+    else:
+        quality = "valid"
     return [_card(
         "QUANT-COMP-01", "quant", "long_term_rating", f"量化综合分={score}",
-        direction, "1-12m", str(summary.get("price_data_date") or trade_date),
+        direction, "1-12m", price_date.isoformat() if price_date else None,
         "quant_score.QUANT_SCORE", falsifier="综合分跨越 35/65 分界",
         quality_status=quality,
     )]
@@ -390,7 +410,12 @@ def compile_research_evidence(state: Mapping[str, Any]) -> dict[str, Any]:
             coverage[domain] = status
             warnings.append(f"{label}摘要{status}，该领域证据未进入归因")
             continue
-        domain_cards = builder(summary, trade_date)
+        try:
+            domain_cards = builder(summary, trade_date)
+        except Exception as exc:  # Evidence attribution must never abort stock analysis.
+            coverage[domain] = "invalid"
+            warnings.append(f"{label}摘要字段类型无效，已跳过该领域证据：{type(exc).__name__}")
+            continue
         cards.extend(domain_cards)
         qualities = {str(card["quality_status"]) for card in domain_cards}
         coverage[domain] = next(
@@ -530,28 +555,44 @@ def _validate_references(
     by_id = {str(card.get("claim_id")): card for card in ledger.get("cards") or []}
     missing = [claim_id for claim_id in ids if claim_id not in by_id]
     allowed = ATTRIBUTION_OWNER_POLICY[policy_key]
+    allowed_variables = ATTRIBUTION_VARIABLE_POLICY[policy_key]
+    invalid = [
+        claim_id for claim_id in ids
+        if claim_id in by_id and str(by_id[claim_id].get("quality_status")) == "invalid"
+    ]
     unauthorized = [
         claim_id for claim_id in ids
-        if claim_id in by_id and str(by_id[claim_id].get("owner")) not in allowed
+        if claim_id in by_id
+        and claim_id not in invalid
+        and str(by_id[claim_id].get("owner")) not in allowed
+    ]
+    wrong_variable = [
+        claim_id for claim_id in ids
+        if claim_id in by_id
+        and claim_id not in invalid
+        and claim_id not in unauthorized
+        and str(by_id[claim_id].get("decision_variable")) not in allowed_variables
     ]
     accepted = [
         claim_id for claim_id in ids
-        if claim_id in by_id and str(by_id[claim_id].get("owner")) in allowed
+        if claim_id in by_id
+        and claim_id not in invalid
+        and claim_id not in unauthorized
+        and claim_id not in wrong_variable
     ]
-    if not accepted:
-        if unauthorized:
-            return ", ".join(ids), f"权限不匹配：{', '.join(unauthorized)}"
-        return ", ".join(ids), f"缺失：证据 ID 不存在 {', '.join(missing)}"
-
     issues = []
     if missing:
         issues.append(f"剔除不存在的证据 {', '.join(missing)}")
+    if invalid:
+        issues.append(f"剔除无效证据 {', '.join(invalid)}")
     if unauthorized:
         issues.append(f"剔除权限不匹配的证据 {', '.join(unauthorized)}")
+    if wrong_variable:
+        issues.append(f"剔除决策变量不匹配的证据 {', '.join(wrong_variable)}")
+    if not accepted:
+        return "-", f"缺失：{'；'.join(issues)}"
     qualities = [str(by_id[claim_id].get("quality_status") or "invalid") for claim_id in accepted]
-    if "invalid" in qualities:
-        issues.append("有效证据解析失败")
-    elif "stale" in qualities:
+    if "stale" in qualities:
         issues.append("有效证据时点过期")
     elif "partial" in qualities:
         issues.append("证据不完整")
@@ -559,15 +600,23 @@ def _validate_references(
 
 
 def render_decision_attribution(
-    pm_content: str, timing: Mapping[str, Any], ledger: Mapping[str, Any]
+    pm_content: str,
+    timing: Mapping[str, Any],
+    ledger: Mapping[str, Any],
+    *,
+    rm_content: str = "",
 ) -> str:
     """Render four PM decisions with validated evidence ownership and quality."""
     rating = _summary_value(pm_content, "pm_rating") or "数据不足"
     short_term = str(timing.get("effective_action") or "数据不足")
-    tp_values = [
-        _display_number(_summary_value(pm_content, key)) for key in ("pm_tp1", "pm_tp2", "pm_tp3")
-    ]
-    target_display = " / ".join(tp_values)
+    target_low = _display_number(_summary_value(rm_content, "target_price_low"))
+    target_mid = _display_number(_summary_value(rm_content, "target_price_mid"))
+    target_high = _display_number(_summary_value(rm_content, "target_price_high"))
+    target_display = (
+        f"{target_low}-{target_high}（中位 {target_mid}）"
+        if "数据不足" not in {target_low, target_mid, target_high}
+        else "数据不足"
+    )
     rows = (
         (
             "未来三日", short_term, "市场分析/风险", "short_term_evidence_ids", "short_term",
@@ -579,7 +628,7 @@ def render_decision_attribution(
             "新建仓位", _display_position(pm_content), "风险/PM", "position_evidence_ids", "position",
         ),
         (
-            "目标价/止盈位", target_display, "基本面/RM", "target_price_evidence_ids", "target_price",
+            "一年期目标价", target_display, "基本面/RM", "target_price_evidence_ids", "target_price",
         ),
     )
     lines = [
@@ -610,13 +659,24 @@ def create_research_evidence_node():
     """Return a LangGraph-compatible deterministic evidence compiler node."""
 
     def research_evidence_node(state: Mapping[str, Any]) -> dict[str, Any]:
-        ledger = compile_research_evidence(state)
-        packet = render_ic_packet(
-            ledger,
-            ticker=str(state.get("company_of_interest") or ""),
-            company_name=str(state.get("company_name") or ""),
-            trade_date=str(state.get("trade_date") or ""),
-        )
+        try:
+            ledger = compile_research_evidence(state)
+            packet = render_ic_packet(
+                ledger,
+                ticker=str(state.get("company_of_interest") or ""),
+                company_name=str(state.get("company_name") or ""),
+                trade_date=str(state.get("trade_date") or ""),
+            )
+        except Exception as exc:  # Never let reporting attribution abort analysis.
+            warning = f"研究证据编译异常，已降级为空账本：{type(exc).__name__}"
+            ledger = {
+                "schema_version": "research-evidence-v1",
+                "cards": [],
+                "conflicts": [],
+                "warnings": [warning],
+                "coverage": {},
+            }
+            packet = f"# IC 决策包\n\n- ⚠️ {warning}\n"
         return {"research_evidence_ledger": ledger, "ic_packet": packet}
 
     return research_evidence_node

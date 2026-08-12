@@ -51,12 +51,15 @@ def test_graph_routes_consensus_through_research_evidence_before_bull():
 def test_progress_logging_and_report_persistence_include_ic_packet():
     graph_source = (ROOT / "tradingagents/graph/trading_graph.py").read_text(encoding="utf-8")
     main_source = (ROOT / "main.py").read_text(encoding="utf-8")
+    cli_source = (ROOT / "cli/main.py").read_text(encoding="utf-8")
 
     assert '"ic_packet": "IC 决策包"' in graph_source
     assert '"research_evidence_ledger": final_state.get(' in graph_source
     assert '"ic_packet": final_state.get(' in graph_source
     assert '("ic_packet", "ic_packet.md", "Research Evidence Officer")' in main_source
     assert '"Research Evidence Officer": "研究证据官"' in main_source
+    assert '(analysts_dir / "ic_packet.md").write_text' in cli_source
+    assert 'final_state["ic_packet"]' in cli_source
 
 
 if __name__ == "__main__":
