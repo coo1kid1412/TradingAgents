@@ -1,0 +1,211 @@
+from __future__ import annotations
+
+import sys
+
+from tradingagents.agents.utils.research_evidence_node import (
+    compile_research_evidence,
+    render_ic_packet,
+)
+
+
+def _report(key: str, body: str) -> str:
+    return f"# report\n\n```yaml\n{key}:\n{body}\n```\n"
+
+
+def _complete_state() -> dict:
+    return {
+        "company_of_interest": "688114",
+        "company_name": "华大智造",
+        "trade_date": "2026-08-12",
+        "market_report": _report(
+            "SUMMARY",
+            """  trend_weekly: 震荡
+  trend_daily: 上行
+  momentum: 强
+  key_support: 82.5
+  key_resistance: 91.2
+  price_data_status: official_daily
+  price_data_date: 2026-08-12
+  price_data_source: tushare_daily
+  capital_flow_regime: 强势
+  data_implied_direction: 偏多
+  data_implied_reasoning: 日线动量与资金共振
+  confidence: 4""",
+        ),
+        "fundamentals_report": _report(
+            "SUMMARY",
+            """  pe_ttm: 42.1
+  pe_zone: 合理
+  pe_industry_median: 45.0
+  growth_yoy_revenue: 31.2
+  growth_yoy_profit: 47.8
+  roe: 12.4
+  earnings_quality: 高
+  governance_score: 高
+  red_flags: []
+  rating: 正面
+  data_implied_direction: 偏多
+  data_implied_reasoning: 盈利增长快于收入""",
+        ),
+        "news_report": _report(
+            "SUMMARY",
+            """  net_sentiment: 正面
+  key_events:
+    - title: 新平台获批
+      category: 公司
+      event_date: 2026Q3
+      source_date: 2026-08-11
+      horizon: 中期(1-3月)
+      priced_in_p: 40
+      impact: +中
+      credibility: 高
+      thesis_relevance: 核心
+    - title: 新平台获批
+      category: 公司
+      event_date: 2026Q3
+      source_date: 2026-08-11
+      horizon: 中期(1-3月)
+      priced_in_p: 40
+      impact: +中
+      credibility: 高
+      thesis_relevance: 核心
+  research_consensus_rating: BUY
+  research_consensus_target_price: 96.0
+  data_implied_direction: 偏多
+  data_implied_reasoning: 催化尚未充分定价""",
+        ),
+        "sentiment_report": _report(
+            "SUMMARY",
+            """  net_sentiment: 分歧
+  bull_post_pct: 45
+  bear_post_pct: 35
+  neutral_post_pct: 20
+  kol_consensus: 分歧
+  sentiment_trend_7d: 12
+  rating: HOLD
+  data_implied_direction: 中性
+  data_implied_reasoning: 多空观点分歧""",
+        ),
+        "quant_score": _report(
+            "QUANT_SCORE",
+            """  price_data_status: official_daily
+  price_data_date: 2026-08-12
+  composite: 72.5
+  factor_scores:
+    momentum: 78
+    value: 48
+    quality: 74
+    growth: 81""",
+        ),
+        "sector_comparison": "- vs 沪深300（30d）：✓ 跑赢大盘（RS = +12.4%）",
+        "market_risk_snapshot": {
+            "as_of_date": "2026-08-12",
+            "risk_level": "中",
+            "entry_gate": "CONDITIONAL",
+            "position_cap_pct": 6,
+            "data_status": "fresh",
+        },
+    }
+
+
+def test_compiler_builds_stable_cards_and_deduplicates_events():
+    ledger = compile_research_evidence(_complete_state())
+    by_id = {card["claim_id"]: card for card in ledger["cards"]}
+
+    assert by_id["MKT-TREND-01"]["decision_variable"] == "short_term_trend"
+    assert by_id["MKT-TREND-01"]["direction"] == "bullish"
+    assert by_id["FUND-GROWTH-01"]["decision_variable"] == "earnings_outlook_12m"
+    assert by_id["FUND-VAL-01"]["decision_variable"] == "target_price"
+    assert by_id["NEWS-CAT-01"]["direction"] == "bullish"
+    assert by_id["QUANT-COMP-01"]["direction"] == "bullish"
+    assert by_id["SECTOR-RS-01"]["direction"] == "bullish"
+    assert by_id["RISK-GATE-01"]["decision_variable"] == "position"
+    assert [card["claim_id"] for card in ledger["cards"]].count("NEWS-CAT-01") == 1
+    assert "NEWS-CAT-02" not in by_id
+
+
+def test_unknown_news_date_and_t_minus_one_price_are_partial():
+    state = _complete_state()
+    state["market_report"] = state["market_report"].replace(
+        "official_daily\n  price_data_date: 2026-08-12",
+        "t_minus_1\n  price_data_date: 2026-08-11",
+    )
+    state["news_report"] = state["news_report"].replace(
+        "source_date: 2026-08-11", "source_date: 未知"
+    )
+
+    ledger = compile_research_evidence(state)
+    by_id = {card["claim_id"]: card for card in ledger["cards"]}
+
+    assert by_id["MKT-TREND-01"]["quality_status"] == "partial"
+    assert by_id["NEWS-CAT-01"]["quality_status"] == "partial"
+
+
+def test_invalid_yaml_degrades_one_domain_without_aborting():
+    state = _complete_state()
+    state["sentiment_report"] = "```yaml\nSUMMARY:\n  broken: [\n```"
+
+    ledger = compile_research_evidence(state)
+
+    assert ledger["coverage"]["sentiment"] == "invalid"
+    assert any("舆情" in warning for warning in ledger["warnings"])
+    assert any(card["owner"] == "market" for card in ledger["cards"])
+
+
+def test_opposite_long_term_directions_create_conflict_without_resolving_it():
+    state = _complete_state()
+    state["news_report"] = state["news_report"].replace(
+        "data_implied_direction: 偏多", "data_implied_direction: 偏空"
+    )
+    state["news_report"] = state["news_report"].replace(
+        "impact: +中", "impact: -中"
+    )
+
+    ledger = compile_research_evidence(state)
+    conflicts = [
+        item for item in ledger["conflicts"]
+        if item["decision_variable"] == "long_term_rating"
+    ]
+
+    assert conflicts
+    assert set(conflicts[0]["directions"]) == {"bullish", "bearish"}
+    assert "FUND-GROWTH-01" in conflicts[0]["evidence_ids"]
+    assert "NEWS-CAT-01" in conflicts[0]["evidence_ids"]
+
+
+def test_ic_packet_lists_quality_conflicts_and_evidence_index():
+    state = _complete_state()
+    state["news_report"] = state["news_report"].replace(
+        "data_implied_direction: 偏多", "data_implied_direction: 偏空"
+    ).replace("impact: +中", "impact: -中")
+    ledger = compile_research_evidence(state)
+
+    packet = render_ic_packet(
+        ledger,
+        ticker="688114",
+        company_name="华大智造",
+        trade_date="2026-08-12",
+    )
+
+    assert packet.startswith("# IC 决策包：688114 华大智造")
+    assert "## 数据完整度" in packet
+    assert "## 未来三日与入场" in packet
+    assert "## 一年期盈利与估值" in packet
+    assert "## 冲突清单" in packet
+    assert "MKT-TREND-01" in packet
+    assert "FUND-GROWTH-01" in packet
+    assert "模型不得编造证据 ID" in packet
+
+
+if __name__ == "__main__":
+    tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
+    failed = 0
+    for test in tests:
+        try:
+            test()
+            print(f"  PASS {test.__name__}")
+        except Exception as exc:  # noqa: BLE001
+            failed += 1
+            print(f"  FAIL {test.__name__}: [{type(exc).__name__}] {exc}")
+    print(f"\n{len(tests) - failed}/{len(tests)} passed")
+    sys.exit(1 if failed else 0)
