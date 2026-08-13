@@ -2,6 +2,8 @@ import logging
 import json
 import re
 
+import yaml
+
 from langchain_core.messages import HumanMessage, AIMessage, ToolMessage, SystemMessage
 
 from tradingagents.agents.utils.agent_utils import build_instrument_context, RISK_DEBATE_PHRASING_RULES
@@ -43,6 +45,67 @@ def _extract_rm_rating(report: str):
         report or "",
     )
     return matches[-1] if matches else None
+
+
+def _normalize_summary_yaml_fence(content: str, summary_key: str) -> str:
+    """Canonicalize the final summary as one fenced YAML block.
+
+    M3 occasionally emits the required summary after an orphan generic fence.
+    Humans can read that output, but the archive parser intentionally accepts
+    only explicit YAML fences. Normalize that formatting deterministically at
+    the manager boundary.
+    """
+    text = (content or "").rstrip()
+    matches = list(re.finditer(rf"(?m)^{re.escape(summary_key)}:\s*$", text))
+    if not matches:
+        return text
+
+    body_end = matches[0].start()
+    key_start = matches[-1].start()
+    tail = text[key_start:]
+    closing = re.search(r"(?m)^```\s*$", tail)
+    summary = tail[:closing.start()].rstrip() if closing else tail.rstrip()
+
+    prefix_lines = text[:body_end].rstrip().splitlines()
+    while prefix_lines and not prefix_lines[-1].strip():
+        prefix_lines.pop()
+    while prefix_lines and prefix_lines[-1].strip() in {"---", "```", "```yaml"}:
+        prefix_lines.pop()
+        while prefix_lines and not prefix_lines[-1].strip():
+            prefix_lines.pop()
+    prefix = "\n".join(prefix_lines).rstrip()
+    fenced = f"```yaml\n{summary}\n```"
+    return f"{prefix}\n\n---\n\n{fenced}" if prefix else fenced
+
+
+_SUMMARY_REQUIRED_FIELDS = {
+    "RM_SUMMARY": {
+        "current_price", "rm_rating", "target_price_mid", "entry_timing",
+        "rating_evidence_ids", "target_price_evidence_ids",
+        "earnings_evidence_ids", "key_conflict_ids",
+    },
+    "PM_SUMMARY": {
+        "current_price", "pm_rating", "pm_action_keyword", "pm_size_low_pct",
+        "pm_size_high_pct", "entry_timing", "short_term_evidence_ids",
+        "long_term_evidence_ids", "position_evidence_ids", "target_price_evidence_ids",
+    },
+}
+
+
+def _summary_yaml_is_complete(content: str, summary_key: str) -> bool:
+    normalized = _normalize_summary_yaml_fence(content, summary_key)
+    blocks = re.findall(r"```yaml\s*\n(.*?)\n```", normalized, re.DOTALL)
+    if not blocks:
+        return False
+    try:
+        parsed = yaml.safe_load(blocks[-1])
+    except yaml.YAMLError:
+        return False
+    summary = parsed.get(summary_key) if isinstance(parsed, dict) else None
+    if not isinstance(summary, dict):
+        return False
+    required = _SUMMARY_REQUIRED_FIELDS.get(summary_key)
+    return required.issubset(summary) if required else True
 
 
 def _enforce_entry_timing_truth(content: str, timing: dict) -> str:
@@ -180,7 +243,7 @@ def _run_tool_calling_loop(llm_with_tools, initial_messages, *,
 
         # —— 不再调工具：检查正文是否完整 ——
         joined = "\n\n".join(cot_segments)
-        if joined.strip() and completion_token in joined:
+        if joined.strip() and _summary_yaml_is_complete(joined, completion_token):
             logger.info(
                 "%s tool calling 循环结束（第 %d 轮，累积 %d 段，总长 %d 字符）",
                 role, iteration, len(cot_segments), len(joined),
@@ -191,13 +254,20 @@ def _run_tool_calling_loop(llm_with_tools, initial_messages, *,
             break
 
         continuations += 1
-        reason = "为空" if not joined.strip() else f"截断（缺 {completion_token} 收尾）"
+        if not joined.strip():
+            reason = "为空"
+        elif completion_token not in joined:
+            reason = f"截断（缺 {completion_token} 收尾）"
+        else:
+            reason = f"截断（{completion_token} 不完整或无法解析）"
         logger.warning("%s 输出正文%s（疑似 think-only 被剥离），第 %d 次续写",
                        role, reason, continuations)
         messages.append(HumanMessage(
-            content=f"你的报告正文{reason}——可能你把内容写进了思考过程。请**从中断处继续输出正文**，"
-                    f"不要重复已输出的部分，不要输出思考标签；尚未完成的步骤继续完成"
-                    f"（该调用的工具照常调用），最后必须以完整的 {completion_token} YAML 段收尾。"
+            content=f"你的报告正文{reason}——可能你把内容写进了思考过程。"
+                    f"若正文缺失则从中断处继续，不要重复正文；若 {completion_token} 已出现但不完整，"
+                    f"请重新完整输出整个 {completion_token} YAML，不要续写残片。不要输出思考标签；"
+                    f"尚未完成的步骤继续完成（该调用的工具照常调用），最后必须以完整且可解析的 "
+                    f"{completion_token} YAML 段收尾。"
         ))
 
     # —— 续写预算用尽 ——
@@ -229,6 +299,7 @@ def create_research_manager(llm):
         quant_score = state.get("quant_score", "")
         sector_comparison = state.get("sector_comparison", "")
         capital_flow_yaml = state.get("capital_flow_yaml", "")
+        ic_packet = state.get("ic_packet", "")
         market_risk_snapshot = state.get("market_risk_snapshot") or {}
         market_mode = derive_market_mode(market_risk_snapshot)
         entry_timing = _derive_entry_timing_from_profile(stock_profile, market_mode)
@@ -249,6 +320,17 @@ def create_research_manager(llm):
 **真实 RM 不是"多空辩论的裁判员"，而是"独立研究员"**：
 - 裁判员看双方哪边说得更有理 → 评级是公式产出
 - 研究员自己看数据、建估值模型、判断业绩拐点 → 评级是综合判断产出
+
+**决策权边界**：RM 只能决定长期 thesis、12 个月评级、目标价和证伪条件；未来三日入场、
+仓位、止损和最终交易动作由市场分析、风险团队与 PM 决定。短线结构不得改变长期评级。
+
+## IC 决策包（首要证据索引）
+
+{ic_packet if ic_packet else "（IC 决策包缺失；不得编造证据 ID，所有归因字段填 null）"}
+
+**证据 ID 规则**：评级、目标价、盈利拐点和关键冲突必须引用本包存在的证据 ID。原始报告仅用于
+冲突下钻和数值复核；引用无效、过期或不存在的 ID 等同于未引用。关键论据正文也应标注证据 ID。
+`SYS_*`、字段名和 `compute_*` 都不是证据 ID；工具结果可用于计算，但不能冒充归因证据。
 
 你的工作是：**走完整 8 步 COT 思考链路，最后给出主观但 COT 透明的评级**。多空辩论是"已识别的争议点清单"，给 PM 做仓位参考，**不主导评级方向**。
 
@@ -935,21 +1017,27 @@ RM_SUMMARY:
   overlay_style_adj: <int>               # 工具返回 overlay_components.style（-1/0/+1）
   overlay_vote_adj: <int>                # 工具返回 overlay_components.vote
   overlay_catalyst_adj: <int>            # 工具返回 overlay_components.catalyst
+  rating_evidence_ids: "<ID1|ID2 或 null>"       # 长期评级的主要证据
+  target_price_evidence_ids: "<ID1|ID2 或 null>" # 目标价的主要证据
+  earnings_evidence_ids: "<ID1|ID2 或 null>"     # 盈利展望/拐点证据
+  key_conflict_ids: "<CONFLICT-01|... 或 null>"  # 已处理的 IC 冲突
 ```
 
 **约束**：
 - 缺数据填 `null`（如某只股 momentum_score 缺失）
 - 不要嵌套、不要加注释行；本节是供 Python 解析的固定格式
+- 证据字段只允许填写 IC 决策包中存在的 ID，多个 ID 用 `|` 分隔；缺失填 null
 - 该 YAML 必须是报告最后一段，前后用 `---` 分隔，方便提取器定位
 """
         # 绑定 RM 计算工具，让 LLM 在 Step 4 / 辅助分析等数值步骤显式调用工具
         # 替代之前 LLM 心算导致的 Bull Score / 目标价区间 等计算 bug
         llm_with_tools = llm.bind_tools(RM_TOOLS)
         response = _run_tool_calling_loop(llm_with_tools, [HumanMessage(content=prompt)])
+        normalized_content = _normalize_summary_yaml_fence(response.content, "RM_SUMMARY")
         final_entry_timing = _derive_entry_timing_from_profile(
-            stock_profile, market_mode, long_term_rating=_extract_rm_rating(response.content),
+            stock_profile, market_mode, long_term_rating=_extract_rm_rating(normalized_content),
         )
-        response = AIMessage(content=_enforce_entry_timing_truth(response.content, final_entry_timing))
+        response = AIMessage(content=_enforce_entry_timing_truth(normalized_content, final_entry_timing))
         logger.info("RM entry_timing 出口真值: %s", final_entry_timing)
 
         new_investment_debate_state = {

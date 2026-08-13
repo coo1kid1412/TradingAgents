@@ -378,6 +378,7 @@ class TradingAgentsGraph:
             "stock_profile": "股票画像识别官",
             "sector_comparison": "板块对照官",
             "consensus_snapshot": "共识识别官",
+            "ic_packet": "IC 决策包",
             "investment_plan": "研究主管 (RM)",
             # "trader_investment_plan": "交易员",  # DEPRECATED in optimization 05
             "final_trade_decision": "投资组合经理 (PM)",
@@ -391,6 +392,7 @@ class TradingAgentsGraph:
             "stock_profile",
             "sector_comparison",
             "consensus_snapshot",
+            "ic_packet",
             "investment_plan", "final_trade_decision",  # trader_investment_plan removed in 05
         ]
 
@@ -458,6 +460,8 @@ class TradingAgentsGraph:
             "stock_profile": final_state.get("stock_profile", ""),
             "sector_comparison": final_state.get("sector_comparison", ""),
             "consensus_snapshot": final_state.get("consensus_snapshot", ""),
+            "research_evidence_ledger": final_state.get("research_evidence_ledger", {}),
+            "ic_packet": final_state.get("ic_packet", ""),
             "investment_debate_state": {
                 "bull_history": final_state["investment_debate_state"]["bull_history"],
                 "bear_history": final_state["investment_debate_state"]["bear_history"],

@@ -168,6 +168,7 @@ _AGENT_CN = {
     "Conservative Analyst": "事件风控分析师",
     "Neutral Analyst": "尾部风控分析师",
     "Portfolio Manager": "投资组合经理",
+    "Research Evidence Officer": "研究证据官",
 }
 
 
@@ -202,6 +203,7 @@ def _save_report(state, ticker: str, save_path: Path):
         ("stock_profile", "stock_profile.md", "Stock Profile Officer"),
         ("sector_comparison", "sector.md", "Sector Comparison Officer"),
         ("consensus_snapshot", "consensus.md", "Consensus Officer"),
+        ("ic_packet", "ic_packet.md", "Research Evidence Officer"),
     ]:
         if state.get(key):
             analysts_dir.mkdir(exist_ok=True)

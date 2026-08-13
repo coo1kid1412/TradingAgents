@@ -91,6 +91,8 @@ class Propagator:
             "macro_context": "",
             "stock_profile": "",
             "consensus_snapshot": "",
+            "research_evidence_ledger": {},
+            "ic_packet": "",
         }
 
     def get_graph_args(self, callbacks: Optional[List] = None) -> Dict[str, Any]:
