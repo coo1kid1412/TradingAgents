@@ -236,6 +236,7 @@ def select_deep_thinking_agent(provider) -> str:
 def select_llm_provider() -> tuple[str, str | None]:
     """Select the LLM provider and its API endpoint."""
     BASE_URLS = [
+        ("DeepSeek", "https://api.deepseek.com"),
         ("OpenAI", "https://api.openai.com/v1"),
         ("Google", None),  # google-genai SDK manages its own endpoint
         ("Anthropic", "https://api.anthropic.com/"),

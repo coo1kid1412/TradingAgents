@@ -17,15 +17,17 @@ DEFAULT_CONFIG = {
         "dataflows/data_cache",
     ),
     # LLM settings
-    "llm_provider": "openai",
-    "deep_think_llm": "gpt-5.4",
-    "quick_think_llm": "gpt-5.4-mini",
-    "backend_url": "https://api.openai.com/v1",
+    "llm_provider": "deepseek",
+    "deep_think_llm": "deepseek-v4-pro",
+    "quick_think_llm": "deepseek-v4-flash",
+    "backend_url": "https://api.deepseek.com",
     # Provider-specific thinking configuration
     "google_thinking_level": None,      # "high", "minimal", etc.
     "openai_reasoning_effort": None,    # "medium", "high", "low"
     "anthropic_effort": None,           # "high", "medium", "low"
     "minimax_max_tokens": 8192,         # MiniMax default max_tokens (upstream default 256 too small)
+    "deepseek_max_tokens": 8192,        # Flash 高频角色默认输出预算；Pro 角色由 role policy 覆盖
+    "deepseek_reasoning_effort": "high",  # 所有 DeepSeek 调用显式 Think，角色可升到 max
     "fundamentals_analyst_max_tokens": 16384,  # 基本面长报告含多表格，避免 think 占满全局预算
     "research_manager_max_tokens": 16384,  # RM 多步工具后需留足最终研究摘要输出预算
     "portfolio_manager_max_tokens": 16384,  # PM 报告 14 章节较长，需高于全局 minimax_max_tokens 防截断

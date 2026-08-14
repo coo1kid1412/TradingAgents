@@ -9,6 +9,16 @@ ProviderModeOptions = Dict[str, Dict[str, List[ModelOption]]]
 
 
 MODEL_OPTIONS: ProviderModeOptions = {
+    "deepseek": {
+        "quick": [
+            ("DeepSeek V4 Flash - 高频 Think 角色", "deepseek-v4-flash"),
+            ("DeepSeek V4 Pro - 深度研究", "deepseek-v4-pro"),
+        ],
+        "deep": [
+            ("DeepSeek V4 Pro - 深度研究与决策", "deepseek-v4-pro"),
+            ("DeepSeek V4 Flash - 高频 Think 角色", "deepseek-v4-flash"),
+        ],
+    },
     "openai": {
         "quick": [
             ("GPT-5.4 Mini - Fast, strong coding and tool use", "gpt-5.4-mini"),

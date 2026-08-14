@@ -936,6 +936,8 @@ def run_analysis():
     config["google_thinking_level"] = selections.get("google_thinking_level")
     config["openai_reasoning_effort"] = selections.get("openai_reasoning_effort")
     config["anthropic_effort"] = selections.get("anthropic_effort")
+    if config["llm_provider"] == "deepseek":
+        config["deepseek_reasoning_effort"] = "high"
     config["output_language"] = selections.get("output_language", "English")
 
     # Create stats callback handler for tracking LLM/tool calls
