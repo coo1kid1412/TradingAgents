@@ -17,7 +17,11 @@ from tradingagents.agents.managers.research_manager import (
     _normalize_summary_yaml_fence,
     _run_tool_calling_loop,
 )
-from tradingagents.agents.utils.research_evidence_node import render_decision_attribution
+from tradingagents.agents.utils.research_evidence_node import (
+    compile_decision_contribution_ledger,
+    render_decision_attribution,
+    render_ic_contribution_summary,
+)
 from tradingagents.agents.managers.rm_tools import derive_market_mode
 from tradingagents.agents.utils.risk_consensus import build_risk_consensus
 from tradingagents.agents.utils.risk_context import build_risk_data_packet
@@ -69,6 +73,25 @@ _ENTRY_PRESENTATION = {
 def _extract_pm_summary_value(content: str, key: str) -> str | None:
     matches = re.findall(rf"(?m)^\s*{re.escape(key)}:\s*([^#\r\n]+?)\s*$", content or "")
     return matches[-1].strip().strip('"\'') if matches else None
+
+
+def _enforce_pm_research_rating(content: str, research_plan: str) -> str:
+    """Make the PM summary mirror the RM's authoritative research rating."""
+    research_rating = _extract_rm_rating(research_plan)
+    if not research_rating:
+        return content
+    fixed = re.sub(
+        r"(?m)^(\s*pm_rating:\s*)(BUY|OVERWEIGHT|HOLD|UNDERWEIGHT|SELL)\s*$",
+        rf"\g<1>{research_rating}",
+        content or "",
+    )
+    fixed = re.sub(
+        r"(?m)^(\s*pm_rating_adjusted_from_rm:\s*)(?:true|false)\s*$",
+        r"\g<1>false",
+        fixed,
+        flags=re.IGNORECASE,
+    )
+    return fixed
 
 
 def _format_position_size(low: str | None, high: str | None) -> str:
@@ -535,7 +558,7 @@ def _format_pm_decision(
     news_report: str = "",
 ) -> str:
     """Remove model working text and prepend a deterministic action summary."""
-    original = (content or "").strip()
+    original = _enforce_pm_research_rating(content or "", research_plan).strip()
     summary_block, summary_start, _summary_was_fenced = _extract_pm_summary_block(original)
     user_source = original[:summary_start].rstrip() if summary_block else original
     trade_ticket = re.search(r"(?m)^#{1,2}\s+Trade Ticket\b.*$", user_source)
@@ -639,7 +662,14 @@ def _format_pm_decision(
         summary_block or original, entry_timing, size, rating,
     )
     attribution = ""
+    contribution_summary = ""
     if research_evidence_ledger is not None:
+        contribution_ledger = compile_decision_contribution_ledger(
+            research_plan, research_evidence_ledger,
+        )
+        contribution_summary = render_ic_contribution_summary(
+            research_plan, contribution_ledger,
+        )
         attribution = render_decision_attribution(
             summary_block or original,
             {**timing, "effective_action": entry_timing},
@@ -647,14 +677,27 @@ def _format_pm_decision(
             rm_content=research_plan,
         )
 
+    pillars = {
+        "经营与盈利": _extract_pm_summary_value(research_plan, "pillar_thesis") or "数据不足",
+        "估值": _extract_pm_summary_value(research_plan, "pillar_valuation") or "数据不足",
+        "催化": _extract_pm_summary_value(research_plan, "pillar_catalyst") or "数据不足",
+        "持续性": _extract_pm_summary_value(research_plan, "pillar_durability") or "数据不足",
+    }
+    mismatch_line = ""
+    if rating in {"BUY", "OVERWEIGHT"} and entry_timing in no_new_position_actions:
+        mismatch_line = f"> **暂不买入原因：{reason}**\n>\n"
     summary = (
         f"# 短期操作结论：{entry_timing}\n\n"
-        f"> **当前动作：{action}｜新建仓位：{size}｜长期评级：{rating}**\n>\n"
+        f"> **一年期研究评级：{rating}｜当前动作：{action}｜新建仓位：{size}**\n>\n"
+        f"> **四支柱：经营与盈利 {pillars['经营与盈利']}｜估值 {pillars['估值']}｜"
+        f"催化 {pillars['催化']}｜持续性 {pillars['持续性']}**\n>\n"
+        f"{mismatch_line}"
         f"> **核心原因：{reason}**\n>\n"
         f"> **趋势判断：未来 3 日 {short_trend}（置信度 {short_confidence}）｜"
         f"未来 12 个月主题 {theme_outlook}**\n>\n"
         f"> **重新评估条件：{trigger}**\n\n"
         f"{position_actions}"
+        f"{f'{chr(10)}{chr(10)}{contribution_summary}' if contribution_summary else ''}"
         f"{f'{chr(10)}{chr(10)}{attribution}' if attribution else ''}\n\n---"
     )
     rendered = f"{summary}\n\n{report_body}".rstrip()
@@ -744,9 +787,10 @@ def create_portfolio_manager(llm, memory):
 
 ## 决策权与问责
 
-PM 是最终交易决策人，独占最终动作、仓位、入场、止损和是否采纳 RM 的决定权。长期评级和目标价
-必须优先尊重基本面/RM，短期入场必须优先尊重市场/风险，仓位必须优先尊重风险门控。不得让舆情单独决定目标价，
-也不得让基本面单独决定未来三日入场。可以否决 RM，但必须引用有效反向证据 ID。
+PM 是最终交易决策人，独占最终动作、仓位、入场和止损的决定权。一年期研究评级由 RM 的四支柱工具
+确定，PM 不得修改 `research_rating`；短期入场必须优先尊重市场/风险，仓位必须优先尊重风险门控。
+不得让舆情单独决定目标价，也不得让基本面单独决定未来三日入场。PM 可以因执行风险拒绝当下买入，
+但只能改变动作与仓位，不能借此改写研究评级。
 
 ## ⚠️ 数值计算必须调用工具（强制约束）
 
@@ -803,8 +847,8 @@ PM 是最终交易决策人，独占最终动作、仓位、入场、止损和�
 6. 反向证伪触发器（What would change my mind）
 7. 核心风险、触发条件 + 必要时的减仓资金去向（机会成本）
 
-**你比 RM 多的信息**：4 个 analyst 原始报告 + consensus + risk 三方辩论。
-**你不该做的**：重新做方向判断（评级以 RM 为准，仅 ±1 档微调）、重新算 PE/EPS。
+**你比 RM 多的信息**：风险三方辩论、市场风险闸门、仓位约束和确定性入场时机。
+**你不该做的**：重新做长期方向判断、重算 PE/EPS 或覆盖 RM 的四支柱研究评级。
 
 ## 用户版报告可读性（最高优先级）
 
@@ -825,13 +869,13 @@ PM 是最终交易决策人，独占最终动作、仓位、入场、止损和�
 
 ## 决策流程（仅内部思考使用，**禁止把流程章节写入最终报告**）
 
-⚠️ **关键格式约束**：以下"第一步～第八步"是你**内部思考流程**，不是报告章节。**最终 decision.md 必须直接以 `## Trade Ticket 决策卡` 开头**，禁止出现"第一步：吸收股票画像"、"第二步：评级微调" 等流程性标题。所有思考结果直接体现在"完整报告结构"列出的十六个正式章节里。
+⚠️ **关键格式约束**：以下"第一步～第八步"是你**内部思考流程**，不是报告章节。**最终 decision.md 必须直接以 `## Trade Ticket 决策卡` 开头**，禁止出现"第一步：吸收股票画像"、"第二步：研究评级复核"等流程性标题。所有思考结果直接体现在正式报告章节里。
 
 ### 第一步：吸收股票画像 + 上下文（内部思考，不输出章节）
 
 从画像识别官的输出（在"输入资料"区"股票画像"段）提取并显式列出：
 - **决策风格**（value_anchor / catalyst_driven / momentum / event_driven）
-- **4 份报告最终权重**（用于校验 RM 评分是否合理）
+- **四支柱状态与被采纳证据**（只用于理解研究评级，不重新计票）
 - **关键时间窗口事件**
 
 **决策风格→操作动作的映射规则**（必须严格遵守）：
@@ -845,7 +889,7 @@ PM 是最终交易决策人，独占最终动作、仓位、入场、止损和�
 
 **从 RM thesis 中提取**（RM 8 步 COT 综合判断产出）：
 
-- **最终评级 R + Conviction**（RM 一、评级与置信度）→ 默认采纳，仅 ±1 档微调；Conviction 映射五星 + 仓位
+- **最终研究评级 R + Conviction**（RM 一、评级与置信度）→ 评级逐字采用；Conviction 映射五星 + 仓位
 - **综合目标价区间 + Bull/Base/Bear 目标价 + 概率**（RM 一 / Step 5）→ 直接复用为情景分布三档，1R 基于综合区间
 - **业绩拐点 + 下一检验点**（RM Step 3）→ Time Stop 触发条件
 - **行业框架 + 决策风格**（RM Step 1 + stock_profile）→ 操作节奏（紧/松 TP/SL）
@@ -856,7 +900,7 @@ PM 是最终交易决策人，独占最终动作、仓位、入场、止损和�
 
 | 字段 | quant_score 输出位置 | 你的用途 |
 |------|--------------------|---------|
-| **QUANT_SCORE.composite**（0-100） | YAML 摘要 | 评级一致性交叉校验：若 RM 评级方向与 quant 严重背离（如 RM=OVERWEIGHT 但 composite<30），需在 2B 评级微调中说明 |
+| **QUANT_SCORE.composite**（0-100） | YAML 摘要 | 独立交叉校验：若与 RM 方向严重背离，写入 Key Risks 并降低 Conviction/仓位，不改研究评级 |
 | **factor_scores 中 <30 分的因子** | YAML 摘要 / 因子分项表 | **必须列入 Trade Ticket 的 Key Risks 段**（如 lowvol=5 → "极端高波动"；value=18 → "估值显著偏贵"）|
 | **Conviction 强化**（评级与 quant 方向一致时）| —— | RM=OVERWEIGHT 且 composite≥70 → Conviction 可在 RM 给的基础上 +1 档 |
 
@@ -911,7 +955,7 @@ stock_profile 末尾的 `TRANSPARENCY:` 段标注了"超共识程度"，按以�
 ⛔ **内部应用要求**：按上述阈值完成 Conviction 调档，但用户版报告只写成
 “估值锚偏离导致置信度下降”及对应结果，不输出 `TRANSPARENCY.*` 字段名、阈值检查过程或开发者留痕。
 
-### 第二步：评级微调（含对 RM thesis 的反向质疑）
+### 第二步：研究评级复核与执行质疑
 
 #### 2A. 对 RM thesis 的反向质疑（内部完成，不输出独立表）
 
@@ -935,17 +979,17 @@ stock_profile 末尾的 `TRANSPARENCY:` 段标注了"超共识程度"，按以�
 > | 1 | RM 假设 Q2 营收同比 >25% 是 Base case | 第 5 步 Bull case 3 | **中** | 若 Q2 仅 +15%，Base case 概率从 55% 降到 30%，加权 E 从 +12% 转为 -3%，评级实际应降至 HOLD |
 > | 2 | RM 用三星 CXL 量产 Q3 落地作为 anchor 1 | Bull 论据 1 | **中** | 若三星推迟到 Q4，anchor 失效，d' 跨档至 HOLD，目标价应砍 20% 至 220 元 |
 
-#### 2B. 评级微调（仅限执行层因素）
+#### 2B. 评级只读与执行层修正
 
-1. 默认采纳 RM 评级 R2
-2. 仅允许 ±1 档微调，禁止跨方向翻转
-3. 调整必须留痕（写明触发理由）
+1. `research_rating` 必须逐字采用 RM_SUMMARY 的权威结果
+2. 反向质疑只能降低 Conviction、缩小仓位、延后入场或触发退出
+3. 若研究评级看多但当前不能买，必须明确写出市场风险、结构或赔率原因
 
 **质疑（2A）→ Conviction 修正**：
 - 若 2A 中有 ≥1 条"假设不成立概率 = 高"的质疑 → Conviction 下调一档（仓位对应下移）
 - 若 2A 中有 ≥2 条"假设不成立概率 = 中"的质疑 → Conviction 下调一档
-- 质疑**不能**修改评级方向（仍按 2B 规则采纳 RM ± 1 档）
-- 质疑结论写入最终决策卡的"评级调整说明"段留痕
+- 质疑**不能**修改研究评级方向
+- 质疑结论写入 Core Thesis、Key Risks 和执行动作，不另造评级
 
 ### 第三步：Conviction Score 五星制 + 仓位映射
 
@@ -997,16 +1041,8 @@ PM 必须明确"thesis 兑现"的具体里程碑（如"Q2 营收增速 >25%"、"
 
 ### 第六步：情景概率分布表（含尾部）
 
-**核心规则（条件性继承）**：
-
-| 你在第二步 2B 的决策 | 第六步该怎么做 |
-|------|---------|
-| **采纳 RM 评级（不微调）**| Bull/Base/Bear 三档**完全沿用 RM Step 5**（目标价 + 概率 + 核心假设原文照抄），你只新增 **黑天鹅 Tail** 一档 |
-| **微调 RM 评级（±1 档，如 HOLD → OVERWEIGHT）**| 允许调整 Bull/Base/Bear 概率（**单档调整不超过 ±15pp**），但**目标价仍沿用 RM**；必须显式输出"RM 原始 vs PM 调整"对照表，并归因到第二步反向质疑的具体条目 |
-
-**为什么目标价必须沿用 RM**：目标价是估值模型（PE×EPS / PEG / 同业可比）的输出。如果你认为目标价错，应该回到第二步质疑 RM Step 4 的估值方法，**而不是在这里悄悄改数字**。概率是对未来路径的主观判断，PM 在这上面有合理裁量空间。
-
-#### 情形 A：评级未微调（直接沿用 RM）
+Bull/Base/Bear 三档目标价、概率和核心假设**完全沿用 RM**。PM 只能基于风险辩论新增
+黑天鹅 Tail，并把原三档概率按比例缩放到 `(100% - tail%)`；不得借场景概率改写一年期研究评级。
 
 | 情景 | 概率 | 12 月目标价 | 收益 | 触发条件 |
 |------|------|------------|------|---------|
@@ -1017,24 +1053,6 @@ PM 必须明确"thesis 兑现"的具体里程碑（如"Q2 营收增速 >25%"、"
 | **概率加权 E** | 100% | __ 元 | __% | — |
 
 加入 Tail 后 Bull/Base/Bear 原始概率之和需从 100% 等比例收缩到 (100% − tail%)。例：RM 给 25/50/25，加 10% Tail，三档变 22.5/45/22.5。
-
-#### 情形 B：评级微调（必须输出对照表）
-
-| 情景 | RM 原始概率 | PM 调整后概率 | 12 月目标价（沿用 RM）| 调整归因 |
-|------|------------|--------------|---------------------|---------|
-| 乐观 Bullish | __% | __% | （沿用 RM）| 引用第二步反向质疑第 N 条：__ |
-| 基础 Base | __% | __% | （沿用 RM）| __ |
-| 悲观 Bearish | __% | __% | （沿用 RM）| __ |
-| 黑天鹅 Tail | — | __% | __ 元 | （PM 新增）|
-| **概率加权 E** | 100% | 100% | __ 元 | — |
-
-**约束（情形 B 专属）**：
-- 单档概率调整**不能超过 ±15pp**（如 Bear 从 25% 降到 10% 不允许，最低只能到 10%）
-- 调整方向必须与微调方向一致：升档（HOLD→OVERWEIGHT）只能 Bull 加 / Bear 减；降档反之
-- 每条调整必须**显式引用**第二步反向质疑的对应条目编号（如"第二步质疑 #2 指出 Q2 营收兑现概率被 RM 低估 → Bull 概率从 25% 升至 35%"）
-- 若你在第二步没有给出对应质疑就修改概率 → 视为静默改写，禁止
-
-#### 共同约束（情形 A / B 都适用）
 
 - 黑天鹅档**必须**显式引用尾部风险分析师的论据
 - 概率加权 E **必须**通过工具 `compute_pm_scenario_e` 计算（输入 4 档目标价 + 概率），禁止心算
@@ -1242,13 +1260,14 @@ PM 必须明确推荐其中之一，并解释理由。
 
 报告**完成后**，必须在最末尾输出一段 YAML 摘要，**字段名严格按以下格式**，否则归档失败。
 所有数值直接采用 Trade Ticket 中已经定下的值，不要再调整。
+`pm_rating 必须逐字镜像 RM_SUMMARY.research_rating`，PM 不得修改 `research_rating`。
 
 ```yaml
 PM_SUMMARY:
   ticker: "{pm_ticker}"
   trade_date: "{pm_trade_date}"
   current_price: <float>                 # 当前价 P_0
-  pm_rating: BUY / OVERWEIGHT / HOLD / UNDERWEIGHT / SELL
+  pm_rating: BUY / OVERWEIGHT / HOLD / UNDERWEIGHT / SELL  # 逐字镜像 RM_SUMMARY.research_rating
   pm_conviction_stars: <int 1-5>
   pm_invest_judgment: YES / NO / CONDITIONAL
   pm_entry_judgment: BUY_NOW / WAIT / DONT_BUY
@@ -1264,7 +1283,7 @@ PM_SUMMARY:
   pm_sl_hard: <float>                    # ⛔ 硬止损（所有评级都必填具体数字，禁止 null）
   pm_horizon_months_low: <int>           # Time Stop 时间窗口下沿（月）
   pm_horizon_months_high: <int>          # Time Stop 时间窗口上沿
-  pm_rating_adjusted_from_rm: <bool>     # PM 是否相对 RM 评级做了 ±1 档微调
+  pm_rating_adjusted_from_rm: false      # 兼容字段；研究评级只读
   market_risk_level: <低 / 中 / 高 / 极高 / 数据不足>
   market_entry_gate: <OPEN / CONDITIONAL / WAIT>
   market_position_cap_pct: <float>
@@ -1292,11 +1311,12 @@ Be decisive and ground every conclusion in specific evidence from the analysts.{
         llm_with_tools = llm.bind_tools(PM_TOOLS)
         response = _pm_tool_loop(llm_with_tools, [HumanMessage(content=prompt)])
         normalized_content = _normalize_summary_yaml_fence(response.content, "PM_SUMMARY")
-        pm_rating_match = re.findall(
-            r"(?m)^\s*pm_rating:\s*(BUY|OVERWEIGHT|HOLD|UNDERWEIGHT|SELL)\s*$",
-            normalized_content,
+        normalized_content = _enforce_pm_research_rating(
+            normalized_content, research_plan,
         )
-        final_rating = pm_rating_match[-1] if pm_rating_match else rm_rating
+        final_rating = rm_rating or _extract_pm_summary_value(
+            normalized_content, "pm_rating",
+        )
         final_entry_timing = _derive_entry_timing_from_profile(
             stock_profile, market_mode, long_term_rating=final_rating,
         )

@@ -93,6 +93,15 @@ def test_pm_summary_has_four_auditable_reference_fields():
     assert "都不是证据 ID" in source
 
 
+def test_pm_treats_rm_research_rating_as_read_only():
+    source = PM_PATH.read_text(encoding="utf-8")
+    assert "PM 不得修改 `research_rating`" in source
+    assert "pm_rating 必须逐字镜像 RM_SUMMARY.research_rating" in source
+    assert "仅 ±1 档微调" not in source
+    assert "评级微调（仅限执行层因素）" not in source
+    assert "pm_rating_adjusted_from_rm: false" in source
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     failed = 0

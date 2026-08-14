@@ -285,7 +285,7 @@ PM_SUMMARY:
         {"structure_class": "healthy_trend", "effective_action": "暂不介入"},
     )
     assert result.startswith("# 短期操作结论：暂不介入\n")
-    assert "**当前动作：WAIT｜新建仓位：0%｜长期评级：OVERWEIGHT**" in result
+    assert "**一年期研究评级：OVERWEIGHT｜当前动作：WAIT｜新建仓位：0%**" in result
     assert "## Trade Ticket 交易票" in result
     assert "我需要重新核算" not in result
     assert result.rstrip().endswith("```")
@@ -841,7 +841,47 @@ PM_SUMMARY:
     assert summary["entry_timing"] == "等待条件确认"
     assert "# 短期操作结论：等待条件确认" in result
     assert "| **Size** 仓位规模 | 新建仓 0% |" in result
-    assert "**当前动作：WAIT｜新建仓位：0%｜长期评级：BUY**" in result
+    assert "**一年期研究评级：BUY｜当前动作：WAIT｜新建仓位：0%**" in result
+
+
+def test_pm_cannot_change_rm_research_rating_and_header_shows_four_pillars():
+    content = """## Trade Ticket 交易票
+
+| **Action** 当前动作 | WAIT |
+
+```yaml
+PM_SUMMARY:
+  current_price: 100
+  pm_rating: SELL
+  pm_action_keyword: WAIT
+  pm_size_low_pct: 0
+  pm_size_high_pct: 0
+  entry_timing: 等回踩
+  short_term_trend: 震荡
+  short_term_confidence: 中
+  theme_outlook_12m: 兑现
+```
+"""
+    research_plan = """```yaml
+RM_SUMMARY:
+  research_rating: OVERWEIGHT
+  rm_rating: OVERWEIGHT
+  pillar_thesis: adequate
+  pillar_valuation: attractive
+  pillar_catalyst: visible
+  pillar_durability: acceptable
+```"""
+
+    result = _format_pm_decision(
+        content,
+        {"structure_class": "healthy_trend", "effective_action": "等回踩"},
+        research_plan=research_plan,
+    )
+
+    assert _find_yaml_block(result, "PM_SUMMARY")["pm_rating"] == "OVERWEIGHT"
+    assert "**一年期研究评级：OVERWEIGHT｜当前动作：WAIT｜新建仓位：0%**" in result
+    assert "**四支柱：经营与盈利 adequate｜估值 attractive｜催化 visible｜持续性 acceptable**" in result
+    assert "**暂不买入原因：趋势仍在，但当前位置不具备理想赔率**" in result
 
 
 def test_no_buy_keeps_partial_research_levels_and_fills_missing_levels_with_r_math():
