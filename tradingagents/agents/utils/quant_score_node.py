@@ -20,6 +20,7 @@ import re
 from typing import Optional
 
 import pandas as pd
+import yaml
 
 from tradingagents.dataflows.factor_calc import (
     compute_price_factors,
@@ -124,7 +125,7 @@ def _parse_table_row(table_str: str, label_keyword: str) -> Optional[float]:
     return None
 
 
-def _parse_fundamentals(fund_str: str) -> dict:
+def _parse_fundamentals(fund_str: str, fundamentals_report: str = "") -> dict:
     """从 fundamentals 原始字符串中抽取因子计算所需的数值。
 
     返回的 dict 字段都是 Optional[float]：缺失字段留 None。
@@ -133,6 +134,7 @@ def _parse_fundamentals(fund_str: str) -> dict:
         "pe_ttm": None,
         "pb": None,
         "roe_ttm_pct": None,
+        "roe_basis": "unknown",
         "gross_margin_pct": None,
         "net_margin_pct": None,
         "revenue_yoy_pct": None,
@@ -157,8 +159,33 @@ def _parse_fundamentals(fund_str: str) -> dict:
     if m:
         out["industry"] = m.group(1).strip()
 
-    # 3. 财务分析指标表（最近报告期）
-    out["roe_ttm_pct"] = _parse_table_row(fund_str, "净资产收益率")
+    # 3. ROE 只接受明确口径。财务表第一列常是单季/累计报告期，不能无条件
+    # 冒充 TTM。优先消费基本面分析师经工具计算并带 basis 的 SUMMARY。
+    for block in reversed(re.findall(r"```yaml\s*\n(.*?)\n```", fundamentals_report or "", re.S)):
+        try:
+            parsed = yaml.safe_load(block)
+        except yaml.YAMLError:
+            continue
+        summary = parsed.get("SUMMARY") if isinstance(parsed, dict) else None
+        if not isinstance(summary, dict):
+            continue
+        basis = str(summary.get("roe_basis") or "unknown").strip().lower()
+        roe = _safe_float(summary.get("roe"))
+        if basis in {"ttm", "annual"} and roe is not None:
+            out["roe_ttm_pct"] = roe
+            out["roe_basis"] = basis
+        break
+    if out["roe_ttm_pct"] is None:
+        explicit_roe = re.search(
+            r"ROE\s*[(（]\s*(TTM|年度|annual)\s*[)）]\s*[:：]\s*([+-]?[0-9.]+)",
+            fund_str,
+            re.I,
+        )
+        if explicit_roe:
+            out["roe_ttm_pct"] = _safe_float(explicit_roe.group(2))
+            out["roe_basis"] = "ttm" if explicit_roe.group(1).upper() == "TTM" else "annual"
+
+    # 其余财务分析指标表字段取最近报告期，并保留原始同比定义。
     out["gross_margin_pct"] = _parse_table_row(fund_str, "销售毛利率")
     out["net_margin_pct"] = _parse_table_row(fund_str, "销售净利率")
     out["revenue_yoy_pct"] = _parse_table_row(fund_str, "营业收入同比增长率")
@@ -402,7 +429,9 @@ def create_quant_score_node():
         }
 
         # 3. 解析基本面字段
-        fund_inputs = _parse_fundamentals(fund_str)
+        fund_inputs = _parse_fundamentals(
+            fund_str, str(state.get("fundamentals_report") or "")
+        )
 
         # 4. 行业 PE 中位数（可能为 None）
         industry_pe = _try_get_industry_pe(fund_inputs.get("industry"), trade_date)

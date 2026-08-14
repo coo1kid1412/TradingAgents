@@ -51,6 +51,7 @@ from rich.rule import Rule
 
 from tradingagents.graph.trading_graph import TradingAgentsGraph
 from tradingagents.default_config import DEFAULT_CONFIG
+from tradingagents.reporting import write_consolidated_reports
 from cli.models import AnalystType
 from cli.utils import *
 from cli.announcements import fetch_announcements, display_announcements
@@ -722,10 +723,13 @@ def save_report_to_disk(final_state, ticker: str, save_path: Path):
             (portfolio_dir / "decision.md").write_text(risk["judge_decision"])
             sections.append(f"## 五、投资组合管理决策\n\n### {t('Portfolio Manager', AGENT_NAMES)}\n{risk['judge_decision']}")
 
-    # Write consolidated report
-    header = f"# 交易分析报告：{ticker}\n\n生成时间: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
-    (save_path / "complete_report.md").write_text(header + "\n\n".join(sections))
-    return save_path / "complete_report.md"
+    risk = final_state.get("risk_debate_state") or {}
+    return write_consolidated_reports(
+        save_path,
+        ticker=ticker,
+        user_decision=str(risk.get("judge_decision") or ""),
+        audit_sections=sections,
+    )
 
 
 def display_complete_report(final_state):

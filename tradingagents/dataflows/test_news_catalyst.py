@@ -17,10 +17,10 @@ from tradingagents.agents.managers.rm_tools import compute_step6_catalyst_moment
 def test_catalyst_calendar():
     """步骤1：催化日历——只收 thesis 相关有方向事件，按日期排，边缘过滤。"""
     nr = ("# 新闻\n```yaml\nSUMMARY:\n  key_events:\n"
-          "    - title: 中报\n      event_date: 2026-07-15\n      thesis_relevance: 核心\n      impact: +中\n      priced_in_p: 40\n"
-          "    - title: 出口管制\n      event_date: 2026Q3\n      thesis_relevance: 核心\n      impact: -大\n"
+          "    - title: 中报\n      event_date: 2026-07-15\n      thesis_relevance: 核心\n      impact: +中\n      priced_in_p: 40\n      source_tier: mainstream\n      verification_status: verified\n"
+          "    - title: 出口管制\n      event_date: 2026Q3\n      thesis_relevance: 核心\n      impact: -大\n      source_tier: mainstream\n      verification_status: verified\n"
           "    - title: 八卦\n      event_date: 未知\n      thesis_relevance: 边缘\n      impact: +小\n"
-          "    - title: 量产\n      event_date: 未知\n      thesis_relevance: 相关\n      impact: +大\n```")
+          "    - title: 量产\n      event_date: 未知\n      thesis_relevance: 相关\n      impact: +大\n      source_tier: mainstream\n      verification_status: verified\n```")
     cal = aggregate_catalyst_calendar(nr)
     titles = [c["title"] for c in cal]
     assert "八卦" not in titles                       # 边缘过滤
@@ -34,6 +34,10 @@ def test_catalyst_calendar():
 
 
 def _report(events_yaml: str) -> str:
+    events_yaml = events_yaml.replace(
+        "    - title:",
+        "    - source_tier: mainstream\n      verification_status: verified\n      title:",
+    )
     return f"# 新闻报告\n正文\n```yaml\nSUMMARY:\n  net_sentiment: 中性\n  key_events:\n{events_yaml}\n```"
 
 
@@ -58,6 +62,76 @@ def test_priced_in_discounts():
     assert cf > cp and cf > 0          # 未定价利好分高
     assert abs(cp) <= 5                # 已定价利好分被压到接近 0
     print("✓ 已定价事件被折价（priced_in 高→权重低）")
+
+
+def test_unverified_social_claim_does_not_drive_catalyst_score():
+    report = _report(
+        "    - title: 匿名大单传闻\n"
+        "      horizon: 短期(≤1周)\n"
+        "      priced_in_p: 0\n"
+        "      impact: +大\n"
+        "      credibility: 高\n"
+        "      source_tier: social\n"
+        "      verification_status: unverified\n"
+    )
+    catalyst = aggregate_news_catalyst(report)
+
+    assert catalyst is None
+
+
+def test_missing_source_grade_does_not_drive_catalyst_score():
+    report = """```yaml
+SUMMARY:
+  key_events:
+    - title: 无来源利好
+      source_date: 2026-08-12
+      horizon: 短期
+      priced_in_p: 0
+      impact: +大
+      credibility: 高
+```"""
+    assert aggregate_news_catalyst(report, current_date="2026-08-14") is None
+
+
+def test_future_publication_date_is_rejected_from_catalyst_score():
+    report = _report(
+        "    - title: 未来才发布的报告\n"
+        "      source_date: 2026-08-15\n"
+        "      horizon: 短期\n"
+        "      priced_in_p: 0\n"
+        "      impact: +大\n"
+        "      credibility: 高\n"
+    )
+    assert aggregate_news_catalyst(report, current_date="2026-08-14") is None
+
+
+def test_partially_quoted_yaml_scalar_is_recovered():
+    """M3 偶发把列表项只引用半句，不能让整份官方新闻摘要失效。"""
+    report = """# 新闻报告
+```yaml
+SUMMARY:
+  net_sentiment: 中性
+  key_events:
+    - title: 业绩预告
+      impact: +大
+      credibility: 高
+      horizon: 中期
+      priced_in_p: 40
+      source_tier: official
+      source_url: https://static.cninfo.com.cn/finalpage/2026-08-13/DOC-1.PDF
+      document_id: DOC-1
+      verification_status: verified
+  cumulative_patterns:
+    - "公告做多、内部人做空"显著背离
+  key_hard_numbers:
+    - metric: 内部人减持占比
+      value: >4%（控股股东及高管）
+```"""
+
+    catalyst = aggregate_news_catalyst(report)
+
+    assert catalyst is not None
+    assert catalyst["direction"] == 1
 
 
 def test_guards():
@@ -126,15 +200,23 @@ def test_earnings_revision():
             body += "  cumulative_patterns:\n" + "".join(f"    - {p}\n" for p in patterns)
         if events is not None:
             body += "  key_events:\n" + "".join(
-                f"    - title: {t}\n      category: {c}\n" for t, c in events)
+                f"    - title: {t}\n      category: {c}\n"
+                "      source_tier: research\n"
+                "      verification_status: verified\n"
+                "      source_date: 2026-06-23\n"
+                for t, c in events)
         return body + "```"
-    # 累积模式"多次评级上调" → 上修
-    r = compute_earnings_revision(nr(patterns=["近30日多次评级上调", "机构密集调研"]))
-    assert r["direction"] == "上修" and r["up"] == 1 and r["down"] == 0, r
-    # 累积模式"多次评级下调" → 下修
-    assert compute_earnings_revision(nr(patterns=["多次评级下调"]))["direction"] == "下修"
+    # 无逐项来源的 cumulative_patterns 不进入确定性盈利修正。
+    r = compute_earnings_revision(
+        nr(patterns=["近30日多次评级上调", "机构密集调研"]),
+        current_date="2026-06-24",
+    )
+    assert r["direction"] == "停修" and r["up"] == 0 and r["down"] == 0, r
     # 机构类事件标题"上调目标价" → 上修
-    r2 = compute_earnings_revision(nr(events=[("中金上调目标价至350元", "机构"), ("行业政策", "行业")]))
+    r2 = compute_earnings_revision(
+        nr(events=[("中金上调目标价至350元", "机构"), ("行业政策", "行业")]),
+        current_date="2026-06-24",
+    )
     assert r2["direction"] == "上修", r2
     # 非机构类事件不计入（行业类"下调"不算盈利下修）
     r3 = compute_earnings_revision(nr(events=[("行业景气下调", "行业")]))
@@ -142,6 +224,12 @@ def test_earnings_revision():
     # 无相关关键词 → 停修；无 SUMMARY → None
     assert compute_earnings_revision(nr(patterns=["机构密集调研"]))["direction"] == "停修"
     assert compute_earnings_revision("无 SUMMARY 块") is None
+    future = nr(events=[("中金上调目标价至350元", "机构")]).replace(
+        "source_date: 2026-06-23", "source_date: 2099-01-01"
+    )
+    assert compute_earnings_revision(
+        future, current_date="2026-06-24"
+    )["direction"] == "停修"
     # SYS 行往返
     assert parse_sys_earnings_revision("SYS_EARNINGS_REVISION: 上修（卖方…）") == "上修"
     assert parse_sys_earnings_revision("无该行") is None
@@ -160,9 +248,10 @@ def test_recency_weight():
     assert _recency_weight(None, cd) == 1.0
     assert _recency_weight("未知", cd) == 1.0
     assert _recency_weight("2026-06-20", None) == 1.0
+    assert _recency_weight("2026-06-25", cd) == 0.0
     # 端到端：陈旧正面事件被新鲜度压低净催化
     fresh = ("# 新闻\n```yaml\nSUMMARY:\n  key_events:\n"
-             "    - title: 卖方上调\n      impact: +大\n      source_date: 2026-06-23\n      horizon: 短期\n      priced_in_p: 20\n```")
+             "    - title: 卖方上调\n      impact: +大\n      source_date: 2026-06-23\n      horizon: 短期\n      priced_in_p: 20\n      source_tier: research\n      verification_status: verified\n```")
     stale = fresh.replace("2026-06-23", "2026-04-01")
     cf_fresh = aggregate_news_catalyst(fresh, current_date=cd)
     cf_stale = aggregate_news_catalyst(stale, current_date=cd)
@@ -174,13 +263,7 @@ def test_recency_weight():
 
 
 if __name__ == "__main__":
-    test_aggregate_bearish_near_term_dominates()
-    test_priced_in_discounts()
-    test_guards()
-    test_sys_catalyst_roundtrip()
-    test_feeds_catalyst_leg()
-    test_catalyst_calendar()
-    test_narrative_shift()
-    test_earnings_revision()
-    test_recency_weight()
-    print("\n全部 9 组通过 ✅")
+    tests = [value for name, value in sorted(globals().items()) if name.startswith("test_")]
+    for test in tests:
+        test()
+    print(f"\n全部 {len(tests)} 组通过 ✅")

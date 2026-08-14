@@ -545,3 +545,44 @@ def load_market_risk_for_ticker(
         analysis_time=analysis_time,
     )
     return compose_effective_market_gate(legacy, warning, market)
+
+
+def ensure_market_risk_for_ticker(
+    ticker: str,
+    trade_date: str,
+    db_path=None,
+    analysis_time: str | None = None,
+    *,
+    today: str | None = None,
+    build_snapshot=None,
+) -> dict[str, Any] | None:
+    """Load the effective gate and build today's missing legacy snapshot once.
+
+    Historical analyses never trigger a rebuild, which prevents accidental
+    look-ahead. The preflight suppresses notifications because the stock run
+    only needs an execution gate; scheduled warning jobs own user messaging.
+    """
+    snapshot = load_market_risk_for_ticker(
+        ticker, trade_date, db_path=db_path, analysis_time=analysis_time,
+    )
+    if snapshot is not None:
+        return snapshot
+    current_date = today or _dt.date.today().isoformat()
+    market = infer_market(ticker)
+    if str(trade_date) != current_date or market not in {"a_share", "us"}:
+        return None
+    if build_snapshot is None:
+        from tradingagents.harness.market_risk_daily import run_market_risk_daily
+        build_snapshot = run_market_risk_daily
+    try:
+        build_snapshot(
+            as_of_date=str(trade_date),
+            db_path=db_path,
+            markets=(market,),
+            send_message=lambda _message: None,
+        )
+    except Exception:
+        return None
+    return load_market_risk_for_ticker(
+        ticker, trade_date, db_path=db_path, analysis_time=analysis_time,
+    )

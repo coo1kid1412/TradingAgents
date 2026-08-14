@@ -92,10 +92,9 @@ def apply_market_risk_gate(
     high = max(low, min(float(proposed_size_high_pct), cap))
     action = (proposed_action or "WAIT").upper()
     gate = (entry_gate or "WAIT").upper()
-    if gate == "WAIT":
+    if gate in {"WAIT", "CONDITIONAL"}:
         effective_action = "WAIT"
-    elif gate == "CONDITIONAL" and action == "BUY_NOW":
-        effective_action = "CONDITIONAL"
+        low = high = 0.0
     else:
         effective_action = action
     return {
@@ -105,7 +104,10 @@ def apply_market_risk_gate(
         "effective_size_low_pct": low,
         "effective_size_high_pct": high,
         "overrode_action": effective_action != action,
-        "reason": f"市场闸门={gate}，仓位上限={cap:g}%",
+        "reason": (
+            f"市场闸门={gate}，当前新仓={high:g}%，"
+            f"条件解除后的仓位上限={cap:g}%"
+        ),
     }
 
 

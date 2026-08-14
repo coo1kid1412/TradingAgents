@@ -47,6 +47,7 @@ def test_structure_to_base_action_mapping():
         "trend_pullback": "分批介入",
         "breakout_ready": "等放量突破",
         "healthy_trend": "等回踩",
+        "weak_rebound_in_downtrend": "继续观察",
         "exhaustion": "暂不介入",
         "broken": "退出观察",
         "neutral": "继续观察",
@@ -76,6 +77,15 @@ def test_unknown_market_mode_fails_closed():
     result = _timing("trend_pullback", "unexpected")
     assert result["market_mode"] == "risk_off", result
     assert result["effective_action"] == "暂不介入", result
+
+
+def test_missing_market_snapshot_is_unknown_and_blocks_execution_without_bearish_label():
+    from tradingagents.agents.managers.rm_tools import derive_market_mode
+
+    assert derive_market_mode({}) == "unknown"
+    result = _timing("trend_pullback", "unknown")
+    assert result["market_mode"] == "unknown"
+    assert result["effective_action"] == "数据不足"
 
 
 def test_fundamental_vetoes_block_active_entry():
@@ -226,11 +236,13 @@ PM_SUMMARY:
   target_price_evidence_ids: FUND-VAL-01
   short_term_structure: healthy_trend
   entry_timing: 等回踩
+  short_term_trend: 上涨
+  short_term_confidence: 中
 ```
 """
     ledger = {
         "cards": [
-            {"claim_id": "MKT-TREND-01", "owner": "market", "decision_variable": "short_term_trend", "quality_status": "valid"},
+            {"claim_id": "MKT-TREND-01", "owner": "market", "decision_variable": "short_term_trend", "direction": "bullish", "quality_status": "valid"},
             {"claim_id": "FUND-GROWTH-01", "owner": "fundamentals", "decision_variable": "earnings_outlook_12m", "quality_status": "partial"},
             {"claim_id": "RISK-GATE-01", "owner": "risk", "decision_variable": "position", "quality_status": "valid"},
             {"claim_id": "FUND-VAL-01", "owner": "fundamentals", "decision_variable": "target_price", "quality_status": "partial"},
@@ -247,7 +259,7 @@ PM_SUMMARY:
     )
 
     assert result.index("## 为什么这样决定") < result.index("## Trade Ticket")
-    assert "| 未来三日 | 等回踩 | 市场分析/风险 | RISK-GATE-01, MKT-TREND-01 | 完整 |" in result
+    assert "| 未来三日 | 上涨 | 市场分析/风险 | RISK-GATE-01, MKT-TREND-01 | 完整 |" in result
     assert "| 一年期目标价 | 86-118（中位 101） | 基本面/RM | FUND-VAL-01 | 部分：证据不完整 |" in result
     summary = _find_yaml_block(result, "PM_SUMMARY")
     assert summary["pm_rating"] == "OVERWEIGHT"
@@ -315,6 +327,54 @@ def test_tool_loop_retries_when_summary_token_exists_but_yaml_is_truncated():
     assert llm.calls == 2
     normalized = _normalize_summary_yaml_fence(result.content, "RM_SUMMARY")
     assert _find_yaml_block(normalized, "RM_SUMMARY")["key_conflict_ids"] is None
+
+
+def test_tool_loop_uses_compact_artifact_retry_after_tool_budget_and_empty_body():
+    class ToolThenEmptyLLM:
+        def __init__(self):
+            self.calls = []
+
+        def invoke(self, messages):
+            self.calls.append(messages)
+            if len(self.calls) == 1:
+                return AIMessage(content="", tool_calls=[{
+                    "name": "calc", "args": {}, "id": "call-1",
+                }])
+            if len(self.calls) == 2:
+                return AIMessage(content="")
+            prompt = messages[-1].content
+            assert "只输出可交付正文" in prompt
+            assert "calc:" in prompt
+            return AIMessage(content="""# 研究结论
+
+长期评级 HOLD。
+
+```yaml
+RM_SUMMARY:
+  current_price: 100
+  rm_rating: HOLD
+  target_price_mid: 108
+  entry_timing: 继续观察
+  rating_evidence_ids: FUND-GROWTH-01
+  target_price_evidence_ids: FUND-VAL-01
+  earnings_evidence_ids: FUND-GROWTH-01
+  key_conflict_ids: null
+```""")
+
+    class Calc:
+        @staticmethod
+        def invoke(_args):
+            return {"rating": "HOLD", "target": 108}
+
+    llm = ToolThenEmptyLLM()
+    result = _run_tool_calling_loop(
+        llm,
+        [HumanMessage(content="证据 FUND-GROWTH-01 FUND-VAL-01\n```yaml\nRM_SUMMARY:\n  current_price: <float>\n  rm_rating: <rating>\n  target_price_mid: <float>\n  entry_timing: <text>\n  rating_evidence_ids: <ids>\n  target_price_evidence_ids: <ids>\n  earnings_evidence_ids: <ids>\n  key_conflict_ids: <ids>\n```")],
+        tools_by_name={"calc": Calc()}, role="RM-test", completion_token="RM_SUMMARY",
+        max_iterations=1, max_continuations=2,
+    )
+    assert len(llm.calls) == 3
+    assert _find_yaml_block(result.content, "RM_SUMMARY")["rm_rating"] == "HOLD"
 
 
 def test_pm_formatter_always_fences_plain_summary_for_archive():
@@ -478,9 +538,9 @@ PM_SUMMARY:
     )
     assert "| **Entry** 入场区间 | **—** | 当前不建仓；重新评估后重算入场区间 |" in result
     assert "| **1R** 风险单元 | **28.34 元** | 以当前价 118.34 元管理已有仓位 |" in result
-    assert "| **TP1** 止盈 1 | **146.68 元**" in result
-    assert "| **TP2** 止盈 2 | **175.02 元**" in result
-    assert "| **TP3** 止盈 3 | **203.36 元**" in result
+    assert "| **TP1** 持仓者处理位 1 | **146.68 元**" in result
+    assert "| **TP2** 持仓者处理位 2 | **175.02 元**" in result
+    assert "| **TP3** 持仓者处理位 3 | **203.36 元**" in result
     assert "| **SL_soft** 软止损 | **101.34 元**" in result
     assert "| Conviction 信心 | ⭐⭐⭐ **中等**（长期判断与短期时机分开，当前不具备新建仓条件） |" in result
     assert "| 结构时机 | 退出观察（短线结构已破坏） |" in result
@@ -496,6 +556,248 @@ PM_SUMMARY:
     assert summary["pm_tp2"] == 175.02
     assert summary["pm_tp3"] == 203.36
     assert summary["pm_sl_soft"] == 101.34
+
+
+def test_no_buy_holder_levels_use_resistance_and_research_targets_not_unbounded_r_multiples():
+    content = """## Trade Ticket 交易票
+
+| **TP1** 止盈 1 | **143.72 元** | 减仓 |
+| **TP2** 止盈 2 | **168.08 元** | 减仓 |
+| **TP3** 止盈 3 | **192.44 元** | 清仓 |
+| **SL_hard** 硬止损 | **95.00 元** | 清仓 |
+
+```yaml
+PM_SUMMARY:
+  current_price: 119.36
+  pm_rating: UNDERWEIGHT
+  pm_action_keyword: WAIT
+  pm_size_low_pct: 0
+  pm_size_high_pct: 0
+  pm_tp1: 143.72
+  pm_tp2: 168.08
+  pm_tp3: 192.44
+  pm_sl_hard: 95.00
+```
+"""
+    result = _format_pm_decision(
+        content,
+        {"structure_class": "weak_rebound_in_downtrend", "effective_action": "继续观察"},
+        market_report="""```yaml
+SUMMARY:
+  key_resistance: 127.00
+```""",
+        research_plan="""```yaml
+RM_SUMMARY:
+  target_price_low: 136.37
+  target_price_mid: 151.82
+  target_price_high: 167.28
+```""",
+    )
+    summary = _find_yaml_block(result, "PM_SUMMARY")
+    assert summary["pm_tp1"] == 127.0
+    assert summary["pm_tp2"] == 136.37
+    assert summary["pm_tp3"] == 151.82
+    assert "192.44" not in result
+    assert "中期下行结构尚未修复，当前仅是弱反弹，不追高" in result
+
+
+def test_no_buy_replaces_conflicting_holder_plan_and_unsafe_execution_claims():
+    content = """## Trade Ticket 交易票
+
+| **Action** 操作 | **WAIT @ 110-115 元**（条件入场）| 当前动作 |
+| **TP1** 止盈 1 | **130 元** | 减仓 |
+| **TP2** 止盈 2 | **145 元** | 减仓 |
+| **TP3** 止盈 3 | **160 元** | 清仓 |
+| **SL_soft** 软止损 | **106 元** | 减仓 |
+| **SL_hard** 硬止损 | **100 元** | 清仓 |
+| **Time Stop** 时间止损 | **2026-08-31 半年报 + 2026-10-30 三季报** | 等财报 |
+
+### 已持仓者操作（假设已建仓者）
+
+| 价位区间 | 动作 | 仓位变化 |
+|---------|------|---------|
+| **TP1 130 元** | 减仓 1/3 | 旧计划 |
+| **TP2 145 元** | 再减 1/3 | 旧计划 |
+| **TP3 160 元** | 清仓 | 旧计划 |
+| **SL_soft 106 元** | 减仓 50% | 旧计划 |
+| **SL_hard 100 元** | 全部退出 | 旧计划 |
+
+### 风控措施
+
+| **对冲建议** | 个股认沽期权最优，做空算力 ETF 次优 |
+
+业绩不及预期则反向考虑做空对冲(若权限允许,否则清仓回避)。
+
+```yaml
+PM_SUMMARY:
+  ticker: "603629"
+  trade_date: "2026-08-13"
+  current_price: 125
+  pm_rating: OVERWEIGHT
+  pm_action_keyword: WAIT
+  pm_size_low_pct: 0
+  pm_size_high_pct: 0
+  pm_tp1: 130
+  pm_tp2: 145
+  pm_tp3: 160
+  pm_sl_soft: 106
+  pm_sl_hard: 100
+  entry_timing: 继续观察
+```"""
+    result = _format_pm_decision(
+        content,
+        {"structure_class": "weak_rebound_in_downtrend", "effective_action": "继续观察"},
+        market_report="""SUMMARY:
+  key_resistance: 139
+""",
+        research_plan="""RM_SUMMARY:
+  target_price_low: 160.72
+  target_price_mid: 182.72
+  target_price_high: 204.71
+""",
+    )
+
+    assert "| **Action** 操作 | **WAIT** | 当前不建仓" in result
+    assert "| **TP1 139 元** | 减仓 1/3 |" in result
+    assert "| **TP2 160.72 元** | 再减仓 1/3 |" in result
+    assert "| **TP3 182.72 元** | 清仓或降至观察仓 |" in result
+    assert "TP1 130 元" not in result
+    assert "SL_soft 106 元" not in result
+    assert "2026年半年报（法定最晚披露日 2026-08-31，预约日待确认）" in result
+    assert "2026年三季报（法定最晚披露日 2026-10-31，预约日待确认）" in result
+    assert "个股认沽期权最优" not in result
+    assert "反向考虑做空对冲" not in result
+    assert "保持空仓观望" in result
+    assert "未核验账户权限与工具可得性" in result
+
+
+def test_no_buy_replaces_holder_heading_variant_and_numbered_old_levels():
+    content = """## Trade Ticket 交易票
+
+| **TP1** 止盈 1 | **130 元** | 减仓 |
+| **TP2** 止盈 2 | **145 元** | 减仓 |
+| **TP3** 止盈 3 | **160 元** | 清仓 |
+| **SL_soft** 软止损 | **106 元** | 减仓 |
+| **SL_hard** 硬止损 | **100 元** | 清仓 |
+
+## 二、操作计划
+
+### 持仓者(已建仓者)
+
+1. **TP1 触发**:126 元附近减仓 1/3
+2. **TP2 触发**:139 元附近再减 1/3
+3. **TP3 触发**:152 元附近清仓
+4. 业绩不及预期则反向考虑做空对冲(若权限允许,否则清仓回避)
+
+### 下一节
+
+保留正文。
+
+```yaml
+PM_SUMMARY:
+  trade_date: "2026-08-13"
+  current_price: 125
+  pm_rating: OVERWEIGHT
+  pm_action_keyword: WAIT
+  pm_size_low_pct: 0
+  pm_size_high_pct: 0
+  pm_tp1: 130
+  pm_tp2: 145
+  pm_tp3: 160
+  pm_sl_soft: 106
+  pm_sl_hard: 100
+  entry_timing: 继续观察
+```"""
+    result = _format_pm_decision(
+        content,
+        {"structure_class": "weak_rebound_in_downtrend", "effective_action": "继续观察"},
+        market_report="""SUMMARY:
+  key_resistance: 139.49
+""",
+        research_plan="""RM_SUMMARY:
+  target_price_low: 142.06
+  target_price_mid: 162.35
+  target_price_high: 182.64
+""",
+    )
+
+    assert "### 已持仓者操作" in result
+    assert "| **TP1 139.49 元** | 减仓 1/3 |" in result
+    assert "| **TP2 142.06 元** | 再减仓 1/3 |" in result
+    assert "| **TP3 162.35 元** | 清仓或降至观察仓 |" in result
+    assert "TP1 触发" not in result
+    assert "反向考虑做空对冲" not in result
+    assert "### 下一节" in result
+
+
+def test_market_and_risk_consensus_cap_is_enforced_at_pm_output_boundary():
+    content = """## Trade Ticket 交易票
+
+| **Size** 仓位规模 | 8-12% |
+
+```yaml
+PM_SUMMARY:
+  current_price: 100
+  pm_rating: BUY
+  pm_action_keyword: BUY_NOW
+  pm_entry_judgment: BUY_NOW
+  pm_size_low_pct: 8
+  pm_size_high_pct: 12
+  pm_tp1: 110
+  pm_tp2: 120
+  pm_tp3: 130
+  pm_sl_hard: 90
+  market_position_cap_pct: 12
+```
+"""
+    result = _format_pm_decision(
+        content,
+        {"structure_class": "trend_pullback", "effective_action": "小仓试探"},
+        market_risk_snapshot={"entry_gate": "CONDITIONAL", "position_cap_pct": 4},
+    )
+    summary = _find_yaml_block(result, "PM_SUMMARY")
+    assert summary["pm_size_low_pct"] == 0
+    assert summary["pm_size_high_pct"] == 0
+    assert summary["market_position_cap_pct"] == 4
+    assert summary["pm_action_keyword"] == "WAIT"
+    assert summary["entry_timing"] == "等待条件确认"
+    assert "# 短期操作结论：等待条件确认" in result
+    assert "| **Size** 仓位规模 | 新建仓 0% |" in result
+    assert "**当前动作：WAIT｜新建仓位：0%｜长期评级：BUY**" in result
+
+
+def test_no_buy_keeps_partial_research_levels_and_fills_missing_levels_with_r_math():
+    content = """## Trade Ticket 交易票
+
+| **TP1** 止盈 1 | **150 元** | 减仓 |
+| **TP2** 止盈 2 | **175 元** | 减仓 |
+| **TP3** 止盈 3 | **200 元** | 清仓 |
+| **SL_hard** 硬止损 | **100 元** | 清仓 |
+
+```yaml
+PM_SUMMARY:
+  current_price: 125
+  pm_rating: HOLD
+  pm_action_keyword: WAIT
+  pm_size_low_pct: 0
+  pm_size_high_pct: 0
+  pm_tp1: 150
+  pm_tp2: 175
+  pm_tp3: 200
+  pm_sl_hard: 100
+```
+"""
+    result = _format_pm_decision(
+        content,
+        {"structure_class": "neutral", "effective_action": "继续观察"},
+        market_report="""SUMMARY:
+  key_resistance: 139
+""",
+    )
+    summary = _find_yaml_block(result, "PM_SUMMARY")
+    assert summary["pm_tp1"] == 139
+    assert summary["pm_tp2"] == 150
+    assert summary["pm_tp3"] == 175
 
 
 def test_no_buy_structure_explanation_matches_the_actual_timing_state():

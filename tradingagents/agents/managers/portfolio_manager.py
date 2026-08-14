@@ -19,6 +19,8 @@ from tradingagents.agents.managers.research_manager import (
 )
 from tradingagents.agents.utils.research_evidence_node import render_decision_attribution
 from tradingagents.agents.managers.rm_tools import derive_market_mode
+from tradingagents.agents.utils.risk_consensus import build_risk_consensus
+from tradingagents.agents.utils.risk_context import build_risk_data_packet
 
 logger = logging.getLogger(__name__)
 
@@ -32,6 +34,10 @@ _ENTRY_PRESENTATION = {
     "小仓试探": (
         "条件尚未完全确认，只允许小仓验证",
         "结构确认且风险条件改善后再评估扩大仓位",
+    ),
+    "等待条件确认": (
+        "市场风险门仍为条件状态，当前不新建仓",
+        "风险门转为 OPEN 且个股结构确认后，再按仓位上限重新生成交易票",
     ),
     "等回踩": (
         "趋势仍在，但当前位置不具备理想赔率",
@@ -106,10 +112,34 @@ def _summary_float(content: str, key: str) -> float | None:
         return None
 
 
+def _holder_exit_levels(
+    current_price: float,
+    market_report: str,
+    research_plan: str,
+) -> list[float]:
+    """Use observable resistance and research targets for holder exits."""
+    candidates = [
+        _summary_float(market_report, "key_resistance"),
+        _summary_float(research_plan, "target_price_low"),
+        _summary_float(research_plan, "target_price_mid"),
+        _summary_float(research_plan, "target_price_high"),
+    ]
+    levels: list[float] = []
+    for value in candidates:
+        if value is None or value <= current_price:
+            continue
+        rounded = round(value, 2)
+        if rounded not in levels:
+            levels.append(rounded)
+    return sorted(levels)[:3]
+
+
 def _enforce_holder_r_levels(
     report_body: str,
     summary_block: str | None,
     source: str,
+    market_report: str = "",
+    research_plan: str = "",
 ) -> tuple[str, str | None]:
     """Use current price as the holder risk basis while new entry is blocked."""
     summary_source = summary_block or source
@@ -125,13 +155,23 @@ def _enforce_holder_r_levels(
     if "error" in levels:
         return report_body, summary_block
 
+    research_levels = _holder_exit_levels(current_price, market_report, research_plan)
+    holder_levels = list(research_levels)
+    for value in (levels["tp1"], levels["tp2"], levels["tp3"]):
+        if len(holder_levels) >= 3:
+            break
+        rounded = round(float(value), 2)
+        if rounded > current_price and rounded not in holder_levels:
+            holder_levels.append(rounded)
+    holder_levels = sorted(holder_levels)[:3]
+
     current = _format_price(str(levels["entry_price"]))
     replacements = {
         "Entry": "| **Entry** 入场区间 | **—** | 当前不建仓；重新评估后重算入场区间 |",
         "1R": f"| **1R** 风险单元 | **{_format_price(str(levels['one_r']))} 元** | 以当前价 {current} 元管理已有仓位 |",
-        "TP1": f"| **TP1** 止盈 1 | **{_format_price(str(levels['tp1']))} 元** (+1R) | 持仓者逢强减仓 1/3 |",
-        "TP2": f"| **TP2** 止盈 2 | **{_format_price(str(levels['tp2']))} 元** (+2R) | 持仓者再减仓 1/3 |",
-        "TP3": f"| **TP3** 止盈 3 | **{_format_price(str(levels['tp3']))} 元** (+3R) | 持仓者清仓 |",
+        "TP1": f"| **TP1** 持仓者处理位 1 | **{_format_price(str(holder_levels[0]))} 元** | 逢强减仓 1/3 |",
+        "TP2": f"| **TP2** 持仓者处理位 2 | **{_format_price(str(holder_levels[1]))} 元** | 再减仓 1/3 |",
+        "TP3": f"| **TP3** 持仓者处理位 3 | **{_format_price(str(holder_levels[2]))} 元** | 清仓或降至观察仓 |",
         "SL_soft": f"| **SL_soft** 软止损 | **{_format_price(str(levels['sl_soft']))} 元** (−0.6R) | 减仓 50% 并复核风险 |",
         "SL_hard": f"| **SL_hard** 硬止损 | **{_format_price(str(levels['sl_hard']))} 元** (−1R) | 全部退出 |",
     }
@@ -144,9 +184,9 @@ def _enforce_holder_r_levels(
 
     if summary_block:
         yaml_values = {
-            "pm_tp1": levels["tp1"],
-            "pm_tp2": levels["tp2"],
-            "pm_tp3": levels["tp3"],
+            "pm_tp1": holder_levels[0],
+            "pm_tp2": holder_levels[1],
+            "pm_tp3": holder_levels[2],
             "pm_sl_soft": levels["sl_soft"],
             "pm_sl_hard": levels["sl_hard"],
         }
@@ -171,6 +211,7 @@ def _normalize_no_new_position_rows(
         "退出观察": "短线结构已破坏",
         "继续观察": "短线方向尚不明确",
         "数据不足": "关键数据不足",
+        "等待条件确认": "市场风险门尚未开放",
     }.get(entry_timing, "当前不具备新建仓条件")
     stars_value = _summary_float(summary_source, "pm_conviction_stars")
     stars = max(1, min(5, int(stars_value))) if stars_value is not None else 0
@@ -192,7 +233,157 @@ def _normalize_no_new_position_rows(
         "| 当前赔率 | 当前不建仓；赔率在重新评估入场条件后重算 |",
         report_body,
     )
+    report_body = re.sub(
+        r"(?m)^\|\s*\*\*Action\*\*\s*操作\s*\|.*$",
+        "| **Action** 操作 | **WAIT** | 当前不建仓；满足重新评估条件后再生成新交易票 |",
+        report_body,
+    )
     return report_body
+
+
+def _canonicalize_holder_action_section(report_body: str, summary_source: str) -> str:
+    """Replace duplicate holder instructions with the canonical PM summary levels."""
+    values = {
+        key: _format_price(_extract_pm_summary_value(summary_source, key))
+        for key in ("pm_tp1", "pm_tp2", "pm_tp3", "pm_sl_soft", "pm_sl_hard")
+    }
+    if not all(values.values()):
+        return report_body
+    section = (
+        "### 已持仓者操作\n\n"
+        "| 价位/条件 | 动作 |\n"
+        "|------|------|\n"
+        f"| **TP1 {values['pm_tp1']} 元** | 减仓 1/3 |\n"
+        f"| **TP2 {values['pm_tp2']} 元** | 再减仓 1/3 |\n"
+        f"| **TP3 {values['pm_tp3']} 元** | 清仓或降至观察仓 |\n"
+        f"| **软止损 {values['pm_sl_soft']} 元** | 减仓 50% 并复核风险 |\n"
+        f"| **硬止损 {values['pm_sl_hard']} 元** | 全部退出 |\n\n"
+    )
+    return re.sub(
+        r"(?ms)^###\s+(?:已)?持仓者[^\n]*\n.*?(?=^###\s|^##\s|\Z)",
+        section,
+        report_body,
+        count=1,
+    )
+
+
+def _normalize_reporting_date_language(
+    report_body: str, news_report: str = "", current_date: str | None = None,
+) -> str:
+    """Do not present statutory reporting deadlines as booked disclosure dates."""
+    allowed: set[tuple[str, str]] = set()
+    if news_report:
+        try:
+            from tradingagents.dataflows.news_catalyst import aggregate_catalyst_calendar
+
+            for event in aggregate_catalyst_calendar(
+                news_report, current_date=current_date,
+            ) or []:
+                if event.get("date_basis") == "exact_reservation" and event.get("reporting_period"):
+                    allowed.add((str(event["reporting_period"]), str(event["date"])))
+        except Exception:  # pragma: no cover - report sanitation must never block output
+            logger.exception("读取官方财报预约日期失败，按未确认日期处理")
+
+    pattern = re.compile(
+        r"(?P<date>(?:20\d{2}[-/.])?\d{1,2}[-/.]\d{1,2})\s*"
+        r"(?P<label>半年报|中报|三季报|第三季度报告)"
+    )
+    year_hint_match = re.search(r"20\d{2}", report_body)
+    year_hint = int(year_hint_match.group(0)) if year_hint_match else 0
+
+    def replace(match: re.Match[str]) -> str:
+        raw_date = match.group("date")
+        label = match.group("label")
+        parts = [part for part in re.split(r"[-/.]", raw_date) if part]
+        if len(parts) == 3:
+            year, month, day = map(int, parts)
+        else:
+            year = year_hint
+            month, day = map(int, parts)
+        if not year:
+            return match.group(0)
+        canonical_date = f"{year:04d}-{month:02d}-{day:02d}"
+        is_h1 = label in {"半年报", "中报"}
+        period = f"{year}H1" if is_h1 else f"{year}Q3"
+        if (period, canonical_date) in allowed:
+            return match.group(0)
+        deadline = f"{year}-08-31" if is_h1 else f"{year}-10-31"
+        report_name = "半年报" if is_h1 else "三季报"
+        return f"{year}年{report_name}（法定最晚披露日 {deadline}，预约日待确认）"
+
+    return pattern.sub(replace, report_body)
+
+
+def _normalize_unverified_hedges(report_body: str) -> str:
+    """Keep unavailable derivatives/shorting out of an executable A-share ticket."""
+    replacement = (
+        "| **对冲建议** | 未核验账户权限与工具可得性，不将个股期权、融券或做空工具写入"
+        "可执行计划；默认以仓位、分批和止损管理风险 |"
+    )
+    report_body = re.sub(
+        r"(?m)^\|\s*\*\*?对冲建议\*\*?\s*\|.*$",
+        replacement,
+        report_body,
+    )
+    report_body = re.sub(
+        r"反向考虑(?:做空|卖空|融券)对冲\s*[（(]若权限允许[^）)]*[）)]",
+        "保持空仓观望",
+        report_body,
+    )
+    return report_body
+
+
+def _enforce_effective_risk_cap(
+    report_body: str,
+    summary_block: str | None,
+    source: str,
+    market_risk_snapshot: dict | None,
+) -> tuple[str, str | None]:
+    """Clamp the model's action and position fields to the effective gate."""
+    if market_risk_snapshot is None:
+        return report_body, summary_block
+    snapshot = market_risk_snapshot or {}
+    gate = str(snapshot.get("entry_gate") or "WAIT").upper()
+    try:
+        cap = max(0.0, float(snapshot.get("position_cap_pct", 0)))
+    except (TypeError, ValueError):
+        cap = 0.0
+    execution_cap = cap if gate == "OPEN" else 0.0
+
+    summary_source = summary_block or source
+    proposed_low = _summary_float(summary_source, "pm_size_low_pct") or 0.0
+    proposed_high = _summary_float(summary_source, "pm_size_high_pct") or proposed_low
+    low = min(max(0.0, proposed_low), execution_cap)
+    high = min(max(low, proposed_high), execution_cap)
+    size = _format_position_size(str(low), str(high))
+    size_cell = f"新建仓 {size}" if re.search(
+        r"(?m)^\|\s*\*\*Size\*\*\s*仓位规模\s*\|[^\n]*新建仓", report_body
+    ) else size
+    report_body = re.sub(
+        r"(?m)^(\|\s*\*\*Size\*\*\s*仓位规模\s*\|).*$",
+        rf"\1 {size_cell} |",
+        report_body,
+    )
+
+    if summary_block:
+        values = {
+            "pm_size_low_pct": f"{low:.2f}",
+            "pm_size_high_pct": f"{high:.2f}",
+            "market_position_cap_pct": f"{cap:.2f}",
+            "market_entry_gate": gate if gate in {"OPEN", "CONDITIONAL", "WAIT"} else "WAIT",
+        }
+        if gate in {"WAIT", "CONDITIONAL"}:
+            values["pm_action_keyword"] = "WAIT"
+            values["pm_entry_judgment"] = "WAIT"
+        if gate == "CONDITIONAL":
+            values["entry_timing"] = "等待条件确认"
+        for key, value in values.items():
+            pattern = rf"(?m)^(\s*{re.escape(key)}:\s*).*$"
+            if re.search(pattern, summary_block):
+                summary_block = re.sub(pattern, rf"\g<1>{value}", summary_block)
+            else:
+                summary_block = f"{summary_block.rstrip()}\n  {key}: {value}"
+    return report_body, summary_block
 
 
 def _extract_pm_summary_block(content: str) -> tuple[str | None, int, bool]:
@@ -300,7 +491,7 @@ def _strip_internal_pm_content(content: str) -> str:
 
 def _position_action_rows(content: str, entry_timing: str, size: str, rating: str) -> str:
     no_new_position_actions = {
-        "等回踩", "等放量突破", "暂不介入", "退出观察", "继续观察", "数据不足",
+        "等回踩", "等放量突破", "等待条件确认", "暂不介入", "退出观察", "继续观察", "数据不足",
     }
     if entry_timing not in no_new_position_actions:
         empty_action = f"按计划分批执行，目标新建仓位 {size}"
@@ -340,6 +531,8 @@ def _format_pm_decision(
     market_risk_snapshot: dict | None = None,
     research_evidence_ledger: dict | None = None,
     research_plan: str = "",
+    market_report: str = "",
+    news_report: str = "",
 ) -> str:
     """Remove model working text and prepend a deterministic action summary."""
     original = (content or "").strip()
@@ -353,13 +546,18 @@ def _format_pm_decision(
         logger.warning("PM 输出未找到 Trade Ticket 标题，保留原文并仅添加操作摘要")
 
     entry_timing = timing.get("effective_action") or "数据不足"
+    if str((market_risk_snapshot or {}).get("entry_gate") or "").upper() == "CONDITIONAL":
+        entry_timing = "等待条件确认"
     if entry_timing not in _ENTRY_PRESENTATION:
         entry_timing = "数据不足"
     reason, trigger = _ENTRY_PRESENTATION[entry_timing]
+    if timing.get("structure_class") == "weak_rebound_in_downtrend":
+        reason = "中期下行结构尚未修复，当前仅是弱反弹，不追高"
+        trigger = "放量站上中期均线且资金转强后重新评估"
     rating = _extract_pm_summary_value(original, "pm_rating") or "数据不足"
     action = _extract_pm_summary_value(original, "pm_action_keyword") or "数据不足"
     no_new_position_actions = {
-        "等回踩", "等放量突破", "暂不介入", "退出观察", "继续观察", "数据不足",
+        "等回踩", "等放量突破", "等待条件确认", "暂不介入", "退出观察", "继续观察", "数据不足",
     }
     if entry_timing in no_new_position_actions:
         report_body = re.sub(
@@ -402,20 +600,41 @@ def _format_pm_decision(
             summary_block = re.sub(
                 r"(?m)^(\s*short_term_trend:\s*).*$", r"\g<1>数据不足", summary_block,
             )
-    size = "0%" if entry_timing in no_new_position_actions else _format_position_size(
-        _extract_pm_summary_value(original, "pm_size_low_pct"),
-        _extract_pm_summary_value(original, "pm_size_high_pct"),
-    )
-
     if entry_timing in no_new_position_actions:
         report_body, summary_block = _enforce_holder_r_levels(
             report_body, summary_block, original,
+            market_report=market_report, research_plan=research_plan,
         )
         report_body = _normalize_no_new_position_rows(
             report_body, summary_block or original, entry_timing,
         )
+        report_body = _canonicalize_holder_action_section(
+            report_body, summary_block or original,
+        )
+
+    report_body, summary_block = _enforce_effective_risk_cap(
+        report_body, summary_block, original, market_risk_snapshot,
+    )
+    size = "0%" if entry_timing in no_new_position_actions else _format_position_size(
+        _extract_pm_summary_value(summary_block or original, "pm_size_low_pct"),
+        _extract_pm_summary_value(summary_block or original, "pm_size_high_pct"),
+    )
+    action = _extract_pm_summary_value(summary_block or original, "pm_action_keyword") or action
+    short_trend = _extract_pm_summary_value(summary_block or original, "short_term_trend") or "数据不足"
+    short_confidence = _extract_pm_summary_value(
+        summary_block or original, "short_term_confidence"
+    ) or "数据不足"
+    theme_outlook = _extract_pm_summary_value(
+        summary_block or original, "theme_outlook_12m"
+    ) or "数据不足"
 
     report_body = _strip_internal_pm_content(report_body)
+    report_body = _normalize_reporting_date_language(
+        report_body,
+        news_report,
+        _extract_pm_summary_value(summary_block or original, "trade_date"),
+    )
+    report_body = _normalize_unverified_hedges(report_body)
     position_actions = _position_action_rows(
         summary_block or original, entry_timing, size, rating,
     )
@@ -423,7 +642,7 @@ def _format_pm_decision(
     if research_evidence_ledger is not None:
         attribution = render_decision_attribution(
             summary_block or original,
-            timing,
+            {**timing, "effective_action": entry_timing},
             research_evidence_ledger,
             rm_content=research_plan,
         )
@@ -432,6 +651,8 @@ def _format_pm_decision(
         f"# 短期操作结论：{entry_timing}\n\n"
         f"> **当前动作：{action}｜新建仓位：{size}｜长期评级：{rating}**\n>\n"
         f"> **核心原因：{reason}**\n>\n"
+        f"> **趋势判断：未来 3 日 {short_trend}（置信度 {short_confidence}）｜"
+        f"未来 12 个月主题 {theme_outlook}**\n>\n"
         f"> **重新评估条件：{trigger}**\n\n"
         f"{position_actions}"
         f"{f'{chr(10)}{chr(10)}{attribution}' if attribution else ''}\n\n---"
@@ -473,13 +694,33 @@ def create_portfolio_manager(llm, memory):
         sector_comparison = state.get("sector_comparison", "")
         capital_flow_yaml = state.get("capital_flow_yaml", "")
         market_risk_snapshot = state.get("market_risk_snapshot") or {}
+        risk_data_packet = build_risk_data_packet(state)
+        allowed_risk_ids = set(risk_data_packet.get("reference_ids") or [])
+        allowed_risk_ids.add("RM-PLAN")
+        official_event_risk_ids = set(
+            risk_data_packet.get("official_event_evidence_ids") or []
+        )
+        risk_consensus = build_risk_consensus(
+            risk_debate_state,
+            market_risk_snapshot,
+            allowed_evidence_ids=allowed_risk_ids,
+            official_event_evidence_ids=official_event_risk_ids,
+        )
+        effective_market_risk_snapshot = dict(market_risk_snapshot)
+        effective_market_risk_snapshot.update({
+            "entry_gate": risk_consensus["entry_gate"],
+            "position_cap_pct": risk_consensus["effective_cap_pct"],
+            "risk_consensus": risk_consensus,
+        })
+        # Direction semantics come from the original market snapshot. The
+        # reconciled WAIT/cap is an execution constraint, not a bearish vote.
         market_mode = derive_market_mode(market_risk_snapshot)
         rm_rating = _extract_rm_rating(research_plan)
         entry_timing = _derive_entry_timing_from_profile(
             stock_profile, market_mode, long_term_rating=rm_rating,
         )
         market_risk_block = (
-            json.dumps(market_risk_snapshot, ensure_ascii=False, indent=2)
+            json.dumps(effective_market_risk_snapshot, ensure_ascii=False, indent=2)
             if market_risk_snapshot
             else "未找到当日市场风险快照：不得假设低风险；短期动作只能为 WAIT，仓位为 0%。"
         )
@@ -576,6 +817,9 @@ PM 是最终交易决策人，独占最终动作、仓位、入场、止损和�
 只输出 Trade Ticket + 四个一级标题：投资决策与入场时机、操作计划、情景概率与赔率、
 风险触发与监控。正文控制在可扫描的机构交易票长度，避免重复同一数据和 thesis。
 `PM_SUMMARY` 作为最后一个 YAML 代码块保留，之前不增加归档章节。
+未经官方公告或交易所预约确认的半年报/三季报日期，只能写“法定最晚披露日，预约日待确认”，
+禁止写成确定披露日。未提供账户权限和真实可交易品种时，禁止把个股期权、融券或做空 ETF
+写成可执行对冲方案，只能提示另行核验。
 
 ---
 
@@ -1058,9 +1302,12 @@ Be decisive and ground every conclusion in specific evidence from the analysts.{
         )
         enforced_content = _enforce_entry_timing_truth(normalized_content, final_entry_timing)
         response = AIMessage(content=_format_pm_decision(
-            enforced_content, final_entry_timing, market_risk_snapshot=market_risk_snapshot,
+            enforced_content, final_entry_timing,
+            market_risk_snapshot=effective_market_risk_snapshot,
             research_evidence_ledger=state.get("research_evidence_ledger", {}),
             research_plan=research_plan,
+            market_report=str(state.get("market_report") or ""),
+            news_report=str(state.get("news_report") or ""),
         ))
         logger.info("PM entry_timing 出口真值: %s", final_entry_timing)
 

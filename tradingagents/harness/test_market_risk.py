@@ -23,6 +23,7 @@ from tradingagents.harness.market_risk import (
     load_market_risk_for_ticker,
     load_market_warning_for_ticker,
     enforce_snapshot_freshness,
+    ensure_market_risk_for_ticker,
 )
 from tradingagents.harness.market_warning.adapters.sqlite_repository import SQLiteWarningRepository
 from tradingagents.harness.market_warning.domain import (
@@ -123,6 +124,32 @@ def test_snapshot_storage_is_unique_per_market_and_date():
         assert infer_market("NVDA") == "us"
         assert infer_market("300308") == "a_share"
         assert load_market_risk_for_ticker("300308", "2026-06-25", db_path)["market"] == "a_share"
+
+
+def test_same_day_missing_snapshot_is_built_once_without_notification():
+    with _tmp_dir() as tmp_path:
+        db_path = tmp_path / "risk.db"
+        calls = []
+
+        def build_snapshot(**kwargs):
+            calls.append(kwargs)
+            snapshot = compute_market_risk_snapshot(
+                "a_share", _prices([100 + i for i in range(60)]), 70, 10,
+                as_of_date="2026-08-13", as_of_time="2026-08-13T08:30:00+08:00",
+            )
+            save_market_risk_snapshot(snapshot, db_path)
+            return {"a_share": {"status": "saved", "snapshot": snapshot}}
+
+        result = ensure_market_risk_for_ticker(
+            "603629", "2026-08-13", db_path=db_path,
+            today="2026-08-13", analysis_time="2026-08-13T08:31:00+08:00",
+            build_snapshot=build_snapshot,
+        )
+        assert result is not None
+        assert result["entry_gate"] == "OPEN"
+        assert len(calls) == 1
+        assert calls[0]["markets"] == ("a_share",)
+        assert calls[0]["send_message"]("ignored") is None
 
 
 def test_same_day_premarket_snapshot_fails_closed_after_intraday_checkpoint():

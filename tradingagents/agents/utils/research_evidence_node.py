@@ -11,7 +11,11 @@ import re
 from collections.abc import Mapping
 from typing import Any
 
-import yaml
+from tradingagents.agents.utils.report_calendar import (
+    has_traceable_official_reference,
+    normalize_reporting_event,
+)
+from tradingagents.agents.utils.yaml_summary import extract_yaml_mapping
 
 
 _DIRECTION = {
@@ -68,21 +72,7 @@ _CONFLICT_FAMILY = {
 
 def _extract_yaml_mapping(report: str, key: str) -> tuple[dict[str, Any] | None, str]:
     """Return a top-level YAML mapping and parse status."""
-    if not report or key not in report:
-        return None, "missing"
-    saw_candidate = False
-    for block in reversed(re.findall(r"```yaml\s*\n(.*?)\n```", report, re.DOTALL)):
-        if not re.search(rf"(?m)^\s*{re.escape(key)}\s*:", block):
-            continue
-        saw_candidate = True
-        try:
-            parsed = yaml.safe_load(block)
-        except yaml.YAMLError:
-            continue
-        value = parsed.get(key) if isinstance(parsed, dict) else None
-        if isinstance(value, dict):
-            return value, "valid"
-    return None, "invalid" if saw_candidate else "missing"
+    return extract_yaml_mapping(report, key)
 
 
 def _as_date(value: Any) -> dt.date | None:
@@ -140,6 +130,14 @@ def _card(
     confidence: str = "medium",
     falsifier: str = "原始数据或前提发生反向变化",
     quality_status: str = "valid",
+    source_tier: str = "system",
+    source_name: str | None = None,
+    source_url: str | None = None,
+    document_id: str | None = None,
+    verification_status: str = "verified",
+    decision_eligible: bool = True,
+    date_basis: str | None = None,
+    event_date: str | None = None,
 ) -> dict[str, Any]:
     return {
         "claim_id": claim_id,
@@ -153,6 +151,14 @@ def _card(
         "source": source,
         "falsifier": falsifier,
         "quality_status": quality_status,
+        "source_tier": source_tier,
+        "source_name": source_name or source,
+        "source_url": source_url,
+        "document_id": document_id,
+        "verification_status": verification_status,
+        "decision_eligible": decision_eligible,
+        "date_basis": date_basis,
+        "event_date": event_date,
     }
 
 
@@ -199,15 +205,25 @@ def _market_cards(summary: Mapping[str, Any], trade_date: str) -> list[dict[str,
 
 def _fundamental_cards(summary: Mapping[str, Any], trade_date: str) -> list[dict[str, Any]]:
     direction = _direction(summary.get("data_implied_direction"), summary.get("rating"))
-    # Existing SUMMARY does not carry the financial statement period, so these
-    # cards are intentionally partial until that upstream schema is extended.
-    quality = "partial"
+    period = str(summary.get("financial_period") or "unknown").upper()
+    match = re.fullmatch(r"(20\d{2})(Q1|H1|Q3|FY)", period)
+    period_ends = {"Q1": "03-31", "H1": "06-30", "Q3": "09-30", "FY": "12-31"}
+    period_as_of = f"{match.group(1)}-{period_ends[match.group(2)]}" if match else None
+    quality = "valid" if period_as_of else "partial"
+    flags = summary.get("data_quality_flags")
+    if not isinstance(flags, list) or flags:
+        quality = "partial"
+    trade_day = _as_date(trade_date)
+    period_date = _as_date(period_as_of)
+    if period_date and trade_day and period_date > trade_day:
+        quality = "invalid"
+    period_note = f"；财务期间={period}" if period_as_of else "；财务期间=未知"
     return [
         _card(
             "FUND-GROWTH-01", "fundamentals", "earnings_outlook_12m",
             f"营收同比 {summary.get('growth_yoy_revenue', '未知')}%，归母净利同比 "
-            f"{summary.get('growth_yoy_profit', '未知')}%",
-            direction, "12m", trade_date, "fundamentals_report.SUMMARY",
+            f"{summary.get('growth_yoy_profit', '未知')}%{period_note}",
+            direction, "12m", period_as_of, "fundamentals_report.SUMMARY",
             falsifier="后续财报显示收入或利润增速显著反转",
             quality_status=quality,
         ),
@@ -223,8 +239,8 @@ def _fundamental_cards(summary: Mapping[str, Any], trade_date: str) -> list[dict
         _card(
             "FUND-QUALITY-01", "fundamentals", "long_term_rating",
             f"盈利质量={summary.get('earnings_quality', '未知')}，治理={summary.get('governance_score', '未知')}，"
-            f"ROE={summary.get('roe', '未知')}%",
-            direction, "12m", trade_date, "fundamentals_report.SUMMARY",
+            f"ROE={summary.get('roe', '未知')}%（{summary.get('roe_basis', 'unknown')}）{period_note}",
+            direction, "12m", period_as_of, "fundamentals_report.SUMMARY",
             falsifier="现金流、应收或治理出现新增红旗",
             quality_status=quality,
         ),
@@ -247,26 +263,84 @@ def _news_cards(summary: Mapping[str, Any], trade_date: str) -> list[dict[str, A
         seen.add(identity)
         source_date = _as_date(event.get("source_date"))
         trade_day = _as_date(trade_date)
-        event_date = event.get("event_date")
+        normalized_event = normalize_reporting_event(
+            str(event.get("title") or ""),
+            str(event.get("event_date") or "未知"),
+            str(event.get("source_date") or "未知"),
+            event_date_basis=event.get("event_date_basis"),
+            source_tier=event.get("source_tier"),
+            verification_status=event.get("verification_status"),
+            source_url=event.get("source_url"),
+            document_id=event.get("document_id"),
+        )
+        event_date = normalized_event["event_date"]
+        date_basis = normalized_event["date_basis"]
+        source_tier = str(event.get("source_tier") or "unknown").strip().lower()
+        verification_status = str(event.get("verification_status") or "unverified").strip().lower()
+        decision_eligible = (
+            has_traceable_official_reference(
+                source_tier=source_tier,
+                verification_status=verification_status,
+                source_url=event.get("source_url"),
+                document_id=event.get("document_id"),
+            )
+        ) or (
+            source_tier in {"mainstream", "research"}
+            and verification_status in {"verified", "corroborated"}
+        )
         quality = "valid" if source_date and event_date not in (None, "", "未知", "null") else "partial"
+        if not decision_eligible:
+            quality = "partial"
         if source_date and trade_day and source_date > trade_day:
             quality = "invalid"
         impact = str(event.get("impact") or "0")
+        date_labels = {
+            "exact_reservation": f"交易所预约披露日={event_date}",
+            "legal_deadline": f"法定最晚披露日={event_date}（非预约日）",
+            "publication_date": f"公告发布日期={event_date}",
+            "reported": f"事件日期={event_date}",
+        }
+        date_claim = date_labels.get(date_basis, f"日期={event_date}")
         cards.append(_card(
             f"NEWS-CAT-{len(cards) + 1:02d}", "news", "long_term_rating",
-            f"{event.get('title', '未命名事件')}；影响={impact}；已定价={event.get('priced_in_p', '未知')}%",
+            f"{event.get('title', '未命名事件')}；{date_claim}；"
+            f"影响={impact}；已定价={event.get('priced_in_p', '未知')}%",
             _impact_direction(impact), str(event.get("horizon") or "event"),
             source_date.isoformat() if source_date else None, "news_report.SUMMARY.key_events",
             confidence={"高": "high", "中": "medium", "低": "low"}.get(str(event.get("credibility")), "medium"),
-            falsifier=f"事件未在 {event.get('event_date', '约定窗口')} 落地或出现反向公告",
+            falsifier=(
+                f"在{date_claim}前后核对正式披露或反向公告"
+                if date_basis in {"legal_deadline", "exact_reservation"}
+                else "后续出现反向公告或事件事实被更正"
+            ),
             quality_status=quality,
+            source_tier=source_tier,
+            source_name=str(event.get("source_name") or "未知来源"),
+            source_url=event.get("source_url"),
+            document_id=event.get("document_id"),
+            verification_status=verification_status,
+            decision_eligible=decision_eligible,
+            date_basis=date_basis,
+            event_date=event_date,
         ))
     target = summary.get("research_consensus_target_price")
     if target not in (None, "null", "None", "不适用"):
+        target_date = _as_date(summary.get("research_consensus_as_of"))
+        trade_day = _as_date(trade_date)
+        target_eligible = target_date is not None and not (
+            trade_day is not None and target_date > trade_day
+        )
+        target_quality = "partial" if target_eligible else (
+            "invalid" if target_date is not None else "partial"
+        )
         cards.append(_card(
             "NEWS-TP-01", "news", "target_price", f"卖方一致目标价 {target}",
-            _direction(summary.get("research_consensus_rating")), "12m", trade_date,
-            "news_report.SUMMARY", falsifier="一致预期目标价发生下修", quality_status="partial",
+            _direction(summary.get("research_consensus_rating")), "12m",
+            target_date.isoformat() if target_date else None,
+            "news_report.SUMMARY", falsifier="一致预期目标价发生下修",
+            quality_status=target_quality, source_tier="research",
+            verification_status="corroborated" if target_eligible else "unverified",
+            decision_eligible=target_eligible,
         ))
     return cards
 
@@ -304,8 +378,16 @@ def _quant_cards(summary: Mapping[str, Any], trade_date: str) -> list[dict[str, 
         quality = "stale"
     else:
         quality = "valid"
+    coverage = summary.get("coverage")
+    missing_factors = coverage.get("missing") if isinstance(coverage, Mapping) else []
+    if isinstance(missing_factors, str):
+        missing_factors = [missing_factors]
+    missing_factors = [str(item) for item in (missing_factors or []) if item not in (None, "")]
+    if missing_factors and quality == "valid":
+        quality = "partial"
+    coverage_note = f"；缺失因子={','.join(missing_factors)}" if missing_factors else ""
     return [_card(
-        "QUANT-COMP-01", "quant", "long_term_rating", f"量化综合分={score}",
+        "QUANT-COMP-01", "quant", "long_term_rating", f"量化综合分={score}{coverage_note}",
         direction, "1-12m", price_date.isoformat() if price_date else None,
         "quant_score.QUANT_SCORE", falsifier="综合分跨越 35/65 分界",
         quality_status=quality,
@@ -333,13 +415,15 @@ def _stock_structure_cards(profile: str, trade_date: str) -> list[dict[str, Any]
         "trend_pullback": "bullish",
         "breakout_ready": "bullish",
         "healthy_trend": "bullish",
+        "weak_rebound_in_downtrend": "bearish",
         "exhaustion": "bearish",
         "broken": "bearish",
         "neutral": "neutral",
         "insufficient_data": "neutral",
     }.get(structure, "neutral")
     quality = "valid" if structure in {
-        "trend_pullback", "breakout_ready", "healthy_trend", "exhaustion", "broken", "neutral",
+        "trend_pullback", "breakout_ready", "healthy_trend", "weak_rebound_in_downtrend",
+        "exhaustion", "broken", "neutral",
     } else "partial"
     return [_card(
         "MKT-STRUCT-01", "market", "entry_timing", f"确定性短线结构={structure}",
@@ -352,10 +436,11 @@ def _risk_cards(snapshot: Mapping[str, Any], trade_date: str) -> list[dict[str, 
     if not snapshot:
         return [_card(
             "RISK-GATE-01", "risk", "position",
-            "市场风险快照缺失，按 WAIT / 新仓上限 0% 处理",
-            "bearish", "intraday", trade_date, "market_risk_snapshot",
+            "市场风险快照缺失，方向未知；执行数据门按 WAIT / 新仓上限 0% 处理",
+            "neutral", "intraday", trade_date, "market_risk_snapshot",
             falsifier="取得有效市场风险快照且入场门不再为 WAIT",
-            quality_status="partial",
+            quality_status="invalid", verification_status="missing",
+            decision_eligible=False,
         )]
     status = str(snapshot.get("data_status") or "missing")
     quality = "valid" if status == "fresh" else "stale" if status == "stale" else "partial"
@@ -416,12 +501,20 @@ def compile_research_evidence(state: Mapping[str, Any]) -> dict[str, Any]:
             coverage[domain] = "invalid"
             warnings.append(f"{label}摘要字段类型无效，已跳过该领域证据：{type(exc).__name__}")
             continue
+        if status == "recovered":
+            for card in domain_cards:
+                if card.get("quality_status") == "valid":
+                    card["quality_status"] = "partial"
         cards.extend(domain_cards)
         qualities = {str(card["quality_status"]) for card in domain_cards}
-        coverage[domain] = next(
+        domain_status = next(
             (quality for quality in ("invalid", "stale", "partial") if quality in qualities),
             "valid" if domain_cards else "missing",
         )
+        if status == "recovered":
+            domain_status = "partial"
+            warnings.append(f"{label}摘要经受限语法自动修复后解析，已标记为部分覆盖")
+        coverage[domain] = domain_status
 
     structure_cards = _stock_structure_cards(str(state.get("stock_profile") or ""), trade_date)
     coverage["structure"] = structure_cards[0]["quality_status"] if structure_cards else "missing"
@@ -444,8 +537,15 @@ def compile_research_evidence(state: Mapping[str, Any]) -> dict[str, Any]:
     ids = [card["claim_id"] for card in cards]
     if len(ids) != len(set(ids)):
         raise ValueError("research evidence contains duplicate claim IDs")
+    if any(status in {"missing", "invalid"} for status in coverage.values()):
+        analysis_status = "incomplete"
+    elif any(status in {"partial", "stale", "recovered"} for status in coverage.values()):
+        analysis_status = "partial"
+    else:
+        analysis_status = "complete"
     return {
         "schema_version": "research-evidence-v1",
+        "analysis_status": analysis_status,
         "cards": cards,
         "conflicts": _detect_conflicts(cards),
         "warnings": warnings,
@@ -548,7 +648,8 @@ def _display_position(content: str) -> str:
 
 
 def _validate_references(
-    ids: list[str], ledger: Mapping[str, Any], policy_key: str
+    ids: list[str], ledger: Mapping[str, Any], policy_key: str,
+    *, expected_direction: str | None = None,
 ) -> tuple[str, str]:
     if not ids:
         return "-", "缺失：PM 未完成证据归因"
@@ -560,10 +661,17 @@ def _validate_references(
         claim_id for claim_id in ids
         if claim_id in by_id and str(by_id[claim_id].get("quality_status")) == "invalid"
     ]
+    ineligible = [
+        claim_id for claim_id in ids
+        if claim_id in by_id
+        and claim_id not in invalid
+        and not bool(by_id[claim_id].get("decision_eligible", True))
+    ]
     unauthorized = [
         claim_id for claim_id in ids
         if claim_id in by_id
         and claim_id not in invalid
+        and claim_id not in ineligible
         and str(by_id[claim_id].get("owner")) not in allowed
     ]
     wrong_variable = [
@@ -571,6 +679,7 @@ def _validate_references(
         if claim_id in by_id
         and claim_id not in invalid
         and claim_id not in unauthorized
+        and claim_id not in ineligible
         and str(by_id[claim_id].get("decision_variable")) not in allowed_variables
     ]
     accepted = [
@@ -578,6 +687,7 @@ def _validate_references(
         if claim_id in by_id
         and claim_id not in invalid
         and claim_id not in unauthorized
+        and claim_id not in ineligible
         and claim_id not in wrong_variable
     ]
     issues = []
@@ -585,12 +695,29 @@ def _validate_references(
         issues.append(f"剔除不存在的证据 {', '.join(missing)}")
     if invalid:
         issues.append(f"剔除无效证据 {', '.join(invalid)}")
+    if ineligible:
+        issues.append(f"剔除不可用于硬决策的证据 {', '.join(ineligible)}")
     if unauthorized:
         issues.append(f"剔除权限不匹配的证据 {', '.join(unauthorized)}")
     if wrong_variable:
         issues.append(f"剔除决策变量不匹配的证据 {', '.join(wrong_variable)}")
     if not accepted:
         return "-", f"缺失：{'；'.join(issues)}"
+    if expected_direction:
+        trend_directions = {
+            str(by_id[claim_id].get("direction") or "neutral")
+            for claim_id in accepted
+            if str(by_id[claim_id].get("decision_variable")) == "short_term_trend"
+        }
+        if expected_direction not in trend_directions:
+            opposite = {"bullish": "bearish", "bearish": "bullish"}.get(expected_direction)
+            issues.append(
+                "证据方向与结论不一致"
+                if opposite in trend_directions
+                else "缺少同向趋势证据"
+            )
+        elif len(trend_directions) > 1:
+            issues.append("趋势证据方向冲突")
     qualities = [str(by_id[claim_id].get("quality_status") or "invalid") for claim_id in accepted]
     if "stale" in qualities:
         issues.append("有效证据时点过期")
@@ -608,7 +735,7 @@ def render_decision_attribution(
 ) -> str:
     """Render four PM decisions with validated evidence ownership and quality."""
     rating = _summary_value(pm_content, "pm_rating") or "数据不足"
-    short_term = str(timing.get("effective_action") or "数据不足")
+    short_term = _summary_value(pm_content, "short_term_trend") or "数据不足"
     target_low = _display_number(_summary_value(rm_content, "target_price_low"))
     target_mid = _display_number(_summary_value(rm_content, "target_price_mid"))
     target_high = _display_number(_summary_value(rm_content, "target_price_high"))
@@ -645,7 +772,17 @@ def render_decision_attribution(
         available = {str(card.get("claim_id")) for card in ledger.get("cards") or []}
         ids = [claim_id for claim_id in deterministic_ids if claim_id in available] + ids
         ids = list(dict.fromkeys(ids))
-        evidence, status = _validate_references(ids, ledger, policy)
+        expected_direction = None
+        if policy == "short_term":
+            if "上涨" in conclusion:
+                expected_direction = "bullish"
+            elif "下跌" in conclusion:
+                expected_direction = "bearish"
+            elif "震荡" in conclusion:
+                expected_direction = "neutral"
+        evidence, status = _validate_references(
+            ids, ledger, policy, expected_direction=expected_direction,
+        )
         lines.append(f"| {label} | {conclusion} | {team} | {evidence} | {status} |")
     lines.extend([
         "",

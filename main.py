@@ -7,6 +7,7 @@ import datetime
 from pathlib import Path
 from typing import Tuple
 from dotenv import load_dotenv
+from tradingagents.reporting import write_consolidated_reports
 
 # Load environment variables from .env file (use project root, not CWD)
 _PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -275,14 +276,17 @@ def _save_report(state, ticker: str, save_path: Path):
                 f"{pm_md}"
             )
 
-    # Write consolidated report
-    header = (
-        f"# 交易分析报告：{ticker}\n\n"
-        f"生成时间: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+    # User artifact is decision-first; all working material remains auditable.
+    user_decision = ""
+    risk = state.get("risk_debate_state") or {}
+    if risk.get("judge_decision"):
+        user_decision = _escape_abs_value_pipes(risk["judge_decision"])
+    return write_consolidated_reports(
+        save_path,
+        ticker=ticker,
+        user_decision=user_decision,
+        audit_sections=sections,
     )
-    report_file = save_path / "complete_report.md"
-    report_file.write_text(header + "\n\n".join(sections), encoding="utf-8")
-    return report_file
 
 
 # ---------------------------------------------------------------------------
@@ -315,9 +319,10 @@ def _run_harness_post_hook(ticker: str, report_path: Path) -> None:
 #  飞书推送 hook（Open Platform API 走 open_id 私聊，发文件类型保留 markdown 渲染）
 # ---------------------------------------------------------------------------
 def _send_decision_to_feishu_as_file(report_path: Path) -> None:
-    """把 PM decision.md 以文件形式推送到飞书。
+    """把精简用户报告以文件形式推送到飞书。
 
     关键设计：
+    - rating 仍从 decision.md 读取，附件优先 complete_report.md
     - disk 上 decision.md 文件名**不动**（harness archive/extractor 等依赖该字面值）
     - 飞书展示名按 `{ticker}_{company_name}_{rating}_{MM-DD}.md` 自定义
     - rating 从 PM_SUMMARY YAML 的 pm_rating 字段提取；抓不到降级为 UNKNOWN
@@ -334,6 +339,9 @@ def _send_decision_to_feishu_as_file(report_path: Path) -> None:
     if not decision_file.exists():
         print(f"[{report_path.name}] ⚠ decision.md 不存在，跳过飞书推送", flush=True)
         return
+    delivery_file = report_path / "complete_report.md"
+    if not delivery_file.exists():
+        delivery_file = decision_file
 
     app_id = os.environ.get("FEISHU_APP_ID")
     app_secret = os.environ.get("FEISHU_APP_SECRET")
@@ -364,9 +372,9 @@ def _send_decision_to_feishu_as_file(report_path: Path) -> None:
         body_text = None  # 降级路径，不需要 rating
 
     try:
-        file_bytes = decision_file.read_bytes()
+        file_bytes = delivery_file.read_bytes()
     except Exception as e:
-        print(f"[{report_path.name}] ⚠ 读 decision.md 字节失败：{e}", flush=True)
+        print(f"[{report_path.name}] ⚠ 读用户报告字节失败：{e}", flush=True)
         return
 
     print(f"[{report_path.name}] ↻ 推送飞书（{feishu_filename}，{len(file_bytes)} bytes）...", flush=True)

@@ -1252,10 +1252,10 @@ _FADING_UP_LOCK = 30.0   # 主题退潮期上沿锁定（主题反噬保护，�
 def derive_market_mode(market_risk_snapshot: dict | None) -> str:
     """把 market_risk_daily 快照压成 AI 主升升档权限。
 
-    缺失快照按 risk_off 处理，避免在没有开盘前风险数据时默认乐观。
+    缺失快照标为 unknown。执行层仍 fail closed，但不能把“没数据”伪装成看空证据。
     """
     if not market_risk_snapshot:
-        return "risk_off"
+        return "unknown"
     gate = str(market_risk_snapshot.get("entry_gate") or "").upper()
     risk = str(market_risk_snapshot.get("risk_level") or "")
     bias = str(market_risk_snapshot.get("t_plus_1_bias") or "")
@@ -1270,6 +1270,7 @@ _ENTRY_TIMING_BY_STRUCTURE = {
     "trend_pullback": "分批介入",
     "breakout_ready": "等放量突破",
     "healthy_trend": "等回踩",
+    "weak_rebound_in_downtrend": "继续观察",
     "exhaustion": "暂不介入",
     "broken": "退出观察",
     "neutral": "继续观察",
@@ -1298,8 +1299,8 @@ def compute_entry_timing(
     """
     structure = (structure_class or "").strip().lower()
     base_action = _ENTRY_TIMING_BY_STRUCTURE.get(structure, "数据不足")
-    normalized_mode = (market_mode or "risk_off").strip().lower()
-    if normalized_mode not in {"risk_on", "conditional", "risk_off"}:
+    normalized_mode = (market_mode or "unknown").strip().lower()
+    if normalized_mode not in {"risk_on", "conditional", "risk_off", "unknown"}:
         normalized_mode = "risk_off"
 
     blockers: list[str] = []
@@ -1332,6 +1333,8 @@ def compute_entry_timing(
     effective_action = base_action
     if blockers:
         effective_action = "退出观察" if structure == "broken" else "暂不介入"
+    elif normalized_mode == "unknown":
+        effective_action = "退出观察" if structure == "broken" else "数据不足"
     elif rating == "HOLD" and base_action == "分批介入":
         effective_action = "等回踩"
     elif normalized_mode == "risk_off":
@@ -1343,6 +1346,8 @@ def compute_entry_timing(
     reasons = list(blockers)
     if normalized_mode == "risk_off" and effective_action == "暂不介入":
         reasons.append("market_risk_daily 总闸=risk_off")
+    elif normalized_mode == "unknown" and effective_action == "数据不足":
+        reasons.append("market_risk_daily 快照缺失，方向未知且执行锁定")
     elif normalized_mode == "conditional" and base_action == "分批介入":
         reasons.append("market_risk_daily 总闸=conditional，积极动作降级")
     if not reasons:

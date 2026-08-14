@@ -3,6 +3,8 @@ import logging
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+import yaml
+
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 
 from tradingagents.agents.utils.agent_utils import (
@@ -15,11 +17,261 @@ from tradingagents.agents.analysts.fundamentals_tools import (
 )
 from tradingagents.dataflows.interface import route_to_vendor
 from tradingagents.dataflows.akshare_vendor import get_industry_pe_table
+from tradingagents.agents.utils.yaml_summary import extract_yaml_mapping
 
 # 工具调用循环上限（防止 LLM 反复调同一工具）
 _MAX_TOOL_ITERATIONS = 8
 
+_FUNDAMENTALS_SUMMARY_FIELDS = {
+    "pe_ttm", "pe_zone", "pe_industry_median", "pe_industry_median_source",
+    "pe_vs_industry", "growth_yoy_revenue", "growth_yoy_profit",
+    "growth_yoy_profit_recurring", "roe", "roe_basis", "financial_period",
+    "cashflow_period_basis", "inventory_comparison_basis", "data_quality_flags",
+    "debt_ratio", "fcf_quality", "business_model_type",
+    "customer_concentration_top5_pct", "governance_score", "governance_red_flags",
+    "ocf_to_net_profit_ratio", "receivable_vs_revenue_growth_gap",
+    "recurring_profit_ratio", "earnings_quality", "red_flags", "rating",
+    "data_implied_direction", "data_implied_reasoning",
+}
+
 logger = logging.getLogger(__name__)
+
+
+def _fundamentals_summary_is_complete(report: str) -> bool:
+    summary, status = extract_yaml_mapping(report or "", "SUMMARY")
+    if not (
+        status in {"valid", "recovered"}
+        and isinstance(summary, dict)
+        and _FUNDAMENTALS_SUMMARY_FIELDS.issubset(summary)
+    ):
+        return False
+    if not all(isinstance(summary.get(key), list) for key in (
+        "data_quality_flags", "governance_red_flags", "red_flags",
+    )):
+        return False
+    enum_fields = {
+        "pe_zone": {"高估", "合理", "低估"},
+        "pe_industry_median_source": {"cninfo", "news_research", "unavailable"},
+        "pe_vs_industry": {"高于", "接近", "低于", "不可比"},
+        "roe_basis": {"ttm", "annual", "quarterly_unannualized"},
+        "cashflow_period_basis": {"cumulative", "single_quarter", "annual", "unknown"},
+        "inventory_comparison_basis": {"same_period", "year_end", "incomparable", "unknown"},
+        "fcf_quality": {"高", "中", "低"},
+        "governance_score": {"高", "中", "低"},
+        "earnings_quality": {"高", "中", "低"},
+        "rating": {"正面", "中性", "负面"},
+        "data_implied_direction": {"偏多", "偏空", "中性"},
+    }
+    for key, allowed in enum_fields.items():
+        if summary.get(key) is not None and summary.get(key) not in allowed:
+            return False
+    period = summary.get("financial_period")
+    if period not in {None, "unknown"} and not re.fullmatch(r"20\d{2}(?:Q1|H1|Q3|FY)", str(period)):
+        return False
+    numeric_fields = {
+        "pe_ttm", "pe_industry_median", "growth_yoy_revenue", "growth_yoy_profit",
+        "growth_yoy_profit_recurring", "roe", "debt_ratio",
+        "customer_concentration_top5_pct", "ocf_to_net_profit_ratio",
+        "receivable_vs_revenue_growth_gap", "recurring_profit_ratio",
+    }
+    return all(
+        summary.get(key) is None
+        or isinstance(summary.get(key), (int, float)) and not isinstance(summary.get(key), bool)
+        for key in numeric_fields
+    )
+
+
+def _fundamentals_data_digest(structured_data: str, max_chars: int = 16000) -> str:
+    """Keep high-signal source rows for an artifact-only retry."""
+    keywords = (
+        "SYS_", "PE", "PB", "PS", "EPS", "ROE", "ROA", "报告期", "营收",
+        "净利润", "扣非", "资产负债率", "流动比率", "现金流", "应收", "存货",
+        "总市值", "客户", "行业", "同比", "毛利率", "净利率",
+    )
+    selected = [
+        line.strip() for line in (structured_data or "").splitlines()
+        if line.strip() and any(keyword in line for keyword in keywords)
+    ]
+    digest = "\n".join(selected)
+    return digest[:max_chars] if digest else (structured_data or "")[:max_chars]
+
+
+def _compact_fundamentals_prompt(structured_data: str, tool_results: list[str]) -> str:
+    return f"""基本面分析已经完成，但上一轮没有留下可见正文。
+
+只输出可交付内容，禁止输出 <think>、思维过程、工具调用或过程说明，也不要再调用工具。
+先用不超过 700 个中文字写出：估值、增长、盈利质量、治理/负债风险和基本面方向；
+随后输出完整可解析的 `SUMMARY` YAML，字段必须与原任务模板完全一致，缺失值填 null。
+不得编造客户、合同、财务期间或行业数据。
+
+已执行的确定性计算工具结果：
+{chr(10).join(tool_results)[-12000:] if tool_results else "无；相关派生字段必须填 null"}
+
+高信号原始数据：
+{_fundamentals_data_digest(structured_data)}
+"""
+
+
+def _mark_fundamentals_retry_partial(report: str) -> str:
+    """Audit compact-retry output as partial even when its YAML is parseable."""
+    matches = list(re.finditer(r"```yaml\s*\n(.*?)\n```", report or "", re.S | re.I))
+    for match in reversed(matches):
+        try:
+            parsed = yaml.safe_load(match.group(1))
+        except yaml.YAMLError:
+            continue
+        summary = parsed.get("SUMMARY") if isinstance(parsed, dict) else None
+        if not isinstance(summary, dict):
+            continue
+        flags = summary.get("data_quality_flags")
+        flags = list(flags) if isinstance(flags, list) else []
+        marker = "M3压缩重试输出，工具口径已保留但需复核"
+        if marker not in flags:
+            flags.append(marker)
+        summary["data_quality_flags"] = flags
+        replacement = "```yaml\n" + yaml.safe_dump(
+            {"SUMMARY": summary}, allow_unicode=True, sort_keys=False,
+        ).rstrip() + "\n```"
+        return report[:match.start()] + replacement + report[match.end():]
+    return report
+
+
+def _run_fundamentals_tool_loop(
+    llm_with_tools,
+    initial_messages: list,
+    *,
+    structured_data: str,
+    max_iterations: int = _MAX_TOOL_ITERATIONS,
+    max_finalization_attempts: int = 2,
+):
+    """Run calculation tools, then require a visible, parseable analyst artifact."""
+    messages = list(initial_messages)
+    visible_segments: list[str] = []
+    tool_result_summaries: list[str] = []
+
+    for iteration in range(max_iterations):
+        try:
+            result = llm_with_tools.invoke(messages)
+        except Exception as exc:
+            logger.warning("Fundamentals 主流程 LLM 调用失败，转入压缩收敛：%s", exc)
+            break
+        messages.append(result)
+        content = str(getattr(result, "content", "") or "").strip()
+        if content:
+            visible_segments.append(content)
+
+        tool_calls = getattr(result, "tool_calls", None) or []
+        if not tool_calls:
+            joined = "\n\n".join(visible_segments)
+            if _fundamentals_summary_is_complete(joined):
+                return AIMessage(content=joined)
+            logger.warning(
+                "Fundamentals 可见正文缺失或 SUMMARY 不完整，第 %d 轮转入压缩收敛",
+                iteration + 1,
+            )
+            break
+
+        logger.info("Fundamentals 第 %d 轮工具调用：%d 个", iteration + 1, len(tool_calls))
+        for tc in tool_calls:
+            tool_name = tc.get("name")
+            tool_args = tc.get("args", {})
+            tool_id = tc.get("id", "")
+            tool = FUNDAMENTALS_TOOLS_BY_NAME.get(tool_name)
+            if tool is None:
+                messages.append(ToolMessage(content=f"未知工具：{tool_name}", tool_call_id=tool_id))
+                continue
+            try:
+                tool_result = tool.invoke(tool_args)
+                payload = json.dumps(tool_result, ensure_ascii=False) if isinstance(tool_result, dict) else str(tool_result)
+                tool_result_summaries.append(f"{tool_name}: {payload[:3000]}")
+                messages.append(ToolMessage(content=payload, tool_call_id=tool_id))
+            except Exception as exc:
+                error = f"工具 {tool_name} 失败: {exc}"
+                tool_result_summaries.append(f"{tool_name}: {error}")
+                messages.append(ToolMessage(content=error, tool_call_id=tool_id))
+    else:
+        logger.warning("Fundamentals 达到工具调用上限 %d 轮，转入压缩收敛", max_iterations)
+
+    final_messages = [
+        SystemMessage(content="你是基本面分析师。内部分析已完成，现在只负责输出最终可见报告。"),
+        HumanMessage(content=_compact_fundamentals_prompt(structured_data, tool_result_summaries)),
+    ]
+    for attempt in range(max_finalization_attempts):
+        try:
+            result = llm_with_tools.invoke(final_messages)
+        except Exception as exc:
+            logger.warning("Fundamentals 压缩收敛第 %d 次调用失败：%s", attempt + 1, exc)
+            continue
+        content = str(getattr(result, "content", "") or "").strip()
+        if content and _fundamentals_summary_is_complete(content):
+            return AIMessage(content=_mark_fundamentals_retry_partial(content))
+        logger.warning("Fundamentals 压缩收敛第 %d 次仍无完整 SUMMARY", attempt + 1)
+        final_messages.append(HumanMessage(
+            content="上一轮仍未生成可见且完整的 SUMMARY。直接输出短报告和完整 YAML，禁止思考过程。"
+        ))
+    return AIMessage(content="\n\n".join(visible_segments))
+
+
+def _find_float(text: str, pattern: str):
+    match = re.search(pattern, text or "", re.I)
+    if not match or match.group(1).upper() in {"NA", "N/A"}:
+        return None
+    try:
+        return round(float(match.group(1)), 2)
+    except (TypeError, ValueError):
+        return None
+
+
+def _yaml_number(value) -> str:
+    return "null" if value is None else str(value)
+
+
+def _build_deterministic_fundamentals_fallback(vendor_text: str, current_date: str) -> str:
+    """Emit a conservative partial SUMMARY when M3 produces think-only output twice."""
+    pe_ttm = _find_float(vendor_text, r"PE\s*\(TTM\)\s*[:：]\s*([-+]?\d+(?:\.\d+)?)")
+    revenue_yoy = _find_float(vendor_text, r"营收YoY[^\n]*?年度=([-+]?\d+(?:\.\d+)?|NA)%")
+    profit_yoy = _find_float(vendor_text, r"归母净利YoY[^\n]*?年度=([-+]?\d+(?:\.\d+)?|NA)%")
+    recurring_yoy = _find_float(vendor_text, r"扣非净利YoY[^\n]*?年度=([-+]?\d+(?:\.\d+)?|NA)%")
+    debt_ratio = _find_float(vendor_text, r"资产负债率=([-+]?\d+(?:\.\d+)?)%")
+    return f"""## 基本面摘要（确定性兜底）
+
+LLM可见正文缺失，以下仅保留可从数据源直接解析的指标；其余字段按缺失处理，
+下游必须将该领域视为部分覆盖，不得据此单独提高评级或仓位。
+
+```yaml
+SUMMARY:
+  pe_ttm: {_yaml_number(pe_ttm)}
+  pe_zone: null
+  pe_industry_median: null
+  pe_industry_median_source: unavailable
+  pe_vs_industry: 不可比
+  growth_yoy_revenue: {_yaml_number(revenue_yoy)}
+  growth_yoy_profit: {_yaml_number(profit_yoy)}
+  growth_yoy_profit_recurring: {_yaml_number(recurring_yoy)}
+  roe: null
+  roe_basis: null
+  financial_period: unknown
+  cashflow_period_basis: unknown
+  inventory_comparison_basis: unknown
+  data_quality_flags:
+    - LLM可见正文缺失，使用确定性兜底
+  debt_ratio: {_yaml_number(debt_ratio)}
+  fcf_quality: null
+  business_model_type: null
+  customer_concentration_top5_pct: null
+  governance_score: null
+  governance_red_flags: []
+  ocf_to_net_profit_ratio: null
+  receivable_vs_revenue_growth_gap: null
+  recurring_profit_ratio: null
+  earnings_quality: null
+  red_flags:
+    - 基本面需在下次分析重试
+  rating: null
+  data_implied_direction: null
+  data_implied_reasoning: 仅确定性指标可用，完整分析缺失
+```
+"""
 
 
 def _safe_fetch(method: str, *args, **kwargs) -> str:
@@ -217,6 +469,14 @@ def create_fundamentals_analyst(llm):
 - 工具返回的数值直接采用，不要"调整"或"修正"
 - ⛔ **禁止偷懒**：发现 raw_data 里没有"净利润同比"字段就填 null —— 这是过往 bug 来源。raw_data 里几乎一定有本期和去年同期的绝对值，必须调工具自算
 
+## ⚠️ 财务期间与单位一致性（强制约束）
+
+- 任何同比、环比、现金流/利润比只允许同口径期间相除：累计对累计、单季对单季、年度对年度；禁止把累计现金流称为“单季现金流”
+- 存货、应收等资产负债表项目只能与同类报告期或明确年末基准比较；没有同口径基期时写“不可比”，不得判断改善/恶化
+- 现金流/净利润比绝对值异常（如 >3 或 <-1）时，先标记“期间或单位待核”，在核验前不得据此把盈利质量评为高
+- 单季 CapEx 不能单独证明扩产周期启动或结束；生命周期判断至少需要连续两个可比期或官方产能公告
+- 每个核心财务结论必须注明 `financial_period` 与口径；发现混期/单位冲突写入 `data_quality_flags`
+
 ## 报告结构（必须按此顺序）
 
 ### 一、公司概况
@@ -374,6 +634,11 @@ SUMMARY:
   growth_yoy_profit_recurring: <百分比 或 null>          # 扣非净利润同比（如可计算）
   roe: <百分比>                                          # 优先填 TTM 年化 ROE，否则填年度 ROE
   roe_basis: ttm / annual / quarterly_unannualized      # ROE 取值口径（强制标注，不允许省略）
+  financial_period: <YYYYQ1 / YYYYH1 / YYYYQ3 / YYYYFY / unknown>
+  cashflow_period_basis: cumulative / single_quarter / annual / unknown
+  inventory_comparison_basis: same_period / year_end / incomparable / unknown
+  data_quality_flags:
+    - <期间/单位异常，≤30字；无则空列表>
   debt_ratio: <百分比>
   fcf_quality: 高 / 中 / 低
   # 商业模式（新增）
@@ -417,36 +682,17 @@ SUMMARY:
         # 绑定 Fundamentals 计算工具，让 LLM 调工具算 FCF / 同比 / TTM ROE 等
         llm_with_tools = llm.bind_tools(FUNDAMENTALS_TOOLS)
 
-        result = None
-        for iteration in range(_MAX_TOOL_ITERATIONS):
-            result = llm_with_tools.invoke(messages)
-            messages.append(result)
-            tool_calls = getattr(result, "tool_calls", None) or []
-            if not tool_calls:
-                logger.info("Fundamentals tool loop 结束（第 %d 轮，无 tool_calls）", iteration + 1)
-                break
-
-            logger.info("Fundamentals 第 %d 轮工具调用：%d 个", iteration + 1, len(tool_calls))
-            for tc in tool_calls:
-                tool_name = tc.get("name")
-                tool_args = tc.get("args", {})
-                tool_id = tc.get("id", "")
-                tool = FUNDAMENTALS_TOOLS_BY_NAME.get(tool_name)
-                if tool is None:
-                    messages.append(ToolMessage(content=f"未知工具：{tool_name}", tool_call_id=tool_id))
-                    continue
-                try:
-                    tool_result = tool.invoke(tool_args)
-                    payload = json.dumps(tool_result, ensure_ascii=False) if isinstance(tool_result, dict) else str(tool_result)
-                    messages.append(ToolMessage(content=payload, tool_call_id=tool_id))
-                except Exception as e:
-                    messages.append(ToolMessage(content=f"工具 {tool_name} 失败: {e}", tool_call_id=tool_id))
-        else:
-            logger.warning("Fundamentals 达到工具调用上限 %d 轮，强制续写", _MAX_TOOL_ITERATIONS)
-            messages.append(HumanMessage(content="请基于已有工具结果直接写出完整报告，不要再调工具。"))
-            result = llm_with_tools.invoke(messages)
-
+        result = _run_fundamentals_tool_loop(
+            llm_with_tools,
+            messages,
+            structured_data=structured_data,
+        )
         report = result.content if hasattr(result, "content") else str(result)
+        if not _fundamentals_summary_is_complete(report):
+            fallback = _build_deterministic_fundamentals_fallback(
+                raw_data.get("fundamentals", ""), current_date,
+            )
+            report = f"{report.rstrip()}\n\n{fallback}" if report.strip() else fallback
         report = _enforce_price_context(report, raw_data.get("fundamentals", ""))
         # 机读行确定性传递（Python 兜底，不靠 LLM 转抄）
         report = _append_sys_lines(report, raw_data.get("fundamentals", ""))

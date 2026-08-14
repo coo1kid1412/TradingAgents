@@ -16,9 +16,9 @@ def test_temperature_config():
     print("=" * 60)
     
     expected_temperatures = {
-        "temperature_market": 0.5,
-        "temperature_sentiment": 0.5,
-        "temperature_news": 0.5,
+        "temperature_market": 0.2,
+        "temperature_sentiment": 0.4,
+        "temperature_news": 0.4,
         "temperature_fundamentals": 0.2,
         "temperature_trader": 0.3,
     }
@@ -49,6 +49,7 @@ def test_temperature_config():
             model="gpt-4o-mini",
             base_url="https://api.openai.com/v1",
             temperature=0.3,
+            api_key="test-key",
         )
         llm = client.get_llm()
         print(f"✓ LLM 客户端创建成功，temperature={llm.temperature}")

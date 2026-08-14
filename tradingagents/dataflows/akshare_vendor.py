@@ -1063,9 +1063,10 @@ def get_cls_telegraph(
 # ---------------------------------------------------------------------------
 def get_research_reports(
     ticker: Annotated[str, "ticker symbol of the company"],
+    curr_date: Annotated[str, "analysis cutoff date YYYY-MM-DD"],
     limit: Annotated[int, "max number of reports"] = 20,
 ) -> str:
-    """获取个股研报（来源：东方财富）。"""
+    """获取分析日及以前发布的个股研报（来源：东方财富）。"""
     if is_etf_or_lof(ticker):
         return (
             f"# Research Reports for {ticker}\n\n"
@@ -1091,7 +1092,24 @@ def get_research_reports(
             f"未找到 {ticker} 的研报数据"
         )
 
-    df = df.head(limit)
+    if "日期" not in df.columns:
+        return (
+            f"# Research Reports for {ticker}\n"
+            f"# Source: AKShare (东方财富)\n\n"
+            "研报数据缺少发布日期列；为防止历史数据穿越，已拒绝返回。"
+        )
+    cutoff = pd.to_datetime(curr_date, errors="coerce")
+    report_dates = pd.to_datetime(df["日期"], errors="coerce")
+    if pd.isna(cutoff):
+        return f"# Research Reports for {ticker}\n\n分析截止日期无效，已拒绝返回研报。"
+    df = df.loc[report_dates.notna() & (report_dates <= cutoff)].head(limit)
+    if df.empty:
+        return (
+            f"# Research Reports for {ticker}\n"
+            f"# Source: AKShare (东方财富)\n"
+            f"# Analysis cutoff: {curr_date}\n\n"
+            "分析截止日前无可用研报。"
+        )
     # 选择关键列，减少 token 消耗
     keep_cols = [c for c in (
         "股票代码", "股票简称", "报告名称", "东财评级", "机构",
@@ -1106,6 +1124,7 @@ def get_research_reports(
     header = (
         f"# Research Reports for {ticker}\n"
         f"# Source: AKShare (东方财富)\n"
+        f"# Analysis cutoff: {curr_date}\n"
         f"# Total results: {len(df)}\n"
         f"# Data retrieved on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
     )

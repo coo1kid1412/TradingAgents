@@ -36,6 +36,9 @@ _CN_ONLY_MSG = (
 
 # 个股新闻固定回看天数
 _NEWS_LOOKBACK_DAYS = 14
+# 法定披露和业绩预告不是短周期新闻。120 天可覆盖上一报告期，避免在
+# 半年报/三季报窗口只看到最近新闻、漏掉交易所已披露的业绩预告。
+_ANNOUNCEMENT_LOOKBACK_DAYS = 120
 
 @tool
 def get_news(
@@ -100,9 +103,9 @@ def get_announcements(
 ) -> str:
     """
     Retrieve company announcements / disclosures (公告) for a given ticker.
-    Data source: 巨潮资讯 (cninfo.com.cn) via AKShare. Only supports A-shares.
+    Data sources: 巨潮资讯公告目录 + Tushare 结构化业绩预告. Only supports A-shares.
     Covers: earnings reports, shareholder changes, risk warnings, M&A, etc.
-    Automatically fetches announcements from T-10 to T (T = curr_date).
+    Automatically fetches announcements from T-120 to T (T = curr_date).
     Args:
         ticker (str): Ticker symbol
         curr_date (str): Current analysis date in yyyy-mm-dd format
@@ -113,13 +116,20 @@ def get_announcements(
         return f"get_announcements: {ticker} — {_CN_ONLY_MSG}"
     try:
         end_dt = datetime.strptime(curr_date, "%Y-%m-%d")
-        start_dt = end_dt - timedelta(days=_NEWS_LOOKBACK_DAYS)
+        start_dt = end_dt - timedelta(days=_ANNOUNCEMENT_LOOKBACK_DAYS)
         start_date = start_dt.strftime("%Y-%m-%d")
         end_date = curr_date
     except ValueError:
         start_date = curr_date
         end_date = curr_date
-    return _safe_route("get_announcements", ticker, start_date, end_date)
+    disclosures = _safe_route("get_announcements", ticker, start_date, end_date)
+    forecasts = _safe_route("get_performance_forecasts", ticker, start_date, end_date)
+    return (
+        "# 官方披露目录（巨潮资讯）\n"
+        f"{disclosures}\n\n"
+        "# 结构化业绩预告（Tushare forecast，交易所公告字段）\n"
+        f"{forecasts}"
+    )
 
 @tool
 def get_cls_telegraph(
@@ -141,6 +151,7 @@ def get_cls_telegraph(
 @tool
 def get_research_reports(
     ticker: Annotated[str, "Ticker symbol"],
+    curr_date: Annotated[str, "Analysis cutoff date in yyyy-mm-dd format"],
     limit: Annotated[int, "Maximum number of reports to return"] = 20,
 ) -> str:
     """
@@ -149,13 +160,14 @@ def get_research_reports(
     Includes analyst ratings, earnings forecasts, target prices, and research institution names.
     Args:
         ticker (str): Ticker symbol
+        curr_date (str): Analysis cutoff; reports after this date are excluded
         limit (int): Maximum number of reports (default 20)
     Returns:
         str: A formatted string containing research report data
     """
     if not is_a_share(ticker):
         return f"get_research_reports: {ticker} — {_CN_ONLY_MSG}"
-    return _safe_route("get_research_reports", ticker, limit)
+    return _safe_route("get_research_reports", ticker, curr_date, limit)
 
 @tool
 def get_news_from_search(

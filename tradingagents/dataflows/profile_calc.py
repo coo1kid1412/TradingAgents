@@ -224,7 +224,10 @@ def compute_short_term_structure(
         "structure_class": "insufficient_data",
         "ma10": None,
         "ma20": None,
+        "ma50": None,
         "ma10_slope_5d_pct": None,
+        "ma20_slope_10d_pct": None,
+        "drawdown_60d_pct": None,
         "price_vs_ma10_pct": None,
         "price_vs_ma20_pct": None,
         "volume_ratio_5d_20d": None,
@@ -265,17 +268,27 @@ def compute_short_term_structure(
     close = frame["close"]
     ma10_series = close.rolling(10).mean()
     ma20_series = close.rolling(20).mean()
+    ma50_series = close.rolling(50).mean()
     ma10 = float(ma10_series.iloc[-1])
     ma20 = float(ma20_series.iloc[-1])
     latest = float(close.iloc[-1])
     ma10_slope = None
     if len(frame) >= 15 and ma10_series.iloc[-6] > 0:
         ma10_slope = float((ma10 / ma10_series.iloc[-6] - 1) * 100)
+    ma20_slope = None
+    if len(frame) >= 30 and ma20_series.iloc[-11] > 0:
+        ma20_slope = float((ma20 / ma20_series.iloc[-11] - 1) * 100)
+    ma50 = float(ma50_series.iloc[-1]) if len(frame) >= 50 else None
+    peak_60d = float(close.tail(60).max())
+    drawdown_60d = float((latest / peak_60d - 1) * 100) if peak_60d > 0 else None
 
     result.update({
         "ma10": round(ma10, 4),
         "ma20": round(ma20, 4),
+        "ma50": round(ma50, 4) if ma50 is not None else None,
         "ma10_slope_5d_pct": round(ma10_slope, 4) if ma10_slope is not None else None,
+        "ma20_slope_10d_pct": round(ma20_slope, 4) if ma20_slope is not None else None,
+        "drawdown_60d_pct": round(drawdown_60d, 4) if drawdown_60d is not None else None,
         "price_vs_ma10_pct": round((latest / ma10 - 1) * 100, 4),
         "price_vs_ma20_pct": round((latest / ma20 - 1) * 100, 4),
     })
@@ -381,6 +394,15 @@ def compute_short_term_structure(
     healthy_trend = bool(
         ma10_slope is not None and ma10_slope > 0 and ma10 > ma20 and latest > ma10
     )
+    weak_rebound = bool(
+        healthy_trend
+        and drawdown_60d is not None
+        and drawdown_60d <= -15.0
+        and (
+            (ma50 is not None and latest <= ma50)
+            or (ma20_slope is not None and ma20_slope <= 0)
+        )
+    )
 
     if broken:
         structure_class = "broken"
@@ -388,6 +410,12 @@ def compute_short_term_structure(
     elif exhaustion:
         structure_class = "exhaustion"
         reasons = ["价格扩张与量能/拥挤不匹配"]
+    elif weak_rebound:
+        structure_class = "weak_rebound_in_downtrend"
+        reasons = [
+            f"短线均线回升，但距60日高点仍{drawdown_60d:+.2f}%",
+            "中期趋势尚未修复，不按健康上升趋势处理",
+        ]
     elif trend_pullback:
         structure_class = "trend_pullback"
         reasons = [

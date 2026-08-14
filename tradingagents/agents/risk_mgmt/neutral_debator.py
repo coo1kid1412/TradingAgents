@@ -1,4 +1,8 @@
+import json
+
 from tradingagents.agents.utils.agent_utils import RISK_DEBATE_PHRASING_RULES
+from tradingagents.agents.utils.risk_context import build_risk_data_packet
+from tradingagents.agents.risk_mgmt.risk_response import invoke_risk_response
 
 
 def create_neutral_debator(llm):
@@ -13,6 +17,7 @@ def create_neutral_debator(llm):
         # trader_decision 已废弃（optimization 05），改为只引用 RM 方案
         # trader_decision = state["trader_investment_plan"]  # DEPRECATED in 05
         investment_plan = state.get("investment_plan", "")
+        risk_data_packet = build_risk_data_packet(state)
 
         prompt = f"""【语言要求】你必须使用中文进行以下所有风险辩论和分析。股票代码和技术指标名称可保留英文。
 
@@ -31,9 +36,16 @@ def create_neutral_debator(llm):
 - 你关注的是"如果一切都错了，损失有多大"
 - 尾部风险往往来自投研团队未充分考虑的维度，你需要主动思考"大家忽略了什么"
 - 不要为 RM 方案辩护——你的职责是找极端风险，不是唱赞歌
+- 压力情景价格/跌幅必须锚定 RM 情景、技术支撑或历史波动；禁止自行发明精确概率和“最大亏损”
+- 没有组合 AUM 时，只分析单票价格风险，不得换算组合金额损失
 
 **Research Manager 的投资方案（含评级、评分、价位区间、执行可行性、风控审查指引）：**
 {investment_plan}
+
+**确定性风险数据包（压力锚只能引用这里或 RM 方案已有的数值）：**
+```json
+{json.dumps(risk_data_packet, ensure_ascii=False, indent=2, default=str)}
+```
 
 **辩论要求**：
 以下是当前的对话历史：{history}
@@ -48,11 +60,25 @@ def create_neutral_debator(llm):
 
 积极回应其他分析师的观点，特别是当他们的流动性或事件风险分析暴露了新的尾部风险路径时，从极端情景角度补充你的评估。特别关注 RM 方案中"风控审查指引"提到的未决问题，这些往往是尾部风险的入口。以中文口语化方式进行辩论。
 
+正文控制在 800-1200 个中文字符内，优先保证末尾 RISK_VIEW 完整；不要输出冗长清单。
+
 {RISK_DEBATE_PHRASING_RULES}
+
+发言末尾必须输出：
+```yaml
+RISK_VIEW:
+  role: tail
+  severity: high / medium / low / unknown
+  cap_pct: <0-100 或 null>
+  cap_basis: <引用的 RM 悲观情景/技术支撑/历史波动；无则 null>
+  evidence_ids: [<从风险数据包 reference_ids 逐字选择；也可用 RM-PLAN>]
+  data_supported: true / false
+```
+未引用可追溯压力锚时 `data_supported=false` 且 `cap_pct=null`。禁止自造 evidence_ids。
 
 **重要：请用中文进行风险辩论。** 股票代码和技术指标名称请保留英文原文。"""
 
-        response = llm.invoke(prompt)
+        response = invoke_risk_response(llm, prompt, role="tail")
 
         argument = f"Neutral Analyst: {response.content}"
 
