@@ -1,12 +1,12 @@
-# DeepSeek V4 全链路模型路由与结构化交接设计
+# DeepSeek V4 全链路路由、结构化交接与投委会评级设计
 
 **日期：** 2026-08-14  
-**状态：** 已确认设计，待实施  
-**范围：** 个股分析主图、CLI、默认配置、大盘预警 LLM 慢路径
+**状态：** DeepSeek 路由与方案 B 已确认，完整修订稿待复核
+**范围：** 个股分析主图、投委会评级、最终报告、CLI、默认配置、大盘预警 LLM 慢路径
 
 ## 1. 目标
 
-将 TradingAgents 的默认 LLM 从 MiniMax M3 切换为 DeepSeek V4，并在全部 LLM 调用中显式启用 Think。按照任务复杂度在 `deepseek-v4-pro` 与 `deepseek-v4-flash` 之间进行角色路由，同时限制跨 Agent 上下文，避免一次个股分析因完整报告和思考内容反复叠加而失控。
+将 TradingAgents 的默认 LLM 从 MiniMax M3 切换为 DeepSeek V4，并在全部 LLM 调用中显式启用 Think。按照任务复杂度在 `deepseek-v4-pro` 与 `deepseek-v4-flash` 之间进行角色路由，同时限制跨 Agent 上下文，避免一次个股分析因完整报告和思考内容反复叠加而失控。个股长期评级同步从“目标价偏离主导”改为可审计的四支柱投委会矩阵，使前置 Agent 的专业结论能够真实影响评级或交易动作。
 
 本次迁移遵循以下边界：
 
@@ -52,7 +52,7 @@ Think 模式下：
 | 宏观环境分析师 | high | 24K | 负责市场环境和行业外部风险 |
 | 股票画像分析师 | high | 24K | 决定股票类型、估值方法和报告权重 |
 | 研究经理 RM | max | 32K | 汇总证据、反证并形成研究结论 |
-| 组合经理 PM | max | 32K | 形成最终评级、仓位和交易动作 |
+| 组合经理 PM | max | 32K | 继承研究评级并形成最终仓位和交易动作 |
 | 大盘预警解释慢路径 | max | 16K | 仅在规则触发时调用，优先保证解释质量 |
 
 ### 4.2 Flash 角色
@@ -186,6 +186,11 @@ DECISION_HANDOFF:
       claim_ids: [<正式证据 ID>]
       assumptions: [<必要假设>]
       affected_horizon: 3d / 3m / 12m / position
+      decision_dimension: thesis / valuation / catalyst / expectation_gap / timing / crowding / macro / risk
+      allowed_effect: foundation / support / oppose / cap / floor / timing_only / conviction_only / veto_request
+      direction: bullish / bearish / neutral / mixed
+      materiality: high / medium / low
+      confidence: high / medium / low
   unresolved_dissent: [<未解决分歧>]
   conditions_to_revisit: [<重新评估条件>]
   quality_status: complete / partial / invalid
@@ -392,16 +397,157 @@ PM 是唯一拥有最终动作权的 LLM 角色，但不得突破确定性代码
 | PM | 最终动作和执行计划 | 覆盖确定性硬约束 |
 | 预警解释器 | 解释和观察点 | 改概率、改灯、改推送 |
 
-### 7.4 数据流
+### 7.4 双层决策：研究评级与当前动作分离
+
+最终报告必须同时给出两个不同问题的答案，不得用一个 `BUY/HOLD/SELL` 混合长期价值与短期时机：
+
+1. **一年期研究评级 `research_rating`**：回答未来 12 个月相对当前价格是否值得配置，由 RM 形成投委会研究结论。
+2. **当前交易动作 `trade_action`**：回答现在是否执行、执行多少和如何退出，由 PM 在市场结构与硬风险约束下决定。
+
+允许出现 `research_rating=OVERWEIGHT`、`trade_action=WAIT`，表示长期方向成立但当前买点或市场风险不允许进场。市场技术面不得把一年期评级从看多改为看空；基本面也不得越权把短期 `WAIT` 改成立即买入。
+
+### 7.5 四支柱投委会矩阵
+
+#### 7.5.1 设计原则
+
+现有“目标价偏离先机械映射评级、其他报告再有限修正”的方式会把大部分专业研究压缩成一个目标价，使前置 Agent 的贡献和分歧难以追溯。本次改为“证据门槛 + 四支柱矩阵 + 情景预期收益 + 风险边界”：
+
+- 估值仍是必要支柱，但不再单独生成初始评级。
+- 不采用 Agent 多数投票，也不把不同职责的方向票线性相加。
+- 高质量分歧必须保留，不能通过平均分消失。
+- 正向评级必须具备正的概率加权预期收益；负向评级必须具备负的概率加权预期收益或明确 thesis breaker。
+- 研究风险和数据质量可以封顶或降级研究评级；风控委员会可以否决当前动作，但不能伪装成另一位专业分析师的结论。
+
+#### 7.5.2 四个研究支柱
+
+| 支柱 | 负责回答的问题 | 主责输入 | 不负责 |
+|---|---|---|---|
+| 经营与盈利质量 `thesis` | 盈利增长是否真实、可持续，竞争力是否改善 | 基本面、行业对照、公司画像 | 三日买点 |
+| 估值与预期收益 `valuation` | 当前价格对应的情景收益和下行空间是否有吸引力 | 基本面估值、画像方法、宏观风险溢价、三情景目标 | 单独决定最终评级 |
+| 催化与预期差 `catalyst` | 什么尚未计价，何时可能被验证 | 新闻、共识、盈利修正、事件日历 | 把传闻当成硬事实 |
+| 持续性与风险 `durability` | thesis 能否穿越一年、失败路径和尾部风险是什么 | 宏观、资金、拥挤、治理、Bull/Bear、确定性风险数据 | 取代评级后的风控委员会和确定性风险硬门 |
+
+股票画像可以按 `DECISION_STYLE` 调整支柱关注顺序和适用门槛，但不得把任一支柱权重设为零。不同风格的差异体现在证据要求和收益阈值，不使用一个全市场固定加权总分。
+
+#### 7.5.3 RM 投委会输入与输出
+
+RM 接收 Evidence Officer 校验后的证据账本，为每个支柱形成：
+
+```yaml
+IC_RECOMMENDATION_INPUT:
+  pillars:
+    thesis:
+      state: strong / adequate / mixed / weak / invalid
+      direction: bullish / bearish / neutral / mixed
+      confidence: high / medium / low
+      accepted_claim_ids: []
+      challenged_claim_ids: []
+      thesis_breakers: []
+    valuation:
+      state: attractive / fair / stretched / invalid
+      scenario_expected_return_pct: <float|null>
+      downside_pct: <float|null>
+      payoff_ratio: <float|null>
+      confidence: high / medium / low
+      accepted_claim_ids: []
+    catalyst:
+      state: strong / visible / weak / absent / adverse
+      priced_in: low / partial / high / unknown
+      next_validation_date: <date|null>
+      accepted_claim_ids: []
+    durability:
+      state: resilient / acceptable / fragile / broken
+      hard_veto: true / false
+      accepted_claim_ids: []
+  unresolved_dissent: []
+  evidence_quality: complete / partial / insufficient
+```
+
+RM 使用 Think 完成证据解释、因果链、情景假设和支柱状态判断；不得直接手写最终评级。这里的 `hard_veto` 仅指正式证据已经验证的研究 thesis breaker，与评级形成之后风控委员会对交易动作施加的 execution veto 不同。确定性工具 `compute_ic_recommendation` 校验枚举、证据资格、情景概率、预期收益、研究硬否决和评级边界后返回 `research_rating`、`rating_reason_codes` 与完整阶段留痕。
+
+#### 7.5.4 确定性评级矩阵
+
+评级工具遵守以下语义，具体收益阈值继续按股票风格、波动率和主题阶段动态生成：
+
+| 评级 | 必要条件 |
+|---|---|
+| `BUY` | 预期收益达到高档阈值；`thesis` 为 strong/adequate；`catalyst` 至少 visible；无 hard veto；证据非 insufficient |
+| `OVERWEIGHT` | 预期收益为正并达到配置阈值；经营 thesis 不为 weak/invalid；没有 broken durability；允许存在一项中等不确定性 |
+| `HOLD` | 预期收益接近中性，或四支柱存在高质量冲突，或证据不足以支持方向性配置 |
+| `UNDERWEIGHT` | 概率加权收益达到负向配置阈值，且经营、催化或持续性至少一项明显偏弱 |
+| `SELL` | 负收益达到高档阈值并伴随 weak thesis / broken durability，或出现经过证据验证的 thesis breaker |
+
+补充规则：
+
+- `BUY/OVERWEIGHT` 的概率加权预期收益必须为正，`UNDERWEIGHT/SELL` 必须为负。仅当出现经过正式证据验证的 thesis breaker 时，允许在目标价数据暂时滞后的情况下输出 `SELL`，并强制标记 `THESIS_BREAK_OVERRIDE`；一般的 weak thesis 只能要求重算情景，不能绕过收益方向不变量。
+- 未触发 `THESIS_BREAK_OVERRIDE` 时，经营与盈利为 `invalid`、估值情景为 `invalid` 或证据质量为 `insufficient`，最高只能 `HOLD`；经过正式证据验证的 thesis breaker 仍可进入 `SELL` 例外路径。
+- 催化缺失不能单独触发负评级，但可阻止 `BUY`；负面催化可以加强 `UNDERWEIGHT/SELL`。
+- 舆情只影响 `crowding`、短期脆弱性、评级封顶和仓位，不提供长期方向基础票。
+- Bull/Bear 不投票，只能挑战证据、假设和因果链；挑战成立时由 RM 重评对应支柱。
+- 市场技术面只生成三日结构和 `trade_action` 条件，不进入一年期评级方向。
+
+#### 7.5.5 LLM 与代码职责
+
+| 任务 | 执行者 |
+|---|---|
+| 识别事实含义、因果链、预期差、情景假设和 thesis breaker | 对应专业 Agent / RM，Think 开启 |
+| 校验日期、来源、证据 ID、字段枚举和跨期穿越 | Evidence Officer / Python |
+| 计算目标价、情景概率和、概率加权收益、赔率、阈值 | Python 工具 |
+| 根据已确认支柱状态执行评级矩阵、封顶、否决和不变量检查 | `compute_ic_recommendation` |
+| 决定当前动作、仓位、入场和止损 | PM + 现有确定性风险/执行工具 |
+
+LLM 可以提出“为什么支柱应为 strong/weak”的有证据判断，代码负责保证相同输入得到相同评级结果。不得把原始 Think 当作评级输入。
+
+现有 `compute_step6_final_rating` 不再作为长期评级的权威入口。实施时保留并复用其中已验证的动态收益阈值、拥挤封顶、数据质量降级和方向不变量逻辑，但删除“先按目标价偏离产生五档初始评级”的主导路径；最终权威结果只来自 `compute_ic_recommendation`，避免两套评级工具并存并互相覆盖。
+
+### 7.6 决策贡献账本与用户报告
+
+Evidence Officer 先生成通过资格校验的候选贡献，RM 只能从候选中选择作用和解释，最终由 Python 编译 `decision_contribution_ledger`。每条贡献必须包含：
+
+```yaml
+- role: fundamentals
+  decision_dimension: thesis
+  conclusion: <专业结论>
+  accepted_effect: foundation / support / oppose / cap / floor / research_veto / timing_only / conviction_only / rejected
+  direction: bullish / bearish / neutral / mixed
+  materiality: high / medium / low
+  confidence: high / medium / low
+  claim_ids: []
+  rejection_reason: <未采纳时必填>
+```
+
+同一结论只能在一个主决策维度中记一次，防止新闻、共识和 Bull/Bear 重复引用同一事实造成多重计分。PM 不得修改贡献归因，只能说明它如何把研究评级转成交易动作。
+
+最终 `decision.md` 顶部必须先显示：
+
+1. 一年期研究评级。
+2. 当前交易动作、新建仓位和未来三日判断。
+3. 四支柱结论及其对评级的作用。
+4. 当前动作与长期评级不一致时的明确原因。
+5. 2-4 条最重要的 Agent 贡献，以及被拒绝的高重要性观点。
+
+用户版只展示结论、证据摘要和贡献，不展示工具调用、矩阵执行过程或原始 Think。示例：
+
+```markdown
+长期研究评级：OVERWEIGHT
+当前交易动作：WAIT
+
+评级依据：经营与盈利支持｜估值与预期收益支持｜催化中性｜持续性风险限制升至 BUY
+暂不买入原因：三日结构尚未确认，市场风险门限制新增仓位
+关键分歧：基本面认为盈利加速可持续；Bear 认为订单兑现节奏尚未验证
+```
+
+### 7.7 数据流
 
 1. 四个基础分析师保留完整 Markdown 报告用于审计，同时输出角色专属 `HANDOFF`；下游 LLM 默认不再接收完整报告。
 2. 宏观、股票画像和共识节点接收有界专业交接单；确定性画像计算仍可在代码内部读取完整报告，但不将其原样放入 LLM prompt。
 3. Research Evidence Officer 由纯 Python 校验专业交接、编译正式证据账本和投委会初始包。
 4. Bull/Bear 只接收 IC 包、正式证据、当前对手观点和有限历史。
-5. RM 接收证据账本、角色交接包和有界辩论摘要，形成研究层投委会包。
-6. 风控辩手接收 RM 包和风险数据包，并只保留最新有效观点。
-7. PM 接收 RM 包、风险共识、市场闸门、仓位约束和正式证据，形成最终动作。
-8. 完整报告只进入审计产物；原始 Think 在任何 Agent 边界前丢弃。
+5. RM 接收证据账本、角色交接包和有界辩论摘要，形成四支柱输入；Python 工具生成一年期研究评级与贡献账本。
+6. 风控辩手接收 RM 包、贡献账本和风险数据包，并只保留最新有效观点。
+7. PM 接收研究评级、贡献账本、风险共识、市场闸门和仓位约束，形成当前动作；PM 不重新计算长期评级。
+8. 报告渲染器将研究评级、当前动作、四支柱贡献和关键分歧置于 `decision.md` 顶部。
+9. 完整报告只进入审计产物；原始 Think 在任何 Agent 边界前丢弃。
 
 ## 8. 上下文预算
 
@@ -478,6 +624,10 @@ MiniMax 适配器和配置保留为显式手动回滚能力，但默认执行路
 - Bull/Bear、RM、风控和 PM 引用不存在或不合格的证据 ID 时必须被剔除并降级。
 - 每个角色的 handoff schema、粒度上限和权限边界分别验证；市场分析师不能输出长期目标价，基本面分析师不能决定三日买点，RM/PM 不能覆盖确定性硬门。
 - 场景概率只由 RM 生成且合计为 100%；基础分析师只提供情景假设和结果范围。
+- 四支柱缺失、非法枚举、重复归因和不合格证据必须被拒绝或确定性降级。
+- `compute_ic_recommendation` 对同一输入必须返回同一评级；BUY/OVERWEIGHT、SELL 和 thesis breaker override 的不变量分别覆盖。
+- 市场技术面只能改变 `trade_action`，不得改变 `research_rating`；基本面不得覆盖短期风险门。
+- `decision_contribution_ledger` 必须标识采纳效果和拒绝原因，同一事实不得跨角色重复计分。
 - 预警系统使用 DeepSeek Pro，且 LLM 失败不改变规则决策。
 - 日志和报告密钥扫描、Think 标签扫描均为空。
 
@@ -486,9 +636,10 @@ MiniMax 适配器和配置保留为显式手动回滚能力，但默认执行路
 1. 使用 `/models` 或最小 Chat Completion 验证 API Key、Pro、Flash 和 Think 可用。
 2. 使用带工具调用的最小请求验证 `reasoning_content` 回传兼容性。
 3. 在 `.venv` 中对一只 A 股执行完整个股分析，检查所有阶段结束、模型路由符合设计、最终报告存在。
-4. 检查完整报告价格日期、短期三天建议、一年期评级、仓位和市场闸门一致。
-5. 执行一次大盘预警 dry-run，确认 DeepSeek Pro 解释可用且不会发送非预期通知。
-6. 运行项目全部可执行测试文件和编译检查。
+4. 检查完整报告价格日期、短期三天建议、一年期评级、仓位和市场闸门一致，并能看到四支柱及 Agent 贡献。
+5. 构造“长期看多但短线 WAIT”“估值便宜但 thesis weak”“目标价滞后但 thesis breaker”三类回归样例，检查评级与动作分离。
+6. 执行一次大盘预警 dry-run，确认 DeepSeek Pro 解释可用且不会发送非预期通知。
+7. 运行项目全部可执行测试文件和编译检查。
 
 ### 12.3 成功标准
 
@@ -496,6 +647,8 @@ MiniMax 适配器和配置保留为显式手动回滚能力，但默认执行路
 - 所有实际 LLM 调用均为 DeepSeek V4 且 Think 已开启。
 - Pro/Flash 角色路由与本设计一致。
 - 单次个股分析下游 prompt 不再反复包含四份完整原始报告。
+- 最终长期评级不再由目标价偏离单独初始化，而由四支柱矩阵确定；目标价与情景收益仍是必要估值输入和方向不变量。
+- 前置 Agent 的高重要性结论能在贡献账本和最终报告中追溯到采纳效果或拒绝原因。
 - 最终报告不出现 `<think>`、`reasoning_content`、原始思维链或 API Key。
 - 完整个股回归和大盘预警 dry-run 均完成，项目测试无回归。
 
@@ -504,5 +657,5 @@ MiniMax 适配器和配置保留为显式手动回滚能力，但默认执行路
 - 不允许 LLM 改写确定性风险概率或规则灯号。
 - 不将原始思维链作为可读报告内容。
 - 不新增多供应商自动路由或自动回退。
-- 不在本次迁移中调整股票评级算法、市场预警阈值或数据供应商。
+- 不调整市场预警阈值或数据供应商；股票评级算法仅按第 7.4-7.6 节改造为四支柱投委会矩阵。
 - 不为已废弃 Trader 节点恢复运行流程。
