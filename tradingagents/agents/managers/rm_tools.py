@@ -13,6 +13,14 @@ from typing import Optional
 
 from langchain_core.tools import tool
 
+from .ic_recommendation import (
+    FADING_HIGH_LOCK as _FADING_UP_LOCK,
+    THRESHOLD_BASE_CONFIGURATION as _THRESHOLD_BASE_DN,
+    THRESHOLD_BASE_HIGH as _THRESHOLD_BASE_UP,
+    THRESHOLD_STYLE_COEF as _THRESHOLD_STYLE_COEF,
+    compute_ic_recommendation,
+)
+
 
 # ============================================================================
 # 多空辩论评分工具
@@ -1235,18 +1243,7 @@ def compute_step6_trend_overlay(
     }
 
 
-# Step 6 动态阈值的 style 系数（与 RM 提示词第一步公式一致，搬进 Python 消手算漂移）
-_THRESHOLD_STYLE_COEF = {
-    "blue_chip": 1.0,
-    "cyclical": 1.0,
-    "illiquid": 0.7,
-    "etf": 1.0,
-    "high_beta_growth": 1.5,
-    "theme_speculation": 2.0,
-}
-_THRESHOLD_BASE_DN = 15.0
-_THRESHOLD_BASE_UP = 35.0
-_FADING_UP_LOCK = 30.0   # 主题退潮期上沿锁定（主题反噬保护，不再放宽）
+# Step 6 与新 IC 矩阵共享同一组动态阈值常量，避免迁移期口径漂移。
 
 
 def derive_market_mode(market_risk_snapshot: dict | None) -> str:
@@ -1876,6 +1873,7 @@ RM_TOOLS = [
     compute_conviction_calibration,
     compute_scenario_consistency_check,
     compute_step6_final_rating,
+    compute_ic_recommendation,
 ]
 
 
