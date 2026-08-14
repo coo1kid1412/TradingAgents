@@ -58,7 +58,7 @@ _PHASES = {
 _THINK_RE = re.compile(r"<think>[\s\S]*?</think>", re.IGNORECASE)
 _SENSITIVE_RE = re.compile(
     r"traceback|api\s*error|provider\s+error|authorization\s*:|bearer\s+\S+|"
-    r"api[_ -]?key\s*[:=]|minimax_api_key|(?:access_)?token\s*[:=]|"
+    r"api[_ -]?key\s*[:=]|(?:minimax|deepseek)_api_key|(?:access_)?token\s*[:=]|"
     r"password\s*[:=]|private[_ -]?key|\bsecret\b|\bsk-[A-Za-z0-9_-]+|"
     r"system\s+(?:prompt|message)|internal\s+prompt|return\s+json\s+only|"
     r"strict_json_output|output_schema|提示词|密钥|令牌|\{\s*[\"']",
@@ -196,21 +196,21 @@ def _rule_shadow_section(result: RunnerResult) -> str | None:
 
 def _rule_context_section(context: LLMContextAssessment) -> str:
     if context.reasoning_status != "validated":
-        return "## M3 情景解释\nM3 本次不可用；规则灯号和操作约束保持不变。"
+        return "## DeepSeek 情景解释\nDeepSeek 本次不可用；规则灯号和操作约束保持不变。"
     causal = " -> ".join(_safe_text(item) for item in context.causal_chain)
     conflicting = "；".join(
         f"`{_safe_code(item)}`" for item in context.conflicting_evidence_ids
     ) or "无"
     overlooked = "；".join(_safe_text(item) for item in context.overlooked_risks) or "无"
     warning = (
-        "\n- 契约提示：M3 返回的决策字段已忽略。"
+        "\n- 契约提示：DeepSeek 返回的决策字段已忽略。"
         if context.error_class == "decision_override_ignored"
         else ""
     )
     return "\n".join(
         (
-            "## M3 情景解释",
-            "M3 仅解释触发背景，不改变规则灯号和操作约束。",
+            "## DeepSeek 情景解释",
+            "DeepSeek 仅解释触发背景，不改变规则灯号和操作约束。",
             f"- 场景：{_safe_text(context.market_scenario)}",
             f"- 因果链：{causal or '[内容已脱敏]'}",
             f"- 反向证据ID：{conflicting}",
@@ -339,9 +339,9 @@ def _contributor_section(result: RunnerResult) -> str:
 
 def _context_section(context: LLMContextAssessment | None) -> str:
     if context is None:
-        return "## M3 情景校验\n本时点未调用 M3；量化与代码规则独立有效。"
+        return "## DeepSeek 情景校验\n本时点未调用 DeepSeek；量化与代码规则独立有效。"
     if context.reasoning_status != "validated":
-        return "## M3 情景校验\nM3 本次不可用；未改变代码基线。"
+        return "## DeepSeek 情景校验\nDeepSeek 本次不可用；未改变代码基线。"
     causal = " -> ".join(_safe_text(item) for item in context.causal_chain)
     conflicting_ids = "；".join(
         f"`{_safe_code(item)}`" for item in context.conflicting_evidence_ids
@@ -349,7 +349,7 @@ def _context_section(context: LLMContextAssessment | None) -> str:
     overlooked = "；".join(_safe_text(item) for item in context.overlooked_risks) or "无"
     return "\n".join(
         (
-            "## M3 情景校验",
+            "## DeepSeek 情景校验",
             f"- 场景：{_safe_text(context.market_scenario)}",
             f"- 因果链：{causal or '[内容已脱敏]'}",
             f"- 反向证据ID：{conflicting_ids}",
@@ -429,7 +429,7 @@ def _trigger_section(result: RunnerResult) -> str:
     context = result.context_assessment
     if context is not None and context.reasoning_status == "validated":
         rows.append(
-            "- M3 支持证据："
+            "- DeepSeek 支持证据："
             + "；".join(f"`{_safe_code(item)}`" for item in context.supporting_evidence_ids)
         )
     return "## 触发证据\n" + ("\n".join(rows) if rows else "未形成可展示的具体触发证据。")

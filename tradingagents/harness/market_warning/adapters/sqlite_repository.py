@@ -753,7 +753,7 @@ class SQLiteWarningRepository:
         self,
         market: Market,
         before_time: datetime,
-        model_name: str = "MiniMax-M3",
+        model_name: str = "deepseek-v4-pro",
     ) -> LLMContextAssessment | None:
         with _db.connect(self._db_path) as connection:
             row = connection.execute(

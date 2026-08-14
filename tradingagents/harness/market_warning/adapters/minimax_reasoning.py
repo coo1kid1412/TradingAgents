@@ -111,7 +111,7 @@ def _coarse_exception(error: BaseException) -> str:
 
 def _fallback(error_class: str) -> LLMContextAssessment:
     return LLMContextAssessment(
-        market_scenario="M3 context unavailable; retain deterministic baseline.",
+        market_scenario="LLM context unavailable; retain deterministic baseline.",
         causal_chain=(),
         supporting_evidence_ids=(),
         conflicting_evidence_ids=(),

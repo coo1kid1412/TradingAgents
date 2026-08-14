@@ -621,7 +621,7 @@ class SQLiteWarningRepositoryTests(TestCase):
                 rule_assessment_id=rule_id,
             )
             context = make_reasoning()
-            reasoning_id = repository.save_reasoning(snapshot_id, context, "MiniMax-M3")
+            reasoning_id = repository.save_reasoning(snapshot_id, context, "deepseek-v4-pro")
 
             repository.attach_reasoning(decision_id, reasoning_id)
 

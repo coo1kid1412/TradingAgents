@@ -425,7 +425,7 @@ class RuleMarketWarningService:
         )
 
     def complete_after_alert(self, result: RunnerResult) -> RunnerResult:
-        """Run optional shadow and M3 work after the fast-scan lease is released."""
+        """Run optional shadow and LLM work after the fast-scan lease is released."""
 
         if (
             not isinstance(result, RunnerResult)
@@ -471,14 +471,18 @@ class RuleMarketWarningService:
                                 getattr(
                                     self.post_alert_reasoning,
                                     "model_name",
-                                    "MiniMax-M3",
+                                    "deepseek-v4-pro",
                                 ),
                             )
                     elif snapshot_id is not None and result.decision_id is not None:
                         reasoning_id = self.repository.save_reasoning(
                             snapshot_id,
                             context,
-                            getattr(self.post_alert_reasoning, "model_name", "MiniMax-M3"),
+                            getattr(
+                                self.post_alert_reasoning,
+                                "model_name",
+                                "deepseek-v4-pro",
+                            ),
                         )
                         self.repository.attach_reasoning(result.decision_id, reasoning_id)
                     result = replace(result, context_assessment=context)

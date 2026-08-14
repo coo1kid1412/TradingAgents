@@ -39,6 +39,9 @@ from tradingagents.harness.market_warning.reasoning import (
 from tradingagents.harness.market_warning.adapters.minimax_reasoning import (
     MiniMaxReasoningAdapter,
 )
+from tradingagents.harness.market_warning.adapters.deepseek_reasoning import (
+    DeepSeekReasoningAdapter,
+)
 from tradingagents.harness.market_warning.adapters.sqlite_repository import (
     SQLiteWarningRepository,
 )
@@ -608,6 +611,34 @@ class AdapterTests(TestCase):
             max_retries=0,
             wall_clock_max_retries=0,
         )
+        self.assertIs(adapter.llm, wrapped)
+
+    def test_deepseek_environment_factory_uses_pro_max_think(self) -> None:
+        wrapped = FakeLLM([json.dumps(valid_payload())])
+        client = mock.Mock()
+        client.get_llm_wrapped.return_value = wrapped
+        env = {
+            "MARKET_WARNING_LLM_TIMEOUT": "45",
+            "MARKET_WARNING_LLM_MAX_TOKENS": "2048",
+            "DEEPSEEK_BASE_URL": "https://example.invalid",
+        }
+        with mock.patch.dict(os.environ, env, clear=False), mock.patch(
+            "tradingagents.harness.market_warning.adapters.deepseek_reasoning.create_llm_client",
+            return_value=client,
+        ) as factory:
+            adapter = DeepSeekReasoningAdapter.from_environment()
+
+        factory.assert_called_once_with(
+            "deepseek",
+            "deepseek-v4-pro",
+            "https://example.invalid",
+            timeout=45,
+            max_tokens=2048,
+            max_retries=0,
+            wall_clock_max_retries=0,
+            reasoning_effort="max",
+        )
+        self.assertEqual(adapter.model_name, "deepseek-v4-pro")
         self.assertIs(adapter.llm, wrapped)
 
     def test_environment_factory_rejects_invalid_limits_without_building_client(self) -> None:
