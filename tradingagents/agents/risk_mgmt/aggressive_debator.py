@@ -3,6 +3,7 @@ import json
 from tradingagents.agents.utils.agent_utils import RISK_DEBATE_PHRASING_RULES
 from tradingagents.agents.utils.risk_context import build_risk_data_packet
 from tradingagents.agents.risk_mgmt.risk_response import invoke_risk_response
+from tradingagents.agents.utils.handoff import decision_handoff_contract, pack_agent_context
 
 
 def create_aggressive_debator(llm):
@@ -18,6 +19,16 @@ def create_aggressive_debator(llm):
         # trader_decision = state["trader_investment_plan"]  # DEPRECATED in 05
         investment_plan = state.get("investment_plan", "")
         risk_data_packet = build_risk_data_packet(state)
+        bounded_input = pack_agent_context(
+            [
+                {"label": "RM 研究包", "content": investment_plan, "priority": "hard_constraint"},
+                {"label": "确定性风险数据包", "content": risk_data_packet, "priority": "hard_constraint"},
+                {"label": "事件风控最新观点", "content": current_conservative_response, "priority": "decision"},
+                {"label": "尾部风控最新观点", "content": current_neutral_response, "priority": "decision"},
+                {"label": "有限历史", "content": history, "priority": "narrative"},
+            ],
+            budget_chars=18_000,
+        )
 
         prompt = f"""【语言要求】你必须使用中文进行以下所有风险辩论和分析。股票代码和技术指标名称可保留英文。
 
@@ -35,18 +46,10 @@ def create_aggressive_debator(llm):
 - 若没有组合 AUM、计划成交金额、日均成交额或 ATR，禁止假设账户规模、成交占比、冲击成本百分比；只能列为待补数据
 - 只有存在报告内可追溯的成交额/ATR/涨跌停数据时，才允许给出仓位上限
 
-**Research Manager 的投资方案（含评级、评分、价位区间、执行可行性、风控审查指引）：**
-{investment_plan}
-
-**确定性风险数据包（只引用这里已有的数值，禁止补造缺失字段）：**
-```json
-{json.dumps(risk_data_packet, ensure_ascii=False, indent=2, default=str)}
-```
+**有界决策上下文（只引用已有数值，禁止补造缺失字段）：**
+{bounded_input}
 
 **辩论要求**：
-以下是当前的对话历史：{history}
-以下是事件风控分析师的最新论点：{current_conservative_response}
-以下是尾部风控分析师的最新论点：{current_neutral_response}
 如果还没有其他分析师的回应，请基于可用数据提出你自己的流动性风险分析。
 
 在辩论中，每轮发言必须包含：
@@ -73,14 +76,22 @@ RISK_VIEW:
 `data_supported=false` 时 `cap_pct` 必须为 null。禁止自造 evidence_ids。
 
 **重要：请用中文进行风险辩论。** 股票代码和技术指标名称请保留英文原文。"""
+        prompt += decision_handoff_contract(
+            "aggressive_risk", "评估流动性、执行和少配机会成本风险",
+        )
 
         response = invoke_risk_response(llm, prompt, role="liquidity")
 
         argument = f"Aggressive Analyst: {response.content}"
 
+        bounded_history = pack_agent_context(
+            [{"label": "上一轮", "content": current_conservative_response or current_neutral_response, "priority": "decision"},
+             {"label": "当前轮", "content": argument, "priority": "decision"}],
+            budget_chars=10_000,
+        )
         new_risk_debate_state = {
-            "history": history + "\n" + argument,
-            "aggressive_history": aggressive_history + "\n" + argument,
+            "history": bounded_history,
+            "aggressive_history": argument,
             "conservative_history": risk_debate_state.get("conservative_history", ""),
             "neutral_history": risk_debate_state.get("neutral_history", ""),
             "latest_speaker": "Aggressive",

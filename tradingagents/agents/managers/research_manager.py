@@ -13,6 +13,7 @@ from tradingagents.agents.managers.rm_tools import (
     compute_entry_timing,
     derive_market_mode,
 )
+from tradingagents.agents.utils.handoff import pack_agent_context, pack_report_handoffs
 
 logger = logging.getLogger(__name__)
 
@@ -399,6 +400,22 @@ def create_research_manager(llm):
         capital_flow_yaml = state.get("capital_flow_yaml", "")
         ic_packet = state.get("ic_packet", "")
         market_risk_snapshot = state.get("market_risk_snapshot") or {}
+        research_context = pack_report_handoffs(
+            {
+                "fundamentals": fundamentals_report,
+                "market": market_research_report,
+                "news": news_report,
+                "sentiment": sentiment_report,
+                "macro": macro_context,
+                "stock_profile": stock_profile,
+                "consensus": consensus_snapshot,
+            },
+            budget_chars=24_000,
+        )
+        debate_context = pack_agent_context(
+            [{"label": "最近两轮多空分歧", "content": history, "priority": "decision"}],
+            budget_chars=12_000,
+        )
         market_mode = derive_market_mode(market_risk_snapshot)
         entry_timing = _derive_entry_timing_from_profile(stock_profile, market_mode)
         market_risk_block = (
@@ -485,13 +502,9 @@ def create_research_manager(llm):
 
 ## 第零步：吸收上下文（不打分，只读）
 
-### 0.1 股票画像（由画像识别官提炼）
+### 0.1 股票画像（见后文有界角色交接上下文）
 
-{stock_profile if stock_profile else "（画像缺失，按通用框架处理）"}
-
-### 0.3 宏观上下文（由宏观策略师提炼）
-
-{macro_context if macro_context else "（宏观上下文缺失，按中性环境处理）"}
+### 0.3 宏观上下文（见后文有界角色交接上下文）
 
 **重点提取**：MACRO_CONTEXT.{{rate_cycle, liquidity, industry_macro_direction, premium_adjustment_pct}}
 
@@ -594,9 +607,7 @@ stock_profile 末尾的 `TRANSPARENCY:` 段是 LLM 自填的"超共识程度标�
 - Step 8 风险清单：若 `capital_flow_regime` = 恶化，风险维度增加"资金面恶化风险"
 - 最终 Thesis 第三节"最关键论据"：若 regime=强势/恶化，计入论据（附 capital_flow_score 数值）
 
-### 0.2 市场共识快照（由共识识别官提炼）
-
-{consensus_snapshot if consensus_snapshot else "（共识缺失，自行从 sentiment+news 推断方向）"}
+### 0.2 市场共识快照（见后文有界角色交接上下文）
 
 **重点提取**：direction / strength / crowded / MARKET_IMPLIED_VALUATION.{{market_expected_eps_2026e, market_implied_pe_range, sell_side_target_price_range, industry_pe_median}}
 
@@ -998,19 +1009,13 @@ Hard Data 修正：yes 不变；no × 0.5
 
 ---
 
-## 原始分析师报告（交叉校验数据用）
+## 有界角色交接上下文（完整报告仅供审计）
 
-[置信度:高] Company fundamentals report: {fundamentals_report}
-
-[置信度:中高] Market research report: {market_research_report}
-
-[置信度:中] Latest world affairs news: {news_report}
-
-[置信度:中低] Social media sentiment report: {sentiment_report}
+{research_context}
 
 ## 多空辩论记录（仅用于辅助 Conviction 校准）
 
-{history}
+{debate_context}
 
 ---
 

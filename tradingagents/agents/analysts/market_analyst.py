@@ -15,6 +15,7 @@ from tradingagents.agents.utils.agent_utils import (
 )
 from tradingagents.dataflows.config import get_config
 from tradingagents.dataflows.intraday_quote import parse_price_metadata
+from tradingagents.agents.utils.handoff import analyst_handoff_contract
 
 logger = logging.getLogger(__name__)
 
@@ -344,6 +345,12 @@ def create_market_analyst(llm):
             + RISK_DEBATE_PHRASING_RULES
             + capital_flow_block
             + get_language_instruction()
+        )
+
+        system_message += analyst_handoff_contract(
+            "market",
+            "判断当前价格结构、未来三日方向、入场时机和关键价位",
+            "交接周线/日线/三日方向、量价与波动、数据时点、支撑阻力失效位、三种短线结构和入场偏好；不得输出一年期目标价、长期评级或最终仓位。",
         )
 
         prompt = ChatPromptTemplate.from_messages(

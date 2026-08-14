@@ -18,6 +18,7 @@ from tradingagents.agents.analysts.fundamentals_tools import (
 from tradingagents.dataflows.interface import route_to_vendor
 from tradingagents.dataflows.akshare_vendor import get_industry_pe_table
 from tradingagents.agents.utils.yaml_summary import extract_yaml_mapping
+from tradingagents.agents.utils.handoff import analyst_handoff_contract
 
 # 工具调用循环上限（防止 LLM 反复调同一工具）
 _MAX_TOOL_ITERATIONS = 8
@@ -673,6 +674,12 @@ SUMMARY:
 - **数据校验警告**：如果数据前方出现「⚠️ 数据质量校验警告」段落，请优先处理其建议
 
 当前日期：{current_date}。{instrument_context}{lang_instruction}"""
+
+        system_message += analyst_handoff_contract(
+            "fundamentals",
+            "判断未来一年盈利质量、竞争力和估值锚是否支持持有",
+            "交接财务期间与口径、增长和现金流变化桥、商业壁垒与治理、12个月盈利驱动、估值方法与区间、bear/base/bull 假设范围及 thesis breaker；不得判断三日买点或绕过市场风险门。",
+        )
 
         messages = [
             SystemMessage(content=system_message),

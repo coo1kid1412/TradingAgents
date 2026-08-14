@@ -12,6 +12,7 @@ from tradingagents.agents.utils.agent_utils import (
 )
 from tradingagents.dataflows.config import get_config
 from tradingagents.dataflows.ticker_utils import is_a_share
+from tradingagents.agents.utils.handoff import analyst_handoff_contract
 
 
 def _get_available_tools(ticker: str):
@@ -254,6 +255,12 @@ def create_news_analyst(llm):
             "- 卖方一致评级/目标价只能使用分析日及以前发布的研报，`research_consensus_as_of` 必须填写最新纳入研报的真实发布日期\n"
             "- 列表中的整项文本如需引号，必须把整句完整放在同一对引号内；禁止在右引号后继续正文\n"
             "- 该 SUMMARY 块是下游 RM / 风控团队的核心信息源，宁缺勿错\n"
+        )
+
+        system_message += analyst_handoff_contract(
+            "news",
+            "识别会在何时改变盈利、估值或风险的新事件",
+            "交接事件/发布日期与日期依据、原始来源和验证状态、一级二级传导、催化日历、已定价程度、失效条件及卖方分歧；传闻与已验证事实必须分区，不得直接生成投资评级。",
         )
 
         prompt = ChatPromptTemplate.from_messages(

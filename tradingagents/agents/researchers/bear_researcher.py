@@ -5,6 +5,11 @@ from tradingagents.agents.utils.agent_utils import (
     RISK_DEBATE_PHRASING_RULES,
     NUMERIC_VALUE_USAGE_RULES,
 )
+from tradingagents.agents.utils.handoff import (
+    decision_handoff_contract,
+    pack_agent_context,
+    pack_report_handoffs,
+)
 
 
 def create_bear_researcher(llm):
@@ -22,6 +27,24 @@ def create_bear_researcher(llm):
         consensus_snapshot = state.get("consensus_snapshot", "")
         stock_profile = state.get("stock_profile", "")
         ic_packet = state.get("ic_packet", "")
+        research_handoffs = pack_report_handoffs(
+            {
+                "fundamentals": fundamentals_report,
+                "market": market_research_report,
+                "news": news_report,
+                "sentiment": sentiment_report,
+                "stock_profile": stock_profile,
+                "consensus": consensus_snapshot,
+            },
+            budget_chars=18_000,
+        )
+        debate_context = pack_agent_context(
+            [
+                {"label": "上一轮对手观点", "content": current_response, "priority": "decision"},
+                {"label": "有限历史", "content": history, "priority": "narrative"},
+            ],
+            budget_chars=7_000,
+        )
 
         prompt = f"""【语言要求】你必须使用中文撰写以下所有分析内容和回复。股票代码和技术指标名称可保留英文。
 
@@ -35,17 +58,13 @@ def create_bear_researcher(llm):
 
 ---
 
-## 股票画像（决定你应该重点引用哪份报告作为论据来源）
-
-{stock_profile if stock_profile else "（画像缺失，按 4 份报告等权处理）"}
+## 股票画像（见下方角色交接上下文）
 
 **使用规则**：画像 YAML 里的 `REPORT_WEIGHTS` 已经给出 4 份报告的具体权重——**权重越高的报告，你的论据应该越多来自该报告**。直接按 stock_profile 给的权重比例分配论据来源，不要自己重新判断股性。
 
 ---
 
-## 市场共识快照（由共识识别官在你之前提炼）
-
-{consensus_snapshot if consensus_snapshot else "（共识快照缺失，请基于 sentiment + news 自行识别共识方向）"}
+## 市场共识快照（见下方角色交接上下文）
 
 ---
 
@@ -107,14 +126,11 @@ def create_bear_researcher(llm):
 
 ---
 
-Resources available:
+Resources available（角色交接单；完整报告仅供审计）:
 
-[置信度:高] Company fundamentals report: {fundamentals_report}
-[置信度:中高] Market research report: {market_research_report}
-[置信度:中] Latest world affairs news: {news_report}
-[置信度:中低] Social media sentiment report: {sentiment_report}
-Conversation history of the debate: {history}
-Last bull argument: {current_response}
+{research_handoffs}
+
+{debate_context}
 
 **重要：请用中文进行辩论和分析。** 股票代码和技术指标名称请保留英文原文。请以中文口语化方式直接反驳多头分析师的观点，进行有力的辩论。
 
@@ -122,14 +138,25 @@ Last bull argument: {current_response}
 
 {RISK_DEBATE_PHRASING_RULES}
 """
+        prompt += decision_handoff_contract(
+            "bear",
+            "在同一正式证据集上提出最强空头论证并挑战多头因果缺口",
+        )
 
         response = llm.invoke(prompt)
 
         argument = f"Bear Analyst: {response.content}"
 
+        bounded_history = pack_agent_context(
+            [
+                {"label": "上一轮", "content": current_response, "priority": "decision"},
+                {"label": "当前轮", "content": argument, "priority": "decision"},
+            ],
+            budget_chars=12_000,
+        )
         new_investment_debate_state = {
-            "history": history + "\n" + argument,
-            "bear_history": bear_history + "\n" + argument,
+            "history": bounded_history,
+            "bear_history": argument,
             "bull_history": investment_debate_state.get("bull_history", ""),
             "current_response": argument,
             "count": investment_debate_state["count"] + 1,

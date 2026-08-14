@@ -21,6 +21,7 @@ import logging
 import re
 
 from tradingagents.agents.utils.agent_utils import build_instrument_context
+from tradingagents.agents.utils.handoff import analyst_handoff_contract, pack_report_handoffs
 from tradingagents.dataflows.factor_calc import compute_price_factors
 from tradingagents.dataflows.interface import route_to_vendor
 from tradingagents.dataflows.ticker_utils import is_a_share
@@ -817,6 +818,16 @@ def create_stock_profile_node(llm):
         peer_median_str = f"{peer_pe_median:.1f}" if peer_pe_median else "null"
         peer_anchor_source_str = peer_pe_source or "none"
         peer_single_comp_str = "true" if brother_single_comp else "false"
+        research_context = pack_report_handoffs(
+            {
+                "fundamentals": fundamentals_report,
+                "market": market_report,
+                "news": news_report,
+                "sentiment": sentiment_report,
+                "macro": macro_context,
+            },
+            budget_chars=16_000,
+        )
 
         prompt = f"""【语言要求】你必须使用中文撰写以下分析。股票代码和技术指标名称可保留英文。
 
@@ -953,21 +964,9 @@ AI 算力 / CPO 光通信 / 算力租赁 / 算电 / 可控核聚变 / 量子计�
 
 ## 输入资料
 
-**【最重要】宏观上下文**：
+**【最重要】有界角色交接上下文**：
 
-{macro_context if macro_context else "（宏观上下文缺失，按中性环境处理）"}
-
-[置信度:高] Company fundamentals report:
-{fundamentals_report}
-
-[置信度:中高] Market research report:
-{market_report}
-
-[置信度:中] Latest world affairs news:
-{news_report}
-
-[置信度:中低] Social media sentiment report:
-{sentiment_report}
+{research_context}
 
 ---
 
@@ -1050,6 +1049,11 @@ TRANSPARENCY:
 - YAML 字段顺序按模板出现顺序，不要重排
 - 这是下游 Python 程序化解析依赖的固定 schema，schema 漂移会导致归档失败
 """
+        prompt += analyst_handoff_contract(
+            "stock_profile",
+            "确定该股票应采用的研究框架、权重和估值方法",
+            "交接市值/行业/风格/流动性/业务暴露、REPORT_WEIGHTS、DECISION_STYLE、估值方法、主题阶段、周期位置、数据完整度及系统参照偏离；只决定怎么研究，不决定最终买卖。",
+        )
 
         response = llm.invoke(prompt)
         content = response.content
