@@ -14,6 +14,7 @@ from tradingagents.agents.managers.rm_tools import compute_entry_timing
 from tradingagents.agents.managers.research_manager import (
     _derive_entry_timing_from_profile,
     _enforce_entry_timing_truth,
+    _enforce_research_rating_truth,
     _extract_rm_rating,
     _normalize_summary_yaml_fence,
     _run_tool_calling_loop,
@@ -161,6 +162,83 @@ def test_rm_rating_extraction_prefers_summary_field():
     report = "正文曾讨论 BUY\nRM_SUMMARY:\n  rm_rating: HOLD\n"
     assert _extract_rm_rating(report) == "HOLD"
     assert _extract_rm_rating("无摘要") is None
+
+
+def test_rm_rating_extraction_prefers_research_rating_over_compatibility_field():
+    report = """RM_SUMMARY:
+  research_rating: OVERWEIGHT
+  rm_rating: HOLD
+"""
+    assert _extract_rm_rating(report) == "OVERWEIGHT"
+
+
+def test_rm_rating_truth_mirrors_research_rating_into_legacy_field():
+    content = """RM_SUMMARY:
+  research_rating: OVERWEIGHT
+  rm_rating: SELL
+"""
+    fixed = _enforce_research_rating_truth(content)
+    assert "research_rating: OVERWEIGHT" in fixed
+    assert "rm_rating: OVERWEIGHT" in fixed
+    assert "rm_rating: SELL" not in fixed
+
+
+def test_tool_loop_can_require_four_pillar_summary_fields():
+    required = {
+        "research_rating",
+        "pillar_thesis",
+        "pillar_valuation",
+        "pillar_catalyst",
+        "pillar_durability",
+    }
+
+    class SequenceLLM:
+        def __init__(self):
+            self.calls = 0
+
+        def invoke(self, _messages):
+            outputs = (
+                AIMessage(content="""RM_SUMMARY:
+  current_price: 100
+  rm_rating: HOLD
+  target_price_mid: 105
+  entry_timing: 继续观察
+  rating_evidence_ids: FUND-GROWTH-01
+  target_price_evidence_ids: FUND-VAL-01
+  earnings_evidence_ids: FUND-GROWTH-01
+  key_conflict_ids: null"""),
+                AIMessage(content="""RM_SUMMARY:
+  current_price: 100
+  research_rating: HOLD
+  rm_rating: HOLD
+  pillar_thesis: mixed
+  pillar_valuation: fair
+  pillar_catalyst: absent
+  pillar_durability: acceptable
+  target_price_mid: 105
+  entry_timing: 继续观察
+  rating_evidence_ids: FUND-GROWTH-01
+  target_price_evidence_ids: FUND-VAL-01
+  earnings_evidence_ids: FUND-GROWTH-01
+  key_conflict_ids: null"""),
+            )
+            result = outputs[self.calls]
+            self.calls += 1
+            return result
+
+    llm = SequenceLLM()
+    result = _run_tool_calling_loop(
+        llm,
+        [HumanMessage(content="生成四支柱报告")],
+        tools_by_name={},
+        role="RM-four-pillars",
+        completion_token="RM_SUMMARY",
+        required_summary_fields=required,
+        max_iterations=1,
+        max_continuations=1,
+    )
+    assert llm.calls == 2
+    assert "pillar_thesis: mixed" in result.content
 
 
 def test_output_truth_overrides_m3_summary_and_trade_ticket_drift():

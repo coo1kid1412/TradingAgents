@@ -1856,10 +1856,9 @@ def compute_step6_final_rating(
 # ============================================================================
 # 工具集合（供 research_manager.py 一次性绑定）
 # ============================================================================
-# 注：Step 6 的子工具（rating_mapping / trend_overlay / style/vote/catalyst/synthesis）
-# 仍保留定义供合并工具内部复用，但**不再单独绑定给 RM**——RM 的 Step 6 评级终段只调
-# compute_step6_final_rating 一次（阈值+映射+拥挤+升降档+叠加+极端防御一次合议）。
-# 评级链中段不再有 LLM 徒手执行的对照表，同股不同跑的残余漂移源就此消除。
+# 旧 Step 6 工具仍保留供历史回放和单元测试使用，但不再绑定给 RM。
+# RM 的长期评级只调用 compute_ic_recommendation；目标价、情景收益和四支柱各自
+# 保留职责边界，不再先由目标价偏离产生初始五档评级。
 
 RM_TOOLS = [
     compute_bull_bear_score,
@@ -1872,7 +1871,6 @@ RM_TOOLS = [
     compute_odds_and_expected_return,
     compute_conviction_calibration,
     compute_scenario_consistency_check,
-    compute_step6_final_rating,
     compute_ic_recommendation,
 ]
 

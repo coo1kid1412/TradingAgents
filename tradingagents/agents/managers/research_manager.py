@@ -17,8 +17,8 @@ from tradingagents.agents.managers.rm_tools import (
 logger = logging.getLogger(__name__)
 
 # 工具调用循环上限——避免 LLM 反复调同一工具陷入死循环
-# Step 6 评级终段已合并为 compute_step6_final_rating 一次调用（阈值/映射/拥挤/
-# 升降档/叠加/极端防御一次合议），典型轮数 ~6-9，15 是宽裕缓冲
+# Step 6 评级终段由 compute_ic_recommendation 一次调用完成四支柱矩阵、
+# 证据门槛和收益方向不变量，典型轮数 ~6-9，15 是宽裕缓冲。
 _MAX_TOOL_ITERATIONS = 15
 
 
@@ -79,11 +79,37 @@ def _profile_float(profile: str, key: str):
 
 
 def _extract_rm_rating(report: str):
-    matches = re.findall(
-        r"(?m)^\s*rm_rating:\s*(BUY|OVERWEIGHT|HOLD|UNDERWEIGHT|SELL)\s*$",
-        report or "",
+    for field in ("research_rating", "rm_rating"):
+        matches = re.findall(
+            rf"(?m)^\s*{field}:\s*(BUY|OVERWEIGHT|HOLD|UNDERWEIGHT|SELL)\s*$",
+            report or "",
+        )
+        if matches:
+            return matches[-1]
+    return None
+
+
+def _enforce_research_rating_truth(content: str) -> str:
+    """Keep the legacy RM field aligned with the authoritative research rating."""
+    text = content or ""
+    match = re.findall(
+        r"(?m)^\s*research_rating:\s*(BUY|OVERWEIGHT|HOLD|UNDERWEIGHT|SELL)\s*$",
+        text,
     )
-    return matches[-1] if matches else None
+    if not match:
+        return text
+    rating = match[-1]
+    text, count = re.subn(
+        r"(?m)^(\s*rm_rating:\s*)(BUY|OVERWEIGHT|HOLD|UNDERWEIGHT|SELL)\s*$",
+        rf"\g<1>{rating}",
+        text,
+    )
+    if count:
+        return text
+    summary = re.search(r"(?m)^RM_SUMMARY:\s*$", text)
+    if not summary:
+        return text
+    return text[:summary.end()] + f"\n  rm_rating: {rating}" + text[summary.end():]
 
 
 def _normalize_summary_yaml_fence(content: str, summary_key: str) -> str:
@@ -130,8 +156,26 @@ _SUMMARY_REQUIRED_FIELDS = {
     },
 }
 
+_RM_FOUR_PILLAR_REQUIRED_FIELDS = {
+    "research_rating",
+    "pillar_thesis",
+    "pillar_valuation",
+    "pillar_catalyst",
+    "pillar_durability",
+    "scenario_expected_return_pct",
+    "rating_reason_codes",
+    "thesis_evidence_ids",
+    "valuation_evidence_ids",
+    "catalyst_evidence_ids",
+    "durability_evidence_ids",
+}
 
-def _summary_yaml_is_complete(content: str, summary_key: str) -> bool:
+
+def _summary_yaml_is_complete(
+    content: str,
+    summary_key: str,
+    required_fields: set[str] | None = None,
+) -> bool:
     normalized = _normalize_summary_yaml_fence(content, summary_key)
     blocks = re.findall(r"```yaml\s*\n(.*?)\n```", normalized, re.DOTALL)
     if not blocks:
@@ -143,7 +187,8 @@ def _summary_yaml_is_complete(content: str, summary_key: str) -> bool:
     summary = parsed.get(summary_key) if isinstance(parsed, dict) else None
     if not isinstance(summary, dict):
         return False
-    required = _SUMMARY_REQUIRED_FIELDS.get(summary_key)
+    required = set(_SUMMARY_REQUIRED_FIELDS.get(summary_key) or ())
+    required.update(required_fields or ())
     return required.issubset(summary) if required else True
 
 
@@ -210,7 +255,8 @@ def _derive_entry_timing_from_profile(
 def _run_tool_calling_loop(llm_with_tools, initial_messages, *,
                            tools_by_name=None, role="RM",
                            completion_token="RM_SUMMARY",
-                           max_iterations=None, max_continuations=2):
+                           max_iterations=None, max_continuations=2,
+                           required_summary_fields: set[str] | None = None):
     """执行 LLM 工具调用循环。返回 AIMessage，content 是所有迭代的 LLM 文本累积。
 
     退出条件不只是『不再调工具』，还要求**正文完整**：必须包含 completion_token
@@ -223,7 +269,7 @@ def _run_tool_calling_loop(llm_with_tools, initial_messages, *,
       下游 PM 拿着没有评级的半截报告自己编了个 OVERWEIGHT 推送出去。
     截断比全空更隐蔽——只查空兜不住，必须查收尾标记。
 
-    恢复策略：正文缺失/截断时带明确指令续写（工具照调，Step 6 的强制工具调用
+    恢复策略：正文缺失/截断时带明确指令续写（工具照调，Step 6 的强制 IC 工具调用
     可能还没发生），最多 max_continuations 次；预算用尽仍全空则抛错显式失败，
     有部分正文则降级返回并 WARNING 留痕。
     """
@@ -286,7 +332,11 @@ def _run_tool_calling_loop(llm_with_tools, initial_messages, *,
 
         # —— 不再调工具：检查正文是否完整 ——
         joined = "\n\n".join(cot_segments)
-        if joined.strip() and _summary_yaml_is_complete(joined, completion_token):
+        if joined.strip() and _summary_yaml_is_complete(
+            joined,
+            completion_token,
+            required_summary_fields,
+        ):
             logger.info(
                 "%s tool calling 循环结束（第 %d 轮，累积 %d 段，总长 %d 字符）",
                 role, iteration, len(cot_segments), len(joined),
@@ -390,7 +440,7 @@ def create_research_manager(llm):
 
 ## ⚠️ 数值计算必须调用工具（全局约束，下面每步不再重复说明）
 
-你已绑定 11 个计算工具（见 `compute_*` 系列）。**凡涉及目标价 / 概率加权 / 偏离度 / 评级映射 / 三情景一致性 / 趋势叠加 / Bull-Bear 评分等数值，必须调用对应工具**，工具返回值直接采用，禁止心算或"调整修正"。引用数值时显式说明来源（"工具计算结果：__"）。
+你已绑定计算工具（见 `compute_*` 系列）。**凡涉及目标价 / 概率加权 / 赔率 / 四支柱评级 / 三情景一致性 / Bull-Bear 评分等数值，必须调用对应工具**，工具返回值直接采用，禁止心算或"调整修正"。引用数值时显式说明来源（"工具计算结果：__"）。
 
 ⚡ **批量调用（省往返，强制）**：**相互独立、不依赖彼此输出的工具调用，必须在同一轮一次性发起**（一条消息里放多个 tool_calls），不要一个一个排队调。典型可批量的场景：
 - Step 4 的多种估值方法（pe_eps / peg 等彼此独立）→ 同一轮一起发；最后再单独调 weighted/overlap 汇总（它依赖前面的结果）。
@@ -400,7 +450,7 @@ def create_research_manager(llm):
 各步骤对应工具速查：
 - Step 4：`compute_pe_eps_target_price` / `compute_peg_target_price` / `compute_overlap_target_price` / `compute_weighted_target_price`
 - Step 5：`compute_scenario_consistency_check`（强制）/ `compute_scenario_weighted_e`
-- Step 6：`compute_step6_final_rating`（强制，一次合议：阈值/映射/regime 闸门/拥挤/升降档/趋势叠加/极端防御/不变量全在工具内）
+- Step 6：`compute_ic_recommendation`（强制，一次合议：四支柱、证据门槛、情景收益、评级边界和不变量全在工具内）
 - 辅助分析：`compute_bull_bear_score` / `compute_score_difference` / `compute_conviction_calibration` / `compute_odds_and_expected_return`
 
 {instrument_context}
@@ -411,7 +461,7 @@ def create_research_manager(llm):
 
 ## 第负一步：地雷排查清单（守门员一票否决）
 
-⚠️ 命中任一条 → **直接 SELL，跳过所有后续步骤**：
+⚠️ 命中任一条且有 IC 包中的正式合格证据 → 标记为 `hard_veto=true` 与 thesis breaker，仍必须调用 `compute_ic_recommendation`；不得绕过工具手写 SELL。没有合格证据时只能列为待核查风险，不能触发硬否决。
 
 | # | 地雷类型 | 触发信号 |
 |---|---------|---------|
@@ -447,7 +497,7 @@ def create_research_manager(llm):
 
 **用法**：
 - Step 1 行业景气度判断必须叠加宏观顺/逆风修正（如行业本身上行但宏观强逆风 → 实际景气度降一档）
-- Step 6 动态阈值计算时，stock_profile.THEMATIC_PREMIUM 已经吸收了宏观修正，你按其最终值使用即可
+- Step 6 动态收益阈值计算时，stock_profile.THEMATIC_PREMIUM 已经吸收了宏观修正，你按其最终值使用即可
 
 ### 0.3B 市场风险快照（由 market_risk_daily 确定性生成）
 
@@ -457,11 +507,11 @@ def create_research_manager(llm):
 
 **派生 market_mode = {market_mode}**
 
-用法：market_mode 只控制 AI 主升升档权限，不直接改变长期评级方向。
-- `risk_on`：允许 AI 主升 confirmed 完整升档。
-- `conditional`：只允许 AI 主升轻度升档，不允许追成 BUY。
-- `risk_off`：AI 主升升档禁用。
-- `unknown`：快照缺失或不可判定；不贴偏空标签，但执行层锁定为 WAIT / 新仓 0%，AI 主升升档禁用。
+用法：market_mode 只进入短期执行和仓位约束，不进入一年期四支柱评级方向。
+- `risk_on`：执行层可按个股结构正常评估入场。
+- `conditional`：执行层只允许条件入场或小仓试探。
+- `risk_off`：执行层禁止新增进攻仓位。
+- `unknown`：快照缺失或不可判定；不贴偏空标签，但执行层锁定为 WAIT / 新仓 0%。
 
 ### 0.3C 确定性短线结构与入场时机（只管时机，不管评级）
 
@@ -475,7 +525,7 @@ def create_research_manager(llm):
 
 ### 0.4 量化锚（由量化打分官 Python 确定性输出，无 LLM 主观空间）
 
-{quant_score if quant_score else "（量化锚缺失，Step 6 趋势叠加路 / 极端背离防御跳过）"}
+{quant_score if quant_score else "（量化锚缺失，作为独立交叉校验降级处理）"}
 
 **重点提取**：
 - QUANT_SCORE.composite（0-100 综合分）
@@ -484,15 +534,15 @@ def create_research_manager(llm):
 
 **用法**：
 - 这是**独立于 LLM 判断的量化锚**，由 Python 直接基于动量/价值/质量/成长/低波/反拥挤 6 因子打分得出
-- **Step 6 趋势叠加路（在 `compute_step6_final_rating` 工具内部）**会用 composite + momentum 按 style 差异化调整评级（最多 ±1 档，不跨 HOLD）——你只需把这两个值如实填进工具入参
-- **Step 6 极端背离防御（同一工具内部兜底）**——只在 composite ≤20 或 ≥80 这种极端值时触发强制调整
+- composite 与 momentum 只用于检查经营 thesis、催化和持续性判断是否存在严重背离，不作为独立长期方向票
+- 极端量化背离必须进入 `unresolved_dissent` 或风险清单，由对应专业证据解释，不能绕过四支柱矩阵直接升降评级
 - factor_scores 中 <30 分的单项代表该维度有显著风险，Step 8 风险清单应当独立列出
 
 **重点提取**：style / industry / VALUATION_METHOD.primary_method / target_pe_range / target_pb_range / data_completeness
 
 **⚠️ stock_profile TRANSPARENCY 段（Layer 3 透明化标注）必读**：
 
-stock_profile 末尾的 `TRANSPARENCY:` 段是 LLM 自填的"超共识程度标注"，按以下规则用于 **Step 6 评级 + Step 7 Conviction 校准**：
+stock_profile 末尾的 `TRANSPARENCY:` 段是 LLM 自填的"超共识程度标注"，按以下规则用于 **Step 6 估值支柱 + Step 7 Conviction 校准**：
 
 | TRANSPARENCY 字段 | 触发条件 | 你的应对 |
 |------------------|---------|---------|
@@ -525,7 +575,7 @@ stock_profile 末尾的 `TRANSPARENCY:` 段是 LLM 自填的"超共识程度标�
 **用法**：
 - **Step 6 第三步评级摘要强制引用一句**：例如 "板块 RS 30d +X% 跑赢大盘 / 主题内排名第 N / 板块β 主导"
 - **作为评级的"反方力量"**：估值偏高时，如果板块 RS 强 + 主题内排名靠前 → Conviction 降一档但不机械改评级；
-  反之估值偏高 + 板块 RS 弱 + 主题内排名靠后 → 强化 SELL 信号
+  反之估值偏高 + 板块 RS 弱 + 主题内排名靠后 → 进入持续性支柱和未解决分歧，不直接生成 SELL
 - **fallback 路径透明**：报告头部已经显示了"层级 1→2→3→4"的匹配链路，根据匹配级别判定信号可靠度
 
 ### 0.6 资金流综合状态（由 Capital Flow Officer Python 确定性输出，无 LLM）
@@ -535,12 +585,12 @@ stock_profile 末尾的 `TRANSPARENCY:` 段是 LLM 自填的"超共识程度标�
 **重点提取**：
 - `capital_flow_regime`（强势/分化/恶化/中性/数据不足）
 - `capital_flow_score`（0-100，第 7 因子）
-- `northbound_5d_direction`（净流入/净流出/平衡/数据停滞）→ **Step 6 工具入参 northbound_flow_5d_direction 必须从这里取**（+1=净流入, 0=平衡/数据停滞, -1=净流出）
+- `northbound_5d_direction`（净流入/净流出/平衡/数据停滞）→ 作为持续性支柱的资金证据，不作为长期方向票
 - `net_inflow_streak_days`（主力资金连续流入/流出天数）
 - `ddx_like_5d_pct_1y`（DDX-like 1 年百分位 0-100）
 
 **用法**：
-- Step 6 调 `compute_step6_final_rating` 时，催化路的 `northbound_flow_5d_direction` **必须**从上方 CAPITAL_FLOW YAML 的 `northbound_5d_direction` 映射（净流入→+1, 平衡/数据停滞→None, 净流出→-1），禁止从 news 报告中猜测
+- Step 6 判断持续性支柱时，资金方向只能从上方 CAPITAL_FLOW YAML 读取，禁止从 news/sentiment 猜测；资金恶化可以限制置信度和仓位，但不能单独决定一年期评级
 - Step 8 风险清单：若 `capital_flow_regime` = 恶化，风险维度增加"资金面恶化风险"
 - 最终 Thesis 第三节"最关键论据"：若 regime=强势/恶化，计入论据（附 capital_flow_score 数值）
 
@@ -776,92 +826,43 @@ bull_target / base_target / bear_target → 你刚设计的三情景目标价
 
 ---
 
-## Step 6: 综合评级判断（一次合议，工具执行）
+## Step 6: 四支柱投委会评级（一次合议，工具执行）
 
-**评级终段是一次合议，不是流水线**。动态阈值 → 估值五档映射 → regime 闸门 → PEG 低置信收敛 → 拥挤度 → 对称升降档 → 趋势叠加 → 极端背离防御 → 全链不变量终检，全部在 `compute_step6_final_rating` **一次工具调用**内按固定顺序执行（历史教训：这九道关卡分步执行且互相不知情时，出过"ride 托底的 HOLD 被趋势叠加再升成 OVERWEIGHT——偏离 +133% 的票评级看多"和"拥挤多头禁 BUY 被叠加绕回 BUY"两类事故）。
+长期评级不再由目标价偏离先定档。你必须先分别判断四个职责不同的研究支柱，再由 `compute_ic_recommendation` 执行证据门槛、情景收益阈值、评级矩阵和方向不变量。
 
-你的工作只有三件：① 备齐输入（全部直读，来源见下表）；② 真正发起这一次工具调用；③ 写简明评级摘要解释链路。
+**最终权威评级不得调用 compute_step6_final_rating**。该旧工具仅保留历史测试和回放兼容，不在本轮绑定工具中。你不得让技术面、舆情热度或多空辩论票数直接生成一年期评级。
 
-⛔ **严禁narrate**：必须真正发起 `compute_step6_final_rating` 工具调用并采用其返回的 `final_rating`，禁止手写伪 JSON 自圆其说——伪造的返回一律视为无效，评级作废。
-⛔ **无人工微调通道**：旧版"例外情形可 ±1 档"已全部收进工具（业绩拐点 / 数据完整度 / 红旗 / 拥挤度都是工具入参）。若认为评级不合理，唯一合法途径是回头修改 Step 4 估值并重新调工具，禁止在工具输出之外加减档、禁止"短期透支 / 估值消化 / 市场情绪"式的主观改判。
+### 第一步：形成四支柱输入
 
-### 第一步：备齐输入（逐项列出，全部直读）
+| 支柱 | 枚举 | 判断依据 | 允许作用 |
+|---|---|---|---|
+| `thesis` 经营与盈利 | strong / adequate / mixed / weak / invalid | 盈利质量、拐点、竞争力、现金流、红旗和行业对照 | 长期评级基础或封顶 |
+| `valuation` 估值与预期收益 | attractive / fair / stretched / invalid | Step 4 目标区间、Step 5 三情景、宏观风险溢价 | 必要收益支柱，不能单独决定评级 |
+| `catalyst` 催化与预期差 | strong / visible / weak / absent / adverse | 新闻、盈利修正、共识已计价程度和验证日期 | 支持、反对或阻止 BUY |
+| `durability` 持续性与风险 | resilient / acceptable / fragile / broken | 宏观、治理、拥挤、资金、Bull/Bear 反证 | 封顶或经正式 breaker 触发研究 veto |
 
-| 入参 | 直读来源 | 说明 |
-|------|---------|------|
-| current_price | instrument_context / market_report | 当前价 P_0 |
-| target_price_mid | **Step 4 的 compute_weighted_target_price 或 compute_overlap_target_price 工具输出的 mid** | 禁止自算调整、禁止用 Base case 反推 |
-| target_price_source | 审计字段 | 如『compute_weighted_target_price 工具输出』 |
-| style | stock_profile.style | 阈值 style 系数由工具内部查表，你不算 |
-| theme_premium_pct | **画像末尾 `SYS_THEME_PREMIUM_PCT:` 行** | Python 确定性值（已按 regime 闸门）；禁止从 theme_stage 重算 |
-| theme_stage | THEMATIC_PREMIUM.theme_stage | 仅用于 fading 上沿锁 |
-| valuation_regime | **画像末尾 `SYS_VALUATION_REGIME:` 行** | 照抄 ride/neutral/discipline；严禁臆断或从正文猜；全文搜不到才填 "" |
-| peg_confidence | 画像末尾 `SYS_PEG_CONFIDENCE:` 行 | normal / low / invalid；无此行填 "" |
-| consensus_crowded | consensus_snapshot.crowded | true/false（软标志，工具内须经硬数据确认才生效） |
-| consensus_direction | consensus_snapshot.direction | 偏多 / 偏空 / 中性 |
-| quant_anticrowding | QUANT_SCORE.factor_scores.anticrowding | 0-100；拥挤的硬确认之一（≤30 = 真拥挤），缺失填 None |
-| retail_concentration_signal | 0.6 节 CAPITAL_FLOW.retail_concentration_signal | 散户高接盘 / 中性；拥挤的硬确认之二，缺失填 ""。⛔已含「机构派发给散户」合成：上方 CAPITAL_FLOW YAML 的 `distribution_into_retail.retail_takeover` 若=散户高接盘（获利盘高位+户数增+主力流出+折价大宗≥2 路共振=顶部派发），此字段即已为「散户高接盘」，直接照抄即可 |
-| ths_hot_rank | 0.6 节 CAPITAL_FLOW.ths_hot_rank | 同花顺热榜排名（越小越热）；拥挤的硬确认之三（≤30=散户关注集中），未上榜/缺失填 None |
-| inflection_stage | 你 Step 3 的『当前周期阶段』 | **只能五选一**：加速期 / 底部反转 / 顶部 / 衰退 / 拐点期。⛔ 禁止复合标签（如『加速期顶部』『顶部加速期』）——既加速又顶部属信号矛盾,工具会判 neutral 不升不降。你必须二选一表态：业绩仍在加速且未见顶 → 加速期；已见顶/边际走弱 → 顶部 |
-| data_completeness | VALUATION_METHOD.data_completeness | L0-L3 |
-| red_flags_count | fundamentals.SUMMARY.red_flags 条数 | 整数 |
-| earnings_sustainability | 你 Step 3 的『可持续性』 | 持续 / 一次性 / 待验证 |
-| bear_anchor_strong | 辅助分析中空头 anchor 论据是否有 hard data 强支撑 | true/false |
-| decision_style | stock_profile.DECISION_STYLE | momentum 风格不靠低估升档 |
-| composite_score / momentum_score | QUANT_SCORE.composite / factor_scores.momentum | 数值 |
-| market_weight / news_weight / sentiment_weight | stock_profile.REPORT_WEIGHTS | 0-1 |
-| market/news_direction_vote | 你读完市场/新闻两份报告后各给一票 | +1.0 全面看多 / +0.5 偏多有保留 / 0 中性 / -0.5 偏空有保留 / -1.0 全面看空 |
-| sentiment_direction_vote | **已废弃，固定填 0**（工具内确定性置零） | ⛔舆情不做趋势方向票——顶部狂热是反向指标，naive 方向票会在狂热时投 +1 把评级抬反。舆情改走「机构派发给散户」反向检测（见 consensus_crowded + SYS_DISTRIBUTION），不进趋势方向 |
-| sell_side_target_change_pct | 近 30 日卖方目标价中位变化% | **缺失填 None，禁止编造** |
-| institutional_holding_change_pct | 近 1 季机构持仓变化% | 缺失填 None，禁止编造 |
-| northbound_flow_5d_direction | **0.6 节 CAPITAL_FLOW.northbound_5d_direction 映射** | 净流入→1，净流出→-1，平衡/数据停滞→None；禁止从 news/sentiment 猜 |
-| kol_bullish_ratio_trend_pct | KOL 多头率相对 30 日均的变化(pp) | 缺失填 None |
-| news_catalyst_score | 新闻报告末尾 `SYS_CATALYST: ... score=__`（Python 从 key_events 确定性聚合的新闻事件催化分，-30..30） | 直读照抄,无此行填 None。⛔禁止自己从新闻里重判方向——聚合已确定性完成 |
-| earnings_revision | 画像末尾 `SYS_EARNINGS_REVISION:` 行 | 上修 / 下修 / 停修；无此行填 "" |
-| ai_main_uptrend | 画像末尾 `SYS_AI_MAIN_UPTREND_ENABLED:` 行 | true/false。AI 算力链主升兑现资格，Python 确定性输出；无此行填 false |
-| ai_main_uptrend_class | 画像末尾 `SYS_AI_MAIN_UPTREND_CLASS:` 行 | confirmed / early / none；无此行填 "" |
-| market_mode | 本 prompt 0.3B 派生值 | 必须填 `{market_mode}`；缺失快照时为 unknown，禁止自行改成 risk_on/conditional |
-| inflection_confirmed_recent | 业绩拐点是否刚被新数据（如刚出的季报）确认 | true 时极端背离防御跳过（量化锚滞后于新数据） |
-| cyclical_class | 画像末尾 `SYS_CYCLICAL_CLASS:` 行 | strong / semi；非周期股（无此行）填 "" |
-| cycle_position | 画像末尾 `SYS_CYCLICAL_POSITION:` 行 | top / mid / trough；无此行填 ""。工具内周期修正：顶部禁升档+正向叠加钳零（顶部要下车不是骑），谷底『拐点衰退』降档静音（谷底盈利差是常态，不追杀） |
+每个支柱必须引用 IC 决策包中存在且可用于决策的证据 ID。市场技术面只进入三日趋势和入场，不进入四支柱方向；舆情只能进入拥挤和脆弱性；Bull/Bear 只能挑战证据与假设。
 
-### 第二步：一次工具调用（强制）
+### 第二步：计算情景收益与赔率
 
-调用 `compute_step6_final_rating`，**最终评级 = 工具返回的 `final_rating`，原样采用**。
+1. 调 `compute_scenario_weighted_e`，用 Step 5 Bull/Base/Bear 的目标价和概率计算 `scenario_expected_return_pct`；禁止用 Base case 收益代替。
+2. 调 `compute_odds_and_expected_return` 或采用已存在的确定性赔率结果，得到 `downside_pct` 与 `payoff_ratio`。
+3. 从 IC 包列出全部 `decision_eligible` 证据 ID，分别填入四个支柱；未经验证的 thesis breaker 不得进入 `hard_veto`。
 
-工具内部链路（你不执行，只需在 COT 里复述返回的 explanation）：
-1. 动态阈值 = 基础 ±15/±35 × style 系数（blue_chip/cyclical/etf 1.0、illiquid 0.7、high_beta_growth 1.5、theme_speculation 2.0）× (1 + SYS_THEME_PREMIUM_PCT/100)；theme_stage=fading 时上沿锁 30%
-2. 估值五档映射 + regime 闸门（ride 把 UNDERWEIGHT/SELL 托底 HOLD；discipline 把 OVERWEIGHT/BUY 封顶 HOLD、SELL 保留；neutral 收敛三档）+ PEG 低置信边界收敛
-3. 拥挤度（拥挤多头禁 BUY、拥挤空头禁 SELL；**禁令固化为边界，对后续所有步骤持续生效，趋势叠加绕不过**。共识官的 crowded 只是软标志，须经硬数据确认——反拥挤分 ≤30 或 散户高接盘——才触发；无硬确认不动评级，对标投研用持仓/成交数据判拥挤而非舆情观感）
-4. 对称升降档（升档需同时满足：拐点加速/底部反转 + L0/L1 + 红旗≤1 + 低估区 + 非 momentum，且仅 HOLD→OW / OW→BUY；降档 L3 / 红旗≥3 / 拐点顶部衰退 / 空头anchor强+待验证 各 -1，合计最多 -2）
-5. AI 主升兑现升档（`SYS_AI_MAIN_UPTREND` + `market_mode` 总闸）：risk_on 可完整生效，conditional 只轻度升档，risk_off 禁用；不能越过 discipline / 拥挤多头 BUY 天花板 / 不变量
-6. 趋势叠加三路（style 动量 / 报告加权方向票 / 催化硬数据，合成最多 ±1）
-7. 极端背离防御（composite ≤20 压看多 → HOLD；≥80 托看空 → HOLD）
-8. **两条全链不变量**：
-   - **闸门边界不可被下游反转**：ride 托底产生的 HOLD 设地板、discipline 封顶产生的 HOLD 设天花板，后续任何升降档不得越过
-   - **评级方向必须与隐含收益同号**：最终看多（BUY/OVERWEIGHT）要求目标价中位 > 现价；看空（UNDERWEIGHT/SELL）要求 < 现价；违反者收敛 HOLD——真实投研不存在『看多但目标价在现价下方』的票
+### 第三步：一次调用权威评级工具
 
-#### 输出格式（强制）
+调用 `compute_ic_recommendation`，**最终研究评级 = 工具返回的 `research_rating`，原样采用**。关键输入必须包括：
 
-> 工具调用：`compute_step6_final_rating`
-> 关键输入：current_price=__, target_price_mid=__（来源：__）, style=__, SYS_THEME_PREMIUM_PCT=__, SYS_VALUATION_REGIME=__, peg_confidence=__, crowded=__/方向__, 拐点=__, 数据完整度=__, 红旗=__, composite=__, momentum=__, 三票=__/__/__, AI主升=__/__, market_mode=__
-> 工具返回：阈值 ±__/±__ | 偏离 __% | rating_raw=__ → regime 闸门 __ → 拥挤 __ → 升降档 __ → AI主升 __ → 趋势叠加 __（style __ / vote __ / catalyst __）→ 极端防御 __ → 不变量终检 → **final_rating = __**
-> 边界与不变量：__（照抄工具返回 bounds.sources 与 stages.e_sign_invariant.note）
+- 情景概率加权收益、下行幅度、赔率。
+- 四支柱状态、thesis 方向、已计价程度和证据质量。
+- style、`SYS_THEME_PREMIUM_PCT`、theme_stage、硬数据确认的拥挤多头状态。
+- 全部合格证据 ID、四支柱证据 ID和 thesis breaker 证据 ID。
 
-### 第三步：评级证据摘要（200-300 字）
+⛔ 禁止手写伪工具结果；禁止在工具输出后人工 ±1 档；若结果不合理，只能修正有证据支持的支柱输入或情景假设后重新调用。
 
-写一段 200-300 字的评级证据摘要，解释工具链路的判断为什么成立，必须包含：
+### 第四步：评级证据摘要（200-300 字）
 
-1. **当前价 vs 综合目标价区间**的位置（结合动态阈值，区间下沿/区间内/区间上沿/超出区间）
-2. **业绩拐点判断**对评级的支撑/反对
-3. **Base case 目标价**是否对当前价格有吸引力
-4. **多元估值交叉一致性**（3 种方法是否一致指向同一方向）
-5. **如果偏离行业典型估值范式**，说明为什么这么做
-6. **板块相对强弱（强制引用一句话）**：从 0.5 节 sector_comparison 取出本股 vs 主题 ETF 或大盘指数的 30d RS，
-   作为评级的支撑/反方力量。例：
-   - 『板块 RS 30d +12%，主题内排名第 2/5，板块β 主导，估值偏高但短期支撑评级不至于 SELL』
-   - 『板块 RS 30d -5%，主题内倒数第 3，板块走弱+估值偏高 → 强化 UNDERWEIGHT 信号』
-7. **反方推理**：明确回答『为什么不给更激进/更保守的评级』；若工具链路中闸门/不变量改写了评级（rating_raw ≠ final_rating），逐段复述工具 explanation 说明每次改写的依据
+摘要必须说明：四支柱分别支持、反对或限制了什么；情景概率加权收益与动态阈值；为什么不是更高或更低一档；最重要的未解决分歧。只展示“事实 → 专业解释 → 决策影响”的可审计桥梁，不展示内部思维过程或工具执行过程。
 
 ---
 
@@ -1018,7 +1019,7 @@ Hard Data 修正：yes 不变；no × 0.5
 **重要：请用中文撰写你的 thesis 报告。** 评级关键词（Buy/Overweight/Hold/Underweight/Sell）和股票代码请保留英文原文。
 
 **最后提醒**：
-- 你的评级是 8 步综合判断的产出，**不是 d 阈值的公式输出**
+- 你的评级是四支柱证据判断经确定性工具映射的产出，**不是目标价偏离或 d 阈值的单变量输出**
 - 多空辩论评分只影响 Conviction，不影响评级方向
 - 你只出 thesis，不出执行细节（建仓价/止损/仓位由 PM 决定）
 
@@ -1033,9 +1034,16 @@ Hard Data 修正：yes 不变；no × 0.5
 RM_SUMMARY:
   ticker: "{rm_ticker}"                  # 已填好，请勿修改
   trade_date: "{rm_trade_date}"          # 已填好，请勿修改
-  current_price: <float>                 # 当前价 P_0（与 Step 6 使用的一致）
-  rm_rating: BUY / OVERWEIGHT / HOLD / UNDERWEIGHT / SELL
+  current_price: <float>                 # 当前价 P_0
+  research_rating: BUY / OVERWEIGHT / HOLD / UNDERWEIGHT / SELL  # compute_ic_recommendation 权威结果
+  rm_rating: BUY / OVERWEIGHT / HOLD / UNDERWEIGHT / SELL        # 必须与 research_rating 相同，兼容归档
   rm_conviction: 高 / 中 / 低
+  pillar_thesis: strong / adequate / mixed / weak / invalid
+  pillar_valuation: attractive / fair / stretched / invalid
+  pillar_catalyst: strong / visible / weak / absent / adverse
+  pillar_durability: resilient / acceptable / fragile / broken
+  scenario_expected_return_pct: <float> # compute_scenario_weighted_e 返回值
+  rating_reason_codes: "<CODE1|CODE2>"  # compute_ic_recommendation 原样返回
   target_price_low: <float>              # Step 4 综合目标价区间下沿
   target_price_mid: <float>              # Step 4 工具返回的中位数
   target_price_high: <float>             # Step 4 综合目标价区间上沿
@@ -1050,22 +1058,27 @@ RM_SUMMARY:
   theme_stage: peak / acceleration / initiation / fading / none
   composite_score: <float>               # QUANT_SCORE.composite
   momentum_score: <float>                # QUANT_SCORE.factor_scores.momentum
-  deviation_pct: <float>                 # compute_step6_final_rating 返回的 deviation_pct
-  threshold_dn_pct: <float>              # 工具返回的动态阈值下沿
-  threshold_up_pct: <float>              # 工具返回的动态阈值上沿
+  deviation_pct: null                    # 旧估值偏离评级字段停用
+  threshold_dn_pct: <float>              # 新工具 thresholds.configuration_pct
+  threshold_up_pct: <float>              # 新工具 thresholds.high_pct
   valuation_regime: ride / neutral / discipline   # 画像 SYS_VALUATION_REGIME 原值（回测分腿归因用）
   regime_legs: "<照抄画像 SYS_VALUATION_REGIME_LEGS 行冒号后的内容，整体加双引号>"
-  rating_raw: BUY / OVERWEIGHT / HOLD / UNDERWEIGHT / SELL  # 工具返回 rating_raw（估值原始倾向，未过闸门）
+  rating_raw: null                       # 旧估值初始评级字段停用
   peg_confidence: normal / low / invalid / null    # 画像 SYS_PEG_CONFIDENCE（无该行填 null）
   ai_main_uptrend_enabled: true / false  # 画像 SYS_AI_MAIN_UPTREND_ENABLED
   ai_main_uptrend_class: confirmed / early / none / null
   market_mode: risk_on / conditional / risk_off
   short_term_structure: trend_pullback / breakout_ready / healthy_trend / exhaustion / broken / neutral / insufficient_data
   entry_timing: 分批介入 / 小仓试探 / 等回踩 / 等放量突破 / 暂不介入 / 退出观察 / 继续观察 / 数据不足
-  ai_main_uptrend_adj: <int>             # 工具 stages.ai_main_uptrend.adjustment（-1/0/+1；当前只会 0/+1）
-  overlay_style_adj: <int>               # 工具返回 overlay_components.style（-1/0/+1）
-  overlay_vote_adj: <int>                # 工具返回 overlay_components.vote
-  overlay_catalyst_adj: <int>            # 工具返回 overlay_components.catalyst
+  ai_main_uptrend_adj: null              # 旧评级叠加字段停用
+  overlay_style_adj: null                # 旧评级叠加字段停用
+  overlay_vote_adj: null                 # 旧评级叠加字段停用
+  overlay_catalyst_adj: null             # 旧评级叠加字段停用
+  thesis_evidence_ids: "<ID1|ID2 或 null>"
+  valuation_evidence_ids: "<ID1|ID2 或 null>"
+  catalyst_evidence_ids: "<ID1|ID2 或 null>"
+  durability_evidence_ids: "<ID1|ID2 或 null>"
+  thesis_breaker_evidence_ids: "<ID1|ID2 或 null>"
   rating_evidence_ids: "<ID1|ID2 或 null>"       # 长期评级的主要证据
   target_price_evidence_ids: "<ID1|ID2 或 null>" # 目标价的主要证据
   earnings_evidence_ids: "<ID1|ID2 或 null>"     # 盈利展望/拐点证据
@@ -1081,8 +1094,13 @@ RM_SUMMARY:
         # 绑定 RM 计算工具，让 LLM 在 Step 4 / 辅助分析等数值步骤显式调用工具
         # 替代之前 LLM 心算导致的 Bull Score / 目标价区间 等计算 bug
         llm_with_tools = llm.bind_tools(RM_TOOLS)
-        response = _run_tool_calling_loop(llm_with_tools, [HumanMessage(content=prompt)])
+        response = _run_tool_calling_loop(
+            llm_with_tools,
+            [HumanMessage(content=prompt)],
+            required_summary_fields=_RM_FOUR_PILLAR_REQUIRED_FIELDS,
+        )
         normalized_content = _normalize_summary_yaml_fence(response.content, "RM_SUMMARY")
+        normalized_content = _enforce_research_rating_truth(normalized_content)
         final_entry_timing = _derive_entry_timing_from_profile(
             stock_profile, market_mode, long_term_rating=_extract_rm_rating(normalized_content),
         )
