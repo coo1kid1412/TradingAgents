@@ -26,6 +26,8 @@ DEFAULT_CONFIG = {
     "openai_reasoning_effort": None,    # "medium", "high", "low"
     "anthropic_effort": None,           # "high", "medium", "low"
     "minimax_max_tokens": 8192,         # MiniMax default max_tokens (upstream default 256 too small)
+    "fundamentals_analyst_max_tokens": 16384,  # 基本面长报告含多表格，避免 think 占满全局预算
+    "research_manager_max_tokens": 16384,  # RM 多步工具后需留足最终研究摘要输出预算
     "portfolio_manager_max_tokens": 16384,  # PM 报告 14 章节较长，需高于全局 minimax_max_tokens 防截断
     # LLM request timeout (seconds); prevents indefinite hangs when API is unresponsive
     "llm_timeout": 300,

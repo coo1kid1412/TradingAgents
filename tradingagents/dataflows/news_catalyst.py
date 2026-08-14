@@ -11,7 +11,8 @@ from __future__ import annotations
 import re
 from typing import Optional
 
-import yaml
+from tradingagents.agents.utils.report_calendar import normalize_reporting_event
+from tradingagents.agents.utils.yaml_summary import extract_yaml_mapping
 
 # impact 措辞 → 数值（+大..-大）
 _IMPACT_MAP = {
@@ -21,6 +22,28 @@ _IMPACT_MAP = {
 _CRED_MAP = {"高": 1.0, "中": 0.7, "低": 0.4}
 # 近端催化对评级窗（~12 月，但短期择时敏感）权重更高
 _HORIZON_MAP = {"短期": 1.0, "中期": 0.7, "长期": 0.4}
+
+
+def _is_decision_eligible_event(event: dict) -> bool:
+    """Only traceable official or verified professional sources may drive decisions."""
+    tier = event.get("source_tier")
+    verification = event.get("verification_status")
+    if tier is None and verification is None:
+        return False
+    tier = str(tier or "unknown").strip().lower()
+    verification = str(verification or "unverified").strip().lower()
+    if tier in {"official", "regulatory"}:
+        from tradingagents.agents.utils.report_calendar import has_traceable_official_reference
+
+        return has_traceable_official_reference(
+            source_tier=tier,
+            verification_status=verification,
+            source_url=event.get("source_url"),
+            document_id=event.get("document_id"),
+        )
+    if tier in {"mainstream", "research"}:
+        return verification in {"verified", "corroborated"}
+    return False
 
 
 def _parse_iso_date(s) -> Optional["datetime.date"]:
@@ -50,6 +73,8 @@ def _recency_weight(source_date, current_date) -> float:
     if sd is None or cd is None:
         return 1.0
     age = (cd - sd).days
+    if age < 0:
+        return 0.0
     if age <= 7:
         return 1.0
     if age <= 21:
@@ -61,18 +86,8 @@ def _recency_weight(source_date, current_date) -> float:
 
 def _find_summary_yaml(news_report: str) -> Optional[dict]:
     """从新闻报告里抽 ```yaml ... ``` 的 SUMMARY 块并解析。"""
-    if not news_report:
-        return None
-    for block in re.findall(r"```yaml\s*\n(.*?)\n```", news_report, flags=re.DOTALL):
-        if "SUMMARY" not in block:
-            continue
-        try:
-            parsed = yaml.safe_load(block)
-        except yaml.YAMLError:
-            continue
-        if isinstance(parsed, dict) and isinstance(parsed.get("SUMMARY"), dict):
-            return parsed["SUMMARY"]
-    return None
+    summary, _ = extract_yaml_mapping(news_report, "SUMMARY")
+    return summary
 
 
 def aggregate_news_catalyst(news_report: str, current_date: Optional[str] = None) -> Optional[dict]:
@@ -94,9 +109,17 @@ def aggregate_news_catalyst(news_report: str, current_date: Optional[str] = None
 
     net = 0.0
     counted = 0
+    accepted_events: list[dict] = []
     for e in events:
         if not isinstance(e, dict):
             continue
+        if not _is_decision_eligible_event(e):
+            continue
+        if current_date is not None:
+            source_date = _parse_iso_date(e.get("source_date"))
+            cutoff = _parse_iso_date(current_date)
+            if source_date is None or cutoff is None or source_date > cutoff:
+                continue
         impact = _IMPACT_MAP.get(str(e.get("impact", "0")).strip())
         if impact is None:
             continue
@@ -112,6 +135,7 @@ def aggregate_news_catalyst(news_report: str, current_date: Optional[str] = None
         rec = _recency_weight(e.get("source_date"), current_date)
         net += impact * cred * (1.0 - priced_frac) * hz * rec
         counted += 1
+        accepted_events.append(e)
 
     if counted == 0:
         return None
@@ -122,7 +146,7 @@ def aggregate_news_catalyst(news_report: str, current_date: Optional[str] = None
     score = int(max(-30, min(30, round(net * 15))))   # 喂催化腿，量级同 sell_side(±30)
     # 最近端事件标题（供 PM Time Stop）
     nearest = None
-    for e in events:
+    for e in accepted_events:
         if isinstance(e, dict) and "短期" in str(e.get("horizon", "")):
             nearest = str(e.get("title", ""))[:30]
             break
@@ -142,15 +166,17 @@ _REVISION_DOWN_KW = (
 )
 
 
-def compute_earnings_revision(news_report: str) -> Optional[dict]:
+def compute_earnings_revision(
+    news_report: str, current_date: Optional[str] = None,
+) -> Optional[dict]:
     """从新闻 SUMMARY 抽确定性"盈利预期修正方向"（上修/停修/下修）——喂 regime earnings 腿。
 
     背景：earnings 腿原只看 TTM 后视镜增速，主升浪里龙头单季高基数回落被判 decelerating→-1，
     但卖方此时常在**上修前瞻预期**（真正的 ride 判据）。这条把"上修方向"确定性抽出来，让前瞻
     修正能中和后视镜减速（见 compute_valuation_regime 3c）。report_rc 没权限前的零成本粗代理。
 
-    取数优先级：① cumulative_patterns（agent 已蒸馏的"多次评级上调/下调"≥2家口径，可信度高）；
-    ② 机构类 key_events 标题。两者命中关键词计票，净方向定上修/停修/下修。
+    只读取逐项带来源元数据的机构类 key_events。无逐项来源的 cumulative_patterns
+    不进入确定性链，避免历史分析把未来研报或模型概括伪装成当时已知信息。
 
     Returns: {direction: 上修/停修/下修, score: up-down, up, down, evidence:[...]}
              或 None（无 SUMMARY 块）。
@@ -159,12 +185,17 @@ def compute_earnings_revision(news_report: str) -> Optional[dict]:
     if not summary:
         return None
     blobs: list[str] = []
-    patterns = summary.get("cumulative_patterns")
-    if isinstance(patterns, list):
-        blobs += [str(p) for p in patterns if p]
     for e in (summary.get("key_events") or []):
-        if isinstance(e, dict) and "机构" in str(e.get("category", "")):
-            blobs.append(str(e.get("title", "")))
+        if not isinstance(e, dict) or "机构" not in str(e.get("category", "")):
+            continue
+        if not _is_decision_eligible_event(e):
+            continue
+        if current_date is not None:
+            source_date = _parse_iso_date(e.get("source_date"))
+            cutoff = _parse_iso_date(current_date)
+            if source_date is None or cutoff is None or source_date > cutoff:
+                continue
+        blobs.append(str(e.get("title", "")))
     up = down = 0
     evidence: list[str] = []
     for blob in blobs:
@@ -216,7 +247,9 @@ _IMPACT_SIGN = {"+大": "+", "+中": "+", "+小": "+", "0": "·",
                 "-小": "-", "-中": "-", "-大": "-"}
 
 
-def aggregate_catalyst_calendar(news_report: str, max_items: int = 6) -> Optional[list[dict]]:
+def aggregate_catalyst_calendar(
+    news_report: str, max_items: int = 6, current_date: Optional[str] = None,
+) -> Optional[list[dict]]:
     """从 SUMMARY.key_events 抽确定性催化日历——对标投研"催化剂日历驱动仓位时机/止损"。
 
     只收**有日期、且 thesis 相关度≥相关、impact≠0** 的事件，按日期排序（未知日期排末）。
@@ -234,13 +267,30 @@ def aggregate_catalyst_calendar(news_report: str, max_items: int = 6) -> Optiona
     for e in events:
         if not isinstance(e, dict):
             continue
+        if not _is_decision_eligible_event(e):
+            continue
+        if current_date is not None:
+            source_date = _parse_iso_date(e.get("source_date"))
+            cutoff = _parse_iso_date(current_date)
+            if source_date is None or cutoff is None or source_date > cutoff:
+                continue
         impact = str(e.get("impact", "0")).strip()
         if impact in ("0", "", "null", None):
             continue
         relevance = str(e.get("thesis_relevance", "")).strip()
         if relevance not in ("核心", "相关"):
             continue   # 只要 thesis 相关的（边缘/无标的不进监控）
-        date = str(e.get("event_date", "未知")).strip() or "未知"
+        normalized = normalize_reporting_event(
+            str(e.get("title") or ""),
+            str(e.get("event_date") or "未知"),
+            str(e.get("source_date") or "未知"),
+            event_date_basis=e.get("event_date_basis"),
+            source_tier=e.get("source_tier"),
+            verification_status=e.get("verification_status"),
+            source_url=e.get("source_url"),
+            document_id=e.get("document_id"),
+        )
+        date = normalized["event_date"]
         cal.append({
             "date": date,
             "title": str(e.get("title", ""))[:30],
@@ -248,6 +298,8 @@ def aggregate_catalyst_calendar(news_report: str, max_items: int = 6) -> Optiona
             "impact": impact,
             "thesis_relevance": relevance,
             "priced_in_p": e.get("priced_in_p"),
+            "reporting_period": normalized["reporting_period"],
+            "date_basis": normalized["date_basis"],
         })
 
     if not cal:

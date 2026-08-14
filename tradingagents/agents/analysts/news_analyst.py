@@ -44,7 +44,7 @@ def _get_tool_description(ticker: str) -> str:
     base_desc = (
         "## 可用工具\n"
         "你拥有以下数据工具，请根据需要合理调用：\n"
-        "1. **get_news(ticker, curr_date)** — 获取个股近 10 天相关新闻（东方财富/新浪财经等），日期范围 T-10 到 T 由系统自动计算，只需传入当前分析日期\n"
+        "1. **get_news(ticker, curr_date)** — 获取个股近 14 天相关新闻（东方财富/新浪财经等），日期范围 T-14 到 T 由系统自动计算，只需传入当前分析日期\n"
         "2. **get_global_news(curr_date, look_back_days, limit)** — 获取宏观经济及全球财经新闻\n"
         "3. **get_insider_transactions(ticker)** — 获取董监高/大股东持股变动数据。"
         "⛔ **增减持方向必须以返回内容顶部的【SYS_INSIDER｜确定性增减持方向】为唯一真相**"
@@ -56,9 +56,9 @@ def _get_tool_description(ticker: str) -> str:
     
     if is_a_share(ticker):
         a_share_desc = (
-            "4. **get_announcements(ticker, curr_date)** — 获取公司公告（巨潮资讯：财报、股东大会、风险提示、资产重组、股权变动等），日期范围 T-10 到 T 由系统自动计算\n"
+            "4. **get_announcements(ticker, curr_date)** — 获取 T-120 至 T 的巨潮公告目录及 Tushare 结构化业绩预告；公告和预告字段属于官方披露事实\n"
             "5. **get_cls_telegraph(curr_date, limit)** — 获取财联社电报快讯（实时市场重大事件、央行政策、大宗商品等）\n"
-            "6. **get_research_reports(ticker, limit)** — 获取个股研报（东方财富：机构评级、盈利预测、目标价等）\n"
+            "6. **get_research_reports(ticker, curr_date, limit)** — 获取分析日及以前的个股研报（东方财富：机构评级、盈利预测、目标价等）\n"
         )
         return base_desc[:base_desc.rfind("\n7.")] + "\n" + a_share_desc + base_desc[base_desc.rfind("\n7."):]
     
@@ -75,7 +75,7 @@ def _get_analysis_steps(ticker: str) -> str:
             "2. 调用 get_news_from_search 搜索实时网络新闻，补充上一步可能遗漏的最新信息\n"
             "3. 调用 get_global_news + get_cls_telegraph 获取宏观和行业层面的信息\n"
             "4. 调用 get_insider_transactions 检查内部交易异动\n"
-            "5. 调用 get_research_reports 获取机构研报观点和盈利预测\n"
+            "5. 调用 get_research_reports（curr_date 必须等于当前分析日期）获取机构研报观点和盈利预测\n"
         )
     else:
         return (
@@ -186,6 +186,12 @@ def create_news_analyst(llm):
             f"3. **数据时效声明（报告必含一句）**：本分析基于截至 {current_date} 可获取的新闻/公告，"
             "**当日盘中或最新实时事件可能尚未被数据源覆盖**；若处于快速行情（板块大幅异动日），"
             "结论的时效性应相应打折，以最新行情和公告为准。\n\n"
+            "## 来源分层与硬决策资格（强制）\n\n"
+            "- `official/regulatory + verified`：交易所、巨潮、公司公告，可进入硬决策。\n"
+            "- `mainstream/research + verified/corroborated`：主流财经媒体或正式研报，需可追溯原文或第二来源交叉确认。\n"
+            "- `social/unknown` 或 `unverified`：只能作为待核线索，不得驱动评级、目标价、催化分或具体事件日期。\n"
+            "- 每条 key_event 必须保留来源名、URL（工具有则填）、公告/文档 ID（有则填）和验证状态。禁止把转述文章伪装成公告原文。\n"
+            "- 半年度报告若无交易所预约日，event_date 填法定最晚日 YYYY-08-31；三季报填 YYYY-10-31。业绩预告公告使用实际发布日期，不得写成未来季度。\n\n"
             "## 关键硬数据提取（驱动 thesis 的数字，必输出）\n\n"
             "投研判一个 thesis 成不成立，最终落到**可验证的硬数字**，不是定性描述。从研报/公告/"
             "调研里把驱动逻辑的**量化指标**抽出来单列（有则列，无则填'未识别到硬数据'，**禁止编造/估算**）：\n\n"
@@ -213,11 +219,17 @@ def create_news_analyst(llm):
             "    - title: <≤30 字>\n"
             "      category: 公司 / 行业 / 宏观 / 机构\n"
             "      event_date: <预期发生/验证日期：YYYY-MM-DD（精确）或 2026Q3（季度）或 未知>\n"
+            "      event_date_basis: official_reservation / legal_deadline / publication_date / reported / unknown\n"
             "      source_date: <该新闻的见报/发布日期：YYYY-MM-DD，从工具返回的新闻时间戳取；未知填 未知>\n"
             "      horizon: 短期(≤1周) / 中期(1-3月) / 长期(>3月)\n"
             "      priced_in_p: <0-100>\n"
             "      impact: +大 / +中 / +小 / 0 / -小 / -中 / -大\n"
             "      credibility: 高 / 中 / 低\n"
+            "      source_tier: official / regulatory / mainstream / research / social / unknown\n"
+            "      source_name: <来源名称或 未知>\n"
+            "      source_url: <原文 URL 或 null>\n"
+            "      document_id: <公告/文档 ID 或 null>\n"
+            "      verification_status: verified / corroborated / unverified\n"
             "      thesis_relevance: 核心 / 相关 / 边缘     # 该事件对投资逻辑(thesis)的相关度\n"
             "      second_order_chain: <≤50 字描述二阶传导链路，无则填 null>\n"
             "  cumulative_patterns:\n"
@@ -230,6 +242,7 @@ def create_news_analyst(llm):
             "      implication: 利好 / 利空 / 中性\n"
             "  research_consensus_rating: BUY / HOLD / SELL / null\n"
             "  research_consensus_target_price: <数值或 null>\n"
+            "  research_consensus_as_of: <最新纳入研报的发布日期 YYYY-MM-DD 或 null>\n"
             "  data_implied_direction: 偏多 / 偏空 / 中性  # 数据真实隐含方向（穿透措辞）\n"
             "  data_implied_reasoning: <≤30 字说明>\n"
             "```\n\n"
@@ -237,6 +250,9 @@ def create_news_analyst(llm):
             '- 字段缺失时填 null 或 "不适用"，不允许省略字段名\n'
             "- 取值必须落在 schema 允许的集合内\n"
             "- 数值字段保留 2 位小数；百分比字段直接填数字（不带 % 符号）\n"
+            "- `event_date_basis=official_reservation` 仅限已核对交易所/巨潮预约披露来源，且必须同时提供可信官方 URL 与 document_id；否则使用 legal_deadline 或 unknown\n"
+            "- 卖方一致评级/目标价只能使用分析日及以前发布的研报，`research_consensus_as_of` 必须填写最新纳入研报的真实发布日期\n"
+            "- 列表中的整项文本如需引号，必须把整句完整放在同一对引号内；禁止在右引号后继续正文\n"
             "- 该 SUMMARY 块是下游 RM / 风控团队的核心信息源，宁缺勿错\n"
         )
 
@@ -290,7 +306,7 @@ def create_news_analyst(llm):
                         + "）\n"
                     )
                 # 催化日历（步骤1）：thesis 相关的有方向事件，按日期排——供 PM 时间止损/监控直读
-                cal = aggregate_catalyst_calendar(report)
+                cal = aggregate_catalyst_calendar(report, current_date=current_date)
                 if cal:
                     lines = "\n".join(
                         f"  - {c['date']} | {c['direction']} {c['impact']} | {c['thesis_relevance']}"

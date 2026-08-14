@@ -10,19 +10,21 @@ def test_high_risk_forces_wait_and_caps_position():
     })
 
     assert result["effective_action"] == "WAIT"
-    assert result["effective_size_low_pct"] == 3
-    assert result["effective_size_high_pct"] == 3
+    assert result["effective_size_low_pct"] == 0
+    assert result["effective_size_high_pct"] == 0
+    assert result["position_cap_pct"] == 3
 
 
-def test_medium_risk_keeps_conditional_entry_but_caps_size():
+def test_medium_risk_waits_now_but_preserves_future_conditional_cap():
     result = apply_market_risk_gate.invoke({
         "entry_gate": "CONDITIONAL", "position_cap_pct": 6,
         "proposed_action": "BUY_NOW", "proposed_size_low_pct": 4, "proposed_size_high_pct": 12,
     })
 
-    assert result["effective_action"] == "CONDITIONAL"
-    assert result["effective_size_low_pct"] == 4
-    assert result["effective_size_high_pct"] == 6
+    assert result["effective_action"] == "WAIT"
+    assert result["effective_size_low_pct"] == 0
+    assert result["effective_size_high_pct"] == 0
+    assert result["position_cap_pct"] == 6
 
 
 def test_warning_orange_uses_existing_conditional_vocabulary_and_three_percent_cap():
@@ -31,9 +33,10 @@ def test_warning_orange_uses_existing_conditional_vocabulary_and_three_percent_c
         "proposed_action": "BUY_NOW", "proposed_size_low_pct": 2, "proposed_size_high_pct": 8,
     })
 
-    assert result["effective_action"] == "CONDITIONAL"
-    assert result["effective_size_low_pct"] == 2
-    assert result["effective_size_high_pct"] == 3
+    assert result["effective_action"] == "WAIT"
+    assert result["effective_size_low_pct"] == 0
+    assert result["effective_size_high_pct"] == 0
+    assert result["position_cap_pct"] == 3
 
 
 def test_warning_unknown_uses_existing_wait_vocabulary():

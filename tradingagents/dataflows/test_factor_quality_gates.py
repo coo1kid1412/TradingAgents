@@ -5,6 +5,7 @@ Run: .venv/bin/python tradingagents/dataflows/test_factor_quality_gates.py
 
 from tradingagents.dataflows.factor_calc import anticrowding_score, growth_score
 from tradingagents.dataflows.capital_flow_utils import compute_capital_flow_score
+from tradingagents.agents.utils.quant_score_node import _parse_fundamentals
 
 
 def test_recurring_loss_caps_headline_growth_score():
@@ -36,6 +37,22 @@ def test_recent_outflow_and_holder_spread_cap_stale_capital_flow_strength():
     score, detail = compute_capital_flow_score(metrics, "中性")
     assert score <= 55, (score, detail)
     assert detail["recent_contradiction_cap"] == "5d流出+股东户数扩散 → ≤55"
+
+
+def test_quant_roe_requires_an_explicit_annual_or_ttm_basis():
+    raw = "| 净资产收益率 | 6.31 | 4.20 |"
+    unknown = _parse_fundamentals(raw, "")
+    assert unknown["roe_ttm_pct"] is None
+    assert unknown["roe_basis"] == "unknown"
+
+    report = """```yaml
+SUMMARY:
+  roe: 23.84
+  roe_basis: ttm
+```"""
+    normalized = _parse_fundamentals(raw, report)
+    assert normalized["roe_ttm_pct"] == 23.84
+    assert normalized["roe_basis"] == "ttm"
 
 
 if __name__ == "__main__":

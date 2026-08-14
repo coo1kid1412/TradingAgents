@@ -53,6 +53,7 @@ from .tushare_vendor import (
     get_news as get_tushare_news,
     get_global_news as get_tushare_global_news,
     get_insider_transactions as get_tushare_insider_transactions,
+    get_performance_forecasts as get_tushare_performance_forecasts,
     get_capital_flow as get_tushare_capital_flow,
     get_holder_number as get_tushare_holder_number,
     get_north_hold as get_tushare_north_hold,
@@ -104,6 +105,7 @@ TOOLS_CATEGORIES = {
             "get_global_news",
             "get_insider_transactions",
             "get_announcements",
+            "get_performance_forecasts",
             "get_cls_telegraph",
             "get_research_reports",
         ]
@@ -148,6 +150,7 @@ _A_SHARE_METHOD_VENDOR_ORDER = {
     "get_news": _A_SHARE_NEWS_ORDER,
     "get_global_news": _A_SHARE_NEWS_ORDER,
     "get_announcements": _A_SHARE_NEWS_ORDER,
+    "get_performance_forecasts": _A_SHARE_MARKET_FINANCE_ORDER,
     "get_cls_telegraph": _A_SHARE_NEWS_ORDER,
     "get_research_reports": _A_SHARE_NEWS_ORDER,
 }
@@ -215,6 +218,10 @@ VENDOR_METHODS = {
     # announcements (A-share only, 巨潮资讯)
     "get_announcements": {
         "akshare": get_akshare_announcements,
+    },
+    # Structured exchange-filed earnings forecasts (A-share only).
+    "get_performance_forecasts": {
+        "tushare": get_tushare_performance_forecasts,
     },
     # CLS telegraph (财联社电报)
     "get_cls_telegraph": {

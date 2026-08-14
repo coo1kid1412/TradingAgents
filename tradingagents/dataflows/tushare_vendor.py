@@ -1250,6 +1250,41 @@ def get_news(
     return header + csv_string
 
 
+def get_performance_forecasts(
+    ticker: Annotated[str, "ticker symbol of the company"],
+    start_date: Annotated[str, "Start announcement date yyyy-mm-dd"],
+    end_date: Annotated[str, "End announcement date yyyy-mm-dd"],
+) -> str:
+    """Return structured A-share earnings forecasts filed with exchanges."""
+    pro = _get_tushare_api()
+    ts_code = to_tushare_format(ticker)
+    fields = (
+        "ts_code,ann_date,end_date,type,p_change_min,p_change_max,"
+        "net_profit_min,net_profit_max,last_parent_net,first_ann_date,"
+        "summary,change_reason"
+    )
+    df = _safe_call(
+        pro.forecast,
+        ts_code=ts_code,
+        start_date=to_akshare_date(start_date),
+        end_date=to_akshare_date(end_date),
+        fields=fields,
+        api_name="forecast",
+    )
+    if df is None or df.empty:
+        return f"未找到 {ticker} 在 {start_date} 至 {end_date} 发布的业绩预告"
+
+    ordered = [name for name in fields.split(",") if name in df.columns]
+    table = df.loc[:, ordered].to_csv(index=False)
+    return (
+        f"# Performance Forecasts for {ticker}\n"
+        "# Source: Tushare Pro forecast (exchange-filed announcement fields)\n"
+        f"# Announcement date range: {start_date} to {end_date}\n"
+        "# net_profit_min/max unit: 万元; p_change_min/max unit: %\n\n"
+        f"{table}"
+    )
+
+
 # ---------------------------------------------------------------------------
 # 8. get_global_news
 # ---------------------------------------------------------------------------

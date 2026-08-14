@@ -106,11 +106,19 @@ class TradingAgentsGraph:
         self.market_llm = self._create_templllm(self.config.get("temperature_market", 0.2), use_deep_think=use_deep)
         self.sentiment_llm = self._create_templllm(self.config.get("temperature_sentiment", 0.5), use_deep_think=use_deep)
         self.news_llm = self._create_templllm(self.config.get("temperature_news", 0.5), use_deep_think=use_deep)
-        self.fundamentals_llm = self._create_templllm(self.config.get("temperature_fundamentals", 0.2), use_deep_think=use_deep)
+        self.fundamentals_llm = self._create_templllm(
+            self.config.get("temperature_fundamentals", 0.2),
+            use_deep_think=use_deep,
+            max_tokens_override=self.config.get("fundamentals_analyst_max_tokens"),
+        )
         # 交易员：默认 quick_think（优化01后只做执行评估），可通过 use_deep_for_trader 回退
         self.trader_llm = self._create_templllm(self.config.get("temperature_trader", 0.3), use_deep_think=self.config.get("use_deep_for_trader", False))
         # RM/PM：固定 deep_think，最终决策推理需要深度
-        self.research_manager_llm = self._create_templllm(self.config.get("temperature_research_manager", 0.3), use_deep_think=True)
+        self.research_manager_llm = self._create_templllm(
+            self.config.get("temperature_research_manager", 0.3),
+            use_deep_think=True,
+            max_tokens_override=self.config.get("research_manager_max_tokens"),
+        )
         # PM 单独提升 max_tokens：14 章节报告 + Trade Ticket 决策卡输出长，全局 8192 频繁截断
         self.portfolio_manager_llm = self._create_templllm(
             self.config.get("temperature_portfolio_manager", 0.3),

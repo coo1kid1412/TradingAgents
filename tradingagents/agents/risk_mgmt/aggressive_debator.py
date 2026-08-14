@@ -1,4 +1,8 @@
+import json
+
 from tradingagents.agents.utils.agent_utils import RISK_DEBATE_PHRASING_RULES
+from tradingagents.agents.utils.risk_context import build_risk_data_packet
+from tradingagents.agents.risk_mgmt.risk_response import invoke_risk_response
 
 
 def create_aggressive_debator(llm):
@@ -13,6 +17,7 @@ def create_aggressive_debator(llm):
         # trader_decision 已废弃（optimization 05），改为只引用 RM 方案
         # trader_decision = state["trader_investment_plan"]  # DEPRECATED in 05
         investment_plan = state.get("investment_plan", "")
+        risk_data_packet = build_risk_data_packet(state)
 
         prompt = f"""【语言要求】你必须使用中文进行以下所有风险辩论和分析。股票代码和技术指标名称可保留英文。
 
@@ -27,9 +32,16 @@ def create_aggressive_debator(llm):
 - 你不是在做方向判断——那是投研团队的职责
 - 你关注的是"即便方向正确，执行过程中会不会翻车"
 - 不要为 RM 方案辩护——你的职责是找执行漏洞，不是唱赞歌
+- 若没有组合 AUM、计划成交金额、日均成交额或 ATR，禁止假设账户规模、成交占比、冲击成本百分比；只能列为待补数据
+- 只有存在报告内可追溯的成交额/ATR/涨跌停数据时，才允许给出仓位上限
 
 **Research Manager 的投资方案（含评级、评分、价位区间、执行可行性、风控审查指引）：**
 {investment_plan}
+
+**确定性风险数据包（只引用这里已有的数值，禁止补造缺失字段）：**
+```json
+{json.dumps(risk_data_packet, ensure_ascii=False, indent=2, default=str)}
+```
 
 **辩论要求**：
 以下是当前的对话历史：{history}
@@ -44,11 +56,25 @@ def create_aggressive_debator(llm):
 
 积极回应其他分析师的观点，特别是当他们的事件风险或尾部风险分析影响了执行可行性时，从流动性角度给出你的评估。特别关注 RM 方案中"风控审查指引"提到的未决问题是否涉及执行层面风险。以中文口语化方式进行辩论。
 
+正文控制在 800-1200 个中文字符内，优先保证末尾 RISK_VIEW 完整；不要输出冗长清单。
+
 {RISK_DEBATE_PHRASING_RULES}
+
+发言末尾必须输出：
+```yaml
+RISK_VIEW:
+  role: liquidity
+  severity: high / medium / low / unknown
+  cap_pct: <0-100 或 null>
+  cap_basis: <引用的成交额/ATR/执行数据；无则 null>
+  evidence_ids: [<从风险数据包 reference_ids 逐字选择；也可用 RM-PLAN>]
+  data_supported: true / false
+```
+`data_supported=false` 时 `cap_pct` 必须为 null。禁止自造 evidence_ids。
 
 **重要：请用中文进行风险辩论。** 股票代码和技术指标名称请保留英文原文。"""
 
-        response = llm.invoke(prompt)
+        response = invoke_risk_response(llm, prompt, role="liquidity")
 
         argument = f"Aggressive Analyst: {response.content}"
 

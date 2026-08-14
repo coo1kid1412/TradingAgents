@@ -22,6 +22,45 @@ logger = logging.getLogger(__name__)
 _MAX_TOOL_ITERATIONS = 15
 
 
+def _compact_finalization_prompt(
+    initial_messages: list,
+    tool_results: list[str],
+    completion_token: str,
+) -> str:
+    """Build a short artifact-only retry after a reasoning-only response."""
+    original = "\n".join(
+        str(getattr(message, "content", "") or "") for message in initial_messages
+    )
+    schema_blocks = re.findall(
+        rf"```yaml\s*\n({re.escape(completion_token)}:.*?)(?:\n```|\Z)",
+        original,
+        re.S,
+    )
+    schema = schema_blocks[-1] if schema_blocks else f"{completion_token}: <完整字段>"
+    evidence_ids = sorted(set(re.findall(
+        r"\b(?:MKT|FUND|NEWS|SENT|QUANT|SECTOR|RISK)-[A-Z0-9-]+\b",
+        original,
+    )))
+    compact_results = "\n".join(tool_results)[-16000:] or "无工具结果"
+    return f"""你正在生成投资研究流程的最终交付件。内部分析已经完成。
+
+只输出可交付正文，禁止输出 <think>、内部思维过程、工具调用或过程说明。
+正文控制在 1200 个中文字以内，包含：长期评级、12个月目标价区间、核心依据、
+关键反证条件，以及为什么不是更高或更低一档评级。最后必须输出完整可解析的 YAML。
+
+允许引用的证据 ID：{', '.join(evidence_ids) or '无'}
+
+已有确定性工具结果：
+{compact_results}
+
+YAML 字段模板（字段不可省略，缺失填 null）：
+```yaml
+{schema}
+```
+
+现在直接输出最终交付件。"""
+
+
 def _profile_scalar(profile: str, key: str):
     match = re.search(rf"(?m)^{re.escape(key)}:\s*([^\n（|]+)", profile or "")
     return match.group(1).strip() if match else None
@@ -194,8 +233,10 @@ def _run_tool_calling_loop(llm_with_tools, initial_messages, *,
 
     messages = list(initial_messages)
     cot_segments: list[str] = []
+    tool_result_summaries: list[str] = []
     continuations = 0
     iteration = 0
+    finalization_requested = False
 
     while iteration < hard_cap:
         iteration += 1
@@ -225,6 +266,7 @@ def _run_tool_calling_loop(llm_with_tools, initial_messages, *,
                 try:
                     result = tool.invoke(tool_args)
                     result_str = json.dumps(result, ensure_ascii=False) if isinstance(result, dict) else str(result)
+                    tool_result_summaries.append(f"{tool_name}: {result_str[:3000]}")
                     logger.debug("%s 工具 %s 结果: %s", role, tool_name, result_str[:200])
                     messages.append(ToolMessage(content=result_str, tool_call_id=tool_id))
                 except Exception as e:
@@ -233,7 +275,8 @@ def _run_tool_calling_loop(llm_with_tools, initial_messages, *,
                     messages.append(ToolMessage(content=error_msg, tool_call_id=tool_id))
 
             # 工具轮数到达上限：要求收笔（仍允许它在续写检查中被抓回来）
-            if iteration == max_iterations:
+            if iteration >= max_iterations and not finalization_requested:
+                finalization_requested = True
                 logger.warning("%s 达到工具调用上限 (%d 轮)，要求直接收笔", role, max_iterations)
                 messages.append(HumanMessage(
                     content="你已经调用足够多次工具了。请基于已有的工具结果直接写出最终报告，"
@@ -262,13 +305,18 @@ def _run_tool_calling_loop(llm_with_tools, initial_messages, *,
             reason = f"截断（{completion_token} 不完整或无法解析）"
         logger.warning("%s 输出正文%s（疑似 think-only 被剥离），第 %d 次续写",
                        role, reason, continuations)
-        messages.append(HumanMessage(
-            content=f"你的报告正文{reason}——可能你把内容写进了思考过程。"
-                    f"若正文缺失则从中断处继续，不要重复正文；若 {completion_token} 已出现但不完整，"
-                    f"请重新完整输出整个 {completion_token} YAML，不要续写残片。不要输出思考标签；"
-                    f"尚未完成的步骤继续完成（该调用的工具照常调用），最后必须以完整且可解析的 "
-                    f"{completion_token} YAML 段收尾。"
-        ))
+        if not joined.strip() and finalization_requested:
+            messages = [HumanMessage(content=_compact_finalization_prompt(
+                initial_messages, tool_result_summaries, completion_token,
+            ))]
+        else:
+            messages.append(HumanMessage(
+                content=f"你的报告正文{reason}——可能你把内容写进了思考过程。"
+                        f"若正文缺失则从中断处继续，不要重复正文；若 {completion_token} 已出现但不完整，"
+                        f"请重新完整输出整个 {completion_token} YAML，不要续写残片。不要输出思考标签；"
+                        f"尚未完成的步骤继续完成（该调用的工具照常调用），最后必须以完整且可解析的 "
+                        f"{completion_token} YAML 段收尾。"
+            ))
 
     # —— 续写预算用尽 ——
     joined = "\n\n".join(cot_segments)
@@ -332,13 +380,13 @@ def create_research_manager(llm):
 冲突下钻和数值复核；引用无效、过期或不存在的 ID 等同于未引用。关键论据正文也应标注证据 ID。
 `SYS_*`、字段名和 `compute_*` 都不是证据 ID；工具结果可用于计算，但不能冒充归因证据。
 
-你的工作是：**走完整 8 步 COT 思考链路，最后给出主观但 COT 透明的评级**。多空辩论是"已识别的争议点清单"，给 PM 做仓位参考，**不主导评级方向**。
+你的工作是：**内部完成 8 步分析，外部只输出可核验的证据链摘要与最终评级**。多空辩论是"已识别的争议点清单"，给 PM 做仓位参考，**不主导评级方向**。
 
 ## 你的角色边界
 
 - 只输出 thesis：评级 + 目标价区间 + 业绩拐点判断 + 风险清单
 - 不输出执行细节：建仓价/止损价/仓位比例由 PM 决定
-- 评级是综合判断，必须 COT 透明（能说清楚"为什么是这个评级而不是其他"）
+- 评级是综合判断；只输出简明理由、关键证据和反证条件，不输出私有思维过程
 
 ## ⚠️ 数值计算必须调用工具（全局约束，下面每步不再重复说明）
 
@@ -359,7 +407,7 @@ def create_research_manager(llm):
 
 ---
 
-# 决策流程（必须严格按 8 步 COT 顺序完成）
+# 决策流程（内部按 8 步完成，对外用结论与证据摘要呈现）
 
 ## 第负一步：地雷排查清单（守门员一票否决）
 
@@ -412,7 +460,8 @@ def create_research_manager(llm):
 用法：market_mode 只控制 AI 主升升档权限，不直接改变长期评级方向。
 - `risk_on`：允许 AI 主升 confirmed 完整升档。
 - `conditional`：只允许 AI 主升轻度升档，不允许追成 BUY。
-- `risk_off`：AI 主升升档禁用；缺失快照也按 risk_off。
+- `risk_off`：AI 主升升档禁用。
+- `unknown`：快照缺失或不可判定；不贴偏空标签，但执行层锁定为 WAIT / 新仓 0%，AI 主升升档禁用。
 
 ### 0.3C 确定性短线结构与入场时机（只管时机，不管评级）
 
@@ -448,8 +497,8 @@ stock_profile 末尾的 `TRANSPARENCY:` 段是 LLM 自填的"超共识程度标�
 | TRANSPARENCY 字段 | 触发条件 | 你的应对 |
 |------------------|---------|---------|
 | `target_pe_high_vs_sell_side_pct` > +50 | 超卖方一致 +50% 以上 | 必须在 Step 7 Conviction 降一档（除非 stock_profile.premium_divergence_reason 列出 ≥2 条产业证据）|
-| `target_pe_high_vs_sell_side_pct` > +100 | 超卖方一致 +100% | Conviction 强制最高"中"，且 Step 6 评级 COT 必须明确写"超共识溢价风险" |
-| `theme_stage_llm_chosen` ≠ `theme_stage_inferred_by_data` | LLM 选的 theme_stage 与量化推断不同 | 必须显式引用 `theme_divergence_reason`，并在 Step 6 评级 COT 里说明是否采纳 LLM 主观判断 |
+| `target_pe_high_vs_sell_side_pct` > +100 | 超卖方一致 +100% | Conviction 强制最高"中"，且 Step 6 评级摘要必须明确写"超共识溢价风险" |
+| `theme_stage_llm_chosen` ≠ `theme_stage_inferred_by_data` | LLM 选的 theme_stage 与量化推断不同 | 必须显式引用 `theme_divergence_reason`，并在 Step 6 评级摘要里说明是否采纳 LLM 主观判断 |
 | `premium_llm_chosen` > `premium_default_template` + 20 | LLM 选的 premium 超默认表 20pp 以上 | 检查 `premium_divergence_reason` 是否有硬数据支撑；无支撑则 Conviction 降一档 |
 | 三源 PE 全部缺失（null）| 卖方/历史/同业都无 PE 参照 | data_completeness 必须标注 L3，Conviction 强制"低" |
 | `peer_anchor_single_comp` = true | 兄弟股可比仅 1 家（单标的低置信，无第二家纠偏）| Step 7 Conviction **减一档**（估值锚靠单一可比，可靠性打折）|
@@ -474,7 +523,7 @@ stock_profile 末尾的 `TRANSPARENCY:` 段是 LLM 自填的"超共识程度标�
 - 本股 vs 大盘指数（沪深300/科创50/创业板）的 RS
 
 **用法**：
-- **Step 6 第三步评级 COT 时强制引用一句**：例如 "板块 RS 30d +X% 跑赢大盘 / 主题内排名第 N / 板块β 主导"
+- **Step 6 第三步评级摘要强制引用一句**：例如 "板块 RS 30d +X% 跑赢大盘 / 主题内排名第 N / 板块β 主导"
 - **作为评级的"反方力量"**：估值偏高时，如果板块 RS 强 + 主题内排名靠前 → Conviction 降一档但不机械改评级；
   反之估值偏高 + 板块 RS 弱 + 主题内排名靠后 → 强化 SELL 信号
 - **fallback 路径透明**：报告头部已经显示了"层级 1→2→3→4"的匹配链路，根据匹配级别判定信号可靠度
@@ -731,7 +780,7 @@ bull_target / base_target / bear_target → 你刚设计的三情景目标价
 
 **评级终段是一次合议，不是流水线**。动态阈值 → 估值五档映射 → regime 闸门 → PEG 低置信收敛 → 拥挤度 → 对称升降档 → 趋势叠加 → 极端背离防御 → 全链不变量终检，全部在 `compute_step6_final_rating` **一次工具调用**内按固定顺序执行（历史教训：这九道关卡分步执行且互相不知情时，出过"ride 托底的 HOLD 被趋势叠加再升成 OVERWEIGHT——偏离 +133% 的票评级看多"和"拥挤多头禁 BUY 被叠加绕回 BUY"两类事故）。
 
-你的工作只有三件：① 备齐输入（全部直读，来源见下表）；② 真正发起这一次工具调用；③ 写评级 COT 解释链路。
+你的工作只有三件：① 备齐输入（全部直读，来源见下表）；② 真正发起这一次工具调用；③ 写简明评级摘要解释链路。
 
 ⛔ **严禁narrate**：必须真正发起 `compute_step6_final_rating` 工具调用并采用其返回的 `final_rating`，禁止手写伪 JSON 自圆其说——伪造的返回一律视为无效，评级作废。
 ⛔ **无人工微调通道**：旧版"例外情形可 ±1 档"已全部收进工具（业绩拐点 / 数据完整度 / 红旗 / 拥挤度都是工具入参）。若认为评级不合理，唯一合法途径是回头修改 Step 4 估值并重新调工具，禁止在工具输出之外加减档、禁止"短期透支 / 估值消化 / 市场情绪"式的主观改判。
@@ -771,7 +820,7 @@ bull_target / base_target / bear_target → 你刚设计的三情景目标价
 | earnings_revision | 画像末尾 `SYS_EARNINGS_REVISION:` 行 | 上修 / 下修 / 停修；无此行填 "" |
 | ai_main_uptrend | 画像末尾 `SYS_AI_MAIN_UPTREND_ENABLED:` 行 | true/false。AI 算力链主升兑现资格，Python 确定性输出；无此行填 false |
 | ai_main_uptrend_class | 画像末尾 `SYS_AI_MAIN_UPTREND_CLASS:` 行 | confirmed / early / none；无此行填 "" |
-| market_mode | 本 prompt 0.3B 派生值 | 必须填 `{market_mode}`；缺失快照时为 risk_off，禁止自行改乐观 |
+| market_mode | 本 prompt 0.3B 派生值 | 必须填 `{market_mode}`；缺失快照时为 unknown，禁止自行改成 risk_on/conditional |
 | inflection_confirmed_recent | 业绩拐点是否刚被新数据（如刚出的季报）确认 | true 时极端背离防御跳过（量化锚滞后于新数据） |
 | cyclical_class | 画像末尾 `SYS_CYCLICAL_CLASS:` 行 | strong / semi；非周期股（无此行）填 "" |
 | cycle_position | 画像末尾 `SYS_CYCLICAL_POSITION:` 行 | top / mid / trough；无此行填 ""。工具内周期修正：顶部禁升档+正向叠加钳零（顶部要下车不是骑），谷底『拐点衰退』降档静音（谷底盈利差是常态，不追杀） |
@@ -799,9 +848,9 @@ bull_target / base_target / bear_target → 你刚设计的三情景目标价
 > 工具返回：阈值 ±__/±__ | 偏离 __% | rating_raw=__ → regime 闸门 __ → 拥挤 __ → 升降档 __ → AI主升 __ → 趋势叠加 __（style __ / vote __ / catalyst __）→ 极端防御 __ → 不变量终检 → **final_rating = __**
 > 边界与不变量：__（照抄工具返回 bounds.sources 与 stages.e_sign_invariant.note）
 
-### 第三步：评级 COT（200-300 字）
+### 第三步：评级证据摘要（200-300 字）
 
-写一段 200-300 字的『评级 COT』，解释工具链路的判断为什么成立，必须包含：
+写一段 200-300 字的评级证据摘要，解释工具链路的判断为什么成立，必须包含：
 
 1. **当前价 vs 综合目标价区间**的位置（结合动态阈值，区间下沿/区间内/区间上沿/超出区间）
 2. **业绩拐点判断**对评级的支撑/反对
@@ -928,7 +977,7 @@ Hard Data 修正：yes 不变；no × 0.5
 
 ## 二、核心 Thesis（200 字内）
 
-复述 Step 6 的评级 COT，但更精炼。引用 Step 4 估值交叉 + Step 3 拐点判断 + Step 5 三情景为主线。
+复述 Step 6 的评级证据摘要，但更精炼。引用 Step 4 估值交叉 + Step 3 拐点判断 + Step 5 三情景为主线。
 
 ## 三、3-5 条最关键论据
 
@@ -969,7 +1018,7 @@ Hard Data 修正：yes 不变；no × 0.5
 **重要：请用中文撰写你的 thesis 报告。** 评级关键词（Buy/Overweight/Hold/Underweight/Sell）和股票代码请保留英文原文。
 
 **最后提醒**：
-- 你的评级是 8 步 COT 综合判断的产出，**不是 d 阈值的公式输出**
+- 你的评级是 8 步综合判断的产出，**不是 d 阈值的公式输出**
 - 多空辩论评分只影响 Conviction，不影响评级方向
 - 你只出 thesis，不出执行细节（建仓价/止损/仓位由 PM 决定）
 
@@ -978,7 +1027,7 @@ Hard Data 修正：yes 不变；no × 0.5
 ## ⚠️ 报告末尾强制输出 RM_SUMMARY YAML（用于 harness 自动归档）
 
 报告**完成后**，必须在最末尾输出一段 YAML 摘要，**字段名严格按以下格式**，否则归档失败。
-所有数值直接采用 8 步 COT 工具调用得到的结果，不要再调整。
+所有数值直接采用 8 步工具调用得到的结果，不要再调整。
 
 ```yaml
 RM_SUMMARY:

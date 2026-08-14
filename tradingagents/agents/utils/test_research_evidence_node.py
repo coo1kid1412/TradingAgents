@@ -42,6 +42,9 @@ def _complete_state() -> dict:
   growth_yoy_revenue: 31.2
   growth_yoy_profit: 47.8
   roe: 12.4
+  roe_basis: ttm
+  financial_period: 2026Q1
+  data_quality_flags: []
   earnings_quality: 高
   governance_score: 高
   red_flags: []
@@ -61,6 +64,11 @@ def _complete_state() -> dict:
       priced_in_p: 40
       impact: +中
       credibility: 高
+      source_tier: official
+      source_name: 巨潮资讯
+      source_url: https://static.cninfo.com.cn/finalpage/CNINFO-20260811-01.pdf
+      document_id: CNINFO-20260811-01
+      verification_status: verified
       thesis_relevance: 核心
     - title: 新平台获批
       category: 公司
@@ -70,9 +78,15 @@ def _complete_state() -> dict:
       priced_in_p: 40
       impact: +中
       credibility: 高
+      source_tier: official
+      source_name: 巨潮资讯
+      source_url: https://static.cninfo.com.cn/finalpage/CNINFO-20260811-01.pdf
+      document_id: CNINFO-20260811-01
+      verification_status: verified
       thesis_relevance: 核心
   research_consensus_rating: BUY
   research_consensus_target_price: 96.0
+  research_consensus_as_of: 2026-08-12
   data_implied_direction: 偏多
   data_implied_reasoning: 催化尚未充分定价""",
         ),
@@ -123,6 +137,8 @@ def test_compiler_builds_stable_cards_and_deduplicates_events():
     assert by_id["MKT-STRUCT-01"]["decision_variable"] == "entry_timing"
     assert by_id["MKT-STRUCT-01"]["direction"] == "bullish"
     assert by_id["FUND-GROWTH-01"]["decision_variable"] == "earnings_outlook_12m"
+    assert by_id["FUND-GROWTH-01"]["as_of"] == "2026-03-31"
+    assert "财务期间=2026Q1" in by_id["FUND-GROWTH-01"]["claim"]
     assert by_id["FUND-VAL-01"]["decision_variable"] == "target_price"
     assert by_id["NEWS-CAT-01"]["direction"] == "bullish"
     assert by_id["QUANT-COMP-01"]["direction"] == "bullish"
@@ -130,6 +146,44 @@ def test_compiler_builds_stable_cards_and_deduplicates_events():
     assert by_id["RISK-GATE-01"]["decision_variable"] == "position"
     assert [card["claim_id"] for card in ledger["cards"]].count("NEWS-CAT-01") == 1
     assert "NEWS-CAT-02" not in by_id
+    assert ledger["analysis_status"] == "partial"
+
+
+def test_reporting_deadline_is_explicitly_labeled_not_presented_as_event_date():
+    state = _complete_state()
+    state["news_report"] = state["news_report"].replace(
+        "title: 新平台获批\n      category: 公司\n      event_date: 2026Q3",
+        "title: 2026年第三季度报告\n      category: 公司\n      event_date: 2026-10-26",
+    )
+    ledger = compile_research_evidence(state)
+    card = next(card for card in ledger["cards"] if card["claim_id"] == "NEWS-CAT-01")
+    assert card["date_basis"] == "legal_deadline"
+    assert "法定最晚披露日=2026-10-31（非预约日）" in card["claim"]
+
+
+def test_self_declared_official_event_without_trusted_reference_is_not_decision_grade():
+    state = _complete_state()
+    state["news_report"] = state["news_report"].replace(
+        "https://static.cninfo.com.cn/finalpage/CNINFO-20260811-01.pdf",
+        "https://example.com/fake.pdf",
+    )
+    ledger = compile_research_evidence(state)
+    card = next(card for card in ledger["cards"] if card["claim_id"] == "NEWS-CAT-01")
+    assert card["decision_eligible"] is False
+    assert card["quality_status"] == "partial"
+
+
+def test_recovered_yaml_is_audited_as_partial_instead_of_silent_valid():
+    state = _complete_state()
+    state["news_report"] = state["news_report"].replace(
+        "  data_implied_reasoning: 催化尚未充分定价",
+        '  data_implied_reasoning: 催化尚未充分定价\n  cumulative_patterns:\n    - "公告利好"但价格未确认',
+    )
+    ledger = compile_research_evidence(state)
+    assert ledger["coverage"]["news"] == "partial"
+    news = next(card for card in ledger["cards"] if card["claim_id"] == "NEWS-CAT-01")
+    assert news["quality_status"] == "partial"
+    assert any("自动修复" in warning for warning in ledger["warnings"])
 
 
 def test_unknown_news_date_and_t_minus_one_price_are_partial():
@@ -147,6 +201,48 @@ def test_unknown_news_date_and_t_minus_one_price_are_partial():
 
     assert by_id["MKT-TREND-01"]["quality_status"] == "partial"
     assert by_id["NEWS-CAT-01"]["quality_status"] == "partial"
+
+
+def test_social_news_is_a_lead_not_decision_grade_evidence():
+    state = _complete_state()
+    state["news_report"] = state["news_report"].replace(
+        "source_tier: official\n      source_name: 巨潮资讯\n"
+        "      source_url: https://static.cninfo.com.cn/finalpage/CNINFO-20260811-01.pdf\n"
+        "      document_id: CNINFO-20260811-01\n"
+        "      verification_status: verified",
+        "source_tier: social\n      source_name: 雪球用户\n"
+        "      source_url: https://xueqiu.com/example\n"
+        "      document_id: null\n      verification_status: unverified",
+    )
+
+    ledger = compile_research_evidence(state)
+    card = next(card for card in ledger["cards"] if card["claim_id"] == "NEWS-CAT-01")
+
+    assert card["source_tier"] == "social"
+    assert card["verification_status"] == "unverified"
+    assert card["decision_eligible"] is False
+    assert card["quality_status"] == "partial"
+
+    table = render_decision_attribution(
+        _pm_summary(long_term_evidence_ids="NEWS-CAT-01"),
+        {"effective_action": "继续观察"},
+        ledger,
+        rm_content=_rm_summary(),
+    )
+    assert "剔除不可用于硬决策的证据 NEWS-CAT-01" in table
+
+
+def test_missing_market_risk_is_unknown_not_bearish_evidence():
+    state = _complete_state()
+    state["market_risk_snapshot"] = {}
+
+    ledger = compile_research_evidence(state)
+    card = next(card for card in ledger["cards"] if card["claim_id"] == "RISK-GATE-01")
+
+    assert card["direction"] == "neutral"
+    assert card["decision_eligible"] is False
+    assert card["quality_status"] == "invalid"
+    assert ledger["analysis_status"] == "incomplete"
 
 
 def test_future_dated_evidence_is_invalid_to_prevent_lookahead():
@@ -173,9 +269,11 @@ def test_missing_market_risk_still_emits_fail_closed_position_evidence():
     by_id = {card["claim_id"]: card for card in ledger["cards"]}
 
     assert by_id["RISK-GATE-01"]["decision_variable"] == "position"
-    assert by_id["RISK-GATE-01"]["quality_status"] == "partial"
+    assert by_id["RISK-GATE-01"]["quality_status"] == "invalid"
+    assert by_id["RISK-GATE-01"]["direction"] == "neutral"
+    assert by_id["RISK-GATE-01"]["decision_eligible"] is False
     assert "WAIT" in by_id["RISK-GATE-01"]["claim"]
-    assert ledger["coverage"]["risk"] == "partial"
+    assert ledger["coverage"]["risk"] == "invalid"
 
 
 def test_valuation_zone_maps_low_to_bullish_and_high_to_bearish():
@@ -288,6 +386,7 @@ def _pm_summary(**overrides) -> str:
         "pm_tp1": "96",
         "pm_tp2": "104",
         "pm_tp3": "112",
+        "short_term_trend": "上涨",
         "short_term_evidence_ids": "MKT-TREND-01|RISK-GATE-01",
         "long_term_evidence_ids": "FUND-GROWTH-01|NEWS-CAT-01",
         "position_evidence_ids": "RISK-GATE-01",
@@ -308,7 +407,11 @@ RM_SUMMARY:
 
 
 def test_attribution_renderer_marks_valid_partial_missing_and_unauthorized_refs():
-    ledger = compile_research_evidence(_complete_state())
+    state = _complete_state()
+    state["fundamentals_report"] = state["fundamentals_report"].replace(
+        "financial_period: 2026Q1", "financial_period: unknown"
+    )
+    ledger = compile_research_evidence(state)
     content = _pm_summary(
         short_term_evidence_ids="MKT-TREND-01|DOES-NOT-EXIST",
         position_evidence_ids="FUND-GROWTH-01",
@@ -322,9 +425,9 @@ def test_attribution_renderer_marks_valid_partial_missing_and_unauthorized_refs(
         rm_content=_rm_summary(),
     )
 
-    assert "| 未来三日 | 等回踩 | 市场分析/风险 |" in table
+    assert "| 未来三日 | 上涨 | 市场分析/风险 |" in table
     assert (
-        "| 未来三日 | 等回踩 | 市场分析/风险 | "
+        "| 未来三日 | 上涨 | 市场分析/风险 | "
         "MKT-STRUCT-01, RISK-GATE-01, MKT-TREND-01 |" in table
     )
     assert "部分：剔除不存在的证据 DOES-NOT-EXIST" in table
@@ -375,6 +478,21 @@ def test_unknown_news_event_date_and_future_quant_date_degrade_quality():
     assert by_id["QUANT-COMP-01"]["quality_status"] == "invalid"
 
 
+def test_quant_missing_factors_degrade_composite_evidence_to_partial():
+    state = _complete_state()
+    state["quant_score"] = state["quant_score"].replace(
+        "    growth: 81",
+        "    growth: 81\n  coverage:\n    available: [momentum, quality, growth]\n    missing: [value]",
+    )
+
+    ledger = compile_research_evidence(state)
+    card = next(card for card in ledger["cards"] if card["claim_id"] == "QUANT-COMP-01")
+
+    assert card["quality_status"] == "partial"
+    assert "缺失因子=value" in card["claim"]
+    assert ledger["coverage"]["quant"] == "partial"
+
+
 def test_attribution_rejects_invalid_and_wrong_variable_cards():
     state = _complete_state()
     state["market_report"] = state["market_report"].replace(
@@ -408,7 +526,40 @@ def test_attribution_renderer_accepts_valid_authorized_references():
 
     assert "MKT-STRUCT-01, RISK-GATE-01, MKT-TREND-01" in table
     assert "| 新建仓位 | 2-3% | 风险/PM | RISK-GATE-01 | 完整 |" in table
-    assert "| 一年期评级 | OVERWEIGHT | 基本面/RM | FUND-GROWTH-01, NEWS-CAT-01 | 部分：证据不完整 |" in table
+    assert "| 一年期评级 | OVERWEIGHT | 基本面/RM | FUND-GROWTH-01, NEWS-CAT-01 | 完整 |" in table
+
+
+def test_short_term_attribution_marks_opposite_direction_as_partial():
+    ledger = compile_research_evidence(_complete_state())
+    for card in ledger["cards"]:
+        if card["claim_id"] == "MKT-TREND-01":
+            card["direction"] = "bearish"
+        elif card["claim_id"] == "MKT-STRUCT-01":
+            card["direction"] = "bullish"
+    content = _pm_summary(short_term_trend="上涨", short_term_evidence_ids="MKT-TREND-01")
+
+    table = render_decision_attribution(
+        content,
+        {"effective_action": "等待条件确认"},
+        ledger,
+        rm_content=_rm_summary(),
+    )
+
+    assert "证据方向与结论不一致" in table
+
+
+def test_sell_side_target_uses_actual_consensus_date_and_rejects_future_date():
+    state = _complete_state()
+    state["news_report"] = state["news_report"].replace(
+        "research_consensus_as_of: 2026-08-12",
+        "research_consensus_as_of: 2026-08-13",
+    )
+    ledger = compile_research_evidence(state)
+    card = next(card for card in ledger["cards"] if card["claim_id"] == "NEWS-TP-01")
+
+    assert card["as_of"] == "2026-08-13"
+    assert card["quality_status"] == "invalid"
+    assert card["decision_eligible"] is False
 
 
 if __name__ == "__main__":

@@ -14,7 +14,7 @@ ROOT = Path(__file__).resolve().parents[2]
 
 def test_initial_state_contains_empty_research_evidence_fields():
     original_resolver = propagation_module.resolve_ticker
-    original_risk_loader = propagation_module.load_market_risk_for_ticker
+    original_risk_loader = propagation_module.ensure_market_risk_for_ticker
     propagation_module.resolve_ticker = lambda _: SimpleNamespace(
         market="a_share",
         code="688114",
@@ -22,12 +22,12 @@ def test_initial_state_contains_empty_research_evidence_fields():
         name="华大智造",
         original_input="688114",
     )
-    propagation_module.load_market_risk_for_ticker = lambda *_: {}
+    propagation_module.ensure_market_risk_for_ticker = lambda *_: {}
     try:
         state = Propagator().create_initial_state("688114", "2026-08-12")
     finally:
         propagation_module.resolve_ticker = original_resolver
-        propagation_module.load_market_risk_for_ticker = original_risk_loader
+        propagation_module.ensure_market_risk_for_ticker = original_risk_loader
 
     assert state["research_evidence_ledger"] == {}
     assert state["ic_packet"] == ""

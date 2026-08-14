@@ -8,7 +8,7 @@ from tradingagents.agents.utils.agent_states import (
     RiskDebateState,
 )
 from tradingagents.dataflows.ticker_resolver import resolve_ticker
-from tradingagents.harness.market_risk import load_market_risk_for_ticker
+from tradingagents.harness.market_risk import ensure_market_risk_for_ticker
 
 logger = logging.getLogger(__name__)
 
@@ -51,7 +51,9 @@ class Propagator:
             resolved.market, normalized_ticker,
         )
 
-        market_risk_snapshot = load_market_risk_for_ticker(normalized_ticker, str(trade_date)) or {}
+        market_risk_snapshot = ensure_market_risk_for_ticker(
+            normalized_ticker, str(trade_date)
+        ) or {}
 
         return {
             "messages": [("human", company_name)],

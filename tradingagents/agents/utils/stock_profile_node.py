@@ -471,7 +471,7 @@ def create_stock_profile_node(llm):
         # 盈利预期上修/下修（新闻 SUMMARY 粗代理）——喂 earnings 腿，让前瞻修正中和后视镜减速。
         # 对标投研：revision 方向才是成长股"骑还是收"的真判据（report_rc 没权限前的零成本代理）。
         from tradingagents.dataflows.news_catalyst import compute_earnings_revision
-        rev_info = compute_earnings_revision(news_report)
+        rev_info = compute_earnings_revision(news_report, current_date=trade_date)
         earnings_revision = rev_info["direction"] if rev_info else None
         if rev_info and rev_info["direction"] != "停修":
             logger.info("SYS_EARNINGS_REVISION: %s（up=%s down=%s 据=%s）",

@@ -366,8 +366,8 @@ def test_market_mode_derivation():
     assert derive_market_mode({"entry_gate": "OPEN", "risk_level": "低", "t_plus_1_bias": "偏多"}) == "risk_on"
     assert derive_market_mode({"entry_gate": "CONDITIONAL", "risk_level": "中", "t_plus_1_bias": "震荡"}) == "conditional"
     assert derive_market_mode({"entry_gate": "WAIT", "risk_level": "高", "t_plus_1_bias": "偏空"}) == "risk_off"
-    assert derive_market_mode({}) == "risk_off"
-    assert derive_market_mode(None) == "risk_off"
+    assert derive_market_mode({}) == "unknown"
+    assert derive_market_mode(None) == "unknown"
     print("✓ market_risk 快照 → market_mode 派生")
 
 
