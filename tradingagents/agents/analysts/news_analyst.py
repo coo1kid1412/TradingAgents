@@ -12,7 +12,10 @@ from tradingagents.agents.utils.agent_utils import (
 )
 from tradingagents.dataflows.config import get_config
 from tradingagents.dataflows.ticker_utils import is_a_share
-from tradingagents.agents.utils.handoff import analyst_handoff_contract
+from tradingagents.agents.utils.handoff import (
+    analyst_handoff_contract,
+    extract_final_report_artifact,
+)
 
 
 def _get_available_tools(ticker: str):
@@ -292,7 +295,7 @@ def create_news_analyst(llm):
         report = ""
 
         if len(result.tool_calls) == 0:
-            report = result.content
+            report = extract_final_report_artifact(str(result.content or ""))
 
         # 确定性催化信号注入（路2）：把 LLM 自产的结构化 key_events 聚合成 SYS_CATALYST 行，
         # 让"新闻催化"确定性进评级链（催化腿第5信号），不再靠 RM 当散文二次解读。

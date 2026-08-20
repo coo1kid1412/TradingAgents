@@ -7,6 +7,8 @@ import os
 import time
 from typing import Any
 
+from langchain_core.messages import AIMessage
+
 from .base_client import BaseLLMClient
 from .openai_client import NormalizedChatOpenAI
 from .validators import validate_model
@@ -25,6 +27,40 @@ _PASSTHROUGH_KWARGS = (
 
 class DeepSeekNormalizedChatOpenAI(NormalizedChatOpenAI):
     """Disable raw I/O logs while retaining aggregate timing and usage logs."""
+
+    def _create_chat_result(self, response, generation_info=None):
+        raw = response if isinstance(response, dict) else response.model_dump()
+        result = super()._create_chat_result(response, generation_info)
+        choices = raw.get("choices") if isinstance(raw, dict) else None
+        if isinstance(choices, list):
+            for generation, choice in zip(result.generations, choices):
+                message_payload = choice.get("message") if isinstance(choice, dict) else None
+                reasoning = (
+                    message_payload.get("reasoning_content")
+                    if isinstance(message_payload, dict)
+                    else None
+                )
+                if reasoning and isinstance(generation.message, AIMessage):
+                    generation.message.additional_kwargs["reasoning_content"] = reasoning
+        return result
+
+    def _get_request_payload(self, input_, *, stop=None, **kwargs):
+        payload = super()._get_request_payload(input_, stop=stop, **kwargs)
+        api_messages = payload.get("messages")
+        if not isinstance(api_messages, list):
+            return payload
+        source_messages = self._convert_input(input_).to_messages()
+        if len(source_messages) != len(api_messages):
+            return payload
+        for source, target in zip(source_messages, api_messages):
+            if not isinstance(source, AIMessage) or not isinstance(target, dict):
+                continue
+            reasoning = source.additional_kwargs.get("reasoning_content")
+            if isinstance(reasoning, str):
+                target["reasoning_content"] = reasoning
+            elif source.tool_calls or source.invalid_tool_calls:
+                target["reasoning_content"] = ""
+        return payload
 
     def invoke(self, input, config=None, **kwargs):
         safe_config = dict(config or {})

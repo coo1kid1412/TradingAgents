@@ -69,6 +69,24 @@ _ENTRY_PRESENTATION = {
     ),
 }
 
+_PILLAR_STATE_CN = {
+    "strong": "强",
+    "adequate": "合格",
+    "mixed": "分化",
+    "weak": "偏弱",
+    "invalid": "无效",
+    "attractive": "有吸引力",
+    "fair": "合理",
+    "stretched": "偏贵",
+    "visible": "明确",
+    "absent": "缺少",
+    "adverse": "不利",
+    "resilient": "稳健",
+    "acceptable": "可接受",
+    "fragile": "脆弱",
+    "broken": "失效",
+}
+
 
 def _extract_pm_summary_value(content: str, key: str) -> str | None:
     matches = re.findall(rf"(?m)^\s*{re.escape(key)}:\s*([^#\r\n]+?)\s*$", content or "")
@@ -81,7 +99,7 @@ def _enforce_pm_research_rating(content: str, research_plan: str) -> str:
     if not research_rating:
         return content
     fixed = re.sub(
-        r"(?m)^(\s*pm_rating:\s*)(BUY|OVERWEIGHT|HOLD|UNDERWEIGHT|SELL)\s*$",
+        r"(?m)^(\s*pm_rating:\s*).*$",
         rf"\g<1>{research_rating}",
         content or "",
     )
@@ -92,6 +110,14 @@ def _enforce_pm_research_rating(content: str, research_plan: str) -> str:
         flags=re.IGNORECASE,
     )
     return fixed
+
+
+def _require_rm_rating(research_plan: str) -> str:
+    """Fail closed before PM execution when the authoritative RM rating is absent."""
+    rating = _extract_rm_rating(research_plan)
+    if not rating:
+        raise RuntimeError("RM 权威研究评级缺失，PM 不得启动或自行定级")
+    return rating
 
 
 def _format_position_size(low: str | None, high: str | None) -> str:
@@ -282,12 +308,42 @@ def _canonicalize_holder_action_section(report_body: str, summary_source: str) -
         f"| **软止损 {values['pm_sl_soft']} 元** | 减仓 50% 并复核风险 |\n"
         f"| **硬止损 {values['pm_sl_hard']} 元** | 全部退出 |\n\n"
     )
-    return re.sub(
+    cleaned = re.sub(
         r"(?ms)^###\s+(?:已)?持仓者[^\n]*\n.*?(?=^###\s|^##\s|\Z)",
         section,
         report_body,
         count=1,
     )
+    return re.sub(
+        r"(?ms)^\*\*(?:已)?持仓者\*\*[：:]\s*\n.*?"
+        r"(?=^\*\*[^*\n]+\*\*[：:]|^###\s|^##\s|\Z)",
+        section,
+        cleaned,
+        count=1,
+    )
+
+
+def _canonicalize_empty_action_section(
+    report_body: str,
+    *,
+    trigger: str,
+) -> str:
+    """Remove conditional orders that conflict with a WAIT/zero-size decision."""
+    section = (
+        "### 空仓者操作\n\n"
+        "- **当前不建仓；满足重新评估条件后再生成新交易票。** "
+        "不沿用本报告中的旧入场价或条件单。\n"
+        f"- **重新评估条件：** {trigger}；满足后重新生成交易票。\n\n"
+    )
+    patterns = (
+        r"(?ms)^###\s+空仓者[^\n]*\n.*?(?=^###\s|^##\s|\Z)",
+        r"(?ms)^\*\*空仓者\*\*[：:]\s*\n.*?"
+        r"(?=^\*\*(?:已)?持仓者\*\*[：:]|^###\s|^##\s|\Z)",
+    )
+    cleaned = report_body
+    for pattern in patterns:
+        cleaned = re.sub(pattern, section, cleaned, count=1)
+    return cleaned
 
 
 def _normalize_reporting_date_language(
@@ -400,6 +456,8 @@ def _enforce_effective_risk_cap(
             values["pm_entry_judgment"] = "WAIT"
         if gate == "CONDITIONAL":
             values["entry_timing"] = "等待条件确认"
+        elif gate != "OPEN":
+            values["entry_timing"] = "暂不介入"
         for key, value in values.items():
             pattern = rf"(?m)^(\s*{re.escape(key)}:\s*).*$"
             if re.search(pattern, summary_block):
@@ -569,8 +627,11 @@ def _format_pm_decision(
         logger.warning("PM 输出未找到 Trade Ticket 标题，保留原文并仅添加操作摘要")
 
     entry_timing = timing.get("effective_action") or "数据不足"
-    if str((market_risk_snapshot or {}).get("entry_gate") or "").upper() == "CONDITIONAL":
+    entry_gate = str((market_risk_snapshot or {}).get("entry_gate") or "").upper()
+    if entry_gate == "CONDITIONAL":
         entry_timing = "等待条件确认"
+    elif entry_gate and entry_gate != "OPEN":
+        entry_timing = "暂不介入"
     if entry_timing not in _ENTRY_PRESENTATION:
         entry_timing = "数据不足"
     reason, trigger = _ENTRY_PRESENTATION[entry_timing]
@@ -631,6 +692,9 @@ def _format_pm_decision(
         report_body = _normalize_no_new_position_rows(
             report_body, summary_block or original, entry_timing,
         )
+        report_body = _canonicalize_empty_action_section(
+            report_body, trigger=trigger,
+        )
         report_body = _canonicalize_holder_action_section(
             report_body, summary_block or original,
         )
@@ -683,6 +747,7 @@ def _format_pm_decision(
         "催化": _extract_pm_summary_value(research_plan, "pillar_catalyst") or "数据不足",
         "持续性": _extract_pm_summary_value(research_plan, "pillar_durability") or "数据不足",
     }
+    pillars = {key: _PILLAR_STATE_CN.get(value, value) for key, value in pillars.items()}
     mismatch_line = ""
     if rating in {"BUY", "OVERWEIGHT"} and entry_timing in no_new_position_actions:
         mismatch_line = f"> **暂不买入原因：{reason}**\n>\n"
@@ -758,7 +823,7 @@ def create_portfolio_manager(llm, memory):
         # Direction semantics come from the original market snapshot. The
         # reconciled WAIT/cap is an execution constraint, not a bearish vote.
         market_mode = derive_market_mode(market_risk_snapshot)
-        rm_rating = _extract_rm_rating(research_plan)
+        rm_rating = _require_rm_rating(research_plan)
         entry_timing = _derive_entry_timing_from_profile(
             stock_profile, market_mode, long_term_rating=rm_rating,
         )

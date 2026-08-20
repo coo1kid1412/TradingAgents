@@ -18,10 +18,13 @@ from tradingagents.agents.managers.research_manager import (
     _extract_rm_rating,
     _normalize_summary_yaml_fence,
     _run_tool_calling_loop,
+    _summary_yaml_is_complete,
 )
 from tradingagents.agents.managers.portfolio_manager import (
     AIMessage as PortfolioAIMessage,
+    _enforce_pm_research_rating,
     _format_pm_decision,
+    _require_rm_rating,
 )
 from tradingagents.agents.utils.agent_utils import RISK_DEBATE_PHRASING_RULES
 from tradingagents.harness.extractor import _find_yaml_block
@@ -241,6 +244,289 @@ def test_tool_loop_can_require_four_pillar_summary_fields():
     assert "pillar_thesis: mixed" in result.content
 
 
+def test_rm_tool_loop_requires_and_enforces_authoritative_ic_result():
+    wrong_summary = """# 最终 Thesis 报告
+
+```yaml
+RM_SUMMARY:
+  current_price: 100
+  research_rating: BUY
+  rm_rating: BUY
+  pillar_thesis: strong
+  pillar_valuation: attractive
+  pillar_catalyst: strong
+  pillar_durability: resilient
+  scenario_expected_return_pct: 40
+  rating_reason_codes: MODEL-WRITTEN
+  target_price_mid: 140
+  entry_timing: 分批介入
+  thesis_evidence_ids: MODEL-01
+  valuation_evidence_ids: MODEL-02
+  catalyst_evidence_ids: MODEL-03
+  durability_evidence_ids: MODEL-04
+  rating_evidence_ids: MODEL-01
+  target_price_evidence_ids: MODEL-02
+  earnings_evidence_ids: MODEL-01
+  key_conflict_ids: null
+```
+"""
+
+    class SequenceLLM:
+        def __init__(self):
+            self.calls = 0
+
+        def invoke(self, _messages):
+            self.calls += 1
+            if self.calls == 1:
+                return AIMessage(content=wrong_summary)
+            if self.calls == 2:
+                return AIMessage(content="", tool_calls=[{
+                    "name": "compute_ic_recommendation",
+                    "args": {},
+                    "id": "ic-1",
+                }])
+            return AIMessage(content=wrong_summary)
+
+    class ICTool:
+        @staticmethod
+        def invoke(_args):
+            return {
+                "research_rating": "HOLD",
+                "rating_reason_codes": ["WEAK_THESIS_CAP", "EXPECTED_RETURN_NEUTRAL"],
+                "scenario_expected_return_pct": 4.5,
+                "thresholds": {"configuration_pct": 15.0, "high_pct": 35.0},
+                "pillar_effects": {
+                    "thesis": {"state": "weak"},
+                    "valuation": {"state": "fair"},
+                    "catalyst": {"state": "visible"},
+                    "durability": {"state": "acceptable"},
+                },
+                "evidence_ids": {
+                    "thesis": ["FUND-GROWTH-01"],
+                    "valuation": ["FUND-VAL-01"],
+                    "catalyst": ["NEWS-CAT-01"],
+                    "durability": ["RISK-GATE-01"],
+                    "thesis_breaker": [],
+                },
+            }
+
+    llm = SequenceLLM()
+    result = _run_tool_calling_loop(
+        llm,
+        [HumanMessage(content="生成报告")],
+        tools_by_name={"compute_ic_recommendation": ICTool()},
+        completion_token="RM_SUMMARY",
+        required_summary_fields={"research_rating", "pillar_thesis"},
+        authoritative_tool_name="compute_ic_recommendation",
+        max_iterations=3,
+        max_continuations=2,
+    )
+
+    summary = _find_yaml_block(result.content, "RM_SUMMARY")
+    assert llm.calls == 3
+    assert summary["research_rating"] == "HOLD"
+    assert summary["rm_rating"] == "HOLD"
+    assert summary["pillar_thesis"] == "weak"
+    assert summary["scenario_expected_return_pct"] == 4.5
+    assert summary["rating_reason_codes"] == "WEAK_THESIS_CAP|EXPECTED_RETURN_NEUTRAL"
+    assert summary["thesis_evidence_ids"] == "FUND-GROWTH-01"
+
+
+def test_rm_tool_loop_fails_when_authoritative_ic_tool_never_succeeds():
+    class SummaryOnlyLLM:
+        def invoke(self, _messages):
+            return AIMessage(content="""RM_SUMMARY:
+  research_rating: BUY
+  pillar_thesis: strong
+""")
+
+    try:
+        _run_tool_calling_loop(
+            SummaryOnlyLLM(),
+            [HumanMessage(content="生成报告")],
+            tools_by_name={},
+            completion_token="RM_SUMMARY",
+            required_summary_fields={"research_rating", "pillar_thesis"},
+            authoritative_tool_name="compute_ic_recommendation",
+            max_iterations=1,
+            max_continuations=1,
+        )
+    except RuntimeError as exc:
+        assert "compute_ic_recommendation" in str(exc)
+    else:
+        raise AssertionError("缺少权威 IC 工具结果时必须中止")
+
+
+def test_manager_tool_loop_never_returns_an_incomplete_summary():
+    class PartialLLM:
+        def invoke(self, _messages):
+            return AIMessage(content="# 最终 Thesis 报告\n\n只有半篇正文，没有摘要。")
+
+    try:
+        _run_tool_calling_loop(
+            PartialLLM(),
+            [HumanMessage(content="生成报告")],
+            tools_by_name={},
+            completion_token="RM_SUMMARY",
+            max_iterations=1,
+            max_continuations=0,
+        )
+    except RuntimeError as exc:
+        assert "RM_SUMMARY" in str(exc)
+    else:
+        raise AssertionError("管理层摘要不完整时必须中止")
+
+
+def test_portfolio_manager_requires_an_authoritative_rm_rating():
+    assert _require_rm_rating("RM_SUMMARY:\n  research_rating: HOLD") == "HOLD"
+    try:
+        _require_rm_rating("只有半篇 RM 正文")
+    except RuntimeError as exc:
+        assert "RM" in str(exc)
+    else:
+        raise AssertionError("RM 评级缺失时 PM 不得启动")
+
+
+def test_pm_rating_enforcement_replaces_null_with_rm_truth():
+    fixed = _enforce_pm_research_rating(
+        """PM_SUMMARY:
+  pm_rating: null
+  pm_rating_adjusted_from_rm: true
+""",
+        """RM_SUMMARY:
+  research_rating: UNDERWEIGHT
+""",
+    )
+
+    assert "pm_rating: UNDERWEIGHT" in fixed
+    assert "pm_rating_adjusted_from_rm: false" in fixed
+
+
+def test_pm_summary_rejects_missing_trade_levels_even_when_old_fields_exist():
+    incomplete = """PM_SUMMARY:
+  current_price: 100
+  pm_rating: HOLD
+  pm_action_keyword: WAIT
+  pm_size_low_pct: 0
+  pm_size_high_pct: 0
+  entry_timing: 继续观察
+  short_term_evidence_ids: MKT-TREND-01
+  long_term_evidence_ids: FUND-GROWTH-01
+  position_evidence_ids: RISK-GATE-01
+  target_price_evidence_ids: FUND-VAL-01
+"""
+
+    assert not _summary_yaml_is_complete(incomplete, "PM_SUMMARY")
+
+
+def test_pm_summary_rejects_incoherent_trade_price_relationships():
+    valid = """PM_SUMMARY:
+  ticker: "300502"
+  trade_date: "2026-08-20"
+  current_price: 100
+  pm_rating: OVERWEIGHT
+  pm_conviction_stars: 4
+  pm_invest_judgment: YES
+  pm_entry_judgment: BUY_NOW
+  pm_action_keyword: BUY_NOW
+  pm_size_low_pct: 4
+  pm_size_high_pct: 6
+  pm_entry_low: 98
+  pm_entry_high: 100
+  pm_tp1: 110
+  pm_tp2: 120
+  pm_tp3: 130
+  pm_sl_soft: 94
+  pm_sl_hard: 90
+  pm_horizon_months_low: 6
+  pm_horizon_months_high: 12
+  pm_rating_adjusted_from_rm: false
+  market_risk_level: 低
+  market_entry_gate: OPEN
+  market_position_cap_pct: 10
+  short_term_structure: trend_pullback
+  entry_timing: 分批介入
+  short_term_trend: 上涨
+  short_term_confidence: 中
+  theme_outlook_12m: 扩张
+  short_term_evidence_ids: MKT-TREND-01
+  long_term_evidence_ids: FUND-GROWTH-01
+  position_evidence_ids: RISK-GATE-01
+  target_price_evidence_ids: FUND-VAL-01
+"""
+
+    assert _summary_yaml_is_complete(valid, "PM_SUMMARY")
+    invalid_cases = (
+        valid.replace("pm_entry_low: 98", "pm_entry_low: null"),
+        valid.replace("pm_tp1: 110", "pm_tp1: 95"),
+        valid.replace("pm_sl_soft: 94", "pm_sl_soft: 102"),
+        valid.replace("pm_horizon_months_low: 6", "pm_horizon_months_low: 18"),
+        valid.replace("current_price: 100", "current_price: 200"),
+    )
+    for content in invalid_cases:
+        assert not _summary_yaml_is_complete(content, "PM_SUMMARY")
+
+
+def test_empty_authoritative_ic_result_is_not_accepted():
+    class SequenceLLM:
+        def __init__(self):
+            self.calls = 0
+
+        def invoke(self, _messages):
+            self.calls += 1
+            if self.calls == 1:
+                return AIMessage(content="", tool_calls=[{
+                    "name": "compute_ic_recommendation",
+                    "args": {},
+                    "id": "ic-1",
+                }])
+            return AIMessage(content="""# 最终 Thesis 报告
+
+```yaml
+RM_SUMMARY:
+  current_price: 100
+  research_rating: BUY
+  rm_rating: BUY
+  pillar_thesis: strong
+  pillar_valuation: attractive
+  pillar_catalyst: strong
+  pillar_durability: resilient
+  scenario_expected_return_pct: 40
+  rating_reason_codes: MODEL-WRITTEN
+  target_price_mid: 140
+  entry_timing: 分批介入
+  thesis_evidence_ids: MODEL-01
+  valuation_evidence_ids: MODEL-02
+  catalyst_evidence_ids: MODEL-03
+  durability_evidence_ids: MODEL-04
+  rating_evidence_ids: MODEL-01
+  target_price_evidence_ids: MODEL-02
+  earnings_evidence_ids: MODEL-01
+  key_conflict_ids: null
+```
+""")
+
+    class EmptyICTool:
+        @staticmethod
+        def invoke(_args):
+            return {}
+
+    try:
+        _run_tool_calling_loop(
+            SequenceLLM(),
+            [HumanMessage(content="生成报告")],
+            tools_by_name={"compute_ic_recommendation": EmptyICTool()},
+            completion_token="RM_SUMMARY",
+            authoritative_tool_name="compute_ic_recommendation",
+            max_iterations=2,
+            max_continuations=0,
+        )
+    except RuntimeError as exc:
+        assert "compute_ic_recommendation" in str(exc)
+    else:
+        raise AssertionError("空权威工具结果不得覆盖 RM 摘要")
+
+
 def test_output_truth_overrides_m3_summary_and_trade_ticket_drift():
     content = """| 结构时机 | 等回踩；结构=healthy_trend |
 RM_SUMMARY:
@@ -452,6 +738,56 @@ RM_SUMMARY:
         max_iterations=1, max_continuations=2,
     )
     assert len(llm.calls) == 3
+    assert _find_yaml_block(result.content, "RM_SUMMARY")["rm_rating"] == "HOLD"
+
+
+def test_rm_tool_loop_returns_only_the_final_thesis_artifact():
+    class ProcessThenReportLLM:
+        def __init__(self):
+            self.calls = 0
+
+        def invoke(self, _messages):
+            self.calls += 1
+            if self.calls == 1:
+                return AIMessage(
+                    content="我将按八步流程分析。\n\n**第一批：先计算估值**",
+                    tool_calls=[{"name": "calc", "args": {}, "id": "call-1"}],
+                )
+            return AIMessage(content="""# 最终 Thesis 报告
+
+## 一、评级与置信度
+
+最终评级为 HOLD。
+
+```yaml
+RM_SUMMARY:
+  current_price: 100
+  rm_rating: HOLD
+  target_price_mid: 108
+  entry_timing: 继续观察
+  rating_evidence_ids: FUND-GROWTH-01
+  target_price_evidence_ids: FUND-VAL-01
+  earnings_evidence_ids: FUND-GROWTH-01
+  key_conflict_ids: null
+```""")
+
+    class Calc:
+        @staticmethod
+        def invoke(_args):
+            return {"rating": "HOLD"}
+
+    result = _run_tool_calling_loop(
+        ProcessThenReportLLM(),
+        [HumanMessage(content="生成最终研究报告")],
+        tools_by_name={"calc": Calc()},
+        role="RM-test",
+        completion_token="RM_SUMMARY",
+        max_iterations=2,
+    )
+
+    assert result.content.startswith("# 最终 Thesis 报告")
+    assert "我将按八步流程" not in result.content
+    assert "第一批" not in result.content
     assert _find_yaml_block(result.content, "RM_SUMMARY")["rm_rating"] == "HOLD"
 
 
@@ -808,6 +1144,66 @@ PM_SUMMARY:
     assert "### 下一节" in result
 
 
+def test_no_buy_replaces_bold_empty_and_holder_blocks_with_canonical_levels():
+    content = """## Trade Ticket 交易票
+
+| **TP1** 止盈 1 | **510 元** | 减仓 |
+| **TP2** 止盈 2 | **580 元** | 减仓 |
+| **TP3** 止盈 3 | **650 元** | 清仓 |
+| **SL_soft** 软止损 | **398 元** | 减仓 |
+| **SL_hard** 硬止损 | **370 元** | 清仓 |
+
+## 二、操作计划
+
+**空仓者**：
+- 回踩后直接买入，合计不超过总仓位 **1%**。
+- 中报落地后可提升仓位。
+
+**持仓者**：
+- 止损阶梯：SL_soft 398 减仓 50%；SL_hard 370 全部清仓。
+- 止盈阶梯：TP1 510 减 1/3 → TP2 580 再减 1/3 → TP3 650 清仓。
+
+## 三、情景概率与赔率
+
+保留本节。
+
+```yaml
+PM_SUMMARY:
+  current_price: 448.08
+  pm_rating: OVERWEIGHT
+  pm_action_keyword: WAIT
+  pm_size_low_pct: 0
+  pm_size_high_pct: 0
+  pm_tp1: 510
+  pm_tp2: 580
+  pm_tp3: 650
+  pm_sl_soft: 398
+  pm_sl_hard: 370
+  entry_timing: 继续观察
+```"""
+
+    result = _format_pm_decision(
+        content,
+        {"structure_class": "neutral", "effective_action": "继续观察"},
+        market_report="""SUMMARY:
+  key_resistance: 465
+""",
+        research_plan="""RM_SUMMARY:
+  target_price_low: 559.73
+  target_price_mid: 633.17
+  target_price_high: 706.62
+""",
+    )
+
+    assert "合计不超过总仓位 **1%**" not in result
+    assert "当前不建仓；满足重新评估条件后再生成新交易票" in result
+    assert "| **TP1 465 元** | 减仓 1/3 |" in result
+    assert "| **TP2 559.73 元** | 再减仓 1/3 |" in result
+    assert "| **TP3 633.17 元** | 清仓或降至观察仓 |" in result
+    assert "TP1 510" not in result
+    assert "SL_soft 398" not in result
+
+
 def test_market_and_risk_consensus_cap_is_enforced_at_pm_output_boundary():
     content = """## Trade Ticket 交易票
 
@@ -842,6 +1238,57 @@ PM_SUMMARY:
     assert "# 短期操作结论：等待条件确认" in result
     assert "| **Size** 仓位规模 | 新建仓 0% |" in result
     assert "**一年期研究评级：BUY｜当前动作：WAIT｜新建仓位：0%**" in result
+
+
+def test_wait_gate_removes_buy_now_and_entry_prices_from_body_and_yaml():
+    content = """## Trade Ticket 交易票
+
+| **Action** 操作 | **BUY NOW** | 立即执行 |
+| **Size** 仓位规模 | 新建仓 8-12% |
+| **Entry** 入场区间 | **98-100 元** | 分批买入 |
+
+### 空仓者操作
+
+- 98-100 元按计划分批执行。
+
+```yaml
+PM_SUMMARY:
+  current_price: 100
+  pm_rating: OVERWEIGHT
+  pm_action_keyword: BUY_NOW
+  pm_entry_judgment: BUY_NOW
+  pm_size_low_pct: 8
+  pm_size_high_pct: 12
+  pm_entry_low: 98
+  pm_entry_high: 100
+  pm_tp1: 110
+  pm_tp2: 120
+  pm_tp3: 130
+  pm_sl_soft: 94
+  pm_sl_hard: 90
+  entry_timing: 分批介入
+  short_term_trend: 上涨
+  short_term_confidence: 中
+```
+"""
+
+    result = _format_pm_decision(
+        content,
+        {"structure_class": "trend_pullback", "effective_action": "分批介入"},
+        market_risk_snapshot={"entry_gate": "WAIT", "position_cap_pct": 0},
+    )
+
+    summary = _find_yaml_block(result, "PM_SUMMARY")
+    assert "# 短期操作结论：暂不介入" in result
+    assert "BUY NOW" not in result
+    assert "98-100" not in result
+    assert "按计划分批执行" not in result
+    assert summary["pm_action_keyword"] == "WAIT"
+    assert summary["entry_timing"] == "暂不介入"
+    assert summary["pm_entry_low"] is None
+    assert summary["pm_entry_high"] is None
+    assert summary["pm_size_low_pct"] == 0
+    assert summary["pm_size_high_pct"] == 0
 
 
 def test_pm_cannot_change_rm_research_rating_and_header_shows_four_pillars():
@@ -880,7 +1327,7 @@ RM_SUMMARY:
 
     assert _find_yaml_block(result, "PM_SUMMARY")["pm_rating"] == "OVERWEIGHT"
     assert "**一年期研究评级：OVERWEIGHT｜当前动作：WAIT｜新建仓位：0%**" in result
-    assert "**四支柱：经营与盈利 adequate｜估值 attractive｜催化 visible｜持续性 acceptable**" in result
+    assert "**四支柱：经营与盈利 合格｜估值 有吸引力｜催化 明确｜持续性 可接受**" in result
     assert "**暂不买入原因：趋势仍在，但当前位置不具备理想赔率**" in result
 
 

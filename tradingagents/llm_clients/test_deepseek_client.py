@@ -3,11 +3,14 @@ from __future__ import annotations
 import os
 import sys
 
-from langchain_core.messages import AIMessage
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
 from tradingagents.agents.utils.handoff import pack_agent_context
 from tradingagents.llm_clients.base_client import normalize_content
-from tradingagents.llm_clients.deepseek_client import DeepSeekClient
+from tradingagents.llm_clients.deepseek_client import (
+    DeepSeekClient,
+    DeepSeekNormalizedChatOpenAI,
+)
 from tradingagents.llm_clients.factory import create_llm_client
 from tradingagents.llm_clients.role_policy import resolve_role_policy
 from tradingagents.default_config import DEFAULT_CONFIG
@@ -127,6 +130,75 @@ def test_reasoning_is_preserved_for_tool_subturn_but_not_visible_content():
     assert "private" not in packed
     assert "<think>" not in packed
     assert "结论" in packed
+
+
+def test_deepseek_response_preserves_reasoning_for_tool_subturn():
+    llm = DeepSeekNormalizedChatOpenAI(model="deepseek-v4-pro", api_key="sk-test")
+    result = llm._create_chat_result({
+        "id": "chat-test",
+        "model": "deepseek-v4-pro",
+        "choices": [{
+            "index": 0,
+            "finish_reason": "tool_calls",
+            "message": {
+                "role": "assistant",
+                "content": None,
+                "reasoning_content": "private reasoning required by provider",
+                "tool_calls": [{
+                    "id": "call-1",
+                    "type": "function",
+                    "function": {"name": "echo_number", "arguments": '{"value":7}'},
+                }],
+            },
+        }],
+        "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+    })
+
+    message = result.generations[0].message
+    assert message.additional_kwargs["reasoning_content"] == (
+        "private reasoning required by provider"
+    )
+
+
+def test_deepseek_request_passes_tool_reasoning_back_to_provider():
+    llm = DeepSeekNormalizedChatOpenAI(model="deepseek-v4-pro", api_key="sk-test")
+    assistant = AIMessage(
+        content="",
+        additional_kwargs={"reasoning_content": "private tool reasoning"},
+        tool_calls=[{
+            "name": "echo_number",
+            "args": {"value": 7},
+            "id": "call-1",
+            "type": "tool_call",
+        }],
+    )
+    payload = llm._get_request_payload([
+        HumanMessage(content="echo 7"),
+        assistant,
+        ToolMessage(content="7", tool_call_id="call-1"),
+    ])
+
+    assert payload["messages"][1]["reasoning_content"] == "private tool reasoning"
+
+
+def test_deepseek_request_marks_synthetic_tool_call_with_empty_reasoning():
+    llm = DeepSeekNormalizedChatOpenAI(model="deepseek-v4-pro", api_key="sk-test")
+    assistant = AIMessage(
+        content="",
+        tool_calls=[{
+            "name": "get_stock_data",
+            "args": {"symbol": "300502"},
+            "id": "prefetch-1",
+            "type": "tool_call",
+        }],
+    )
+    payload = llm._get_request_payload([
+        HumanMessage(content="analyze 300502"),
+        assistant,
+        ToolMessage(content="cached data", tool_call_id="prefetch-1"),
+    ])
+
+    assert payload["messages"][1]["reasoning_content"] == ""
 
 
 if __name__ == "__main__":

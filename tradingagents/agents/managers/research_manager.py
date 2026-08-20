@@ -1,5 +1,6 @@
 import logging
 import json
+import math
 import re
 
 import yaml
@@ -116,7 +117,7 @@ def _enforce_research_rating_truth(content: str) -> str:
 def _normalize_summary_yaml_fence(content: str, summary_key: str) -> str:
     """Canonicalize the final summary as one fenced YAML block.
 
-    M3 occasionally emits the required summary after an orphan generic fence.
+    Some models emit the required summary after an orphan generic fence.
     Humans can read that output, but the archive parser intentionally accepts
     only explicit YAML fences. Normalize that formatting deterministically at
     the manager boundary.
@@ -144,6 +145,18 @@ def _normalize_summary_yaml_fence(content: str, summary_key: str) -> str:
     return f"{prefix}\n\n---\n\n{fenced}" if prefix else fenced
 
 
+def _extract_final_manager_artifact(content: str, completion_token: str) -> str:
+    """Keep the final manager deliverable, excluding visible tool-round narration."""
+    text = (content or "").strip()
+    patterns = {
+        "RM_SUMMARY": r"(?m)^#\s+最终\s+Thesis\s+报告\s*$",
+        "PM_SUMMARY": r"(?m)^#{1,2}\s+Trade Ticket\b.*$",
+    }
+    pattern = patterns.get(completion_token)
+    matches = list(re.finditer(pattern, text)) if pattern else []
+    return text[matches[-1].start():].strip() if matches else text
+
+
 _SUMMARY_REQUIRED_FIELDS = {
     "RM_SUMMARY": {
         "current_price", "rm_rating", "target_price_mid", "entry_timing",
@@ -151,11 +164,106 @@ _SUMMARY_REQUIRED_FIELDS = {
         "earnings_evidence_ids", "key_conflict_ids",
     },
     "PM_SUMMARY": {
-        "current_price", "pm_rating", "pm_action_keyword", "pm_size_low_pct",
-        "pm_size_high_pct", "entry_timing", "short_term_evidence_ids",
-        "long_term_evidence_ids", "position_evidence_ids", "target_price_evidence_ids",
+        "ticker", "trade_date", "current_price", "pm_rating", "pm_conviction_stars",
+        "pm_invest_judgment", "pm_entry_judgment", "pm_action_keyword",
+        "pm_size_low_pct", "pm_size_high_pct", "pm_entry_low", "pm_entry_high",
+        "pm_tp1", "pm_tp2", "pm_tp3", "pm_sl_soft", "pm_sl_hard",
+        "pm_horizon_months_low", "pm_horizon_months_high",
+        "pm_rating_adjusted_from_rm", "market_risk_level", "market_entry_gate",
+        "market_position_cap_pct", "short_term_structure", "entry_timing",
+        "short_term_trend", "short_term_confidence", "theme_outlook_12m",
+        "short_term_evidence_ids", "long_term_evidence_ids",
+        "position_evidence_ids", "target_price_evidence_ids",
     },
 }
+
+_RATINGS = {"BUY", "OVERWEIGHT", "HOLD", "UNDERWEIGHT", "SELL"}
+
+
+def _finite_number(value, *, allow_none: bool = False) -> bool:
+    if value is None:
+        return allow_none
+    return (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and math.isfinite(float(value))
+    )
+
+
+def _summary_semantics_are_valid(summary: dict, summary_key: str) -> bool:
+    if summary_key == "RM_SUMMARY":
+        rating = summary.get("research_rating", summary.get("rm_rating"))
+        return rating in _RATINGS
+    if summary_key != "PM_SUMMARY":
+        return True
+    if summary.get("pm_rating") not in _RATINGS:
+        return False
+    if summary.get("pm_rating_adjusted_from_rm") is not False:
+        return False
+    required_numbers = (
+        "current_price", "pm_conviction_stars", "pm_size_low_pct", "pm_size_high_pct",
+        "pm_tp1", "pm_tp2", "pm_tp3", "pm_sl_soft", "pm_sl_hard",
+        "pm_horizon_months_low", "pm_horizon_months_high", "market_position_cap_pct",
+    )
+    if not all(_finite_number(summary.get(key)) for key in required_numbers):
+        return False
+    if not all(_finite_number(summary.get(key), allow_none=True) for key in (
+        "pm_entry_low", "pm_entry_high",
+    )):
+        return False
+    action = summary.get("pm_action_keyword")
+    gate = summary.get("market_entry_gate")
+    if action not in {"BUY_NOW", "WAIT", "REDUCE", "EXIT"}:
+        return False
+    if gate not in {"OPEN", "CONDITIONAL", "WAIT"}:
+        return False
+    if summary.get("entry_timing") not in {
+        "分批介入", "小仓试探", "等回踩", "等放量突破", "等待条件确认",
+        "暂不介入", "退出观察", "继续观察", "数据不足",
+    }:
+        return False
+
+    current = float(summary["current_price"])
+    size_low = float(summary["pm_size_low_pct"])
+    size_high = float(summary["pm_size_high_pct"])
+    cap = float(summary["market_position_cap_pct"])
+    horizon_low = summary["pm_horizon_months_low"]
+    horizon_high = summary["pm_horizon_months_high"]
+    tp1, tp2, tp3 = (float(summary[key]) for key in ("pm_tp1", "pm_tp2", "pm_tp3"))
+    sl_soft = float(summary["pm_sl_soft"])
+    sl_hard = float(summary["pm_sl_hard"])
+    if not (current > 0 and 0 <= size_low <= size_high <= cap):
+        return False
+    if not (
+        isinstance(horizon_low, int) and not isinstance(horizon_low, bool)
+        and isinstance(horizon_high, int) and not isinstance(horizon_high, bool)
+        and 0 < horizon_low <= horizon_high
+    ):
+        return False
+    if not (0 < sl_hard < sl_soft and 0 < tp1 < tp2 < tp3):
+        return False
+
+    entry_low = summary.get("pm_entry_low")
+    entry_high = summary.get("pm_entry_high")
+    if action == "BUY_NOW":
+        if gate != "OPEN" or summary.get("pm_entry_judgment") != "BUY_NOW":
+            return False
+        if entry_low is None or entry_high is None:
+            return False
+        entry_low = float(entry_low)
+        entry_high = float(entry_high)
+        return (
+            0 < sl_hard < sl_soft < entry_low <= current <= entry_high < tp1
+            and size_high > 0
+        )
+
+    if entry_low is not None or entry_high is not None or size_low != 0 or size_high != 0:
+        return False
+    if summary.get("pm_entry_judgment") not in {"WAIT", "DONT_BUY"}:
+        return False
+    if gate != "OPEN" and action != "WAIT":
+        return False
+    return sl_soft < current < tp1
 
 _RM_FOUR_PILLAR_REQUIRED_FIELDS = {
     "research_rating",
@@ -190,11 +298,93 @@ def _summary_yaml_is_complete(
         return False
     required = set(_SUMMARY_REQUIRED_FIELDS.get(summary_key) or ())
     required.update(required_fields or ())
-    return required.issubset(summary) if required else True
+    return required.issubset(summary) and _summary_semantics_are_valid(
+        summary, summary_key,
+    )
+
+
+def _valid_ic_recommendation_result(result: object) -> bool:
+    if not isinstance(result, dict) or "error" in result:
+        return False
+    if result.get("research_rating") not in _RATINGS:
+        return False
+    if not isinstance(result.get("rating_reason_codes"), list):
+        return False
+    if not _finite_number(result.get("scenario_expected_return_pct")):
+        return False
+    thresholds = result.get("thresholds")
+    if not isinstance(thresholds, dict) or not all(
+        _finite_number(thresholds.get(key)) for key in ("configuration_pct", "high_pct")
+    ):
+        return False
+    pillars = result.get("pillar_effects")
+    if not isinstance(pillars, dict) or any(
+        not isinstance(pillars.get(key), dict) or not pillars[key].get("state")
+        for key in ("thesis", "valuation", "catalyst", "durability")
+    ):
+        return False
+    evidence = result.get("evidence_ids")
+    return isinstance(evidence, dict) and all(
+        isinstance(evidence.get(key), list)
+        for key in ("thesis", "valuation", "catalyst", "durability", "thesis_breaker")
+    )
+
+
+def _join_ids(values) -> str | None:
+    items = [str(value) for value in (values or []) if value]
+    return "|".join(dict.fromkeys(items)) or None
+
+
+def _enforce_ic_recommendation_truth(content: str, result: dict) -> str:
+    """Overwrite RM four-pillar fields with the successful IC tool result."""
+    normalized = _normalize_summary_yaml_fence(content, "RM_SUMMARY")
+    blocks = list(re.finditer(r"```yaml\s*\n(.*?)\n```", normalized, re.DOTALL))
+    for match in reversed(blocks):
+        try:
+            parsed = yaml.safe_load(match.group(1))
+        except yaml.YAMLError:
+            continue
+        summary = parsed.get("RM_SUMMARY") if isinstance(parsed, dict) else None
+        if not isinstance(summary, dict):
+            continue
+
+        pillars = result.get("pillar_effects") or {}
+        evidence = result.get("evidence_ids") or {}
+        rating = result.get("research_rating")
+        all_rating_ids: list[str] = []
+        for dimension in ("thesis", "valuation", "catalyst", "durability", "thesis_breaker"):
+            all_rating_ids.extend(evidence.get(dimension) or [])
+        updates = {
+            "research_rating": rating,
+            "rm_rating": rating,
+            "pillar_thesis": (pillars.get("thesis") or {}).get("state"),
+            "pillar_valuation": (pillars.get("valuation") or {}).get("state"),
+            "pillar_catalyst": (pillars.get("catalyst") or {}).get("state"),
+            "pillar_durability": (pillars.get("durability") or {}).get("state"),
+            "scenario_expected_return_pct": result.get("scenario_expected_return_pct"),
+            "rating_reason_codes": _join_ids(result.get("rating_reason_codes")),
+            "thesis_evidence_ids": _join_ids(evidence.get("thesis")),
+            "valuation_evidence_ids": _join_ids(evidence.get("valuation")),
+            "catalyst_evidence_ids": _join_ids(evidence.get("catalyst")),
+            "durability_evidence_ids": _join_ids(evidence.get("durability")),
+            "thesis_breaker_evidence_ids": _join_ids(evidence.get("thesis_breaker")),
+            "rating_evidence_ids": _join_ids(all_rating_ids),
+            "target_price_evidence_ids": _join_ids(evidence.get("valuation")),
+            "earnings_evidence_ids": _join_ids(evidence.get("thesis")),
+            "threshold_dn_pct": (result.get("thresholds") or {}).get("configuration_pct"),
+            "threshold_up_pct": (result.get("thresholds") or {}).get("high_pct"),
+        }
+        for key, value in updates.items():
+            summary[key] = value
+        replacement = "```yaml\n" + yaml.safe_dump(
+            {"RM_SUMMARY": summary}, allow_unicode=True, sort_keys=False,
+        ).rstrip() + "\n```"
+        return normalized[:match.start()] + replacement + normalized[match.end():]
+    raise RuntimeError("RM_SUMMARY 无法解析，不能写入权威 IC 工具结果")
 
 
 def _enforce_entry_timing_truth(content: str, timing: dict) -> str:
-    """Overwrite M3 timing drift at report output boundaries."""
+    """Overwrite model timing drift at report output boundaries."""
     structure = timing.get("structure_class") or "insufficient_data"
     action = timing.get("effective_action") or "数据不足"
     text = content or ""
@@ -257,13 +447,14 @@ def _run_tool_calling_loop(llm_with_tools, initial_messages, *,
                            tools_by_name=None, role="RM",
                            completion_token="RM_SUMMARY",
                            max_iterations=None, max_continuations=2,
-                           required_summary_fields: set[str] | None = None):
+                           required_summary_fields: set[str] | None = None,
+                           authoritative_tool_name: str | None = None):
     """执行 LLM 工具调用循环。返回 AIMessage，content 是所有迭代的 LLM 文本累积。
 
     退出条件不只是『不再调工具』，还要求**正文完整**：必须包含 completion_token
     （RM_SUMMARY / PM_SUMMARY，两者本就是 prompt 强制的收尾 YAML，天然的完成标记）。
 
-    为什么：MiniMax 推理模型会把部分轮次的正文整段写进 <think> 块，被
+    为什么：部分推理模型会把某些轮次的正文整段写进 <think> 块，被
     _strip_think_tags 剥成空串。两类真实事故：
     - 全空（603629 PM）：decision.md 缺失；
     - 截断（300394 RM）：首轮有正文、后续轮全空，thesis 停在 Step 4 中途，
@@ -272,7 +463,7 @@ def _run_tool_calling_loop(llm_with_tools, initial_messages, *,
 
     恢复策略：正文缺失/截断时带明确指令续写（工具照调，Step 6 的强制 IC 工具调用
     可能还没发生），最多 max_continuations 次；预算用尽仍全空则抛错显式失败，
-    有部分正文则降级返回并 WARNING 留痕。
+    有部分正文但缺完整摘要也显式失败，避免下游自行补齐权威字段。
     """
     tools_by_name = tools_by_name if tools_by_name is not None else RM_TOOLS_BY_NAME
     max_iterations = max_iterations or _MAX_TOOL_ITERATIONS
@@ -284,6 +475,7 @@ def _run_tool_calling_loop(llm_with_tools, initial_messages, *,
     continuations = 0
     iteration = 0
     finalization_requested = False
+    authoritative_result: dict | None = None
 
     while iteration < hard_cap:
         iteration += 1
@@ -314,6 +506,8 @@ def _run_tool_calling_loop(llm_with_tools, initial_messages, *,
                     result = tool.invoke(tool_args)
                     result_str = json.dumps(result, ensure_ascii=False) if isinstance(result, dict) else str(result)
                     tool_result_summaries.append(f"{tool_name}: {result_str[:3000]}")
+                    if tool_name == authoritative_tool_name and _valid_ic_recommendation_result(result):
+                        authoritative_result = result
                     logger.debug("%s 工具 %s 结果: %s", role, tool_name, result_str[:200])
                     messages.append(ToolMessage(content=result_str, tool_call_id=tool_id))
                 except Exception as e:
@@ -333,22 +527,33 @@ def _run_tool_calling_loop(llm_with_tools, initial_messages, *,
 
         # —— 不再调工具：检查正文是否完整 ——
         joined = "\n\n".join(cot_segments)
-        if joined.strip() and _summary_yaml_is_complete(
+        summary_complete = joined.strip() and _summary_yaml_is_complete(
             joined,
             completion_token,
             required_summary_fields,
-        ):
+        )
+        authority_complete = authoritative_tool_name is None or authoritative_result is not None
+        if summary_complete and authority_complete:
             logger.info(
                 "%s tool calling 循环结束（第 %d 轮，累积 %d 段，总长 %d 字符）",
                 role, iteration, len(cot_segments), len(joined),
             )
-            return AIMessage(content=joined)
+            artifact = _extract_final_manager_artifact(joined, completion_token)
+            if authoritative_result is not None:
+                artifact = _enforce_ic_recommendation_truth(artifact, authoritative_result)
+                if not _summary_yaml_is_complete(
+                    artifact, completion_token, required_summary_fields,
+                ):
+                    raise RuntimeError("权威 IC 工具结果写入后 RM_SUMMARY 仍不完整")
+            return AIMessage(content=artifact)
 
         if continuations >= max_continuations:
             break
 
         continuations += 1
-        if not joined.strip():
+        if summary_complete and not authority_complete:
+            reason = f"缺强制工具 {authoritative_tool_name} 的成功结果"
+        elif not joined.strip():
             reason = "为空"
         elif completion_token not in joined:
             reason = f"截断（缺 {completion_token} 收尾）"
@@ -371,14 +576,13 @@ def _run_tool_calling_loop(llm_with_tools, initial_messages, *,
 
     # —— 续写预算用尽 ——
     joined = "\n\n".join(cot_segments)
-    if not joined.strip():
-        raise RuntimeError(
-            f"{role} 连续 {max_continuations + 1} 次输出空正文（think-only 剥离后无内容），"
-            "中止本次分析——空 thesis 流向下游只会产出无依据的报告"
-        )
-    logger.warning("%s 续写预算用尽仍缺 %s 收尾，按现有 %d 字符正文降级返回（下游解析会标 warning）",
-                   role, completion_token, len(joined))
-    return AIMessage(content=joined)
+    if authoritative_tool_name and authoritative_result is None:
+        raise RuntimeError(f"{role} 未获得强制工具 {authoritative_tool_name} 的成功结果，中止分析")
+    detail = "正文为空" if not joined.strip() else f"已有 {len(joined)} 字符正文"
+    raise RuntimeError(
+        f"{role} 续写预算用尽仍缺完整 {completion_token}（{detail}），中止本次分析；"
+        "管理层权威摘要不完整时不得流向下游"
+    )
 
 
 def create_research_manager(llm):
@@ -1103,6 +1307,7 @@ RM_SUMMARY:
             llm_with_tools,
             [HumanMessage(content=prompt)],
             required_summary_fields=_RM_FOUR_PILLAR_REQUIRED_FIELDS,
+            authoritative_tool_name="compute_ic_recommendation",
         )
         normalized_content = _normalize_summary_yaml_fence(response.content, "RM_SUMMARY")
         normalized_content = _enforce_research_rating_truth(normalized_content)

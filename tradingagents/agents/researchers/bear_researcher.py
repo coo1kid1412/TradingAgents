@@ -10,6 +10,7 @@ from tradingagents.agents.utils.handoff import (
     pack_agent_context,
     pack_report_handoffs,
 )
+from tradingagents.agents.utils.decision_response import invoke_decision_response
 
 
 def create_bear_researcher(llm):
@@ -143,7 +144,7 @@ Resources available（角色交接单；完整报告仅供审计）:
             "在同一正式证据集上提出最强空头论证并挑战多头因果缺口",
         )
 
-        response = llm.invoke(prompt)
+        response = invoke_decision_response(llm, prompt, role="bear")
 
         argument = f"Bear Analyst: {response.content}"
 

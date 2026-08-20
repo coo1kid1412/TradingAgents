@@ -79,6 +79,23 @@ def _strip_reasoning(text: str) -> str:
     return clean.strip()
 
 
+def extract_final_report_artifact(text: str) -> str:
+    """Drop tool-status narration before the first deliverable report heading."""
+    clean = _strip_reasoning(text)
+    if re.match(r"^#{1,6}\s+\S", clean):
+        return clean
+    heading = re.search(r"(?m)^#\s+\S.*$", clean)
+    if not heading:
+        return clean
+    prefix = clean[:heading.start()]
+    tool_status = re.search(
+        r"(?is)(?:工具.{0,80}(?:超时|失败|重试)|"
+        r"(?:我|现在|接下来).{0,80}(?:调用|检索|获取|撰写)|已获取.{0,40}数据)",
+        prefix,
+    )
+    return clean[heading.start():].strip() if tool_status else clean
+
+
 def _sanitize(value: Any) -> Any:
     if isinstance(value, str):
         return _strip_reasoning(value)
@@ -318,16 +335,6 @@ def pack_report_handoffs(
         quality = str((handoff.get("quality") or {}).get("status") or "invalid")
         payload: Any = handoff
         label = f"{_normalize_role(role)} HANDOFF"
-        if quality == "invalid":
-            summary, _status = extract_yaml_mapping(report or "", "SUMMARY")
-            if summary is not None:
-                payload = {
-                    "role": _normalize_role(role),
-                    "fallback": "SUMMARY",
-                    "quality_status": "partial",
-                    "summary": _sanitize(summary),
-                }
-                label = f"{_normalize_role(role)} SUMMARY 降级交接"
         items.append({
             "label": label,
             "content": payload,
