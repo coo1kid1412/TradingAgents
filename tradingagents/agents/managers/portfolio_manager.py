@@ -420,6 +420,65 @@ def _normalize_no_new_position_rows(
     return report_body
 
 
+def _replace_plan_actor_block(
+    report_body: str,
+    *,
+    actor: str,
+    replacement: str,
+) -> str:
+    """Replace one Markdown action block without depending on punctuation layout."""
+    actor_pattern = "空仓者" if actor == "empty" else "(?:已)?持仓者"
+    bold_pattern = re.compile(
+        rf"^\*\*{actor_pattern}(?:（[^*\n]*）|\([^*\n]*\))?"
+        rf"(?P<inside>[^*\n]*)\*\*(?P<outside>.*)$"
+    )
+    heading_pattern = re.compile(rf"^###\s+{actor_pattern}")
+    protected_tail = re.compile(
+        r"^(?:Time\s*Stop|时间止损|(?:未来\s*)?12\s*个月|情景概率|"
+        r"风险、触发与监控|为什么这样决定|减仓资金去向|[三四五六]、)"
+    )
+    holder_boundary = re.compile(
+        r"^(?:###\s+(?:已)?持仓者|\*\*(?:已)?持仓者(?:\b|[：:（(]))"
+    )
+    lines = report_body.splitlines()
+
+    def is_protected_tail(line: str) -> bool:
+        normalized = re.sub(
+            r"^(?:(?:[-*+>]|\d+[.)])\s*)+",
+            "",
+            line.strip(),
+        ).removeprefix("**")
+        return bool(protected_tail.match(normalized))
+
+    for index, line in enumerate(lines):
+        stripped = line.strip()
+        bold_match = bold_pattern.match(stripped)
+        heading_match = heading_pattern.match(stripped)
+        if not bold_match and not heading_match:
+            continue
+
+        has_inline_body = False
+        if bold_match:
+            payload = f"{bold_match.group('inside')}{bold_match.group('outside')}"
+            has_inline_body = bool(payload.strip(" \t：:"))
+
+        end = index + 1
+        if not has_inline_body:
+            while end < len(lines):
+                candidate = lines[end].strip()
+                if (
+                    candidate.startswith("##")
+                    or is_protected_tail(candidate)
+                    or (actor == "empty" and holder_boundary.match(candidate))
+                ):
+                    break
+                end += 1
+
+        replacement_lines = replacement.rstrip().splitlines()
+        return "\n".join(lines[:index] + replacement_lines + lines[end:])
+    return report_body
+
+
 def _canonicalize_holder_action_section(report_body: str, summary_source: str) -> str:
     """Replace duplicate holder instructions with the canonical PM summary levels."""
     values = {
@@ -438,20 +497,10 @@ def _canonicalize_holder_action_section(report_body: str, summary_source: str) -
         f"| **软止损 {values['pm_sl_soft']} 元** | 减仓 50% 并复核风险 |\n"
         f"| **硬止损 {values['pm_sl_hard']} 元** | 全部退出 |\n\n"
     )
-    cleaned = re.sub(
-        r"(?ms)^###\s+(?:已)?持仓者[^\n]*\n.*?(?=^###\s|^##\s|\Z)",
-        section,
+    return _replace_plan_actor_block(
         report_body,
-        count=1,
-    )
-    return re.sub(
-        r"(?ms)^\*\*(?:已)?持仓者(?:（[^*\n]*）|\([^*\n]*\))?[：:]?\*\*[：:]?\s*\n.*?"
-        r"(?=^\*\*(?:(?:未来\s*)?12\s*个月|情景概率|风险、触发与监控|"
-        r"为什么这样决定|减仓资金去向|[三四五六]、)[^*\n]*\*\*[：:]?\s*$|"
-        r"^###\s|^##\s|\Z)",
-        section,
-        cleaned,
-        count=1,
+        actor="holder",
+        replacement=section,
     )
 
 
@@ -467,15 +516,11 @@ def _canonicalize_empty_action_section(
         "不沿用本报告中的旧入场价或条件单。\n"
         f"- **重新评估条件：** {trigger}；满足后重新生成交易票。\n\n"
     )
-    patterns = (
-        r"(?ms)^###\s+空仓者[^\n]*\n.*?(?=^###\s|^##\s|\Z)",
-        r"(?ms)^\*\*空仓者\*\*[：:]\s*\n.*?"
-        r"(?=^\*\*(?:已)?持仓者(?:（[^*\n]*）|\([^*\n]*\))?[：:]?\*\*[：:]?\s*$|^###\s|^##\s|\Z)",
+    return _replace_plan_actor_block(
+        report_body,
+        actor="empty",
+        replacement=section,
     )
-    cleaned = report_body
-    for pattern in patterns:
-        cleaned = re.sub(pattern, section, cleaned, count=1)
-    return cleaned
 
 
 def _normalize_reporting_date_language(

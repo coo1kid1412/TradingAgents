@@ -1345,6 +1345,14 @@ PM_SUMMARY:
     result = _format_pm_decision(
         content,
         {"structure_class": "neutral", "effective_action": "暂不介入"},
+        market_report="""SUMMARY:
+  key_resistance: 430
+""",
+        research_plan="""RM_SUMMARY:
+  target_price_low: 463.48
+  target_price_mid: 540.17
+  target_price_high: 616.85
+""",
         market_risk_snapshot={"data_status": "stale", "required_checkpoint": "14:30"},
     )
 
@@ -1681,6 +1689,174 @@ PM_SUMMARY:
     assert "SL_soft 398" not in result
     assert "**12 个月主题：扩张。**" in result
     assert "长期逻辑与持仓交易价位无关，应保留。" in result
+
+
+def test_no_buy_replaces_inline_holder_plan_with_canonical_levels():
+    content = """## Trade Ticket 交易票
+
+| **TP1** 止盈 1 | **430 元** | 减仓 |
+| **TP2** 止盈 2 | **463.48 元** | 减仓 |
+| **TP3** 止盈 3 | **540.17 元** | 清仓 |
+| **SL_soft** 软止损 | **375.61 元** | 减仓 |
+| **SL_hard** 硬止损 | **350 元** | 清仓 |
+
+## 二、操作计划
+
+**空仓者：现时点不建仓（Action = WAIT @400-414）。** 条件触发后参考仓位 2-3%，成交区间 400-414。
+
+**持仓者（R-multiple 以 414.02 计）：** TP1 478.04 减 1/3 → TP2 542.06 再减 1/3 → TP3 606.08 清仓；SL_soft 375.61 减半预警；SL_hard 350.00 全部清仓。
+
+**Time Stop：** 6 个月检查一次，12 个月无兑现则清仓。
+
+```yaml
+PM_SUMMARY:
+  current_price: 414.02
+  pm_rating: OVERWEIGHT
+  pm_action_keyword: WAIT
+  pm_size_low_pct: 0
+  pm_size_high_pct: 0
+  pm_tp1: 430
+  pm_tp2: 463.48
+  pm_tp3: 540.17
+  pm_sl_soft: 375.61
+  pm_sl_hard: 350
+  entry_timing: 暂不介入
+```"""
+
+    result = _format_pm_decision(
+        content,
+        {"structure_class": "neutral", "effective_action": "暂不介入"},
+        market_report="""SUMMARY:
+  key_resistance: 430
+""",
+        research_plan="""RM_SUMMARY:
+  target_price_low: 463.48
+  target_price_mid: 540.17
+  target_price_high: 616.85
+""",
+    )
+
+    assert "| **TP1 430 元** | 减仓 1/3 |" in result
+    assert "| **TP2 463.48 元** | 再减仓 1/3 |" in result
+    assert "| **TP3 540.17 元** | 清仓或降至观察仓 |" in result
+    assert "478.04" not in result
+    assert "542.06" not in result
+    assert "606.08" not in result
+    assert "WAIT @400-414" not in result
+    assert "参考仓位 2-3%" not in result
+    assert "### 空仓者操作" in result
+    assert "当前不建仓；满足重新评估条件后再生成新交易票" in result
+    assert "**Time Stop：** 6 个月检查一次" in result
+
+
+def test_no_buy_replaces_multiline_empty_plan_with_colon_inside_bold_heading():
+    content = """## Trade Ticket 交易票
+
+| **TP1** 止盈 1 | **430 元** | 减仓 |
+| **TP2** 止盈 2 | **463.48 元** | 减仓 |
+| **TP3** 止盈 3 | **540.17 元** | 清仓 |
+| **SL_soft** 软止损 | **375.61 元** | 减仓 |
+| **SL_hard** 硬止损 | **350 元** | 清仓 |
+
+## 二、操作计划
+
+**空仓者：**
+- 在 400-414 元挂单，目标仓位 3%。
+
+**持仓者：**
+- TP1 478.04 减仓，TP2 542.06 再减仓。
+
+- **Time Stop：** 6 个月检查一次。
+12 个月主题：扩张，保留后续正文。
+
+```yaml
+PM_SUMMARY:
+  current_price: 414.02
+  pm_rating: OVERWEIGHT
+  pm_action_keyword: WAIT
+  pm_size_low_pct: 0
+  pm_size_high_pct: 0
+  pm_tp1: 430
+  pm_tp2: 463.48
+  pm_tp3: 540.17
+  pm_sl_soft: 375.61
+  pm_sl_hard: 350
+  entry_timing: 暂不介入
+```"""
+
+    result = _format_pm_decision(
+        content,
+        {"structure_class": "neutral", "effective_action": "暂不介入"},
+        market_report="""SUMMARY:
+  key_resistance: 430
+""",
+        research_plan="""RM_SUMMARY:
+  target_price_low: 463.48
+  target_price_mid: 540.17
+  target_price_high: 616.85
+""",
+    )
+
+    assert "400-414 元挂单" not in result
+    assert "目标仓位 3%" not in result
+    assert "### 空仓者操作" in result
+    assert "### 已持仓者操作" in result
+    assert "478.04" not in result
+    assert "542.06" not in result
+    assert "- **Time Stop：** 6 个月检查一次。" in result
+    assert "12 个月主题：扩张，保留后续正文。" in result
+
+
+def test_no_buy_replaces_inline_empty_plan_after_bold_heading():
+    content = """## Trade Ticket 交易票
+
+| **TP1** 止盈 1 | **430 元** | 减仓 |
+| **TP2** 止盈 2 | **463.48 元** | 减仓 |
+| **TP3** 止盈 3 | **540.17 元** | 清仓 |
+| **SL_soft** 软止损 | **375.61 元** | 减仓 |
+| **SL_hard** 硬止损 | **350 元** | 清仓 |
+
+## 二、操作计划
+
+**空仓者：** 同行旧挂单 400-414 元，目标仓位 3%。
+
+**持仓者：** 保留持仓计划。
+
+**Time Stop：** 6 个月检查一次。
+
+```yaml
+PM_SUMMARY:
+  current_price: 414.02
+  pm_rating: OVERWEIGHT
+  pm_action_keyword: WAIT
+  pm_size_low_pct: 0
+  pm_size_high_pct: 0
+  pm_tp1: 430
+  pm_tp2: 463.48
+  pm_tp3: 540.17
+  pm_sl_soft: 375.61
+  pm_sl_hard: 350
+  entry_timing: 暂不介入
+```"""
+
+    result = _format_pm_decision(
+        content,
+        {"structure_class": "neutral", "effective_action": "暂不介入"},
+        market_report="""SUMMARY:
+  key_resistance: 430
+""",
+        research_plan="""RM_SUMMARY:
+  target_price_low: 463.48
+  target_price_mid: 540.17
+  target_price_high: 616.85
+""",
+    )
+
+    assert "同行旧挂单" not in result
+    assert "目标仓位 3%" not in result
+    assert "### 空仓者操作" in result
+    assert "### 已持仓者操作" in result
+    assert "**Time Stop：** 6 个月检查一次。" in result
 
 
 def test_market_and_risk_consensus_cap_is_enforced_at_pm_output_boundary():
