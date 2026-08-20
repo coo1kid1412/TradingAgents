@@ -270,7 +270,7 @@ class ReportGoldenTests(TestCase):
         self.assertNotIn("A-FOURTH-RULE", report)
         self.assertNotIn("骤跌概率", report)
 
-    def test_rule_m3_section_is_explanation_only(self) -> None:
+    def test_rule_deepseek_section_is_explanation_only(self) -> None:
         context = replace(
             _context(),
             recommended_risk_level=RiskLevel.RED,
@@ -281,7 +281,7 @@ class ReportGoldenTests(TestCase):
 
         report = render_premarket_report(result, None)
 
-        self.assertIn("M3 情景解释", report)
+        self.assertIn("DeepSeek 情景解释", report)
         self.assertIn("不改变规则灯号和操作约束", report)
         self.assertNotIn("建议：", report)
         self.assertNotIn("99.00%", report)
@@ -298,7 +298,7 @@ class ReportGoldenTests(TestCase):
             "## 市场阶段",
             "## 相比上一份",
             "## 主要驱动",
-            "## M3 情景校验",
+            "## DeepSeek 情景校验",
             "## 数据与模型",
         ]
         positions = [report.index(item) for item in ordered]

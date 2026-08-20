@@ -32,6 +32,9 @@ class GraphSetup:
         sentiment_llm: Any = None,
         news_llm: Any = None,
         fundamentals_llm: Any = None,
+        macro_llm: Any = None,
+        stock_profile_llm: Any = None,
+        consensus_llm: Any = None,
         trader_llm: Any = None,
         research_manager_llm: Any = None,
         portfolio_manager_llm: Any = None,
@@ -53,6 +56,9 @@ class GraphSetup:
         self.sentiment_llm = sentiment_llm or quick_thinking_llm
         self.news_llm = news_llm or quick_thinking_llm
         self.fundamentals_llm = fundamentals_llm or quick_thinking_llm
+        self.macro_llm = macro_llm or deep_thinking_llm
+        self.stock_profile_llm = stock_profile_llm or deep_thinking_llm
+        self.consensus_llm = consensus_llm or quick_thinking_llm
         self.trader_llm = trader_llm or quick_thinking_llm
         self.research_manager_llm = research_manager_llm or deep_thinking_llm
         self.portfolio_manager_llm = portfolio_manager_llm or deep_thinking_llm
@@ -119,16 +125,16 @@ class GraphSetup:
         capital_flow_officer_node = create_capital_flow_node()
 
         # Macro Strategist: identifies rate cycle, liquidity, geopolitical risks, sector relative impact
-        macro_context_officer_node = create_macro_context_node(self.quick_thinking_llm)
+        macro_context_officer_node = create_macro_context_node(self.macro_llm)
 
         # Stock profile officer: identifies stock characteristics + recommended report weights
-        stock_profile_officer_node = create_stock_profile_node(self.quick_thinking_llm)
+        stock_profile_officer_node = create_stock_profile_node(self.stock_profile_llm)
 
         # Sector Comparison Officer: 纯 Python，无 LLM。算本股 vs 主题 ETF / 行业 ETF / 市场指数 的 RS
         sector_comparison_officer_node = create_sector_comparison_node()
 
         # Consensus officer: synthesizes market consensus before bull/bear debate
-        consensus_officer_node = create_consensus_node(self.quick_thinking_llm)
+        consensus_officer_node = create_consensus_node(self.consensus_llm)
 
         # Research Evidence Officer: pure Python evidence cards + IC packet.
         research_evidence_officer_node = create_research_evidence_node()

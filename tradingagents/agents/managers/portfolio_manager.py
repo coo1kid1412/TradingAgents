@@ -2,6 +2,8 @@ import logging
 import json
 import re
 
+import yaml
+
 from langchain_core.messages import AIMessage, HumanMessage
 
 from tradingagents.agents.utils.agent_utils import build_instrument_context, get_language_instruction, RISK_DEBATE_PHRASING_RULES
@@ -11,13 +13,20 @@ from tradingagents.agents.managers.pm_tools import (
     compute_r_multiple_levels,
 )
 from tradingagents.agents.managers.research_manager import (
+    _canonical_pm_execution,
     _derive_entry_timing_from_profile,
     _enforce_entry_timing_truth,
     _extract_rm_rating,
     _normalize_summary_yaml_fence,
     _run_tool_calling_loop,
 )
-from tradingagents.agents.utils.research_evidence_node import render_decision_attribution
+from tradingagents.agents.utils.research_evidence_node import (
+    ATTRIBUTION_OWNER_POLICY,
+    ATTRIBUTION_VARIABLE_POLICY,
+    compile_decision_contribution_ledger,
+    render_decision_attribution,
+    render_ic_contribution_summary,
+)
 from tradingagents.agents.managers.rm_tools import derive_market_mode
 from tradingagents.agents.utils.risk_consensus import build_risk_consensus
 from tradingagents.agents.utils.risk_context import build_risk_data_packet
@@ -65,10 +74,158 @@ _ENTRY_PRESENTATION = {
     ),
 }
 
+_PILLAR_STATE_CN = {
+    "strong": "强",
+    "adequate": "合格",
+    "mixed": "分化",
+    "weak": "偏弱",
+    "invalid": "无效",
+    "attractive": "有吸引力",
+    "fair": "合理",
+    "stretched": "偏贵",
+    "visible": "明确",
+    "absent": "缺少",
+    "adverse": "不利",
+    "resilient": "稳健",
+    "acceptable": "可接受",
+    "fragile": "脆弱",
+    "broken": "失效",
+}
+
 
 def _extract_pm_summary_value(content: str, key: str) -> str | None:
     matches = re.findall(rf"(?m)^\s*{re.escape(key)}:\s*([^#\r\n]+?)\s*$", content or "")
     return matches[-1].strip().strip('"\'') if matches else None
+
+
+def _enforce_pm_research_rating(content: str, research_plan: str) -> str:
+    """Make the PM summary mirror the RM's authoritative research rating."""
+    research_rating = _extract_rm_rating(research_plan)
+    if not research_rating:
+        return content
+    fixed = re.sub(
+        r"(?m)^(\s*pm_rating:\s*).*$",
+        rf"\g<1>{research_rating}",
+        content or "",
+    )
+    fixed = re.sub(
+        r"(?m)^(\s*pm_rating_adjusted_from_rm:\s*)(?:true|false)\s*$",
+        r"\g<1>false",
+        fixed,
+        flags=re.IGNORECASE,
+    )
+    return fixed
+
+
+def _enforce_pm_summary_truth(
+    content: str,
+    tool_results: dict[str, object],
+    expected_values: dict[str, object],
+    allowed_evidence_ids: set[str] | dict[str, set[str]] | None,
+) -> str:
+    """Overwrite code-owned PM summary fields and filter untraceable evidence IDs."""
+    normalized = _normalize_summary_yaml_fence(content, "PM_SUMMARY")
+    blocks = list(re.finditer(r"```yaml\s*\n(.*?)\n```", normalized, re.DOTALL))
+    if not blocks:
+        return normalized
+    match = blocks[-1]
+    try:
+        parsed = yaml.safe_load(match.group(1))
+    except yaml.YAMLError:
+        return normalized
+    summary = parsed.get("PM_SUMMARY") if isinstance(parsed, dict) else None
+    if not isinstance(summary, dict):
+        return normalized
+
+    summary.update(expected_values)
+    summary["pm_rating_adjusted_from_rm"] = False
+
+    scenario = tool_results.get("compute_pm_scenario_e")
+    if isinstance(scenario, dict) and scenario.get("p_0") is not None:
+        summary["current_price"] = scenario["p_0"]
+
+    conviction = tool_results.get("compute_conviction_position_map")
+    if isinstance(conviction, dict) and conviction.get("conviction_stars") is not None:
+        summary["pm_conviction_stars"] = conviction["conviction_stars"]
+
+    r_levels = tool_results.get("compute_r_multiple_levels")
+    if isinstance(r_levels, dict):
+        for summary_key, tool_key in (
+            ("pm_tp1", "tp1"), ("pm_tp2", "tp2"), ("pm_tp3", "tp3"),
+            ("pm_sl_soft", "sl_soft"), ("pm_sl_hard", "sl_hard"),
+        ):
+            if r_levels.get(tool_key) is not None:
+                summary[summary_key] = r_levels[tool_key]
+
+    gate_result = tool_results.get("apply_market_risk_gate")
+    gate_result = gate_result if isinstance(gate_result, dict) else None
+    execution = _canonical_pm_execution(summary, conviction, gate_result)
+    if execution is not None:
+        if execution["action"] == "BUY_NOW":
+            try:
+                entry_price = float((r_levels or {}).get("entry_price"))
+                current = float(summary["current_price"])
+                entry_low = float(summary["pm_entry_low"])
+                entry_high = float(summary["pm_entry_high"])
+                sl_soft = float(summary["pm_sl_soft"])
+                tp1 = float(summary["pm_tp1"])
+                entry_is_valid = (
+                    sl_soft < entry_low <= entry_price <= entry_high < tp1
+                    and entry_low <= current <= entry_high
+                )
+            except (TypeError, ValueError, AttributeError):
+                entry_is_valid = False
+            if not entry_is_valid:
+                execution = {
+                    "action": "WAIT",
+                    "size_low_pct": 0.0,
+                    "size_high_pct": 0.0,
+                }
+        action = str(execution["action"])
+        summary["pm_action_keyword"] = action
+        summary["pm_size_low_pct"] = execution["size_low_pct"]
+        summary["pm_size_high_pct"] = execution["size_high_pct"]
+        summary["pm_entry_judgment"] = "BUY_NOW" if action == "BUY_NOW" else (
+            "WAIT" if action == "WAIT" else "DONT_BUY"
+        )
+        summary["pm_invest_judgment"] = "YES" if action == "BUY_NOW" else (
+            "CONDITIONAL" if action == "WAIT" else "NO"
+        )
+        if action != "BUY_NOW":
+            summary["pm_entry_low"] = None
+            summary["pm_entry_high"] = None
+
+    if allowed_evidence_ids is not None:
+        for field in (
+            "short_term_evidence_ids", "long_term_evidence_ids",
+            "position_evidence_ids", "target_price_evidence_ids",
+        ):
+            raw = summary.get(field)
+            allowed_for_field = (
+                set(allowed_evidence_ids.get(field) or ())
+                if isinstance(allowed_evidence_ids, dict)
+                else allowed_evidence_ids
+            )
+            ids = [
+                item.strip() for item in str(raw or "").split("|")
+                if item.strip() in allowed_for_field
+            ]
+            summary[field] = "|".join(dict.fromkeys(ids)) or None
+
+    replacement = "```yaml\n" + yaml.safe_dump(
+        {"PM_SUMMARY": summary},
+        allow_unicode=True,
+        sort_keys=False,
+    ).rstrip() + "\n```"
+    return normalized[:match.start()] + replacement + normalized[match.end():]
+
+
+def _require_rm_rating(research_plan: str) -> str:
+    """Fail closed before PM execution when the authoritative RM rating is absent."""
+    rating = _extract_rm_rating(research_plan)
+    if not rating:
+        raise RuntimeError("RM 权威研究评级缺失，PM 不得启动或自行定级")
+    return rating
 
 
 def _format_position_size(low: str | None, high: str | None) -> str:
@@ -90,6 +247,28 @@ def _format_position_size(low: str | None, high: str | None) -> str:
     if low_value is None:
         return f"0-{high_value}%"
     return f"{low_value}-{high_value}%"
+
+
+def _presented_entry_timing(
+    timing: dict,
+    entry_gate: str | None,
+    position_cap_pct: float | None = None,
+) -> str:
+    """Apply the market gate to the timing phrase shown across PM outputs."""
+    entry_timing = timing.get("effective_action") or "数据不足"
+    gate = str(entry_gate or "").upper()
+    if position_cap_pct is not None:
+        try:
+            cap = float(position_cap_pct)
+        except (TypeError, ValueError):
+            cap = 0.0
+        if cap <= 0:
+            return "暂不介入"
+    if gate == "CONDITIONAL":
+        return "等待条件确认"
+    if gate and gate != "OPEN":
+        return "暂不介入"
+    return entry_timing
 
 
 def _format_price(value: str | None) -> str | None:
@@ -241,6 +420,65 @@ def _normalize_no_new_position_rows(
     return report_body
 
 
+def _replace_plan_actor_block(
+    report_body: str,
+    *,
+    actor: str,
+    replacement: str,
+) -> str:
+    """Replace one Markdown action block without depending on punctuation layout."""
+    actor_pattern = "空仓者" if actor == "empty" else "(?:已)?持仓者"
+    bold_pattern = re.compile(
+        rf"^\*\*{actor_pattern}(?:（[^*\n]*）|\([^*\n]*\))?"
+        rf"(?P<inside>[^*\n]*)\*\*(?P<outside>.*)$"
+    )
+    heading_pattern = re.compile(rf"^###\s+{actor_pattern}")
+    protected_tail = re.compile(
+        r"^(?:Time\s*Stop|时间止损|(?:未来\s*)?12\s*个月|情景概率|"
+        r"风险、触发与监控|为什么这样决定|减仓资金去向|[三四五六]、)"
+    )
+    holder_boundary = re.compile(
+        r"^(?:###\s+(?:已)?持仓者|\*\*(?:已)?持仓者(?:\b|[：:（(]))"
+    )
+    lines = report_body.splitlines()
+
+    def is_protected_tail(line: str) -> bool:
+        normalized = re.sub(
+            r"^(?:(?:[-*+>]|\d+[.)])\s*)+",
+            "",
+            line.strip(),
+        ).removeprefix("**")
+        return bool(protected_tail.match(normalized))
+
+    for index, line in enumerate(lines):
+        stripped = line.strip()
+        bold_match = bold_pattern.match(stripped)
+        heading_match = heading_pattern.match(stripped)
+        if not bold_match and not heading_match:
+            continue
+
+        has_inline_body = False
+        if bold_match:
+            payload = f"{bold_match.group('inside')}{bold_match.group('outside')}"
+            has_inline_body = bool(payload.strip(" \t：:"))
+
+        end = index + 1
+        if not has_inline_body:
+            while end < len(lines):
+                candidate = lines[end].strip()
+                if (
+                    candidate.startswith("##")
+                    or is_protected_tail(candidate)
+                    or (actor == "empty" and holder_boundary.match(candidate))
+                ):
+                    break
+                end += 1
+
+        replacement_lines = replacement.rstrip().splitlines()
+        return "\n".join(lines[:index] + replacement_lines + lines[end:])
+    return report_body
+
+
 def _canonicalize_holder_action_section(report_body: str, summary_source: str) -> str:
     """Replace duplicate holder instructions with the canonical PM summary levels."""
     values = {
@@ -259,11 +497,29 @@ def _canonicalize_holder_action_section(report_body: str, summary_source: str) -
         f"| **软止损 {values['pm_sl_soft']} 元** | 减仓 50% 并复核风险 |\n"
         f"| **硬止损 {values['pm_sl_hard']} 元** | 全部退出 |\n\n"
     )
-    return re.sub(
-        r"(?ms)^###\s+(?:已)?持仓者[^\n]*\n.*?(?=^###\s|^##\s|\Z)",
-        section,
+    return _replace_plan_actor_block(
         report_body,
-        count=1,
+        actor="holder",
+        replacement=section,
+    )
+
+
+def _canonicalize_empty_action_section(
+    report_body: str,
+    *,
+    trigger: str,
+) -> str:
+    """Remove conditional orders that conflict with a WAIT/zero-size decision."""
+    section = (
+        "### 空仓者操作\n\n"
+        "- **当前不建仓；满足重新评估条件后再生成新交易票。** "
+        "不沿用本报告中的旧入场价或条件单。\n"
+        f"- **重新评估条件：** {trigger}；满足后重新生成交易票。\n\n"
+    )
+    return _replace_plan_actor_block(
+        report_body,
+        actor="empty",
+        replacement=section,
     )
 
 
@@ -377,6 +633,8 @@ def _enforce_effective_risk_cap(
             values["pm_entry_judgment"] = "WAIT"
         if gate == "CONDITIONAL":
             values["entry_timing"] = "等待条件确认"
+        elif gate != "OPEN":
+            values["entry_timing"] = "暂不介入"
         for key, value in values.items():
             pattern = rf"(?m)^(\s*{re.escape(key)}:\s*).*$"
             if re.search(pattern, summary_block):
@@ -535,7 +793,7 @@ def _format_pm_decision(
     news_report: str = "",
 ) -> str:
     """Remove model working text and prepend a deterministic action summary."""
-    original = (content or "").strip()
+    original = _enforce_pm_research_rating(content or "", research_plan).strip()
     summary_block, summary_start, _summary_was_fenced = _extract_pm_summary_block(original)
     user_source = original[:summary_start].rstrip() if summary_block else original
     trade_ticket = re.search(r"(?m)^#{1,2}\s+Trade Ticket\b.*$", user_source)
@@ -545,9 +803,12 @@ def _format_pm_decision(
         report_body = user_source
         logger.warning("PM 输出未找到 Trade Ticket 标题，保留原文并仅添加操作摘要")
 
-    entry_timing = timing.get("effective_action") or "数据不足"
-    if str((market_risk_snapshot or {}).get("entry_gate") or "").upper() == "CONDITIONAL":
-        entry_timing = "等待条件确认"
+    entry_gate = str((market_risk_snapshot or {}).get("entry_gate") or "").upper()
+    entry_timing = _presented_entry_timing(
+        timing,
+        entry_gate,
+        (market_risk_snapshot or {}).get("position_cap_pct"),
+    )
     if entry_timing not in _ENTRY_PRESENTATION:
         entry_timing = "数据不足"
     reason, trigger = _ENTRY_PRESENTATION[entry_timing]
@@ -594,6 +855,14 @@ def _format_pm_decision(
             count=1,
         )
         report_body = re.sub(
+            r"(?m)^\*\*未来\s*3\s*日[：:].*?"
+            r"(?=(?:\*\*)?(?:未来\s*)?12\s*个月(?:主题|趋势|判断)?[：:]|$)",
+            f"**未来 3 日：数据不足**（盘中风险快照陈旧，需 {checkpoint} 检查点；"
+            "当前仅执行 WAIT、0%）。 ",
+            report_body,
+            count=1,
+        )
+        report_body = re.sub(
             r"(?m)^(\s*short_term_trend:\s*).*$", r"\g<1>数据不足", report_body,
         )
         if summary_block:
@@ -607,6 +876,9 @@ def _format_pm_decision(
         )
         report_body = _normalize_no_new_position_rows(
             report_body, summary_block or original, entry_timing,
+        )
+        report_body = _canonicalize_empty_action_section(
+            report_body, trigger=trigger,
         )
         report_body = _canonicalize_holder_action_section(
             report_body, summary_block or original,
@@ -639,7 +911,14 @@ def _format_pm_decision(
         summary_block or original, entry_timing, size, rating,
     )
     attribution = ""
+    contribution_summary = ""
     if research_evidence_ledger is not None:
+        contribution_ledger = compile_decision_contribution_ledger(
+            research_plan, research_evidence_ledger,
+        )
+        contribution_summary = render_ic_contribution_summary(
+            research_plan, contribution_ledger,
+        )
         attribution = render_decision_attribution(
             summary_block or original,
             {**timing, "effective_action": entry_timing},
@@ -647,14 +926,28 @@ def _format_pm_decision(
             rm_content=research_plan,
         )
 
+    pillars = {
+        "经营与盈利": _extract_pm_summary_value(research_plan, "pillar_thesis") or "数据不足",
+        "估值": _extract_pm_summary_value(research_plan, "pillar_valuation") or "数据不足",
+        "催化": _extract_pm_summary_value(research_plan, "pillar_catalyst") or "数据不足",
+        "持续性": _extract_pm_summary_value(research_plan, "pillar_durability") or "数据不足",
+    }
+    pillars = {key: _PILLAR_STATE_CN.get(value, value) for key, value in pillars.items()}
+    mismatch_line = ""
+    if rating in {"BUY", "OVERWEIGHT"} and entry_timing in no_new_position_actions:
+        mismatch_line = f"> **暂不买入原因：{reason}**\n>\n"
     summary = (
         f"# 短期操作结论：{entry_timing}\n\n"
-        f"> **当前动作：{action}｜新建仓位：{size}｜长期评级：{rating}**\n>\n"
+        f"> **一年期研究评级：{rating}｜当前动作：{action}｜新建仓位：{size}**\n>\n"
+        f"> **四支柱：经营与盈利 {pillars['经营与盈利']}｜估值 {pillars['估值']}｜"
+        f"催化 {pillars['催化']}｜持续性 {pillars['持续性']}**\n>\n"
+        f"{mismatch_line}"
         f"> **核心原因：{reason}**\n>\n"
         f"> **趋势判断：未来 3 日 {short_trend}（置信度 {short_confidence}）｜"
         f"未来 12 个月主题 {theme_outlook}**\n>\n"
         f"> **重新评估条件：{trigger}**\n\n"
         f"{position_actions}"
+        f"{f'{chr(10)}{chr(10)}{contribution_summary}' if contribution_summary else ''}"
         f"{f'{chr(10)}{chr(10)}{attribution}' if attribution else ''}\n\n---"
     )
     rendered = f"{summary}\n\n{report_body}".rstrip()
@@ -664,7 +957,13 @@ def _format_pm_decision(
     return rendered.rstrip() + "\n"
 
 
-def _pm_tool_loop(llm_with_tools, initial_messages):
+def _pm_tool_loop(
+    llm_with_tools,
+    initial_messages,
+    *,
+    expected_summary_values: dict[str, object],
+    allowed_evidence_ids: set[str] | dict[str, set[str]],
+):
     """PM 工具调用循环——复用 RM 的共享循环（含空输出/截断续写兜底）。
 
     完成标记 PM_SUMMARY：prompt 强制的收尾 YAML，缺了说明正文被 think-only
@@ -674,6 +973,10 @@ def _pm_tool_loop(llm_with_tools, initial_messages):
         llm_with_tools, initial_messages,
         tools_by_name=PM_TOOLS_BY_NAME, role="PM",
         completion_token="PM_SUMMARY", max_iterations=_MAX_TOOL_ITERATIONS,
+        required_tool_names=set(PM_TOOLS_BY_NAME),
+        expected_summary_values=expected_summary_values,
+        allowed_summary_evidence_ids=allowed_evidence_ids,
+        summary_enforcer=_enforce_pm_summary_truth,
     )
 
 
@@ -715,7 +1018,7 @@ def create_portfolio_manager(llm, memory):
         # Direction semantics come from the original market snapshot. The
         # reconciled WAIT/cap is an execution constraint, not a bearish vote.
         market_mode = derive_market_mode(market_risk_snapshot)
-        rm_rating = _extract_rm_rating(research_plan)
+        rm_rating = _require_rm_rating(research_plan)
         entry_timing = _derive_entry_timing_from_profile(
             stock_profile, market_mode, long_term_rating=rm_rating,
         )
@@ -744,9 +1047,10 @@ def create_portfolio_manager(llm, memory):
 
 ## 决策权与问责
 
-PM 是最终交易决策人，独占最终动作、仓位、入场、止损和是否采纳 RM 的决定权。长期评级和目标价
-必须优先尊重基本面/RM，短期入场必须优先尊重市场/风险，仓位必须优先尊重风险门控。不得让舆情单独决定目标价，
-也不得让基本面单独决定未来三日入场。可以否决 RM，但必须引用有效反向证据 ID。
+PM 是最终交易决策人，独占最终动作、仓位、入场和止损的决定权。一年期研究评级由 RM 的四支柱工具
+确定，PM 不得修改 `research_rating`；短期入场必须优先尊重市场/风险，仓位必须优先尊重风险门控。
+不得让舆情单独决定目标价，也不得让基本面单独决定未来三日入场。PM 可以因执行风险拒绝当下买入，
+但只能改变动作与仓位，不能借此改写研究评级。
 
 ## ⚠️ 数值计算必须调用工具（强制约束）
 
@@ -803,8 +1107,8 @@ PM 是最终交易决策人，独占最终动作、仓位、入场、止损和�
 6. 反向证伪触发器（What would change my mind）
 7. 核心风险、触发条件 + 必要时的减仓资金去向（机会成本）
 
-**你比 RM 多的信息**：4 个 analyst 原始报告 + consensus + risk 三方辩论。
-**你不该做的**：重新做方向判断（评级以 RM 为准，仅 ±1 档微调）、重新算 PE/EPS。
+**你比 RM 多的信息**：风险三方辩论、市场风险闸门、仓位约束和确定性入场时机。
+**你不该做的**：重新做长期方向判断、重算 PE/EPS 或覆盖 RM 的四支柱研究评级。
 
 ## 用户版报告可读性（最高优先级）
 
@@ -825,13 +1129,13 @@ PM 是最终交易决策人，独占最终动作、仓位、入场、止损和�
 
 ## 决策流程（仅内部思考使用，**禁止把流程章节写入最终报告**）
 
-⚠️ **关键格式约束**：以下"第一步～第八步"是你**内部思考流程**，不是报告章节。**最终 decision.md 必须直接以 `## Trade Ticket 决策卡` 开头**，禁止出现"第一步：吸收股票画像"、"第二步：评级微调" 等流程性标题。所有思考结果直接体现在"完整报告结构"列出的十六个正式章节里。
+⚠️ **关键格式约束**：以下"第一步～第八步"是你**内部思考流程**，不是报告章节。**最终 decision.md 必须直接以 `## Trade Ticket 决策卡` 开头**，禁止出现"第一步：吸收股票画像"、"第二步：研究评级复核"等流程性标题。所有思考结果直接体现在正式报告章节里。
 
 ### 第一步：吸收股票画像 + 上下文（内部思考，不输出章节）
 
 从画像识别官的输出（在"输入资料"区"股票画像"段）提取并显式列出：
 - **决策风格**（value_anchor / catalyst_driven / momentum / event_driven）
-- **4 份报告最终权重**（用于校验 RM 评分是否合理）
+- **四支柱状态与被采纳证据**（只用于理解研究评级，不重新计票）
 - **关键时间窗口事件**
 
 **决策风格→操作动作的映射规则**（必须严格遵守）：
@@ -845,7 +1149,7 @@ PM 是最终交易决策人，独占最终动作、仓位、入场、止损和�
 
 **从 RM thesis 中提取**（RM 8 步 COT 综合判断产出）：
 
-- **最终评级 R + Conviction**（RM 一、评级与置信度）→ 默认采纳，仅 ±1 档微调；Conviction 映射五星 + 仓位
+- **最终研究评级 R + Conviction**（RM 一、评级与置信度）→ 评级逐字采用；Conviction 映射五星 + 仓位
 - **综合目标价区间 + Bull/Base/Bear 目标价 + 概率**（RM 一 / Step 5）→ 直接复用为情景分布三档，1R 基于综合区间
 - **业绩拐点 + 下一检验点**（RM Step 3）→ Time Stop 触发条件
 - **行业框架 + 决策风格**（RM Step 1 + stock_profile）→ 操作节奏（紧/松 TP/SL）
@@ -856,7 +1160,7 @@ PM 是最终交易决策人，独占最终动作、仓位、入场、止损和�
 
 | 字段 | quant_score 输出位置 | 你的用途 |
 |------|--------------------|---------|
-| **QUANT_SCORE.composite**（0-100） | YAML 摘要 | 评级一致性交叉校验：若 RM 评级方向与 quant 严重背离（如 RM=OVERWEIGHT 但 composite<30），需在 2B 评级微调中说明 |
+| **QUANT_SCORE.composite**（0-100） | YAML 摘要 | 独立交叉校验：若与 RM 方向严重背离，写入 Key Risks 并降低 Conviction/仓位，不改研究评级 |
 | **factor_scores 中 <30 分的因子** | YAML 摘要 / 因子分项表 | **必须列入 Trade Ticket 的 Key Risks 段**（如 lowvol=5 → "极端高波动"；value=18 → "估值显著偏贵"）|
 | **Conviction 强化**（评级与 quant 方向一致时）| —— | RM=OVERWEIGHT 且 composite≥70 → Conviction 可在 RM 给的基础上 +1 档 |
 
@@ -911,7 +1215,7 @@ stock_profile 末尾的 `TRANSPARENCY:` 段标注了"超共识程度"，按以�
 ⛔ **内部应用要求**：按上述阈值完成 Conviction 调档，但用户版报告只写成
 “估值锚偏离导致置信度下降”及对应结果，不输出 `TRANSPARENCY.*` 字段名、阈值检查过程或开发者留痕。
 
-### 第二步：评级微调（含对 RM thesis 的反向质疑）
+### 第二步：研究评级复核与执行质疑
 
 #### 2A. 对 RM thesis 的反向质疑（内部完成，不输出独立表）
 
@@ -935,17 +1239,17 @@ stock_profile 末尾的 `TRANSPARENCY:` 段标注了"超共识程度"，按以�
 > | 1 | RM 假设 Q2 营收同比 >25% 是 Base case | 第 5 步 Bull case 3 | **中** | 若 Q2 仅 +15%，Base case 概率从 55% 降到 30%，加权 E 从 +12% 转为 -3%，评级实际应降至 HOLD |
 > | 2 | RM 用三星 CXL 量产 Q3 落地作为 anchor 1 | Bull 论据 1 | **中** | 若三星推迟到 Q4，anchor 失效，d' 跨档至 HOLD，目标价应砍 20% 至 220 元 |
 
-#### 2B. 评级微调（仅限执行层因素）
+#### 2B. 评级只读与执行层修正
 
-1. 默认采纳 RM 评级 R2
-2. 仅允许 ±1 档微调，禁止跨方向翻转
-3. 调整必须留痕（写明触发理由）
+1. `research_rating` 必须逐字采用 RM_SUMMARY 的权威结果
+2. 反向质疑只能降低 Conviction、缩小仓位、延后入场或触发退出
+3. 若研究评级看多但当前不能买，必须明确写出市场风险、结构或赔率原因
 
 **质疑（2A）→ Conviction 修正**：
 - 若 2A 中有 ≥1 条"假设不成立概率 = 高"的质疑 → Conviction 下调一档（仓位对应下移）
 - 若 2A 中有 ≥2 条"假设不成立概率 = 中"的质疑 → Conviction 下调一档
-- 质疑**不能**修改评级方向（仍按 2B 规则采纳 RM ± 1 档）
-- 质疑结论写入最终决策卡的"评级调整说明"段留痕
+- 质疑**不能**修改研究评级方向
+- 质疑结论写入 Core Thesis、Key Risks 和执行动作，不另造评级
 
 ### 第三步：Conviction Score 五星制 + 仓位映射
 
@@ -997,16 +1301,8 @@ PM 必须明确"thesis 兑现"的具体里程碑（如"Q2 营收增速 >25%"、"
 
 ### 第六步：情景概率分布表（含尾部）
 
-**核心规则（条件性继承）**：
-
-| 你在第二步 2B 的决策 | 第六步该怎么做 |
-|------|---------|
-| **采纳 RM 评级（不微调）**| Bull/Base/Bear 三档**完全沿用 RM Step 5**（目标价 + 概率 + 核心假设原文照抄），你只新增 **黑天鹅 Tail** 一档 |
-| **微调 RM 评级（±1 档，如 HOLD → OVERWEIGHT）**| 允许调整 Bull/Base/Bear 概率（**单档调整不超过 ±15pp**），但**目标价仍沿用 RM**；必须显式输出"RM 原始 vs PM 调整"对照表，并归因到第二步反向质疑的具体条目 |
-
-**为什么目标价必须沿用 RM**：目标价是估值模型（PE×EPS / PEG / 同业可比）的输出。如果你认为目标价错，应该回到第二步质疑 RM Step 4 的估值方法，**而不是在这里悄悄改数字**。概率是对未来路径的主观判断，PM 在这上面有合理裁量空间。
-
-#### 情形 A：评级未微调（直接沿用 RM）
+Bull/Base/Bear 三档目标价、概率和核心假设**完全沿用 RM**。PM 只能基于风险辩论新增
+黑天鹅 Tail，并把原三档概率按比例缩放到 `(100% - tail%)`；不得借场景概率改写一年期研究评级。
 
 | 情景 | 概率 | 12 月目标价 | 收益 | 触发条件 |
 |------|------|------------|------|---------|
@@ -1017,24 +1313,6 @@ PM 必须明确"thesis 兑现"的具体里程碑（如"Q2 营收增速 >25%"、"
 | **概率加权 E** | 100% | __ 元 | __% | — |
 
 加入 Tail 后 Bull/Base/Bear 原始概率之和需从 100% 等比例收缩到 (100% − tail%)。例：RM 给 25/50/25，加 10% Tail，三档变 22.5/45/22.5。
-
-#### 情形 B：评级微调（必须输出对照表）
-
-| 情景 | RM 原始概率 | PM 调整后概率 | 12 月目标价（沿用 RM）| 调整归因 |
-|------|------------|--------------|---------------------|---------|
-| 乐观 Bullish | __% | __% | （沿用 RM）| 引用第二步反向质疑第 N 条：__ |
-| 基础 Base | __% | __% | （沿用 RM）| __ |
-| 悲观 Bearish | __% | __% | （沿用 RM）| __ |
-| 黑天鹅 Tail | — | __% | __ 元 | （PM 新增）|
-| **概率加权 E** | 100% | 100% | __ 元 | — |
-
-**约束（情形 B 专属）**：
-- 单档概率调整**不能超过 ±15pp**（如 Bear 从 25% 降到 10% 不允许，最低只能到 10%）
-- 调整方向必须与微调方向一致：升档（HOLD→OVERWEIGHT）只能 Bull 加 / Bear 减；降档反之
-- 每条调整必须**显式引用**第二步反向质疑的对应条目编号（如"第二步质疑 #2 指出 Q2 营收兑现概率被 RM 低估 → Bull 概率从 25% 升至 35%"）
-- 若你在第二步没有给出对应质疑就修改概率 → 视为静默改写，禁止
-
-#### 共同约束（情形 A / B 都适用）
 
 - 黑天鹅档**必须**显式引用尾部风险分析师的论据
 - 概率加权 E **必须**通过工具 `compute_pm_scenario_e` 计算（输入 4 档目标价 + 概率），禁止心算
@@ -1242,13 +1520,14 @@ PM 必须明确推荐其中之一，并解释理由。
 
 报告**完成后**，必须在最末尾输出一段 YAML 摘要，**字段名严格按以下格式**，否则归档失败。
 所有数值直接采用 Trade Ticket 中已经定下的值，不要再调整。
+`pm_rating 必须逐字镜像 RM_SUMMARY.research_rating`，PM 不得修改 `research_rating`。
 
 ```yaml
 PM_SUMMARY:
   ticker: "{pm_ticker}"
   trade_date: "{pm_trade_date}"
   current_price: <float>                 # 当前价 P_0
-  pm_rating: BUY / OVERWEIGHT / HOLD / UNDERWEIGHT / SELL
+  pm_rating: BUY / OVERWEIGHT / HOLD / UNDERWEIGHT / SELL  # 逐字镜像 RM_SUMMARY.research_rating
   pm_conviction_stars: <int 1-5>
   pm_invest_judgment: YES / NO / CONDITIONAL
   pm_entry_judgment: BUY_NOW / WAIT / DONT_BUY
@@ -1264,12 +1543,12 @@ PM_SUMMARY:
   pm_sl_hard: <float>                    # ⛔ 硬止损（所有评级都必填具体数字，禁止 null）
   pm_horizon_months_low: <int>           # Time Stop 时间窗口下沿（月）
   pm_horizon_months_high: <int>          # Time Stop 时间窗口上沿
-  pm_rating_adjusted_from_rm: <bool>     # PM 是否相对 RM 评级做了 ±1 档微调
+  pm_rating_adjusted_from_rm: false      # 兼容字段；研究评级只读
   market_risk_level: <低 / 中 / 高 / 极高 / 数据不足>
   market_entry_gate: <OPEN / CONDITIONAL / WAIT>
   market_position_cap_pct: <float>
   short_term_structure: trend_pullback / breakout_ready / healthy_trend / exhaustion / broken / neutral / insufficient_data
-  entry_timing: 分批介入 / 小仓试探 / 等回踩 / 等放量突破 / 暂不介入 / 退出观察 / 继续观察 / 数据不足
+  entry_timing: 分批介入 / 小仓试探 / 等待条件确认 / 等回踩 / 等放量突破 / 暂不介入 / 退出观察 / 继续观察 / 数据不足
   short_term_trend: <上涨 / 震荡 / 下跌>
   short_term_confidence: <高 / 中 / 低>
   theme_outlook_12m: <扩张 / 兑现 / 降速 / 破裂>
@@ -1290,13 +1569,71 @@ Be decisive and ground every conclusion in specific evidence from the analysts.{
 
         # 绑定 PM 计算工具，让 LLM 调工具算 R-multiple / Conviction / 4 情景 E
         llm_with_tools = llm.bind_tools(PM_TOOLS)
-        response = _pm_tool_loop(llm_with_tools, [HumanMessage(content=prompt)])
-        normalized_content = _normalize_summary_yaml_fence(response.content, "PM_SUMMARY")
-        pm_rating_match = re.findall(
-            r"(?m)^\s*pm_rating:\s*(BUY|OVERWEIGHT|HOLD|UNDERWEIGHT|SELL)\s*$",
-            normalized_content,
+        evidence_field_policies = {
+            "short_term_evidence_ids": "short_term",
+            "long_term_evidence_ids": "long_term",
+            "position_evidence_ids": "position",
+            "target_price_evidence_ids": "target_price",
+        }
+        allowed_summary_evidence_ids = {
+            field: set() for field in evidence_field_policies
+        }
+        for card in state.get("research_evidence_ledger", {}).get("cards") or []:
+            claim_id = card.get("claim_id")
+            if (
+                not claim_id
+                or card.get("decision_eligible") is not True
+                or str(card.get("quality_status") or "") == "invalid"
+            ):
+                continue
+            for field, policy in evidence_field_policies.items():
+                if (
+                    card.get("owner") in ATTRIBUTION_OWNER_POLICY[policy]
+                    and card.get("decision_variable") in ATTRIBUTION_VARIABLE_POLICY[policy]
+                ):
+                    allowed_summary_evidence_ids[field].add(str(claim_id))
+        synthetic_risk_ids = {
+            str(evidence_id)
+            for evidence_id in allowed_risk_ids
+            if str(evidence_id).startswith("RISK-")
+        }
+        allowed_summary_evidence_ids["short_term_evidence_ids"].update(
+            synthetic_risk_ids
         )
-        final_rating = pm_rating_match[-1] if pm_rating_match else rm_rating
+        allowed_summary_evidence_ids["position_evidence_ids"].update(
+            synthetic_risk_ids
+        )
+        expected_summary_values = {
+            "ticker": pm_ticker,
+            "trade_date": pm_trade_date,
+            "pm_rating": rm_rating,
+            "short_term_structure": entry_timing.get("structure_class"),
+            "entry_timing": _presented_entry_timing(
+                entry_timing,
+                effective_market_risk_snapshot.get("entry_gate"),
+                effective_market_risk_snapshot.get("position_cap_pct"),
+            ),
+            "market_entry_gate": str(
+                effective_market_risk_snapshot.get("entry_gate") or "WAIT"
+            ).upper(),
+            "market_position_cap_pct": max(
+                0.0,
+                float(effective_market_risk_snapshot.get("position_cap_pct") or 0),
+            ),
+        }
+        response = _pm_tool_loop(
+            llm_with_tools,
+            [HumanMessage(content=prompt)],
+            expected_summary_values=expected_summary_values,
+            allowed_evidence_ids=allowed_summary_evidence_ids,
+        )
+        normalized_content = _normalize_summary_yaml_fence(response.content, "PM_SUMMARY")
+        normalized_content = _enforce_pm_research_rating(
+            normalized_content, research_plan,
+        )
+        final_rating = rm_rating or _extract_pm_summary_value(
+            normalized_content, "pm_rating",
+        )
         final_entry_timing = _derive_entry_timing_from_profile(
             stock_profile, market_mode, long_term_rating=final_rating,
         )

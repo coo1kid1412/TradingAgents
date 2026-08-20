@@ -198,7 +198,7 @@ def validate_rule_context_assessment(
         overlooked_risks=_string_list(explanation["overlooked_risks"], allow_empty=True),
         recommended_risk_level=level,
         confidence=0.0,
-        action_reason="M3仅作情景解释，不改变规则决策。",
+        action_reason="LLM仅作情景解释，不改变规则决策。",
         reasoning_status="validated",
         error_class="decision_override_ignored" if override_present else None,
     )
@@ -259,7 +259,7 @@ class CircuitBreaker:
 def should_call_reasoning(
     session_slot: str, candidate: RiskLevel, previous: RiskLevel | None
 ) -> bool:
-    """Return whether the deterministic call policy permits an M3 invocation."""
+    """Return whether the deterministic call policy permits an LLM invocation."""
 
     normalized_slot = str(session_slot).strip().lower()
     try:

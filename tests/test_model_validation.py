@@ -20,6 +20,13 @@ class DummyLLMClient(BaseLLMClient):
 
 
 class ModelValidationTests(unittest.TestCase):
+    def test_deepseek_v4_models_are_known(self):
+        self.assertIn("deepseek", get_known_models())
+        self.assertIn("deepseek-v4-pro", get_known_models()["deepseek"])
+        self.assertIn("deepseek-v4-flash", get_known_models()["deepseek"])
+        self.assertTrue(validate_model("deepseek", "deepseek-v4-pro"))
+        self.assertTrue(validate_model("deepseek", "deepseek-v4-flash"))
+
     def test_cli_catalog_models_are_all_validator_approved(self):
         for provider, models in get_known_models().items():
             if provider in ("ollama", "openrouter"):

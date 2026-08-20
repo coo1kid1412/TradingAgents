@@ -299,15 +299,18 @@ class RunnerTests(TestCase):
         self.assertEqual(len(results), 1)
         self.assertEqual(results[0].session_slot, "premarket")
 
-    def test_m3_initialization_failure_becomes_a_persistable_fallback_adapter(self) -> None:
+    def test_deepseek_initialization_failure_becomes_a_persistable_fallback_adapter(self) -> None:
         repository = mock.Mock()
         repository.circuit_breaker.return_value = mock.Mock()
         with mock.patch(
-            "tradingagents.harness.market_warning.adapters.minimax_reasoning."
-            "MiniMaxReasoningAdapter.from_environment",
+            "tradingagents.harness.market_warning.adapters.deepseek_reasoning."
+            "DeepSeekReasoningAdapter.from_environment",
             side_effect=RuntimeError("private initialization failure"),
         ):
             reasoning = _reasoning_adapter(repository)
+
+        repository.circuit_breaker.assert_called_once_with("deepseek-v4-pro")
+        self.assertEqual(reasoning.model_name, "deepseek-v4-pro")
 
         result = _result(1, RiskLevel.ORANGE, slot="premarket")
         assessment = reasoning.assess(

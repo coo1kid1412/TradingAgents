@@ -12,6 +12,10 @@ from tradingagents.agents.utils.agent_utils import (
 )
 from tradingagents.dataflows.config import get_config
 from tradingagents.dataflows.ticker_utils import is_a_share
+from tradingagents.agents.utils.handoff import (
+    analyst_handoff_contract,
+    extract_final_report_artifact,
+)
 
 
 def _get_available_tools(ticker: str):
@@ -256,6 +260,12 @@ def create_news_analyst(llm):
             "- 该 SUMMARY 块是下游 RM / 风控团队的核心信息源，宁缺勿错\n"
         )
 
+        system_message += analyst_handoff_contract(
+            "news",
+            "识别会在何时改变盈利、估值或风险的新事件",
+            "交接事件/发布日期与日期依据、原始来源和验证状态、一级二级传导、催化日历、已定价程度、失效条件及卖方分歧；传闻与已验证事实必须分区，不得直接生成投资评级。",
+        )
+
         prompt = ChatPromptTemplate.from_messages(
             [
                 (
@@ -285,7 +295,7 @@ def create_news_analyst(llm):
         report = ""
 
         if len(result.tool_calls) == 0:
-            report = result.content
+            report = extract_final_report_artifact(str(result.content or ""))
 
         # 确定性催化信号注入（路2）：把 LLM 自产的结构化 key_events 聚合成 SYS_CATALYST 行，
         # 让"新闻催化"确定性进评级链（催化腿第5信号），不再靠 RM 当散文二次解读。

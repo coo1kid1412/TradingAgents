@@ -6,6 +6,7 @@ from .anthropic_client import AnthropicClient
 from .google_client import GoogleClient
 from .minimax_client import MiniMaxClient
 from .glm_client import GLMClient
+from .deepseek_client import DeepSeekClient
 
 
 def create_llm_client(
@@ -50,6 +51,9 @@ def create_llm_client(
 
     if provider_lower == "minimax":
         return MiniMaxClient(model, base_url, **kwargs)
+
+    if provider_lower == "deepseek":
+        return DeepSeekClient(model, base_url, **kwargs)
 
     if provider_lower in ("glm", "zhipu", "zhipuai", "bigmodel"):
         return GLMClient(model, base_url, **kwargs)

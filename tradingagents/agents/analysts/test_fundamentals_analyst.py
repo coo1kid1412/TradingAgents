@@ -66,7 +66,8 @@ def test_fundamentals_tool_loop_retries_when_think_body_is_empty():
     )
 
     assert _fundamentals_summary_is_complete(result.content)
-    assert "M3压缩重试输出" in result.content
+    assert "模型压缩重试输出" in result.content
+    assert "M3" not in result.content
     assert len(llm.messages) == 2
     assert "只输出可交付" in llm.messages[-1][-1].content
 
@@ -112,6 +113,29 @@ def test_compact_retry_carries_forward_tool_results():
 
     assert _fundamentals_summary_is_complete(result.content)
     assert "compute_fcf" in llm.messages[-1][-1].content
+
+
+def test_fundamentals_report_removes_tool_process_preamble():
+    first = AIMessage(
+        content="我先调用工具完成派生指标计算。",
+        tool_calls=[{
+            "name": "compute_fcf",
+            "args": {"operating_cash_flow": 10, "capex": 4},
+            "id": "fcf-1",
+            "type": "tool_call",
+        }],
+    )
+    final = AIMessage(content="# 基本面分析报告\n\n" + _COMPLETE_SUMMARY)
+    llm = _SequenceLLM([first, final])
+
+    result = _run_fundamentals_tool_loop(
+        llm,
+        [HumanMessage(content="原始基本面输入")],
+        structured_data="经营现金流 10，资本开支 4",
+    )
+
+    assert result.content.startswith("# 基本面分析报告")
+    assert "我先调用工具" not in result.content
 
 
 def test_llm_errors_degrade_to_caller_fallback_instead_of_escaping():

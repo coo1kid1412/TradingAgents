@@ -9,6 +9,7 @@
 """
 
 from tradingagents.agents.utils.agent_utils import build_instrument_context
+from tradingagents.agents.utils.handoff import analyst_handoff_contract, pack_report_handoffs
 
 
 def create_consensus_node(llm):
@@ -22,6 +23,16 @@ def create_consensus_node(llm):
         news_report = state.get("news_report", "")
         fundamentals_report = state.get("fundamentals_report", "")
         stock_profile = state.get("stock_profile", "")
+        research_context = pack_report_handoffs(
+            {
+                "fundamentals": fundamentals_report,
+                "market": market_report,
+                "news": news_report,
+                "sentiment": sentiment_report,
+                "stock_profile": stock_profile,
+            },
+            budget_chars=18_000,
+        )
 
         prompt = f"""【语言要求】你必须使用中文撰写以下分析。股票代码和技术指标名称可保留英文。
 
@@ -31,9 +42,7 @@ def create_consensus_node(llm):
 
 ---
 
-## 股票画像（由画像识别官在你之前提炼，影响你的报告权重）
-
-{stock_profile if stock_profile else "（画像缺失，按 4 份报告等权处理）"}
+## 股票画像（已包含在下方角色交接上下文，影响报告权重）
 
 **重要**：画像里给了 4 份报告的推荐权重。**权重越高的报告，你在识别共识时越要重点引用其口径**。例如：
 - 题材炒作小盘股：舆情权重高 → 共识 narrative 应主要来自舆情/新闻口径
@@ -91,19 +100,9 @@ def create_consensus_node(llm):
 
 ---
 
-## 输入资料
+## 输入资料（角色交接单；完整报告仅供审计）
 
-[置信度:高] Company fundamentals report:
-{fundamentals_report}
-
-[置信度:中高] Market research report:
-{market_report}
-
-[置信度:中] Latest world affairs news:
-{news_report}
-
-[置信度:中低] Social media sentiment report:
-{sentiment_report}
+{research_context}
 
 ---
 
@@ -139,6 +138,11 @@ MARKET_IMPLIED_VALUATION:
 - 优先级：news 报告中卖方研报口径 > sentiment 中 KOL 引述 > fundamentals 报告中行业对照
 - 区间型字段（pe_range / target_price_range）至少要找到 2 个独立来源做交叉验证（如高盛 + 中金）；只有 1 个来源时区间用单点表达 [X, X]
 """
+        prompt += analyst_handoff_contract(
+            "consensus",
+            "识别市场已经相信什么、价格计入什么及未回答问题",
+            "交接共识方向、强度与拥挤度，已计价的盈利/估值/催化假设，卖方新闻舆情的一致与分歧，市场隐含预期差及2-4个可证伪问题；不得生成最终推荐。",
+        )
 
         response = llm.invoke(prompt)
         return {"consensus_snapshot": response.content}

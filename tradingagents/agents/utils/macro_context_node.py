@@ -15,6 +15,7 @@
 """
 
 from tradingagents.agents.utils.agent_utils import build_instrument_context
+from tradingagents.agents.utils.handoff import analyst_handoff_contract, pack_report_handoffs
 
 
 def create_macro_context_node(llm):
@@ -28,6 +29,15 @@ def create_macro_context_node(llm):
         sentiment_report = state.get("sentiment_report", "")
         market_report = state.get("market_report", "")
         trade_date = state.get("trade_date", "")
+        research_context = pack_report_handoffs(
+            {
+                "news": news_report,
+                "fundamentals": fundamentals_report,
+                "market": market_report,
+                "sentiment": sentiment_report,
+            },
+            budget_chars=14_000,
+        )
 
         prompt = f"""【语言要求】你必须使用中文撰写以下分析。利率/政策/汇率等术语可保留英文缩写（如 PMI、CPI、HIBOR）。
 
@@ -154,20 +164,15 @@ MACRO_CONTEXT:
   premium_adjustment_pct: <整数百分比，相对基础阈值的调整，如 +10、0、-15>
 ```
 
-## 输入资料
+## 输入资料（角色交接单；完整报告仅供审计）
 
-[置信度:中] Latest news report:
-{news_report}
-
-[置信度:高] Company fundamentals report:
-{fundamentals_report}
-
-[置信度:中高] Market research report:
-{market_report}
-
-[置信度:中低] Social media sentiment report:
-{sentiment_report}
+{research_context}
 """
+        prompt += analyst_handoff_contract(
+            "macro",
+            "判断自上而下环境如何改变该行业的风险溢价和胜率",
+            "交接利率、流动性、风险偏好与数据时点，对行业的传导链，3个月/1年顺逆风，宏观事件日历、主题溢价和风险预算建议；不得直接决定个股评级。",
+        )
 
         response = llm.invoke(prompt)
         return {"macro_context": response.content}

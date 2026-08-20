@@ -75,7 +75,7 @@ class WarningRepository(Protocol):
     def attach_reasoning(self, decision_id: int, reasoning_id: int) -> None: ...
 
     def load_latest_reasoning(
-        self, market: Market, before_time: datetime, model_name: str = "MiniMax-M3"
+        self, market: Market, before_time: datetime, model_name: str = "deepseek-v4-pro"
     ) -> LLMContextAssessment | None: ...
 
     def save_decision(

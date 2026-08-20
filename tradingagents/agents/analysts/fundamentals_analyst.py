@@ -18,6 +18,10 @@ from tradingagents.agents.analysts.fundamentals_tools import (
 from tradingagents.dataflows.interface import route_to_vendor
 from tradingagents.dataflows.akshare_vendor import get_industry_pe_table
 from tradingagents.agents.utils.yaml_summary import extract_yaml_mapping
+from tradingagents.agents.utils.handoff import (
+    analyst_handoff_contract,
+    extract_final_report_artifact,
+)
 
 # 工具调用循环上限（防止 LLM 反复调同一工具）
 _MAX_TOOL_ITERATIONS = 8
@@ -125,7 +129,7 @@ def _mark_fundamentals_retry_partial(report: str) -> str:
             continue
         flags = summary.get("data_quality_flags")
         flags = list(flags) if isinstance(flags, list) else []
-        marker = "M3压缩重试输出，工具口径已保留但需复核"
+        marker = "模型压缩重试输出，工具口径已保留但需复核"
         if marker not in flags:
             flags.append(marker)
         summary["data_quality_flags"] = flags
@@ -164,7 +168,7 @@ def _run_fundamentals_tool_loop(
         if not tool_calls:
             joined = "\n\n".join(visible_segments)
             if _fundamentals_summary_is_complete(joined):
-                return AIMessage(content=joined)
+                return AIMessage(content=extract_final_report_artifact(joined))
             logger.warning(
                 "Fundamentals 可见正文缺失或 SUMMARY 不完整，第 %d 轮转入压缩收敛",
                 iteration + 1,
@@ -204,12 +208,16 @@ def _run_fundamentals_tool_loop(
             continue
         content = str(getattr(result, "content", "") or "").strip()
         if content and _fundamentals_summary_is_complete(content):
-            return AIMessage(content=_mark_fundamentals_retry_partial(content))
+            return AIMessage(content=extract_final_report_artifact(
+                _mark_fundamentals_retry_partial(content)
+            ))
         logger.warning("Fundamentals 压缩收敛第 %d 次仍无完整 SUMMARY", attempt + 1)
         final_messages.append(HumanMessage(
             content="上一轮仍未生成可见且完整的 SUMMARY。直接输出短报告和完整 YAML，禁止思考过程。"
         ))
-    return AIMessage(content="\n\n".join(visible_segments))
+    return AIMessage(content=extract_final_report_artifact(
+        "\n\n".join(visible_segments)
+    ))
 
 
 def _find_float(text: str, pattern: str):
@@ -227,7 +235,7 @@ def _yaml_number(value) -> str:
 
 
 def _build_deterministic_fundamentals_fallback(vendor_text: str, current_date: str) -> str:
-    """Emit a conservative partial SUMMARY when M3 produces think-only output twice."""
+    """Emit a conservative partial SUMMARY when visible output stays unavailable."""
     pe_ttm = _find_float(vendor_text, r"PE\s*\(TTM\)\s*[:：]\s*([-+]?\d+(?:\.\d+)?)")
     revenue_yoy = _find_float(vendor_text, r"营收YoY[^\n]*?年度=([-+]?\d+(?:\.\d+)?|NA)%")
     profit_yoy = _find_float(vendor_text, r"归母净利YoY[^\n]*?年度=([-+]?\d+(?:\.\d+)?|NA)%")
@@ -673,6 +681,12 @@ SUMMARY:
 - **数据校验警告**：如果数据前方出现「⚠️ 数据质量校验警告」段落，请优先处理其建议
 
 当前日期：{current_date}。{instrument_context}{lang_instruction}"""
+
+        system_message += analyst_handoff_contract(
+            "fundamentals",
+            "判断未来一年盈利质量、竞争力和估值锚是否支持持有",
+            "交接财务期间与口径、增长和现金流变化桥、商业壁垒与治理、12个月盈利驱动、估值方法与区间、bear/base/bull 假设范围及 thesis breaker；不得判断三日买点或绕过市场风险门。",
+        )
 
         messages = [
             SystemMessage(content=system_message),

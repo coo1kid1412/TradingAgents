@@ -7,6 +7,7 @@ from tradingagents.agents.utils.agent_utils import (
     get_xueqiu_posts,
 )
 from tradingagents.dataflows.config import get_config
+from tradingagents.agents.utils.handoff import analyst_handoff_contract
 
 
 def create_social_media_analyst(llm):
@@ -74,6 +75,12 @@ def create_social_media_analyst(llm):
             "- bull_post_pct + bear_post_pct + neutral_post_pct 必须 = 100\n"
             "- 数值字段保留 2 位小数；百分比字段直接填数字（不带 % 符号）\n"
             "- 该 SUMMARY 块是下游 RM / 风控团队的核心信息源，宁缺勿错\n"
+        )
+
+        system_message += analyst_handoff_contract(
+            "sentiment",
+            "判断投资者行为是否显示拥挤、脆弱或叙事变化",
+            "交接样本覆盖与限制、多空占比及7日变化、KOL一致性、叙事变化、拥挤方向、传闻标记和价格背离；社交内容只能作为行为证据，不得成为盈利、订单或估值硬事实。",
         )
 
         prompt = ChatPromptTemplate.from_messages(

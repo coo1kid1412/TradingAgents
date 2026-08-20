@@ -13,6 +13,14 @@ from typing import Optional
 
 from langchain_core.tools import tool
 
+from .ic_recommendation import (
+    FADING_HIGH_LOCK as _FADING_UP_LOCK,
+    THRESHOLD_BASE_CONFIGURATION as _THRESHOLD_BASE_DN,
+    THRESHOLD_BASE_HIGH as _THRESHOLD_BASE_UP,
+    THRESHOLD_STYLE_COEF as _THRESHOLD_STYLE_COEF,
+    compute_ic_recommendation,
+)
+
 
 # ============================================================================
 # 多空辩论评分工具
@@ -1235,18 +1243,7 @@ def compute_step6_trend_overlay(
     }
 
 
-# Step 6 动态阈值的 style 系数（与 RM 提示词第一步公式一致，搬进 Python 消手算漂移）
-_THRESHOLD_STYLE_COEF = {
-    "blue_chip": 1.0,
-    "cyclical": 1.0,
-    "illiquid": 0.7,
-    "etf": 1.0,
-    "high_beta_growth": 1.5,
-    "theme_speculation": 2.0,
-}
-_THRESHOLD_BASE_DN = 15.0
-_THRESHOLD_BASE_UP = 35.0
-_FADING_UP_LOCK = 30.0   # 主题退潮期上沿锁定（主题反噬保护，不再放宽）
+# Step 6 与新 IC 矩阵共享同一组动态阈值常量，避免迁移期口径漂移。
 
 
 def derive_market_mode(market_risk_snapshot: dict | None) -> str:
@@ -1859,10 +1856,9 @@ def compute_step6_final_rating(
 # ============================================================================
 # 工具集合（供 research_manager.py 一次性绑定）
 # ============================================================================
-# 注：Step 6 的子工具（rating_mapping / trend_overlay / style/vote/catalyst/synthesis）
-# 仍保留定义供合并工具内部复用，但**不再单独绑定给 RM**——RM 的 Step 6 评级终段只调
-# compute_step6_final_rating 一次（阈值+映射+拥挤+升降档+叠加+极端防御一次合议）。
-# 评级链中段不再有 LLM 徒手执行的对照表，同股不同跑的残余漂移源就此消除。
+# 旧 Step 6 工具仍保留供历史回放和单元测试使用，但不再绑定给 RM。
+# RM 的长期评级只调用 compute_ic_recommendation；目标价、情景收益和四支柱各自
+# 保留职责边界，不再先由目标价偏离产生初始五档评级。
 
 RM_TOOLS = [
     compute_bull_bear_score,
@@ -1875,7 +1871,7 @@ RM_TOOLS = [
     compute_odds_and_expected_return,
     compute_conviction_calibration,
     compute_scenario_consistency_check,
-    compute_step6_final_rating,
+    compute_ic_recommendation,
 ]
 
 

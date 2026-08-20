@@ -51,7 +51,7 @@ def _unavailable_quant(snapshot: FeatureSnapshot, reason: str) -> QuantRiskAsses
 
 def _reasoning_fallback(error_class: str) -> LLMContextAssessment:
     return LLMContextAssessment(
-        market_scenario="M3 context unavailable; retain deterministic baseline.",
+        market_scenario="LLM context unavailable; retain deterministic baseline.",
         causal_chain=(),
         supporting_evidence_ids=(),
         conflicting_evidence_ids=(),
@@ -272,7 +272,7 @@ class MarketWarningService:
                     reasoning_id = self.repository.save_reasoning(
                         feature_snapshot_id,
                         context,
-                        getattr(self.reasoning, "model_name", "MiniMax-M3"),
+                        getattr(self.reasoning, "model_name", "deepseek-v4-pro"),
                     )
                 except Exception:
                     context = _reasoning_fallback("persistence_error")
@@ -296,7 +296,7 @@ class MarketWarningService:
         if not previous_state_available:
             reasons.append("Previous warning state is unavailable; recovery state cannot be assessed.")
         if context is not None and context.reasoning_status == "validated":
-            reasons.append("M3 supplied a validated evidence-bounded context assessment.")
+            reasons.append("DeepSeek supplied a validated evidence-bounded context assessment.")
         decision = build_final_decision(
             baseline=baseline,
             candidate=candidate,

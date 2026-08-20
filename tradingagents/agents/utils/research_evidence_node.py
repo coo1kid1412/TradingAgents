@@ -62,6 +62,57 @@ ATTRIBUTION_VARIABLE_POLICY = {
     "target_price": frozenset({"target_price"}),
 }
 
+CONTRIBUTION_OWNER_POLICY = {
+    "thesis": frozenset({"fundamentals", "news", "quant", "sector"}),
+    "valuation": frozenset({"fundamentals", "news", "research_manager"}),
+    "catalyst": frozenset({"news", "fundamentals", "sector", "sentiment"}),
+    "durability": frozenset({"fundamentals", "news", "quant", "sector", "sentiment"}),
+}
+
+_CONTRIBUTION_FIELDS = {
+    "thesis": ("pillar_thesis", "thesis_evidence_ids", "经营与盈利"),
+    "valuation": ("pillar_valuation", "valuation_evidence_ids", "估值"),
+    "catalyst": ("pillar_catalyst", "catalyst_evidence_ids", "催化"),
+    "durability": ("pillar_durability", "durability_evidence_ids", "持续性"),
+}
+
+_PILLAR_EFFECTS = {
+    "thesis": {
+        "strong": "强支撑", "adequate": "支撑", "mixed": "中性",
+        "weak": "评级上限", "invalid": "拒绝方向性评级",
+    },
+    "valuation": {
+        "attractive": "支撑", "fair": "中性", "stretched": "评级上限",
+        "invalid": "拒绝方向性评级",
+    },
+    "catalyst": {
+        "strong": "强支撑", "visible": "支撑", "weak": "弱支撑",
+        "absent": "中性", "adverse": "反对",
+    },
+    "durability": {
+        "resilient": "强支撑", "acceptable": "支撑", "fragile": "评级上限",
+        "broken": "反对",
+    },
+}
+
+_PILLAR_STATE_LABELS = {
+    "strong": "强",
+    "adequate": "合格",
+    "mixed": "分化",
+    "weak": "偏弱",
+    "invalid": "无效",
+    "attractive": "有吸引力",
+    "fair": "合理",
+    "stretched": "偏贵",
+    "visible": "明确",
+    "absent": "缺少",
+    "adverse": "不利",
+    "resilient": "稳健",
+    "acceptable": "可接受",
+    "fragile": "脆弱",
+    "broken": "失效",
+}
+
 _CONFLICT_FAMILY = {
     "earnings_outlook_12m": "long_term_rating",
     "long_term_rating": "long_term_rating",
@@ -625,6 +676,133 @@ def _reference_ids(content: str, key: str) -> list[str]:
     if not raw:
         return []
     return [item.strip() for item in re.split(r"[|,，]", raw) if item.strip()]
+
+
+def compile_decision_contribution_ledger(
+    rm_content: str,
+    evidence_ledger: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Compile RM pillar references into one auditable contribution per claim."""
+    by_id = {
+        str(card.get("claim_id")): card
+        for card in evidence_ledger.get("cards") or []
+        if card.get("claim_id")
+    }
+    seen: set[str] = set()
+    items: list[dict[str, Any]] = []
+    pillars: dict[str, dict[str, Any]] = {}
+    warnings: list[str] = []
+
+    for dimension, (state_field, evidence_field, label) in _CONTRIBUTION_FIELDS.items():
+        state = (_summary_value(rm_content, state_field) or "数据不足").lower()
+        effect = _PILLAR_EFFECTS.get(dimension, {}).get(state, "数据不足")
+        references = _reference_ids(rm_content, evidence_field)
+        accepted_ids: list[str] = []
+        rejected_ids: list[str] = []
+
+        for claim_id in references:
+            if claim_id in seen:
+                warnings.append(f"{claim_id} 已归入其他支柱，忽略重复引用")
+                continue
+            seen.add(claim_id)
+            card = by_id.get(claim_id)
+            rejection_reason = None
+            if card is None:
+                rejection_reason = "证据 ID 不存在"
+            elif str(card.get("quality_status") or "invalid") == "invalid":
+                rejection_reason = "证据质量无效"
+            elif not bool(card.get("decision_eligible", True)):
+                rejection_reason = "证据不具备硬决策资格"
+            elif str(card.get("owner") or "") not in CONTRIBUTION_OWNER_POLICY[dimension]:
+                rejection_reason = "角色无权支撑该研究支柱"
+
+            if rejection_reason:
+                rejected_ids.append(claim_id)
+            else:
+                accepted_ids.append(claim_id)
+            quality = str(card.get("quality_status") or "invalid") if card else "missing"
+            confidence = str(card.get("confidence") or "low") if card else "low"
+            items.append({
+                "claim_id": claim_id,
+                "role": str(card.get("owner") or "unknown") if card else "unknown",
+                "decision_dimension": dimension,
+                "conclusion": str(card.get("claim") or "未找到证据") if card else "未找到证据",
+                "accepted_effect": "rejected" if rejection_reason else effect,
+                "direction": str(card.get("direction") or "neutral") if card else "neutral",
+                "materiality": "high" if confidence == "high" else "medium" if confidence == "medium" else "low",
+                "confidence": confidence,
+                "claim_ids": [claim_id],
+                "quality_status": quality,
+                "rejection_reason": rejection_reason,
+            })
+
+        pillars[dimension] = {
+            "label": label,
+            "state": state,
+            "accepted_effect": effect,
+            "accepted_claim_ids": accepted_ids,
+            "rejected_claim_ids": rejected_ids,
+        }
+
+    return {
+        "schema_version": "decision-contribution-v1",
+        "research_rating": _summary_value(rm_content, "research_rating")
+        or _summary_value(rm_content, "rm_rating")
+        or "数据不足",
+        "pillars": pillars,
+        "items": items,
+        "warnings": warnings,
+    }
+
+
+def render_ic_contribution_summary(
+    rm_content: str,
+    contribution_ledger: Mapping[str, Any],
+) -> str:
+    """Render four pillars and selected/rejected analyst contributions."""
+    rating = str(
+        contribution_ledger.get("research_rating")
+        or _summary_value(rm_content, "research_rating")
+        or "数据不足"
+    )
+    lines = [
+        "## 四支柱投委会结论", "",
+        f"一年期研究评级：**{rating}**", "",
+        "| 支柱 | 状态 | 对评级作用 | 已采纳证据 |",
+        "|---|---|---|---|",
+    ]
+    for dimension in _CONTRIBUTION_FIELDS:
+        pillar = (contribution_ledger.get("pillars") or {}).get(dimension, {})
+        evidence = ", ".join(pillar.get("accepted_claim_ids") or []) or "-"
+        state = str(pillar.get("state", "数据不足"))
+        lines.append(
+            f"| {pillar.get('label', dimension)} | {_PILLAR_STATE_LABELS.get(state, state)} | "
+            f"{pillar.get('accepted_effect', '数据不足')} | {evidence} |"
+        )
+
+    accepted = [
+        item for item in contribution_ledger.get("items") or []
+        if not item.get("rejection_reason")
+    ]
+    if accepted:
+        lines.extend(["", "### 关键 Agent 贡献", ""])
+        for item in accepted[:4]:
+            lines.append(
+                f"- **{item['role']} / {item['claim_id']}**：{item['conclusion']}"
+                f"（作用：{item['accepted_effect']}）"
+            )
+
+    rejected = [
+        item for item in contribution_ledger.get("items") or []
+        if item.get("rejection_reason")
+    ]
+    if rejected:
+        lines.extend(["", "### 未采纳的关键观点", ""])
+        for item in rejected[:4]:
+            lines.append(
+                f"- `{item['claim_id']}`：{item['rejection_reason']}"
+            )
+    return "\n".join(lines)
 
 
 def _display_number(value: str | None) -> str:

@@ -294,17 +294,17 @@ def _load_history_incrementally(
 
 
 def _reasoning_adapter(repository):
-    from tradingagents.harness.market_warning.adapters.minimax_reasoning import (
-        MiniMaxReasoningAdapter,
-        UnavailableReasoningAdapter,
+    from tradingagents.harness.market_warning.adapters.deepseek_reasoning import (
+        DeepSeekReasoningAdapter,
+        DeepSeekUnavailableReasoningAdapter,
     )
 
     try:
-        return MiniMaxReasoningAdapter.from_environment(
-            breaker=repository.circuit_breaker("minimax-m3")
+        return DeepSeekReasoningAdapter.from_environment(
+            breaker=repository.circuit_breaker("deepseek-v4-pro")
         )
     except Exception:
-        return UnavailableReasoningAdapter("initialization_error")
+        return DeepSeekUnavailableReasoningAdapter("initialization_error")
 
 
 def _load_environment() -> None:

@@ -10,6 +10,7 @@ from typing import Dict, Any, Tuple, List, Optional, Set
 from langgraph.prebuilt import ToolNode
 
 from tradingagents.llm_clients import create_llm_client
+from tradingagents.llm_clients.role_policy import resolve_role_policy
 
 from tradingagents.agents import *
 from tradingagents.default_config import DEFAULT_CONFIG
@@ -100,38 +101,22 @@ class TradingAgentsGraph:
         self.deep_thinking_llm = deep_client.get_llm_wrapped()
         self.quick_thinking_llm = quick_client.get_llm_wrapped()
         
-        # Create LLM instances with role-specific temperatures
-        # 四个基础分析师：使用 CLI 选择的模型（受 use_deep_think_for_analysts 控制）
-        use_deep = self.config.get("use_deep_think_for_analysts", True)
-        self.market_llm = self._create_templllm(self.config.get("temperature_market", 0.2), use_deep_think=use_deep)
-        self.sentiment_llm = self._create_templllm(self.config.get("temperature_sentiment", 0.5), use_deep_think=use_deep)
-        self.news_llm = self._create_templllm(self.config.get("temperature_news", 0.5), use_deep_think=use_deep)
-        self.fundamentals_llm = self._create_templllm(
-            self.config.get("temperature_fundamentals", 0.2),
-            use_deep_think=use_deep,
-            max_tokens_override=self.config.get("fundamentals_analyst_max_tokens"),
-        )
-        # 交易员：默认 quick_think（优化01后只做执行评估），可通过 use_deep_for_trader 回退
-        self.trader_llm = self._create_templllm(self.config.get("temperature_trader", 0.3), use_deep_think=self.config.get("use_deep_for_trader", False))
-        # RM/PM：固定 deep_think，最终决策推理需要深度
-        self.research_manager_llm = self._create_templllm(
-            self.config.get("temperature_research_manager", 0.3),
-            use_deep_think=True,
-            max_tokens_override=self.config.get("research_manager_max_tokens"),
-        )
-        # PM 单独提升 max_tokens：14 章节报告 + Trade Ticket 决策卡输出长，全局 8192 频繁截断
-        self.portfolio_manager_llm = self._create_templllm(
-            self.config.get("temperature_portfolio_manager", 0.3),
-            use_deep_think=True,
-            max_tokens_override=self.config.get("portfolio_manager_max_tokens"),
-        )
-        # 多/空研究员：默认 quick_think（修辞密度高但推理深度低），可通过 config flag 回退
-        self.bull_researcher_llm = self._create_templllm(self.config.get("temperature_bull_researcher", 0.5), use_deep_think=self.config.get("use_deep_for_bull_researcher", False))
-        self.bear_researcher_llm = self._create_templllm(self.config.get("temperature_bear_researcher", 0.5), use_deep_think=self.config.get("use_deep_for_bear_researcher", False))
-        # 风控分析师：固定使用 quick_think_llm
-        self.aggressive_risk_llm = self._create_templllm(self.config.get("temperature_aggressive_risk", 0.4), use_deep_think=False)
-        self.conservative_risk_llm = self._create_templllm(self.config.get("temperature_conservative_risk", 0.4), use_deep_think=False)
-        self.neutral_risk_llm = self._create_templllm(self.config.get("temperature_neutral_risk", 0.4), use_deep_think=False)
+        # Role policy selects Pro/Flash, Think effort and token budget explicitly.
+        self.market_llm = self._create_role_llm("market", self.config.get("temperature_market", 0.2))
+        self.sentiment_llm = self._create_role_llm("sentiment", self.config.get("temperature_sentiment", 0.5))
+        self.news_llm = self._create_role_llm("news", self.config.get("temperature_news", 0.5))
+        self.fundamentals_llm = self._create_role_llm("fundamentals", self.config.get("temperature_fundamentals", 0.2))
+        self.macro_llm = self._create_role_llm("macro", 0.2)
+        self.stock_profile_llm = self._create_role_llm("stock_profile", 0.2)
+        self.consensus_llm = self._create_role_llm("consensus", 0.3)
+        self.trader_llm = self._create_role_llm("trader", self.config.get("temperature_trader", 0.3))
+        self.research_manager_llm = self._create_role_llm("research_manager", self.config.get("temperature_research_manager", 0.3))
+        self.portfolio_manager_llm = self._create_role_llm("portfolio_manager", self.config.get("temperature_portfolio_manager", 0.3))
+        self.bull_researcher_llm = self._create_role_llm("bull_researcher", self.config.get("temperature_bull_researcher", 0.5))
+        self.bear_researcher_llm = self._create_role_llm("bear_researcher", self.config.get("temperature_bear_researcher", 0.5))
+        self.aggressive_risk_llm = self._create_role_llm("aggressive_risk", self.config.get("temperature_aggressive_risk", 0.4))
+        self.conservative_risk_llm = self._create_role_llm("conservative_risk", self.config.get("temperature_conservative_risk", 0.4))
+        self.neutral_risk_llm = self._create_role_llm("neutral_risk", self.config.get("temperature_neutral_risk", 0.4))
         
         # Initialize memories
         # Memory 系统简化：旧版给 bull/bear/trader/invest_judge 各分配一个 memory 实例，
@@ -159,6 +144,9 @@ class TradingAgentsGraph:
             sentiment_llm=self.sentiment_llm,
             news_llm=self.news_llm,
             fundamentals_llm=self.fundamentals_llm,
+            macro_llm=self.macro_llm,
+            stock_profile_llm=self.stock_profile_llm,
+            consensus_llm=self.consensus_llm,
             trader_llm=self.trader_llm,
             research_manager_llm=self.research_manager_llm,
             portfolio_manager_llm=self.portfolio_manager_llm,
@@ -219,6 +207,12 @@ class TradingAgentsGraph:
             if max_tokens:
                 kwargs["max_tokens"] = max_tokens
 
+        elif provider == "deepseek":
+            kwargs["reasoning_effort"] = self.config.get(
+                "deepseek_reasoning_effort", "high",
+            )
+            kwargs["max_tokens"] = self.config.get("deepseek_max_tokens", 8192)
+
         return kwargs
 
     def _create_templllm(
@@ -256,6 +250,40 @@ class TradingAgentsGraph:
             **llm_kwargs,
         )
         # 使用 get_llm_wrapped 注入 wall-clock 超时保护
+        return client.get_llm_wrapped()
+
+    def _create_role_llm(self, role: str, temperature: float) -> Any:
+        """Create one LLM using the explicit role policy for DeepSeek."""
+        if self.config.get("llm_provider", "").lower() != "deepseek":
+            deep_roles = {
+                "market", "fundamentals", "macro", "stock_profile",
+                "research_manager", "portfolio_manager",
+            }
+            return self._create_templllm(
+                temperature,
+                use_deep_think=role in deep_roles,
+                max_tokens_override={
+                    "fundamentals": self.config.get("fundamentals_analyst_max_tokens"),
+                    "research_manager": self.config.get("research_manager_max_tokens"),
+                    "portfolio_manager": self.config.get("portfolio_manager_max_tokens"),
+                }.get(role),
+            )
+
+        policy = resolve_role_policy(self.config, role)
+        llm_kwargs = self._get_provider_kwargs()
+        llm_kwargs.update({
+            "reasoning_effort": policy.reasoning_effort,
+            "max_tokens": policy.max_tokens,
+            "temperature": temperature,
+        })
+        if self.callbacks:
+            llm_kwargs["callbacks"] = self.callbacks
+        client = create_llm_client(
+            provider="deepseek",
+            model=policy.model,
+            base_url=self.config.get("backend_url"),
+            **llm_kwargs,
+        )
         return client.get_llm_wrapped()
 
     def _create_tool_nodes(self) -> Dict[str, ToolNode]:

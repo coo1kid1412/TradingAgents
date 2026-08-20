@@ -3,6 +3,8 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+from tradingagents.agents.managers.rm_tools import RM_TOOLS
+
 
 ROOT = Path(__file__).resolve().parents[3]
 RM_PATH = ROOT / "tradingagents/agents/managers/research_manager.py"
@@ -40,6 +42,34 @@ def test_rm_summary_has_four_auditable_reference_fields():
     assert "RM 只能决定长期 thesis" in source
 
 
+def test_rm_uses_four_pillar_tool_as_only_rating_authority():
+    source = RM_PATH.read_text(encoding="utf-8")
+    tool_names = {tool.name for tool in RM_TOOLS}
+
+    assert "compute_ic_recommendation" in tool_names
+    assert "compute_step6_final_rating" not in tool_names
+    assert "最终权威评级不得调用 compute_step6_final_rating" in source
+    assert "最终研究评级 = 工具返回的 `research_rating`，原样采用" in source
+
+
+def test_rm_summary_exposes_four_pillars_and_evidence_ids():
+    source = RM_PATH.read_text(encoding="utf-8")
+    for field in (
+        "research_rating",
+        "pillar_thesis",
+        "pillar_valuation",
+        "pillar_catalyst",
+        "pillar_durability",
+        "scenario_expected_return_pct",
+        "rating_reason_codes",
+        "thesis_evidence_ids",
+        "valuation_evidence_ids",
+        "catalyst_evidence_ids",
+        "durability_evidence_ids",
+    ):
+        assert field in source
+
+
 def test_pm_uses_ic_packet_instead_of_four_full_analyst_reports():
     source = PM_PATH.read_text(encoding="utf-8")
     assert 'state.get("ic_packet", "")' in source
@@ -61,6 +91,15 @@ def test_pm_summary_has_four_auditable_reference_fields():
     for invalid_prefix in ("SYS_*", "CAPITAL_FLOW", "字段名", "compute_*"):
         assert invalid_prefix in source
     assert "都不是证据 ID" in source
+
+
+def test_pm_treats_rm_research_rating_as_read_only():
+    source = PM_PATH.read_text(encoding="utf-8")
+    assert "PM 不得修改 `research_rating`" in source
+    assert "pm_rating 必须逐字镜像 RM_SUMMARY.research_rating" in source
+    assert "仅 ±1 档微调" not in source
+    assert "评级微调（仅限执行层因素）" not in source
+    assert "pm_rating_adjusted_from_rm: false" in source
 
 
 if __name__ == "__main__":

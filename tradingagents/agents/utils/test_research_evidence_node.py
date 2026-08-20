@@ -3,9 +3,11 @@ from __future__ import annotations
 import sys
 
 from tradingagents.agents.utils.research_evidence_node import (
+    compile_decision_contribution_ledger,
     compile_research_evidence,
     create_research_evidence_node,
     render_decision_attribution,
+    render_ic_contribution_summary,
     render_ic_packet,
 )
 
@@ -404,6 +406,57 @@ RM_SUMMARY:
   target_price_mid: 101
   target_price_high: 118
 ```"""
+
+
+def _rm_four_pillars() -> str:
+    return """```yaml
+RM_SUMMARY:
+  research_rating: OVERWEIGHT
+  rm_rating: OVERWEIGHT
+  pillar_thesis: adequate
+  pillar_valuation: attractive
+  pillar_catalyst: visible
+  pillar_durability: acceptable
+  thesis_evidence_ids: FUND-GROWTH-01|NEWS-CAT-01
+  valuation_evidence_ids: FUND-VAL-01
+  catalyst_evidence_ids: NEWS-CAT-01|DOES-NOT-EXIST
+  durability_evidence_ids: FUND-QUALITY-01|RISK-GATE-01
+```"""
+
+
+def test_contribution_ledger_maps_each_claim_once_and_rejects_bad_references():
+    ledger = compile_decision_contribution_ledger(
+        _rm_four_pillars(), compile_research_evidence(_complete_state())
+    )
+    items = ledger["items"]
+
+    assert ledger["research_rating"] == "OVERWEIGHT"
+    assert [row["claim_id"] for row in items].count("NEWS-CAT-01") == 1
+    assert next(row for row in items if row["claim_id"] == "NEWS-CAT-01")["decision_dimension"] == "thesis"
+    assert next(row for row in items if row["claim_id"] == "DOES-NOT-EXIST")["rejection_reason"] == "证据 ID 不存在"
+    assert next(row for row in items if row["claim_id"] == "RISK-GATE-01")["rejection_reason"] == "角色无权支撑该研究支柱"
+    assert all(row["accepted_effect"] for row in items)
+
+
+def test_contribution_summary_renders_four_pillars_and_rejections():
+    contribution = compile_decision_contribution_ledger(
+        _rm_four_pillars(), compile_research_evidence(_complete_state())
+    )
+    summary = render_ic_contribution_summary(_rm_four_pillars(), contribution)
+
+    assert summary.startswith("## 四支柱投委会结论")
+    assert "一年期研究评级：**OVERWEIGHT**" in summary
+    assert "经营与盈利" in summary
+    assert "估值" in summary
+    assert "催化" in summary
+    assert "持续性" in summary
+    assert "| 经营与盈利 | 合格 |" in summary
+    assert "| 估值 | 有吸引力 |" in summary
+    assert "| 催化 | 明确 |" in summary
+    assert "| 持续性 | 可接受 |" in summary
+    assert "| 经营与盈利 | adequate |" not in summary
+    assert "未采纳的关键观点" in summary
+    assert "RISK-GATE-01" in summary
 
 
 def test_attribution_renderer_marks_valid_partial_missing_and_unauthorized_refs():
