@@ -69,7 +69,7 @@ def _compact_summary_repair_prompt(
     tool_results: list[str],
     completion_token: str,
     visible_content: str,
-    allowed_evidence_ids: set[str] | None = None,
+    allowed_evidence_ids: set[str] | dict[str, set[str]] | None = None,
 ) -> str:
     """Repair a missing manager summary without replaying the full tool conversation."""
     original = "\n".join(
@@ -86,6 +86,12 @@ def _compact_summary_repair_prompt(
             r"\b(?:MKT|FUND|NEWS|SENT|QUANT|SECTOR|RISK|RM)-[A-Z0-9-]+\b",
             original,
         )))
+    elif isinstance(allowed_evidence_ids, dict):
+        evidence_ids = sorted({
+            evidence_id
+            for field_ids in allowed_evidence_ids.values()
+            for evidence_id in field_ids
+        })
     else:
         evidence_ids = sorted(allowed_evidence_ids)
     report = html.escape(
@@ -297,7 +303,7 @@ def _summary_semantics_are_valid(summary: dict, summary_key: str) -> bool:
     }:
         return False
     active_entry_timings = {"分批介入", "小仓试探"}
-    if (action == "BUY_NOW") != (entry_timing in active_entry_timings):
+    if action == "BUY_NOW" and entry_timing not in active_entry_timings:
         return False
 
     current = float(summary["current_price"])
@@ -340,7 +346,7 @@ def _summary_semantics_are_valid(summary: dict, summary_key: str) -> bool:
         return False
     if gate != "OPEN" and action != "WAIT":
         return False
-    return sl_soft < current < tp1
+    return True
 
 
 def _same_number(actual, expected) -> bool:
@@ -349,6 +355,48 @@ def _same_number(actual, expected) -> bool:
         and _finite_number(expected)
         and math.isclose(float(actual), float(expected), rel_tol=1e-9, abs_tol=0.011)
     )
+
+
+def _canonical_pm_execution(
+    summary: dict,
+    conviction: dict | None,
+    gate_result: dict | None,
+) -> dict[str, object] | None:
+    """Derive PM action and size from code-owned timing, cap and conviction."""
+    try:
+        cap = max(0.0, float(summary.get("market_position_cap_pct")))
+    except (TypeError, ValueError):
+        return None
+    gate = str(summary.get("market_entry_gate") or "WAIT").upper()
+    timing = summary.get("entry_timing")
+    active = timing in {"分批介入", "小仓试探"}
+    proposed_action = str((gate_result or {}).get("effective_action") or "WAIT").upper()
+    if gate != "OPEN" or cap <= 0:
+        action = "WAIT"
+    elif proposed_action == "BUY_NOW" and active:
+        action = "BUY_NOW"
+    elif proposed_action in {"REDUCE", "EXIT"}:
+        action = proposed_action
+    else:
+        action = "WAIT"
+
+    if action != "BUY_NOW":
+        return {"action": action, "size_low_pct": 0.0, "size_high_pct": 0.0}
+    if not (
+        isinstance(conviction, dict)
+        and _finite_number(conviction.get("position_low_pct"))
+        and _finite_number(conviction.get("position_high_pct"))
+    ):
+        return None
+    max_low = min(float(conviction["position_low_pct"]), cap)
+    max_high = max(max_low, min(float(conviction["position_high_pct"]), cap))
+    proposed_low = (gate_result or {}).get("effective_size_low_pct", max_low)
+    proposed_high = (gate_result or {}).get("effective_size_high_pct", max_high)
+    if not (_finite_number(proposed_low) and _finite_number(proposed_high)):
+        return None
+    low = min(max(0.0, float(proposed_low)), max_low)
+    high = min(max(low, float(proposed_high)), max_high)
+    return {"action": action, "size_low_pct": low, "size_high_pct": high}
 
 
 def _pm_summary_matches_tool_results(
@@ -383,40 +431,20 @@ def _pm_summary_matches_tool_results(
 
     gate = tool_results.get("apply_market_risk_gate")
     if isinstance(gate, dict):
-        exact_fields = {
-            "market_entry_gate": gate.get("entry_gate"),
-            "pm_action_keyword": gate.get("effective_action"),
-        }
-        if any(summary.get(key) != value for key, value in exact_fields.items()):
+        execution = _canonical_pm_execution(summary, conviction, gate)
+        if execution is None:
             return False
-        numeric_fields = {
-            "market_position_cap_pct": gate.get("position_cap_pct"),
-            "pm_size_low_pct": gate.get("effective_size_low_pct"),
-            "pm_size_high_pct": gate.get("effective_size_high_pct"),
-        }
-        if any(
-            not _same_number(summary.get(key), value)
-            for key, value in numeric_fields.items()
+        summary_action = summary.get("pm_action_keyword")
+        safe_wait_downgrade = execution["action"] == "BUY_NOW" and summary_action == "WAIT"
+        if summary_action != execution["action"] and not safe_wait_downgrade:
+            return False
+        expected_low = 0.0 if safe_wait_downgrade else execution["size_low_pct"]
+        expected_high = 0.0 if safe_wait_downgrade else execution["size_high_pct"]
+        if not (
+            _same_number(summary.get("pm_size_low_pct"), expected_low)
+            and _same_number(summary.get("pm_size_high_pct"), expected_high)
         ):
             return False
-        if (
-            summary.get("pm_action_keyword") == "BUY_NOW"
-            and isinstance(conviction, dict)
-            and _finite_number(conviction.get("position_low_pct"))
-            and _finite_number(conviction.get("position_high_pct"))
-            and _finite_number(gate.get("position_cap_pct"))
-        ):
-            cap = float(gate["position_cap_pct"])
-            expected_low = min(float(conviction["position_low_pct"]), cap)
-            expected_high = max(
-                expected_low,
-                min(float(conviction["position_high_pct"]), cap),
-            )
-            if not (
-                _same_number(gate.get("effective_size_low_pct"), expected_low)
-                and _same_number(gate.get("effective_size_high_pct"), expected_high)
-            ):
-                return False
     return True
 
 _RM_FOUR_PILLAR_REQUIRED_FIELDS = {
@@ -440,7 +468,7 @@ def _summary_yaml_is_complete(
     required_fields: set[str] | None = None,
     *,
     expected_summary_values: dict[str, object] | None = None,
-    allowed_evidence_ids: set[str] | None = None,
+    allowed_evidence_ids: set[str] | dict[str, set[str]] | None = None,
     successful_tool_results: dict[str, object] | None = None,
 ) -> bool:
     normalized = _normalize_summary_yaml_fence(content, summary_key)
@@ -473,7 +501,12 @@ def _summary_yaml_is_complete(
             if raw in (None, "", "null", "None"):
                 continue
             ids = {item.strip() for item in str(raw).split("|") if item.strip()}
-            if not ids or not ids.issubset(allowed_evidence_ids):
+            allowed_for_field = (
+                set(allowed_evidence_ids.get(field) or ())
+                if isinstance(allowed_evidence_ids, dict)
+                else allowed_evidence_ids
+            )
+            if not ids or not ids.issubset(allowed_for_field):
                 return False
     if summary_key == "PM_SUMMARY" and successful_tool_results:
         return _pm_summary_matches_tool_results(summary, successful_tool_results)
@@ -628,7 +661,8 @@ def _run_tool_calling_loop(llm_with_tools, initial_messages, *,
                            authoritative_tool_name: str | None = None,
                            required_tool_names: set[str] | None = None,
                            expected_summary_values: dict[str, object] | None = None,
-                           allowed_summary_evidence_ids: set[str] | None = None):
+                           allowed_summary_evidence_ids: set[str] | dict[str, set[str]] | None = None,
+                           summary_enforcer=None):
     """执行 LLM 工具调用循环。返回 AIMessage，content 是所有迭代的 LLM 文本累积。
 
     退出条件不只是『不再调工具』，还要求**正文完整**：必须包含 completion_token
@@ -711,8 +745,16 @@ def _run_tool_calling_loop(llm_with_tools, initial_messages, *,
 
         # —— 不再调工具：检查正文是否完整 ——
         joined = "\n\n".join(cot_segments)
-        summary_complete = joined.strip() and _summary_yaml_is_complete(
-            joined,
+        candidate = joined
+        if candidate.strip() and summary_enforcer is not None:
+            candidate = summary_enforcer(
+                candidate,
+                successful_tool_results,
+                expected_summary_values or {},
+                allowed_summary_evidence_ids,
+            )
+        summary_complete = candidate.strip() and _summary_yaml_is_complete(
+            candidate,
             completion_token,
             required_summary_fields,
             expected_summary_values=expected_summary_values,
@@ -726,7 +768,7 @@ def _run_tool_calling_loop(llm_with_tools, initial_messages, *,
                 "%s tool calling 循环结束（第 %d 轮，累积 %d 段，总长 %d 字符）",
                 role, iteration, len(cot_segments), len(joined),
             )
-            artifact = _extract_final_manager_artifact(joined, completion_token)
+            artifact = _extract_final_manager_artifact(candidate, completion_token)
             if authoritative_result is not None:
                 artifact = _enforce_ic_recommendation_truth(artifact, authoritative_result)
                 if not _summary_yaml_is_complete(
@@ -769,7 +811,7 @@ def _run_tool_calling_loop(llm_with_tools, initial_messages, *,
                 initial_messages,
                 repair_tool_results,
                 completion_token,
-                joined,
+                candidate,
                 allowed_summary_evidence_ids,
             ))]
         elif not joined.strip() and finalization_requested:

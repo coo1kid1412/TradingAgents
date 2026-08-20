@@ -23,6 +23,7 @@ from tradingagents.agents.managers.research_manager import (
 )
 from tradingagents.agents.managers.portfolio_manager import (
     AIMessage as PortfolioAIMessage,
+    _enforce_pm_summary_truth,
     _enforce_pm_research_rating,
     _format_pm_decision,
     _presented_entry_timing,
@@ -531,6 +532,160 @@ def test_pm_summary_rejects_incoherent_trade_price_relationships():
         "PM_SUMMARY",
         successful_tool_results=oversized_tool_results,
     )
+    drifted = (
+        valid.replace("pm_conviction_stars: 4", "pm_conviction_stars: 1")
+        .replace("pm_size_low_pct: 8", "pm_size_low_pct: 15")
+        .replace("pm_size_high_pct: 10", "pm_size_high_pct: 20")
+        .replace(
+            "short_term_evidence_ids: MKT-TREND-01",
+            "short_term_evidence_ids: MKT-TREND-01|MKT-INJECTED-999",
+        )
+    )
+    enforced = _enforce_pm_summary_truth(
+        drifted,
+        tool_results,
+        {
+            "ticker": "300502",
+            "trade_date": "2026-08-20",
+            "pm_rating": "OVERWEIGHT",
+            "short_term_structure": "trend_pullback",
+            "entry_timing": "分批介入",
+        },
+        allowed_ids,
+    )
+    enforced_summary = _find_yaml_block(enforced, "PM_SUMMARY")
+    assert enforced_summary["pm_conviction_stars"] == 4
+    assert enforced_summary["pm_size_low_pct"] == 8
+    assert enforced_summary["pm_size_high_pct"] == 10
+    assert enforced_summary["short_term_evidence_ids"] == "MKT-TREND-01"
+    assert _summary_yaml_is_complete(
+        enforced,
+        "PM_SUMMARY",
+        expected_summary_values={
+            "ticker": "300502",
+            "trade_date": "2026-08-20",
+            "pm_rating": "OVERWEIGHT",
+            "short_term_structure": "trend_pullback",
+            "entry_timing": "分批介入",
+        },
+        allowed_evidence_ids=allowed_ids,
+        successful_tool_results=tool_results,
+    )
+    wait_tool_results = {
+        name: dict(result) for name, result in tool_results.items()
+    }
+    wait_tool_results["apply_market_risk_gate"].update({
+        "effective_action": "WAIT",
+        "effective_size_low_pct": 0,
+        "effective_size_high_pct": 0,
+    })
+    waited = _enforce_pm_summary_truth(
+        valid,
+        wait_tool_results,
+        {
+            "ticker": "300502",
+            "trade_date": "2026-08-20",
+            "pm_rating": "OVERWEIGHT",
+            "short_term_structure": "trend_pullback",
+            "entry_timing": "分批介入",
+            "market_entry_gate": "OPEN",
+            "market_position_cap_pct": 10,
+        },
+        allowed_ids,
+    )
+    waited_summary = _find_yaml_block(waited, "PM_SUMMARY")
+    assert waited_summary["pm_action_keyword"] == "WAIT"
+    assert waited_summary["pm_size_low_pct"] == 0
+    assert waited_summary["pm_size_high_pct"] == 0
+    assert waited_summary["pm_entry_low"] is None
+    assert waited_summary["pm_entry_high"] is None
+    assert _summary_yaml_is_complete(
+        waited,
+        "PM_SUMMARY",
+        successful_tool_results=wait_tool_results,
+    )
+
+    far_price_tool_results = {
+        name: dict(result) for name, result in tool_results.items()
+    }
+    far_price_tool_results["compute_pm_scenario_e"]["p_0"] = 109.9
+    far_price = _enforce_pm_summary_truth(
+        valid.replace("current_price: 100", "current_price: 109.9"),
+        far_price_tool_results,
+        {
+            "ticker": "300502",
+            "trade_date": "2026-08-20",
+            "pm_rating": "OVERWEIGHT",
+            "short_term_structure": "trend_pullback",
+            "entry_timing": "分批介入",
+            "market_entry_gate": "OPEN",
+            "market_position_cap_pct": 10,
+        },
+        allowed_ids,
+    )
+    far_summary = _find_yaml_block(far_price, "PM_SUMMARY")
+    assert far_summary["pm_action_keyword"] == "WAIT"
+    assert far_summary["pm_entry_low"] is None
+    assert far_summary["pm_entry_high"] is None
+
+    for crossed_price in (93, 110, 111):
+        crossed_tool_results = {
+            name: dict(result) for name, result in tool_results.items()
+        }
+        crossed_tool_results["compute_pm_scenario_e"]["p_0"] = crossed_price
+        crossed = _enforce_pm_summary_truth(
+            valid.replace("current_price: 100", f"current_price: {crossed_price}"),
+            crossed_tool_results,
+            {
+                "ticker": "300502",
+                "trade_date": "2026-08-20",
+                "pm_rating": "OVERWEIGHT",
+                "short_term_structure": "trend_pullback",
+                "entry_timing": "分批介入",
+                "market_entry_gate": "OPEN",
+                "market_position_cap_pct": 10,
+            },
+            allowed_ids,
+        )
+        assert _find_yaml_block(crossed, "PM_SUMMARY")["pm_action_keyword"] == "WAIT"
+        assert _summary_yaml_is_complete(
+            crossed,
+            "PM_SUMMARY",
+            successful_tool_results=crossed_tool_results,
+        )
+
+    field_allowed_ids = {
+        "short_term_evidence_ids": {"MKT-TREND-01"},
+        "long_term_evidence_ids": {"FUND-GROWTH-01"},
+        "position_evidence_ids": {"RISK-GATE-01"},
+        "target_price_evidence_ids": {"FUND-VAL-01"},
+    }
+    wrong_owner = valid.replace(
+        "short_term_evidence_ids: MKT-TREND-01",
+        "short_term_evidence_ids: MKT-TREND-01|FUND-GROWTH-01",
+    )
+    assert not _summary_yaml_is_complete(
+        wrong_owner,
+        "PM_SUMMARY",
+        allowed_evidence_ids=field_allowed_ids,
+    )
+    field_filtered = _enforce_pm_summary_truth(
+        wrong_owner,
+        tool_results,
+        {
+            "ticker": "300502",
+            "trade_date": "2026-08-20",
+            "pm_rating": "OVERWEIGHT",
+            "short_term_structure": "trend_pullback",
+            "entry_timing": "分批介入",
+            "market_entry_gate": "OPEN",
+            "market_position_cap_pct": 10,
+        },
+        field_allowed_ids,
+    )
+    assert _find_yaml_block(field_filtered, "PM_SUMMARY")[
+        "short_term_evidence_ids"
+    ] == "MKT-TREND-01"
     invalid_cases = (
         valid.replace("pm_entry_low: 98", "pm_entry_low: null"),
         valid.replace("pm_tp1: 110", "pm_tp1: 95"),
@@ -843,6 +998,43 @@ PM_SUMMARY:
     assert len(llm.calls) == 3
     assert result.content.startswith("## Trade Ticket 交易票")
     assert _find_yaml_block(result.content, "PM_SUMMARY")["pm_rating"] == "HOLD"
+
+
+def test_tool_loop_applies_summary_enforcer_before_validation():
+    class OneShotLLM:
+        def __init__(self):
+            self.calls = 0
+
+        def invoke(self, _messages):
+            self.calls += 1
+            return AIMessage(content="""```yaml
+RM_SUMMARY:
+  current_price: 100
+  rm_rating: null
+  target_price_mid: 108
+  entry_timing: 继续观察
+  rating_evidence_ids: FUND-GROWTH-01
+  target_price_evidence_ids: FUND-VAL-01
+  earnings_evidence_ids: FUND-GROWTH-01
+  key_conflict_ids: null
+```""")
+
+    llm = OneShotLLM()
+    result = _run_tool_calling_loop(
+        llm,
+        [HumanMessage(content="生成 RM 报告")],
+        tools_by_name={},
+        role="RM",
+        completion_token="RM_SUMMARY",
+        max_iterations=1,
+        max_continuations=0,
+        summary_enforcer=lambda content, *_args: content.replace(
+            "rm_rating: null", "rm_rating: HOLD",
+        ),
+    )
+
+    assert llm.calls == 1
+    assert _find_yaml_block(result.content, "RM_SUMMARY")["rm_rating"] == "HOLD"
 
 
 def test_compact_summary_repair_escapes_untrusted_closing_tags():

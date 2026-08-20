@@ -2,6 +2,8 @@ import logging
 import json
 import re
 
+import yaml
+
 from langchain_core.messages import AIMessage, HumanMessage
 
 from tradingagents.agents.utils.agent_utils import build_instrument_context, get_language_instruction, RISK_DEBATE_PHRASING_RULES
@@ -11,6 +13,7 @@ from tradingagents.agents.managers.pm_tools import (
     compute_r_multiple_levels,
 )
 from tradingagents.agents.managers.research_manager import (
+    _canonical_pm_execution,
     _derive_entry_timing_from_profile,
     _enforce_entry_timing_truth,
     _extract_rm_rating,
@@ -18,6 +21,8 @@ from tradingagents.agents.managers.research_manager import (
     _run_tool_calling_loop,
 )
 from tradingagents.agents.utils.research_evidence_node import (
+    ATTRIBUTION_OWNER_POLICY,
+    ATTRIBUTION_VARIABLE_POLICY,
     compile_decision_contribution_ledger,
     render_decision_attribution,
     render_ic_contribution_summary,
@@ -110,6 +115,109 @@ def _enforce_pm_research_rating(content: str, research_plan: str) -> str:
         flags=re.IGNORECASE,
     )
     return fixed
+
+
+def _enforce_pm_summary_truth(
+    content: str,
+    tool_results: dict[str, object],
+    expected_values: dict[str, object],
+    allowed_evidence_ids: set[str] | dict[str, set[str]] | None,
+) -> str:
+    """Overwrite code-owned PM summary fields and filter untraceable evidence IDs."""
+    normalized = _normalize_summary_yaml_fence(content, "PM_SUMMARY")
+    blocks = list(re.finditer(r"```yaml\s*\n(.*?)\n```", normalized, re.DOTALL))
+    if not blocks:
+        return normalized
+    match = blocks[-1]
+    try:
+        parsed = yaml.safe_load(match.group(1))
+    except yaml.YAMLError:
+        return normalized
+    summary = parsed.get("PM_SUMMARY") if isinstance(parsed, dict) else None
+    if not isinstance(summary, dict):
+        return normalized
+
+    summary.update(expected_values)
+    summary["pm_rating_adjusted_from_rm"] = False
+
+    scenario = tool_results.get("compute_pm_scenario_e")
+    if isinstance(scenario, dict) and scenario.get("p_0") is not None:
+        summary["current_price"] = scenario["p_0"]
+
+    conviction = tool_results.get("compute_conviction_position_map")
+    if isinstance(conviction, dict) and conviction.get("conviction_stars") is not None:
+        summary["pm_conviction_stars"] = conviction["conviction_stars"]
+
+    r_levels = tool_results.get("compute_r_multiple_levels")
+    if isinstance(r_levels, dict):
+        for summary_key, tool_key in (
+            ("pm_tp1", "tp1"), ("pm_tp2", "tp2"), ("pm_tp3", "tp3"),
+            ("pm_sl_soft", "sl_soft"), ("pm_sl_hard", "sl_hard"),
+        ):
+            if r_levels.get(tool_key) is not None:
+                summary[summary_key] = r_levels[tool_key]
+
+    gate_result = tool_results.get("apply_market_risk_gate")
+    gate_result = gate_result if isinstance(gate_result, dict) else None
+    execution = _canonical_pm_execution(summary, conviction, gate_result)
+    if execution is not None:
+        if execution["action"] == "BUY_NOW":
+            try:
+                entry_price = float((r_levels or {}).get("entry_price"))
+                current = float(summary["current_price"])
+                entry_low = float(summary["pm_entry_low"])
+                entry_high = float(summary["pm_entry_high"])
+                sl_soft = float(summary["pm_sl_soft"])
+                tp1 = float(summary["pm_tp1"])
+                entry_is_valid = (
+                    sl_soft < entry_low <= entry_price <= entry_high < tp1
+                    and entry_low <= current <= entry_high
+                )
+            except (TypeError, ValueError, AttributeError):
+                entry_is_valid = False
+            if not entry_is_valid:
+                execution = {
+                    "action": "WAIT",
+                    "size_low_pct": 0.0,
+                    "size_high_pct": 0.0,
+                }
+        action = str(execution["action"])
+        summary["pm_action_keyword"] = action
+        summary["pm_size_low_pct"] = execution["size_low_pct"]
+        summary["pm_size_high_pct"] = execution["size_high_pct"]
+        summary["pm_entry_judgment"] = "BUY_NOW" if action == "BUY_NOW" else (
+            "WAIT" if action == "WAIT" else "DONT_BUY"
+        )
+        summary["pm_invest_judgment"] = "YES" if action == "BUY_NOW" else (
+            "CONDITIONAL" if action == "WAIT" else "NO"
+        )
+        if action != "BUY_NOW":
+            summary["pm_entry_low"] = None
+            summary["pm_entry_high"] = None
+
+    if allowed_evidence_ids is not None:
+        for field in (
+            "short_term_evidence_ids", "long_term_evidence_ids",
+            "position_evidence_ids", "target_price_evidence_ids",
+        ):
+            raw = summary.get(field)
+            allowed_for_field = (
+                set(allowed_evidence_ids.get(field) or ())
+                if isinstance(allowed_evidence_ids, dict)
+                else allowed_evidence_ids
+            )
+            ids = [
+                item.strip() for item in str(raw or "").split("|")
+                if item.strip() in allowed_for_field
+            ]
+            summary[field] = "|".join(dict.fromkeys(ids)) or None
+
+    replacement = "```yaml\n" + yaml.safe_dump(
+        {"PM_SUMMARY": summary},
+        allow_unicode=True,
+        sort_keys=False,
+    ).rstrip() + "\n```"
+    return normalized[:match.start()] + replacement + normalized[match.end():]
 
 
 def _require_rm_rating(research_plan: str) -> str:
@@ -809,7 +917,7 @@ def _pm_tool_loop(
     initial_messages,
     *,
     expected_summary_values: dict[str, object],
-    allowed_evidence_ids: set[str],
+    allowed_evidence_ids: set[str] | dict[str, set[str]],
 ):
     """PM 工具调用循环——复用 RM 的共享循环（含空输出/截断续写兜底）。
 
@@ -823,6 +931,7 @@ def _pm_tool_loop(
         required_tool_names=set(PM_TOOLS_BY_NAME),
         expected_summary_values=expected_summary_values,
         allowed_summary_evidence_ids=allowed_evidence_ids,
+        summary_enforcer=_enforce_pm_summary_truth,
     )
 
 
@@ -1415,12 +1524,40 @@ Be decisive and ground every conclusion in specific evidence from the analysts.{
 
         # 绑定 PM 计算工具，让 LLM 调工具算 R-multiple / Conviction / 4 情景 E
         llm_with_tools = llm.bind_tools(PM_TOOLS)
-        allowed_summary_evidence_ids = {
-            str(card.get("claim_id"))
-            for card in (state.get("research_evidence_ledger", {}).get("cards") or [])
-            if card.get("claim_id")
+        evidence_field_policies = {
+            "short_term_evidence_ids": "short_term",
+            "long_term_evidence_ids": "long_term",
+            "position_evidence_ids": "position",
+            "target_price_evidence_ids": "target_price",
         }
-        allowed_summary_evidence_ids.update(allowed_risk_ids)
+        allowed_summary_evidence_ids = {
+            field: set() for field in evidence_field_policies
+        }
+        for card in state.get("research_evidence_ledger", {}).get("cards") or []:
+            claim_id = card.get("claim_id")
+            if (
+                not claim_id
+                or card.get("decision_eligible") is not True
+                or str(card.get("quality_status") or "") == "invalid"
+            ):
+                continue
+            for field, policy in evidence_field_policies.items():
+                if (
+                    card.get("owner") in ATTRIBUTION_OWNER_POLICY[policy]
+                    and card.get("decision_variable") in ATTRIBUTION_VARIABLE_POLICY[policy]
+                ):
+                    allowed_summary_evidence_ids[field].add(str(claim_id))
+        synthetic_risk_ids = {
+            str(evidence_id)
+            for evidence_id in allowed_risk_ids
+            if str(evidence_id).startswith("RISK-")
+        }
+        allowed_summary_evidence_ids["short_term_evidence_ids"].update(
+            synthetic_risk_ids
+        )
+        allowed_summary_evidence_ids["position_evidence_ids"].update(
+            synthetic_risk_ids
+        )
         expected_summary_values = {
             "ticker": pm_ticker,
             "trade_date": pm_trade_date,
@@ -1430,6 +1567,13 @@ Be decisive and ground every conclusion in specific evidence from the analysts.{
                 entry_timing,
                 effective_market_risk_snapshot.get("entry_gate"),
                 effective_market_risk_snapshot.get("position_cap_pct"),
+            ),
+            "market_entry_gate": str(
+                effective_market_risk_snapshot.get("entry_gate") or "WAIT"
+            ).upper(),
+            "market_position_cap_pct": max(
+                0.0,
+                float(effective_market_risk_snapshot.get("position_cap_pct") or 0),
             ),
         }
         response = _pm_tool_loop(
