@@ -141,6 +141,28 @@ def _format_position_size(low: str | None, high: str | None) -> str:
     return f"{low_value}-{high_value}%"
 
 
+def _presented_entry_timing(
+    timing: dict,
+    entry_gate: str | None,
+    position_cap_pct: float | None = None,
+) -> str:
+    """Apply the market gate to the timing phrase shown across PM outputs."""
+    entry_timing = timing.get("effective_action") or "数据不足"
+    gate = str(entry_gate or "").upper()
+    if position_cap_pct is not None:
+        try:
+            cap = float(position_cap_pct)
+        except (TypeError, ValueError):
+            cap = 0.0
+        if cap <= 0:
+            return "暂不介入"
+    if gate == "CONDITIONAL":
+        return "等待条件确认"
+    if gate and gate != "OPEN":
+        return "暂不介入"
+    return entry_timing
+
+
 def _format_price(value: str | None) -> str | None:
     if value is None or value.lower() == "null":
         return None
@@ -628,12 +650,12 @@ def _format_pm_decision(
         report_body = user_source
         logger.warning("PM 输出未找到 Trade Ticket 标题，保留原文并仅添加操作摘要")
 
-    entry_timing = timing.get("effective_action") or "数据不足"
     entry_gate = str((market_risk_snapshot or {}).get("entry_gate") or "").upper()
-    if entry_gate == "CONDITIONAL":
-        entry_timing = "等待条件确认"
-    elif entry_gate and entry_gate != "OPEN":
-        entry_timing = "暂不介入"
+    entry_timing = _presented_entry_timing(
+        timing,
+        entry_gate,
+        (market_risk_snapshot or {}).get("position_cap_pct"),
+    )
     if entry_timing not in _ENTRY_PRESENTATION:
         entry_timing = "数据不足"
     reason, trigger = _ENTRY_PRESENTATION[entry_timing]
@@ -782,7 +804,13 @@ def _format_pm_decision(
     return rendered.rstrip() + "\n"
 
 
-def _pm_tool_loop(llm_with_tools, initial_messages):
+def _pm_tool_loop(
+    llm_with_tools,
+    initial_messages,
+    *,
+    expected_summary_values: dict[str, object],
+    allowed_evidence_ids: set[str],
+):
     """PM 工具调用循环——复用 RM 的共享循环（含空输出/截断续写兜底）。
 
     完成标记 PM_SUMMARY：prompt 强制的收尾 YAML，缺了说明正文被 think-only
@@ -792,6 +820,9 @@ def _pm_tool_loop(llm_with_tools, initial_messages):
         llm_with_tools, initial_messages,
         tools_by_name=PM_TOOLS_BY_NAME, role="PM",
         completion_token="PM_SUMMARY", max_iterations=_MAX_TOOL_ITERATIONS,
+        required_tool_names=set(PM_TOOLS_BY_NAME),
+        expected_summary_values=expected_summary_values,
+        allowed_summary_evidence_ids=allowed_evidence_ids,
     )
 
 
@@ -1363,7 +1394,7 @@ PM_SUMMARY:
   market_entry_gate: <OPEN / CONDITIONAL / WAIT>
   market_position_cap_pct: <float>
   short_term_structure: trend_pullback / breakout_ready / healthy_trend / exhaustion / broken / neutral / insufficient_data
-  entry_timing: 分批介入 / 小仓试探 / 等回踩 / 等放量突破 / 暂不介入 / 退出观察 / 继续观察 / 数据不足
+  entry_timing: 分批介入 / 小仓试探 / 等待条件确认 / 等回踩 / 等放量突破 / 暂不介入 / 退出观察 / 继续观察 / 数据不足
   short_term_trend: <上涨 / 震荡 / 下跌>
   short_term_confidence: <高 / 中 / 低>
   theme_outlook_12m: <扩张 / 兑现 / 降速 / 破裂>
@@ -1384,7 +1415,29 @@ Be decisive and ground every conclusion in specific evidence from the analysts.{
 
         # 绑定 PM 计算工具，让 LLM 调工具算 R-multiple / Conviction / 4 情景 E
         llm_with_tools = llm.bind_tools(PM_TOOLS)
-        response = _pm_tool_loop(llm_with_tools, [HumanMessage(content=prompt)])
+        allowed_summary_evidence_ids = {
+            str(card.get("claim_id"))
+            for card in (state.get("research_evidence_ledger", {}).get("cards") or [])
+            if card.get("claim_id")
+        }
+        allowed_summary_evidence_ids.update(allowed_risk_ids)
+        expected_summary_values = {
+            "ticker": pm_ticker,
+            "trade_date": pm_trade_date,
+            "pm_rating": rm_rating,
+            "short_term_structure": entry_timing.get("structure_class"),
+            "entry_timing": _presented_entry_timing(
+                entry_timing,
+                effective_market_risk_snapshot.get("entry_gate"),
+                effective_market_risk_snapshot.get("position_cap_pct"),
+            ),
+        }
+        response = _pm_tool_loop(
+            llm_with_tools,
+            [HumanMessage(content=prompt)],
+            expected_summary_values=expected_summary_values,
+            allowed_evidence_ids=allowed_summary_evidence_ids,
+        )
         normalized_content = _normalize_summary_yaml_fence(response.content, "PM_SUMMARY")
         normalized_content = _enforce_pm_research_rating(
             normalized_content, research_plan,
