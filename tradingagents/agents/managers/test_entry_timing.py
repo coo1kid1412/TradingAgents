@@ -912,6 +912,66 @@ PM_SUMMARY:
     assert _find_yaml_block(result, "PM_SUMMARY")["short_term_trend"] == "数据不足"
 
 
+def test_stale_snapshot_replaces_inline_bold_three_day_paragraph():
+    content = """## Trade Ticket 交易票
+| 未来 3 个交易日趋势 | **下行**（置信度：中） |
+
+## 一、投资决策与入场时机
+
+**未来 3 日：下行（置信度中）。** 周线与日线双下行，若放量收复阻力则失效。 **12 个月主题：降速。** 增速换挡。
+
+```yaml
+PM_SUMMARY:
+  pm_rating: HOLD
+  pm_action_keyword: WAIT
+  short_term_trend: 下行
+  short_term_confidence: 中
+  entry_timing: 暂不介入
+```
+"""
+
+    result = _format_pm_decision(
+        content,
+        {"structure_class": "neutral", "effective_action": "暂不介入"},
+        market_risk_snapshot={"data_status": "stale", "required_checkpoint": "14:30"},
+    )
+
+    assert "未来 3 日：下行" not in result
+    assert "周线与日线双下行" not in result
+    assert "**未来 3 日：数据不足**" in result
+    assert "**12 个月主题：降速。**" in result
+
+
+def test_stale_snapshot_removes_emphasized_short_term_reason_but_keeps_plain_long_term():
+    content = """## Trade Ticket 交易票
+| 未来 3 个交易日趋势 | **下行**（置信度：中） |
+
+## 一、投资决策与入场时机
+
+**未来 3 日：下行（置信度中）。** 跌破 **400 元** 后短期风险上升。 12 个月主题：扩张，长期逻辑不变。
+
+```yaml
+PM_SUMMARY:
+  pm_rating: HOLD
+  pm_action_keyword: WAIT
+  short_term_trend: 下行
+  short_term_confidence: 中
+  entry_timing: 暂不介入
+```
+"""
+
+    result = _format_pm_decision(
+        content,
+        {"structure_class": "neutral", "effective_action": "暂不介入"},
+        market_risk_snapshot={"data_status": "stale", "required_checkpoint": "14:30"},
+    )
+
+    assert "**400 元**" not in result
+    assert "短期风险上升" not in result
+    assert "12 个月主题：扩张，长期逻辑不变。" in result
+    assert "**未来 3 日：数据不足**" in result
+
+
 def test_no_buy_recomputes_holder_levels_from_current_price():
     content = """## Trade Ticket 交易票
 
@@ -1159,9 +1219,13 @@ def test_no_buy_replaces_bold_empty_and_holder_blocks_with_canonical_levels():
 - 回踩后直接买入，合计不超过总仓位 **1%**。
 - 中报落地后可提升仓位。
 
-**持仓者**：
+**持仓者（已有仓位，以 448.08 为基准的 R 体系，1R=50 元）：**
 - 止损阶梯：SL_soft 398 减仓 50%；SL_hard 370 全部清仓。
+**止盈策略：**
 - 止盈阶梯：TP1 510 减 1/3 → TP2 580 再减 1/3 → TP3 650 清仓。
+
+**12 个月主题：扩张。**
+- 长期逻辑与持仓交易价位无关，应保留。
 
 ## 三、情景概率与赔率
 
@@ -1201,7 +1265,10 @@ PM_SUMMARY:
     assert "| **TP2 559.73 元** | 再减仓 1/3 |" in result
     assert "| **TP3 633.17 元** | 清仓或降至观察仓 |" in result
     assert "TP1 510" not in result
+    assert "TP2 580" not in result
     assert "SL_soft 398" not in result
+    assert "**12 个月主题：扩张。**" in result
+    assert "长期逻辑与持仓交易价位无关，应保留。" in result
 
 
 def test_market_and_risk_consensus_cap_is_enforced_at_pm_output_boundary():

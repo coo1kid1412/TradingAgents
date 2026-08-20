@@ -227,6 +227,27 @@ def test_missing_decision_handoff_fails_closed_after_one_retry():
     assert "第一轮没有交接" not in response.content
 
 
+def test_failed_decision_handoff_repair_does_not_infer_direction_from_mentions():
+    llm = _FakeLLM([
+        "空方判断：FUND-GROWTH-01 与 NEWS-CAT-02 支撑谨慎结论。",
+        RuntimeError("provider timeout"),
+    ])
+
+    response = invoke_decision_response(
+        llm,
+        "允许引用 FUND-GROWTH-01、NEWS-CAT-02",
+        role="bear",
+    )
+
+    handoff_data, status = extract_yaml_mapping(response.content, "DECISION_HANDOFF")
+    assert status == "valid"
+    assert handoff_data["quality_status"] == "invalid"
+    assert handoff_data["accepted_claim_ids"] == []
+    assert handoff_data["decision_judgments"] == []
+    assert "空方判断" not in response.content
+    assert response.content.count("DECISION_HANDOFF:") == 1
+
+
 def test_explicitly_invalid_decision_handoff_is_repaired_before_use():
     invalid = """空头正文
 

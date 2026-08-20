@@ -95,6 +95,24 @@ _PILLAR_EFFECTS = {
     },
 }
 
+_PILLAR_STATE_LABELS = {
+    "strong": "强",
+    "adequate": "合格",
+    "mixed": "分化",
+    "weak": "偏弱",
+    "invalid": "无效",
+    "attractive": "有吸引力",
+    "fair": "合理",
+    "stretched": "偏贵",
+    "visible": "明确",
+    "absent": "缺少",
+    "adverse": "不利",
+    "resilient": "稳健",
+    "acceptable": "可接受",
+    "fragile": "脆弱",
+    "broken": "失效",
+}
+
 _CONFLICT_FAMILY = {
     "earnings_outlook_12m": "long_term_rating",
     "long_term_rating": "long_term_rating",
@@ -756,8 +774,9 @@ def render_ic_contribution_summary(
     for dimension in _CONTRIBUTION_FIELDS:
         pillar = (contribution_ledger.get("pillars") or {}).get(dimension, {})
         evidence = ", ".join(pillar.get("accepted_claim_ids") or []) or "-"
+        state = str(pillar.get("state", "数据不足"))
         lines.append(
-            f"| {pillar.get('label', dimension)} | {pillar.get('state', '数据不足')} | "
+            f"| {pillar.get('label', dimension)} | {_PILLAR_STATE_LABELS.get(state, state)} | "
             f"{pillar.get('accepted_effect', '数据不足')} | {evidence} |"
         )
 

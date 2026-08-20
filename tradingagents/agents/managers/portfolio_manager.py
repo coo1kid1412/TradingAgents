@@ -315,8 +315,10 @@ def _canonicalize_holder_action_section(report_body: str, summary_source: str) -
         count=1,
     )
     return re.sub(
-        r"(?ms)^\*\*(?:已)?持仓者\*\*[：:]\s*\n.*?"
-        r"(?=^\*\*[^*\n]+\*\*[：:]|^###\s|^##\s|\Z)",
+        r"(?ms)^\*\*(?:已)?持仓者(?:（[^*\n]*）|\([^*\n]*\))?[：:]?\*\*[：:]?\s*\n.*?"
+        r"(?=^\*\*(?:(?:未来\s*)?12\s*个月|情景概率|风险、触发与监控|"
+        r"为什么这样决定|减仓资金去向|[三四五六]、)[^*\n]*\*\*[：:]?\s*$|"
+        r"^###\s|^##\s|\Z)",
         section,
         cleaned,
         count=1,
@@ -338,7 +340,7 @@ def _canonicalize_empty_action_section(
     patterns = (
         r"(?ms)^###\s+空仓者[^\n]*\n.*?(?=^###\s|^##\s|\Z)",
         r"(?ms)^\*\*空仓者\*\*[：:]\s*\n.*?"
-        r"(?=^\*\*(?:已)?持仓者\*\*[：:]|^###\s|^##\s|\Z)",
+        r"(?=^\*\*(?:已)?持仓者(?:（[^*\n]*）|\([^*\n]*\))?[：:]?\*\*[：:]?\s*$|^###\s|^##\s|\Z)",
     )
     cleaned = report_body
     for pattern in patterns:
@@ -674,6 +676,14 @@ def _format_pm_decision(
             r"(?ms)^###\s+(?:1\.3\s+)?未来\s*3\s*个交易日趋势[^\n]*\n.*?(?=^###\s|^##\s|\Z)",
             f"### 未来 3 个交易日趋势\n\n"
             f"**数据不足**（盘中风险快照陈旧，需 {checkpoint} 检查点；当前仅执行 WAIT、0%）。\n\n",
+            report_body,
+            count=1,
+        )
+        report_body = re.sub(
+            r"(?m)^\*\*未来\s*3\s*日[：:].*?"
+            r"(?=(?:\*\*)?(?:未来\s*)?12\s*个月(?:主题|趋势|判断)?[：:]|$)",
+            f"**未来 3 日：数据不足**（盘中风险快照陈旧，需 {checkpoint} 检查点；"
+            "当前仅执行 WAIT、0%）。 ",
             report_body,
             count=1,
         )

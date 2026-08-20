@@ -450,6 +450,11 @@ def test_contribution_summary_renders_four_pillars_and_rejections():
     assert "估值" in summary
     assert "催化" in summary
     assert "持续性" in summary
+    assert "| 经营与盈利 | 合格 |" in summary
+    assert "| 估值 | 有吸引力 |" in summary
+    assert "| 催化 | 明确 |" in summary
+    assert "| 持续性 | 可接受 |" in summary
+    assert "| 经营与盈利 | adequate |" not in summary
     assert "未采纳的关键观点" in summary
     assert "RISK-GATE-01" in summary
 
