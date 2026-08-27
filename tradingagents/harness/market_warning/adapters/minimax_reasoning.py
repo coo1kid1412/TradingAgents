@@ -10,6 +10,7 @@ from typing import Any, Mapping
 
 from tradingagents.llm_clients.base_client import WallClockTimeoutLLM, _strip_think_tags
 from tradingagents.llm_clients.factory import create_llm_client
+from tradingagents.llm_clients.provider_config import resolve_llm_provider_settings
 
 from ..domain import (
     FeatureSnapshot,
@@ -129,8 +130,14 @@ class UnavailableReasoningAdapter:
 
     model_name = "MiniMax-M3"
 
-    def __init__(self, error_class: str = "initialization_error") -> None:
+    def __init__(
+        self,
+        error_class: str = "initialization_error",
+        model_name: str | None = None,
+    ) -> None:
         self.error_class = error_class
+        if model_name:
+            self.model_name = model_name
 
     def assess(self, snapshot, quant, previous) -> LLMContextAssessment:
         return _fallback(self.error_class)
@@ -214,19 +221,26 @@ class MiniMaxReasoningAdapter:
     def from_environment(
         cls, breaker: CircuitBreaker | None = None
     ) -> "MiniMaxReasoningAdapter":
+        settings = resolve_llm_provider_settings()
+        if settings.provider != "minimax":
+            raise ValueError("LLM_PROVIDER is not minimax")
         timeout = _env_int("MARKET_WARNING_LLM_TIMEOUT", 90, 1, 90)
         max_tokens = _env_int("MARKET_WARNING_LLM_MAX_TOKENS", 4096, 256, 65536)
-        base_url = os.environ.get("MINIMAX_BASE_URL") or None
         client = create_llm_client(
             "minimax",
-            "MiniMax-M3",
-            base_url,
+            settings.deep_model,
+            settings.backend_url,
             timeout=timeout,
             max_tokens=max_tokens,
             max_retries=0,
             wall_clock_max_retries=0,
         )
-        return cls(client.get_llm_wrapped(), timeout=timeout, breaker=breaker)
+        return cls(
+            client.get_llm_wrapped(),
+            model_name=settings.deep_model,
+            timeout=timeout,
+            breaker=breaker,
+        )
 
     def assess(
         self,

@@ -114,36 +114,9 @@ def _clamp_debate_rounds(value: int, name: str, default: int, min_val: int = 1, 
 def _build_config() -> dict:
     """构建分析配置"""
     from tradingagents.default_config import DEFAULT_CONFIG
+    from tradingagents.llm_clients.provider_config import apply_llm_provider_settings
     
-    config = DEFAULT_CONFIG.copy()
-    # 默认 DeepSeek V4；MiniMax/GLM 仅在 LLM_PROVIDER 显式选择时进入兼容路径。
-    _provider = os.environ.get("LLM_PROVIDER", "deepseek").strip().lower()
-    if _provider == "deepseek":
-        config["llm_provider"] = "deepseek"
-        config["backend_url"] = os.environ.get(
-            "DEEPSEEK_BASE_URL", "https://api.deepseek.com",
-        ).rstrip("/")
-        config["deep_think_llm"] = os.environ.get(
-            "DEEPSEEK_DEEP_MODEL", "deepseek-v4-pro",
-        )
-        config["quick_think_llm"] = os.environ.get(
-            "DEEPSEEK_QUICK_MODEL", "deepseek-v4-flash",
-        )
-    elif _provider in ("glm", "zhipu", "zhipuai", "bigmodel"):
-        config["llm_provider"] = "glm"
-        config["backend_url"] = "https://open.bigmodel.cn/api/paas/v4/"
-        config["deep_think_llm"] = os.environ.get("GLM_MODEL", "glm-5.1")
-        config["quick_think_llm"] = os.environ.get("GLM_MODEL", "glm-5.1")
-    elif _provider == "minimax":
-        config["llm_provider"] = "minimax"
-        config["backend_url"] = "https://api.minimaxi.com/v1"
-        minimax_model = os.environ.get("MINIMAX_MODEL", "MiniMax-M3")
-        config["deep_think_llm"] = os.environ.get("MINIMAX_DEEP_MODEL", minimax_model)
-        config["quick_think_llm"] = os.environ.get("MINIMAX_QUICK_MODEL", minimax_model)
-    else:
-        raise ValueError(
-            f"不支持的 LLM_PROVIDER={_provider}；批量入口支持 deepseek/minimax/glm"
-        )
+    config = apply_llm_provider_settings(DEFAULT_CONFIG)
     config["use_deep_think_for_analysts"] = True
     # P1 LLM 选择配置（perf_02 保留）
     config["use_deep_for_trader"] = False       # trader 默认 quick_think

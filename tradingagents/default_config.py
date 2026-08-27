@@ -1,5 +1,7 @@
 import os
 
+from tradingagents.llm_clients.provider_config import apply_llm_provider_settings
+
 _PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 
 DEFAULT_CONFIG = {
@@ -17,10 +19,10 @@ DEFAULT_CONFIG = {
         "dataflows/data_cache",
     ),
     # LLM settings
-    "llm_provider": "deepseek",
-    "deep_think_llm": "deepseek-v4-pro",
-    "quick_think_llm": "deepseek-v4-flash",
-    "backend_url": "https://api.deepseek.com",
+    "llm_provider": "minimax",
+    "deep_think_llm": "MiniMax-M3",
+    "quick_think_llm": "MiniMax-M3",
+    "backend_url": "https://api.minimaxi.com/v1",
     # Provider-specific thinking configuration
     "google_thinking_level": None,      # "high", "minimal", etc.
     "openai_reasoning_effort": None,    # "medium", "high", "low"
@@ -77,3 +79,6 @@ DEFAULT_CONFIG = {
         # Example: "get_stock_data": "alpha_vantage",  # Override category default
     },
 }
+
+# Direct library users receive the same provider selected by LLM_PROVIDER.
+DEFAULT_CONFIG = apply_llm_provider_settings(DEFAULT_CONFIG)

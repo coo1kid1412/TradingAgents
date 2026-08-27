@@ -471,7 +471,7 @@ class RuleMarketWarningService:
                                 getattr(
                                     self.post_alert_reasoning,
                                     "model_name",
-                                    "deepseek-v4-pro",
+                                    "unknown",
                                 ),
                             )
                     elif snapshot_id is not None and result.decision_id is not None:
@@ -481,7 +481,7 @@ class RuleMarketWarningService:
                             getattr(
                                 self.post_alert_reasoning,
                                 "model_name",
-                                "deepseek-v4-pro",
+                                "unknown",
                             ),
                         )
                         self.repository.attach_reasoning(result.decision_id, reasoning_id)

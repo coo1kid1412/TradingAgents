@@ -592,6 +592,7 @@ class AdapterTests(TestCase):
         client = mock.Mock()
         client.get_llm_wrapped.return_value = wrapped
         env = {
+            "LLM_PROVIDER": "minimax",
             "MARKET_WARNING_LLM_TIMEOUT": "45",
             "MARKET_WARNING_LLM_MAX_TOKENS": "2048",
             "MINIMAX_BASE_URL": "https://example.invalid/v1",
@@ -618,6 +619,7 @@ class AdapterTests(TestCase):
         client = mock.Mock()
         client.get_llm_wrapped.return_value = wrapped
         env = {
+            "LLM_PROVIDER": "deepseek",
             "MARKET_WARNING_LLM_TIMEOUT": "45",
             "MARKET_WARNING_LLM_MAX_TOKENS": "2048",
             "DEEPSEEK_BASE_URL": "https://example.invalid",

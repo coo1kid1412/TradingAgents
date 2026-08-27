@@ -2,11 +2,10 @@
 
 from __future__ import annotations
 
-import os
 from typing import Any
 
-from tradingagents.llm_clients.deepseek_client import DEEPSEEK_BASE_URL
 from tradingagents.llm_clients.factory import create_llm_client
+from tradingagents.llm_clients.provider_config import resolve_llm_provider_settings
 
 from .minimax_reasoning import (
     MiniMaxReasoningAdapter,
@@ -41,17 +40,24 @@ class DeepSeekReasoningAdapter(MiniMaxReasoningAdapter):
     def from_environment(
         cls, breaker: CircuitBreaker | None = None
     ) -> "DeepSeekReasoningAdapter":
+        settings = resolve_llm_provider_settings()
+        if settings.provider != "deepseek":
+            raise ValueError("LLM_PROVIDER is not deepseek")
         timeout = _env_int("MARKET_WARNING_LLM_TIMEOUT", 90, 1, 90)
         max_tokens = _env_int("MARKET_WARNING_LLM_MAX_TOKENS", 4096, 256, 65536)
-        base_url = os.environ.get("DEEPSEEK_BASE_URL") or DEEPSEEK_BASE_URL
         client = create_llm_client(
             "deepseek",
-            MODEL_NAME,
-            base_url,
+            settings.deep_model,
+            settings.backend_url,
             timeout=timeout,
             max_tokens=max_tokens,
             max_retries=0,
             wall_clock_max_retries=0,
             reasoning_effort="max",
         )
-        return cls(client.get_llm_wrapped(), timeout=timeout, breaker=breaker)
+        return cls(
+            client.get_llm_wrapped(),
+            model_name=settings.deep_model,
+            timeout=timeout,
+            breaker=breaker,
+        )

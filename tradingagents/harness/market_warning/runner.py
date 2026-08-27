@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import logging
 import re
 import uuid
 from dataclasses import dataclass
@@ -27,6 +28,7 @@ _MARKET_ZONES = {
 }
 _CALENDAR_NAMES = {Market.A_SHARE: "XSHG", Market.US: "XNYS"}
 _MARKET_NAMES = {Market.A_SHARE: "A股", Market.US: "美股"}
+_LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -294,17 +296,34 @@ def _load_history_incrementally(
 
 
 def _reasoning_adapter(repository):
-    from tradingagents.harness.market_warning.adapters.deepseek_reasoning import (
-        DeepSeekReasoningAdapter,
-        DeepSeekUnavailableReasoningAdapter,
+    from tradingagents.llm_clients.provider_config import resolve_llm_provider_settings
+    from tradingagents.harness.market_warning.adapters.minimax_reasoning import (
+        MiniMaxReasoningAdapter,
+        UnavailableReasoningAdapter,
     )
 
+    settings = resolve_llm_provider_settings()
     try:
-        return DeepSeekReasoningAdapter.from_environment(
-            breaker=repository.circuit_breaker("deepseek-v4-pro")
+        breaker = repository.circuit_breaker(settings.deep_model)
+        if settings.provider == "minimax":
+            return MiniMaxReasoningAdapter.from_environment(breaker=breaker)
+        if settings.provider == "deepseek":
+            from tradingagents.harness.market_warning.adapters.deepseek_reasoning import (
+                DeepSeekReasoningAdapter,
+            )
+
+            return DeepSeekReasoningAdapter.from_environment(breaker=breaker)
+    except Exception as error:
+        _LOGGER.warning(
+            "market-warning reasoning unavailable provider=%s model=%s error=%s",
+            settings.provider,
+            settings.deep_model,
+            type(error).__name__,
         )
-    except Exception:
-        return DeepSeekUnavailableReasoningAdapter("initialization_error")
+    return UnavailableReasoningAdapter(
+        "initialization_error",
+        model_name=settings.deep_model,
+    )
 
 
 def _load_environment() -> None:

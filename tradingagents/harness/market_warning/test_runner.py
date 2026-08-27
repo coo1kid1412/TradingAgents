@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import io
+import os
 import tempfile
 from contextlib import redirect_stdout
 from dataclasses import replace
@@ -299,23 +300,79 @@ class RunnerTests(TestCase):
         self.assertEqual(len(results), 1)
         self.assertEqual(results[0].session_slot, "premarket")
 
-    def test_deepseek_initialization_failure_becomes_a_persistable_fallback_adapter(self) -> None:
+    def test_reasoning_adapter_uses_minimax_when_global_provider_is_minimax(self) -> None:
         repository = mock.Mock()
         repository.circuit_breaker.return_value = mock.Mock()
-        with mock.patch(
+        expected = mock.Mock(model_name="MiniMax-M3")
+        with mock.patch.dict(os.environ, {"LLM_PROVIDER": "minimax"}), mock.patch(
+            "tradingagents.harness.market_warning.adapters.minimax_reasoning."
+            "MiniMaxReasoningAdapter.from_environment",
+            return_value=expected,
+        ) as factory:
+            reasoning = _reasoning_adapter(repository)
+
+        repository.circuit_breaker.assert_called_once_with("MiniMax-M3")
+        factory.assert_called_once()
+        self.assertIs(reasoning, expected)
+
+    def test_minimax_initialization_failure_never_falls_back_to_deepseek(self) -> None:
+        repository = mock.Mock()
+        repository.circuit_breaker.return_value = mock.Mock()
+        with mock.patch.dict(os.environ, {"LLM_PROVIDER": "minimax"}), mock.patch(
+            "tradingagents.harness.market_warning.adapters.minimax_reasoning."
+            "MiniMaxReasoningAdapter.from_environment",
+            side_effect=RuntimeError("private initialization failure"),
+        ), mock.patch(
+            "tradingagents.harness.market_warning.adapters.deepseek_reasoning."
+            "DeepSeekReasoningAdapter.from_environment",
+        ) as deepseek_factory:
+            reasoning = _reasoning_adapter(repository)
+
+        deepseek_factory.assert_not_called()
+        self.assertEqual(reasoning.model_name, "MiniMax-M3")
+
+    def test_deepseek_initialization_failure_never_falls_back_to_minimax(self) -> None:
+        repository = mock.Mock()
+        repository.circuit_breaker.return_value = mock.Mock()
+        with mock.patch.dict(os.environ, {"LLM_PROVIDER": "deepseek"}), mock.patch(
             "tradingagents.harness.market_warning.adapters.deepseek_reasoning."
             "DeepSeekReasoningAdapter.from_environment",
             side_effect=RuntimeError("private initialization failure"),
-        ):
+        ), mock.patch(
+            "tradingagents.harness.market_warning.adapters.minimax_reasoning."
+            "MiniMaxReasoningAdapter.from_environment",
+        ) as minimax_factory:
             reasoning = _reasoning_adapter(repository)
 
         repository.circuit_breaker.assert_called_once_with("deepseek-v4-pro")
+        minimax_factory.assert_not_called()
         self.assertEqual(reasoning.model_name, "deepseek-v4-pro")
 
         result = _result(1, RiskLevel.ORANGE, slot="premarket")
         assessment = reasoning.assess(
             result.feature_snapshot,
             result.quant_assessment,
+            None,
+        )
+        self.assertEqual(assessment.reasoning_status, "fallback")
+        self.assertEqual(assessment.error_class, "initialization_error")
+
+    def test_reasoning_repository_failure_degrades_without_changing_provider(self) -> None:
+        repository = mock.Mock()
+        repository.circuit_breaker.side_effect = RuntimeError("repository unavailable")
+
+        with mock.patch.dict(os.environ, {"LLM_PROVIDER": "minimax"}), self.assertLogs(
+            "tradingagents.harness.market_warning.runner",
+            level="WARNING",
+        ) as logs:
+            reasoning = _reasoning_adapter(repository)
+
+        self.assertEqual(reasoning.model_name, "MiniMax-M3")
+        self.assertIn("provider=minimax", "\n".join(logs.output))
+        self.assertIn("error=RuntimeError", "\n".join(logs.output))
+        assessment = reasoning.assess(
+            _result(1, RiskLevel.ORANGE, slot="premarket").feature_snapshot,
+            _result(1, RiskLevel.ORANGE, slot="premarket").quant_assessment,
             None,
         )
         self.assertEqual(assessment.reasoning_status, "fallback")

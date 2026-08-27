@@ -272,7 +272,7 @@ class MarketWarningService:
                     reasoning_id = self.repository.save_reasoning(
                         feature_snapshot_id,
                         context,
-                        getattr(self.reasoning, "model_name", "deepseek-v4-pro"),
+                        getattr(self.reasoning, "model_name", "unknown"),
                     )
                 except Exception:
                     context = _reasoning_fallback("persistence_error")
@@ -296,7 +296,7 @@ class MarketWarningService:
         if not previous_state_available:
             reasons.append("Previous warning state is unavailable; recovery state cannot be assessed.")
         if context is not None and context.reasoning_status == "validated":
-            reasons.append("DeepSeek supplied a validated evidence-bounded context assessment.")
+            reasons.append("LLM supplied a validated evidence-bounded context assessment.")
         decision = build_final_decision(
             baseline=baseline,
             candidate=candidate,
