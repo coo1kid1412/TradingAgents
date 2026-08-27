@@ -32,18 +32,17 @@ class MiniMaxClient(BaseLLMClient):
 
     def get_llm(self) -> Any:
         """Return configured NormalizedChatOpenAI instance for MiniMax."""
+        api_key = self.kwargs.get("api_key") or os.environ.get(_MINIMAX_API_KEY_ENV)
+        if not api_key:
+            raise ValueError("缺少 MINIMAX_API_KEY，无法创建 MiniMax 客户端")
+
         llm_kwargs = {
             "model": self.model,
             "base_url": self.base_url or _MINIMAX_BASE_URL,
+            "api_key": api_key,
             "max_tokens": self.kwargs.get("max_tokens", 8192),
             "timeout": self._get_timeout(),
         }
-
-        # Read API key from env if not explicitly provided
-        if "api_key" not in self.kwargs:
-            api_key = os.environ.get(_MINIMAX_API_KEY_ENV)
-            if api_key:
-                llm_kwargs["api_key"] = api_key
 
         # Forward user-provided kwargs (timeout already set, skip it)
         for key in _PASSTHROUGH_KWARGS:

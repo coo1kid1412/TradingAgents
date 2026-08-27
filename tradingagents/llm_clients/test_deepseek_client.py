@@ -12,6 +12,7 @@ from tradingagents.llm_clients.deepseek_client import (
     DeepSeekNormalizedChatOpenAI,
 )
 from tradingagents.llm_clients.factory import create_llm_client
+from tradingagents.llm_clients.provider_config import resolve_llm_provider_settings
 from tradingagents.llm_clients.role_policy import resolve_role_policy
 from tradingagents.default_config import DEFAULT_CONFIG
 
@@ -60,17 +61,18 @@ def test_deepseek_client_fails_fast_without_key():
         _restore_key(previous)
 
 
-def test_factory_and_defaults_select_deepseek_without_minimax_fallback():
+def test_factory_selects_deepseek_explicitly_and_defaults_stay_on_minimax():
     previous = _with_key("sk-test-deepseek")
     try:
         client = create_llm_client("deepseek", "deepseek-v4-flash")
     finally:
         _restore_key(previous)
     assert isinstance(client, DeepSeekClient)
-    assert DEFAULT_CONFIG["llm_provider"] == "deepseek"
-    assert DEFAULT_CONFIG["deep_think_llm"] == "deepseek-v4-pro"
-    assert DEFAULT_CONFIG["quick_think_llm"] == "deepseek-v4-flash"
-    assert DEFAULT_CONFIG["backend_url"] == "https://api.deepseek.com"
+    defaults = resolve_llm_provider_settings({})
+    assert defaults.provider == "minimax"
+    assert defaults.deep_model == "MiniMax-M3"
+    assert defaults.quick_model == "MiniMax-M3"
+    assert defaults.backend_url == "https://api.minimaxi.com/v1"
 
 
 def test_role_policy_routes_agents_by_judgment_cost():
@@ -100,6 +102,12 @@ def test_graph_role_factory_applies_policy_to_actual_clients():
     previous = _with_key("sk-test-deepseek")
     graph = TradingAgentsGraph.__new__(TradingAgentsGraph)
     graph.config = DEFAULT_CONFIG.copy()
+    graph.config.update({
+        "llm_provider": "deepseek",
+        "backend_url": "https://api.deepseek.com",
+        "deep_think_llm": "deepseek-v4-pro",
+        "quick_think_llm": "deepseek-v4-flash",
+    })
     graph.callbacks = []
     try:
         market = graph._create_role_llm("market", 0.2)

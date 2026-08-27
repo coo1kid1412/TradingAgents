@@ -51,6 +51,7 @@ from rich.rule import Rule
 
 from tradingagents.graph.trading_graph import TradingAgentsGraph
 from tradingagents.default_config import DEFAULT_CONFIG
+from tradingagents.llm_clients.provider_config import resolve_llm_provider_settings
 from tradingagents.reporting import write_consolidated_reports
 from cli.models import AnalystType
 from cli.utils import *
@@ -65,6 +66,19 @@ app = typer.Typer(
     help="TradingAgents CLI: 多智能体大模型金融交易分析框架",
     add_completion=True,  # Enable shell completion
 )
+
+
+def _configured_llm_selection(environ=None):
+    """Return CLI model fields when the global provider switch is configured."""
+
+    env = os.environ if environ is None else environ
+    settings = resolve_llm_provider_settings(env)
+    return {
+        "llm_provider": settings.provider,
+        "backend_url": settings.backend_url,
+        "shallow_thinker": settings.quick_model,
+        "deep_thinker": settings.deep_model,
+    }
 
 
 # Create a deque to store recent messages with a maximum length
@@ -535,22 +549,15 @@ def get_user_selections():
     )
     selected_research_depth = select_research_depth()
 
-    # Step 6: LLM provider
+    configured_llm = _configured_llm_selection()
+    selected_llm_provider = configured_llm["llm_provider"]
+    backend_url = configured_llm["backend_url"]
+    selected_shallow_thinker = configured_llm["shallow_thinker"]
+    selected_deep_thinker = configured_llm["deep_thinker"]
     console.print(
-        create_question_box(
-            "第六步：大模型供应商", "选择 LLM 服务提供商"
-        )
+        f"[green]大模型配置:[/green] {selected_llm_provider} | "
+        f"quick={selected_shallow_thinker} | deep={selected_deep_thinker}"
     )
-    selected_llm_provider, backend_url = select_llm_provider()
-
-    # Step 7: Thinking agents
-    console.print(
-        create_question_box(
-            "第七步：思考模型", "选择快速/深度思考模型"
-        )
-    )
-    selected_shallow_thinker = select_shallow_thinking_agent(selected_llm_provider)
-    selected_deep_thinker = select_deep_thinking_agent(selected_llm_provider)
 
     # Step 8: Provider-specific thinking configuration
     thinking_level = None
