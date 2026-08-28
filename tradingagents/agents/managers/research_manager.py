@@ -218,16 +218,62 @@ def _normalize_summary_yaml_fence(content: str, summary_key: str) -> str:
     return f"{prefix}\n\n---\n\n{fenced}" if prefix else fenced
 
 
+def _manager_artifact_pattern(completion_token: str) -> str | None:
+    patterns = {
+        "RM_SUMMARY": (
+            r"(?mi)^(?:"
+            r"#{1,2}\s+最终\s+Thesis\s+报告[^\n]*"
+            r"|#\s+[^\n]+?\s+[-—–|]\s*Thesis\s+报告[^\n]*"
+            r"|#{1,2}\s+最终输出[:：]\s*Thesis\s+报告[^\n]*"
+            r")$"
+        ),
+        "PM_SUMMARY": r"(?m)^#{1,2}\s+Trade Ticket\b.*$",
+    }
+    return patterns.get(completion_token)
+
+
 def _extract_final_manager_artifact(content: str, completion_token: str) -> str:
     """Keep the final manager deliverable, excluding visible tool-round narration."""
     text = (content or "").strip()
-    patterns = {
-        "RM_SUMMARY": r"(?m)^#\s+最终\s+Thesis\s+报告\s*$",
-        "PM_SUMMARY": r"(?m)^#{1,2}\s+Trade Ticket\b.*$",
-    }
-    pattern = patterns.get(completion_token)
+    pattern = _manager_artifact_pattern(completion_token)
     matches = list(re.finditer(pattern, text)) if pattern else []
     return text[matches[-1].start():].strip() if matches else text
+
+
+def _has_substantive_final_manager_body(content: str, completion_token: str) -> bool:
+    """Require an identifiable RM deliverable before summary-only serialization repair."""
+    if completion_token != "RM_SUMMARY":
+        return bool((content or "").strip())
+    pattern = _manager_artifact_pattern(completion_token)
+    text = (content or "").strip()
+    matches = list(re.finditer(pattern, text)) if pattern else []
+    if not matches:
+        return False
+    artifact = text[matches[-1].start():]
+    artifact_body = re.split(r"(?m)^RM_SUMMARY:\s*$", artifact, maxsplit=1)[0]
+    section_patterns = (
+        ("rating", r"评级与置信度"),
+        ("thesis", r"核心\s*Thesis"),
+        ("arguments", r"最关键论据"),
+        ("falsifiers", r"证伪触发器"),
+        ("risk", r"反面风险"),
+        ("risk_review", r"风控审查指引"),
+    )
+    headings = list(re.finditer(r"(?mi)^#{2,4}\s+([^\n]+)$", artifact_body))
+    substantive_sections: set[str] = set()
+    for index, heading in enumerate(headings):
+        title = heading.group(1)
+        section_key = next(
+            (key for key, pattern in section_patterns if re.search(pattern, title, re.I)),
+            None,
+        )
+        if section_key is None:
+            continue
+        body_end = headings[index + 1].start() if index + 1 < len(headings) else len(artifact_body)
+        plain_body = re.sub(r"[\W_]+", "", artifact_body[heading.end():body_end])
+        if len(plain_body) >= 8:
+            substantive_sections.add(section_key)
+    return len(substantive_sections) >= 3
 
 
 _SUMMARY_REQUIRED_FIELDS = {
@@ -676,12 +722,13 @@ def _run_tool_calling_loop(llm_with_tools, initial_messages, *,
     截断比全空更隐蔽——只查空兜不住，必须查收尾标记。
 
     恢复策略：正文缺失/截断时带明确指令续写（工具照调，Step 6 的强制 IC 工具调用
-    可能还没发生），最多 max_continuations 次；预算用尽仍全空则抛错显式失败，
-    有部分正文但缺完整摘要也显式失败，避免下游自行补齐权威字段。
+    可能还没发生）。RM 在权威 IC 工具已成功且已有可见正文后，只允许一次隔离的
+    YAML 修复；修复失败立即关闭。预算用尽仍全空或摘要不完整时显式失败，避免下游
+    自行补齐权威字段。
     """
     tools_by_name = tools_by_name if tools_by_name is not None else RM_TOOLS_BY_NAME
     max_iterations = max_iterations or _MAX_TOOL_ITERATIONS
-    hard_cap = max_iterations + 2 * max_continuations + 2  # 续写也要算轮数，防死循环
+    hard_cap = max_iterations + 2 * max_continuations + 2
 
     messages = list(initial_messages)
     cot_segments: list[str] = []
@@ -689,11 +736,15 @@ def _run_tool_calling_loop(llm_with_tools, initial_messages, *,
     continuations = 0
     iteration = 0
     finalization_requested = False
+    rm_compact_repair_attempted = False
+    rm_compact_repair_pending = False
     authoritative_result: dict | None = None
     successful_tool_results: dict[str, object] = {}
     required_tool_names = set(required_tool_names or ())
 
-    while iteration < hard_cap:
+    while iteration < hard_cap or rm_compact_repair_pending:
+        is_rm_compact_repair_call = rm_compact_repair_pending
+        rm_compact_repair_pending = False
         iteration += 1
         response = llm_with_tools.invoke(messages)
         messages.append(response)
@@ -705,6 +756,10 @@ def _run_tool_calling_loop(llm_with_tools, initial_messages, *,
 
         tool_calls = getattr(response, "tool_calls", None) or []
         if tool_calls:
+            if is_rm_compact_repair_call:
+                raise RuntimeError(
+                    f"{role} 精简摘要修复阶段意外调用工具，仍缺完整 {completion_token}，中止分析"
+                )
             logger.info("%s 第 %d 轮工具调用：%d 个工具", role, iteration, len(tool_calls))
             for tc in tool_calls:
                 tool_name = tc.get("name")
@@ -776,6 +831,43 @@ def _run_tool_calling_loop(llm_with_tools, initial_messages, *,
                 ):
                     raise RuntimeError("权威 IC 工具结果写入后 RM_SUMMARY 仍不完整")
             return AIMessage(content=artifact)
+
+        if (
+            completion_token == "RM_SUMMARY"
+            and is_rm_compact_repair_call
+            and authority_complete
+            and required_tools_complete
+        ):
+            raise RuntimeError(
+                f"{role} 单次精简修复后仍缺完整 {completion_token}，中止本次分析；"
+                "管理层权威摘要不完整时不得流向下游"
+            )
+
+        rm_compact_repair_eligible = (
+            completion_token == "RM_SUMMARY"
+            and authoritative_tool_name is not None
+            and not rm_compact_repair_attempted
+            and not summary_complete
+            and authority_complete
+            and required_tools_complete
+            and _has_substantive_final_manager_body(joined, completion_token)
+        )
+        if rm_compact_repair_eligible:
+            repair_tool_results = [
+                f"{name}: {json.dumps(result, ensure_ascii=False)}"
+                for name, result in successful_tool_results.items()
+            ]
+            messages = [HumanMessage(content=_compact_summary_repair_prompt(
+                initial_messages,
+                repair_tool_results,
+                completion_token,
+                candidate,
+                allowed_summary_evidence_ids,
+            ))]
+            rm_compact_repair_attempted = True
+            rm_compact_repair_pending = True
+            logger.warning("%s 启用单次隔离 RM_SUMMARY 修复", role)
+            continue
 
         if continuations >= max_continuations:
             break

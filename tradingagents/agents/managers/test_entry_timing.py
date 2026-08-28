@@ -1105,6 +1105,461 @@ RM_SUMMARY:
     assert _find_yaml_block(result.content, "RM_SUMMARY")["rm_rating"] == "HOLD"
 
 
+def _valid_ic_result():
+    return {
+        "research_rating": "HOLD",
+        "rating_reason_codes": ["EXPECTED_RETURN_NEUTRAL"],
+        "scenario_expected_return_pct": 4.5,
+        "thresholds": {"configuration_pct": 15.0, "high_pct": 35.0},
+        "pillar_effects": {
+            "thesis": {"state": "mixed"},
+            "valuation": {"state": "fair"},
+            "catalyst": {"state": "visible"},
+            "durability": {"state": "acceptable"},
+        },
+        "evidence_ids": {
+            "thesis": ["FUND-GROWTH-01"],
+            "valuation": ["FUND-VAL-01"],
+            "catalyst": ["NEWS-CAT-01"],
+            "durability": ["RISK-GATE-01"],
+            "thesis_breaker": [],
+        },
+    }
+
+
+def _complete_rm_summary():
+    return """```yaml
+RM_SUMMARY:
+  current_price: 100
+  research_rating: BUY
+  rm_rating: BUY
+  pillar_thesis: strong
+  pillar_valuation: attractive
+  pillar_catalyst: strong
+  pillar_durability: resilient
+  scenario_expected_return_pct: 40
+  rating_reason_codes: MODEL-WRITTEN
+  target_price_mid: 108
+  entry_timing: 继续观察
+  thesis_evidence_ids: MODEL-01
+  valuation_evidence_ids: MODEL-02
+  catalyst_evidence_ids: MODEL-03
+  durability_evidence_ids: MODEL-04
+  rating_evidence_ids: MODEL-01
+  target_price_evidence_ids: MODEL-02
+  earnings_evidence_ids: MODEL-01
+  key_conflict_ids: null
+```"""
+
+
+def _substantive_rm_body():
+    return """# 601869 长飞光纤 - Thesis 报告
+
+## 一、评级与置信度
+
+长期评级为 HOLD，置信度中等。
+
+## 二、核心 Thesis
+
+盈利改善与高估值并存，当前赔率不足。
+
+## 三、最关键论据
+
+业绩增长较快，但估值约束仍然明显。
+
+## 四、证伪触发器
+
+盈利预期继续上修后重新评估。
+
+## 五、反面风险
+
+行业景气度超预期上行。"""
+
+
+class _ICTool:
+    @staticmethod
+    def invoke(_args):
+        return _valid_ic_result()
+
+
+def test_rm_repairs_incomplete_summary_in_compact_context_after_ic_success():
+    class PartialRMThenRepairLLM:
+        def __init__(self):
+            self.calls = []
+
+        def invoke(self, messages):
+            self.calls.append(messages)
+            if len(self.calls) == 1:
+                return AIMessage(content="", tool_calls=[{
+                    "name": "compute_ic_recommendation",
+                    "args": {},
+                    "id": "ic-1",
+                }])
+            if len(self.calls) == 2:
+                return AIMessage(content=(
+                    _substantive_rm_body() + "\n\n"
+                    "RM_SUMMARY:\n  current_price: 100\n  research_rating: HOL"
+                ))
+            assert len(messages) == 1
+            prompt = messages[0].content
+            assert "只输出一个完整的 RM_SUMMARY YAML" in prompt
+            assert "# 601869 长飞光纤 - Thesis 报告" in prompt
+            assert "compute_ic_recommendation" in prompt
+            assert "EXPECTED_RETURN_NEUTRAL" in prompt
+            return AIMessage(content=_complete_rm_summary())
+
+    llm = PartialRMThenRepairLLM()
+    result = _run_tool_calling_loop(
+        llm,
+        [HumanMessage(content="生成 RM 报告并以 RM_SUMMARY YAML 收尾")],
+        tools_by_name={"compute_ic_recommendation": _ICTool()},
+        role="RM",
+        completion_token="RM_SUMMARY",
+        required_summary_fields={"research_rating", "pillar_thesis"},
+        authoritative_tool_name="compute_ic_recommendation",
+        max_iterations=2,
+        max_continuations=2,
+    )
+
+    summary = _find_yaml_block(result.content, "RM_SUMMARY")
+    assert len(llm.calls) == 3
+    assert result.content.startswith("# 601869 长飞光纤 - Thesis 报告")
+    assert summary["research_rating"] == "HOLD"
+    assert summary["pillar_thesis"] == "mixed"
+    assert summary["rating_reason_codes"] == "EXPECTED_RETURN_NEUTRAL"
+
+
+def test_rm_compact_summary_repair_is_attempted_only_once():
+    class AlwaysPartialRM:
+        def __init__(self):
+            self.calls = []
+
+        def invoke(self, messages):
+            self.calls.append(messages)
+            if len(self.calls) == 1:
+                return AIMessage(content="", tool_calls=[{
+                    "name": "compute_ic_recommendation",
+                    "args": {},
+                    "id": "ic-1",
+                }])
+            if len(self.calls) == 3:
+                assert len(messages) == 1
+                assert "只输出一个完整的 RM_SUMMARY YAML" in messages[0].content
+            if len(self.calls) > 3:
+                raise AssertionError("RM 精简摘要修复不得重复调用")
+            return AIMessage(content=(
+                _substantive_rm_body() + "\n\nRM_SUMMARY:\n  research_rating: HOL"
+            ))
+
+    llm = AlwaysPartialRM()
+    try:
+        _run_tool_calling_loop(
+            llm,
+            [HumanMessage(content="生成 RM 报告")],
+            tools_by_name={"compute_ic_recommendation": _ICTool()},
+            role="RM",
+            completion_token="RM_SUMMARY",
+            authoritative_tool_name="compute_ic_recommendation",
+            max_iterations=2,
+            max_continuations=2,
+        )
+    except RuntimeError as exc:
+        assert "RM_SUMMARY" in str(exc)
+    else:
+        raise AssertionError("单次精简修复后摘要仍不完整时必须失败关闭")
+
+    assert len(llm.calls) == 3
+
+
+def test_rm_process_narration_does_not_trigger_compact_summary_repair():
+    class NarrationThenReportLLM:
+        def __init__(self):
+            self.calls = []
+
+        def invoke(self, messages):
+            self.calls.append(messages)
+            if len(self.calls) == 1:
+                return AIMessage(
+                    content="先调用权威工具，再撰写最终报告。",
+                    tool_calls=[{
+                        "name": "compute_ic_recommendation",
+                        "args": {},
+                        "id": "ic-1",
+                    }],
+                )
+            if len(self.calls) == 2:
+                return AIMessage(content="权威工具已完成，现在准备撰写报告。")
+            assert len(messages) > 1
+            assert "只输出一个完整的 RM_SUMMARY YAML" not in messages[-1].content
+            return AIMessage(content=_substantive_rm_body() + "\n\n" + _complete_rm_summary())
+
+    llm = NarrationThenReportLLM()
+    result = _run_tool_calling_loop(
+        llm,
+        [HumanMessage(content="生成 RM 报告")],
+        tools_by_name={"compute_ic_recommendation": _ICTool()},
+        role="RM",
+        completion_token="RM_SUMMARY",
+        authoritative_tool_name="compute_ic_recommendation",
+        max_iterations=2,
+        max_continuations=1,
+    )
+
+    assert len(llm.calls) == 3
+    assert result.content.startswith("# 601869 长飞光纤 - Thesis 报告")
+    assert "先调用权威工具" not in result.content
+
+
+def test_rm_internal_thesis_report_heading_does_not_truncate_root_artifact():
+    body = _substantive_rm_body().replace(
+        "## 二、核心 Thesis",
+        "## 二、核心 Thesis 报告摘要",
+    )
+
+    class OneShotLLM:
+        @staticmethod
+        def invoke(_messages):
+            return AIMessage(content=(
+                "工具计算已经完成。\n\n" + body + "\n\n" + _complete_rm_summary()
+            ))
+
+    result = _run_tool_calling_loop(
+        OneShotLLM(),
+        [HumanMessage(content="生成 RM 报告")],
+        tools_by_name={},
+        role="RM",
+        completion_token="RM_SUMMARY",
+        max_iterations=1,
+        max_continuations=0,
+    )
+
+    assert result.content.startswith("# 601869 长飞光纤 - Thesis 报告")
+    assert "## 一、评级与置信度" in result.content
+    assert "工具计算已经完成" not in result.content
+
+
+def test_rm_actual_h2_final_thesis_heading_removes_working_steps():
+    body = _substantive_rm_body().replace(
+        "# 601869 长飞光纤 - Thesis 报告",
+        "## 最终 Thesis 报告",
+    ).replace("## 一、", "### 一、").replace(
+        "## 二、", "### 二、",
+    ).replace("## 三、", "### 三、").replace(
+        "## 四、", "### 四、",
+    ).replace("## 五、", "### 五、")
+
+    class OneShotLLM:
+        @staticmethod
+        def invoke(_messages):
+            return AIMessage(content=(
+                "我将系统性完成八步分析。\n\n## Step 8 风险清单\n\n工作文本。\n\n"
+                + body + "\n\n" + _complete_rm_summary()
+            ))
+
+    result = _run_tool_calling_loop(
+        OneShotLLM(),
+        [HumanMessage(content="生成 RM 报告")],
+        tools_by_name={},
+        role="RM",
+        completion_token="RM_SUMMARY",
+        max_iterations=1,
+        max_continuations=0,
+    )
+
+    assert result.content.startswith("## 最终 Thesis 报告")
+    assert "我将系统性完成" not in result.content
+    assert "## Step 8" not in result.content
+
+
+def test_rm_empty_report_outline_does_not_trigger_compact_summary_repair():
+    empty_outline = """# 601869 长飞光纤 - Thesis 报告
+
+## 一、评级与置信度
+
+## 二、核心 Thesis
+
+## 四、证伪触发器
+"""
+
+    class EmptyOutlineThenReportLLM:
+        def __init__(self):
+            self.calls = []
+
+        def invoke(self, messages):
+            self.calls.append(messages)
+            if len(self.calls) == 1:
+                return AIMessage(content="", tool_calls=[{
+                    "name": "compute_ic_recommendation",
+                    "args": {},
+                    "id": "ic-1",
+                }])
+            if len(self.calls) == 2:
+                return AIMessage(content=(
+                    empty_outline + "\nRM_SUMMARY:\n  research_rating: HOL"
+                ))
+            assert len(messages) > 1
+            assert "只输出一个完整的 RM_SUMMARY YAML" not in messages[-1].content
+            return AIMessage(content=_substantive_rm_body() + "\n\n" + _complete_rm_summary())
+
+    llm = EmptyOutlineThenReportLLM()
+    result = _run_tool_calling_loop(
+        llm,
+        [HumanMessage(content="生成 RM 报告")],
+        tools_by_name={"compute_ic_recommendation": _ICTool()},
+        role="RM",
+        completion_token="RM_SUMMARY",
+        authoritative_tool_name="compute_ic_recommendation",
+        max_iterations=2,
+        max_continuations=1,
+    )
+
+    assert len(llm.calls) == 3
+    assert result.content.startswith("# 601869 长飞光纤 - Thesis 报告")
+
+
+def test_rm_compact_repair_has_budget_after_generic_continuations_are_exhausted():
+    class LateICToolThenRepairLLM:
+        def __init__(self):
+            self.calls = []
+
+        def invoke(self, messages):
+            self.calls.append(messages)
+            if len(self.calls) <= 2:
+                return AIMessage(content=f"第 {len(self.calls)} 轮研究仍在进行。")
+            if len(self.calls) == 3:
+                return AIMessage(content="", tool_calls=[{
+                    "name": "compute_ic_recommendation",
+                    "args": {},
+                    "id": "ic-1",
+                }])
+            if len(self.calls) == 4:
+                return AIMessage(content=(
+                    _substantive_rm_body() + "\n\nRM_SUMMARY:\n  research_rating: HOL"
+                ))
+            assert len(messages) == 1
+            assert "只输出一个完整的 RM_SUMMARY YAML" in messages[0].content
+            return AIMessage(content=_complete_rm_summary())
+
+    llm = LateICToolThenRepairLLM()
+    result = _run_tool_calling_loop(
+        llm,
+        [HumanMessage(content="生成 RM 报告")],
+        tools_by_name={"compute_ic_recommendation": _ICTool()},
+        role="RM",
+        completion_token="RM_SUMMARY",
+        authoritative_tool_name="compute_ic_recommendation",
+        max_iterations=1,
+        max_continuations=2,
+    )
+
+    assert len(llm.calls) == 5
+    assert _find_yaml_block(result.content, "RM_SUMMARY")["research_rating"] == "HOLD"
+
+
+def test_rm_compact_repair_invocation_survives_normal_loop_hard_cap():
+    class AuxTool:
+        @staticmethod
+        def invoke(_args):
+            return {"ok": True}
+
+    class ToolsUntilHardCapThenRepairLLM:
+        def __init__(self):
+            self.calls = []
+
+        def invoke(self, messages):
+            self.calls.append(messages)
+            if len(self.calls) == 1:
+                return AIMessage(content="", tool_calls=[{
+                    "name": "compute_ic_recommendation",
+                    "args": {},
+                    "id": "ic-1",
+                }])
+            if len(self.calls) == 2:
+                return AIMessage(content="", tool_calls=[{
+                    "name": "aux_tool",
+                    "args": {},
+                    "id": f"aux-{len(self.calls)}",
+                }])
+            if len(self.calls) == 3:
+                return AIMessage(content=(
+                    _substantive_rm_body() + "\n\nRM_SUMMARY:\n  research_rating: HOL"
+                ))
+            assert len(messages) == 1
+            assert "只输出一个完整的 RM_SUMMARY YAML" in messages[0].content
+            return AIMessage(content=_complete_rm_summary())
+
+    llm = ToolsUntilHardCapThenRepairLLM()
+    result = _run_tool_calling_loop(
+        llm,
+        [HumanMessage(content="生成 RM 报告")],
+        tools_by_name={
+            "compute_ic_recommendation": _ICTool(),
+            "aux_tool": AuxTool(),
+        },
+        role="RM",
+        completion_token="RM_SUMMARY",
+        authoritative_tool_name="compute_ic_recommendation",
+        max_iterations=1,
+        max_continuations=0,
+    )
+
+    assert len(llm.calls) == 4
+    assert _find_yaml_block(result.content, "RM_SUMMARY")["research_rating"] == "HOLD"
+
+
+def test_rm_compact_repair_rejects_tool_calls_without_executing_them():
+    class UnexpectedTool:
+        calls = 0
+
+        @classmethod
+        def invoke(cls, _args):
+            cls.calls += 1
+            return {"unexpected": True}
+
+    class RepairCallsToolLLM:
+        def __init__(self):
+            self.calls = 0
+
+        def invoke(self, _messages):
+            self.calls += 1
+            if self.calls == 1:
+                return AIMessage(content="", tool_calls=[{
+                    "name": "compute_ic_recommendation",
+                    "args": {},
+                    "id": "ic-1",
+                }])
+            if self.calls == 2:
+                return AIMessage(content=(
+                    _substantive_rm_body() + "\n\nRM_SUMMARY:\n  research_rating: HOL"
+                ))
+            return AIMessage(content="", tool_calls=[{
+                "name": "unexpected_tool",
+                "args": {},
+                "id": "unexpected-1",
+            }])
+
+    try:
+        _run_tool_calling_loop(
+            RepairCallsToolLLM(),
+            [HumanMessage(content="生成 RM 报告")],
+            tools_by_name={
+                "compute_ic_recommendation": _ICTool(),
+                "unexpected_tool": UnexpectedTool(),
+            },
+            role="RM",
+            completion_token="RM_SUMMARY",
+            authoritative_tool_name="compute_ic_recommendation",
+            max_iterations=2,
+            max_continuations=2,
+        )
+    except RuntimeError as exc:
+        assert "意外调用工具" in str(exc)
+    else:
+        raise AssertionError("精简摘要修复阶段不得执行工具")
+
+    assert UnexpectedTool.calls == 0
+
+
 def test_tool_loop_uses_compact_artifact_retry_after_tool_budget_and_empty_body():
     class ToolThenEmptyLLM:
         def __init__(self):
