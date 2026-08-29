@@ -18,6 +18,7 @@ from tradingagents.agents.managers.research_manager import (
     _enforce_entry_timing_truth,
     _extract_rm_rating,
     _normalize_summary_yaml_fence,
+    _resolve_authoritative_current_price,
     _run_tool_calling_loop,
 )
 from tradingagents.agents.utils.research_evidence_node import (
@@ -137,12 +138,13 @@ def _enforce_pm_summary_truth(
     if not isinstance(summary, dict):
         return normalized
 
-    summary.update(expected_values)
     summary["pm_rating_adjusted_from_rm"] = False
 
     scenario = tool_results.get("compute_pm_scenario_e")
     if isinstance(scenario, dict) and scenario.get("p_0") is not None:
         summary["current_price"] = scenario["p_0"]
+
+    summary.update(expected_values)
 
     conviction = tool_results.get("compute_conviction_position_map")
     if isinstance(conviction, dict) and conviction.get("conviction_stars") is not None:
@@ -693,6 +695,11 @@ def _strip_internal_pm_content(content: str) -> str:
     cleaned = cleaned.replace("结构 broken", "结构已破坏")
     cleaned = cleaned.replace("thesis", "核心逻辑")
     cleaned = re.sub(
+        r"((?:量化)?价值因子)\s*=?\s*([0-9]+(?:\.[0-9]+)?)\s*分?\s*(?:极端|显著)?低估",
+        r"\1 \2 分，估值吸引力极低",
+        cleaned,
+    )
+    cleaned = re.sub(
         r'effective_action=["\']?退出观察["\']?逐字采用[^。\n]*',
         "当前短线结构已破坏，当前不新建仓",
         cleaned,
@@ -988,6 +995,9 @@ def create_portfolio_manager(llm, memory):
         history = state["risk_debate_state"]["history"]
         risk_debate_state = state["risk_debate_state"]
         research_plan = state["investment_plan"]
+        authoritative_current_price = _resolve_authoritative_current_price(
+            state.get("market_report", ""), state.get("fundamentals_report", ""),
+        )
 
         # PM reads the compact IC packet instead of four repeated long reports.
         ic_packet = state.get("ic_packet", "")
@@ -1044,6 +1054,10 @@ def create_portfolio_manager(llm, memory):
         prompt = fr"""【语言要求】你必须使用中文撰写以下所有分析内容和回复。评级关键词（Buy/Overweight/Hold/Underweight/Sell）、股票代码、专业交易术语（Action/Size/R/TP/SL/Time Stop）可保留英文，但需带中文注释。
 
 你是**投资组合经理（Portfolio Manager）**，对标头部对冲基金 PM 角色，输出**专业交易票（Trade Ticket）**风格的决策。
+
+SYS_CURRENT_PRICE: {authoritative_current_price if authoritative_current_price is not None else "不可得"}
+该值由 Python 从行情契约确定；`compute_pm_scenario_e.p_0`、当前价、止盈止损的当前价基准和
+PM_SUMMARY.current_price 必须采用该值，不得沿用模型记忆或旧报告价格。
 
 ## 决策权与问责
 
@@ -1161,7 +1175,7 @@ PM 是最终交易决策人，独占最终动作、仓位、入场和止损的�
 | 字段 | quant_score 输出位置 | 你的用途 |
 |------|--------------------|---------|
 | **QUANT_SCORE.composite**（0-100） | YAML 摘要 | 独立交叉校验：若与 RM 方向严重背离，写入 Key Risks 并降低 Conviction/仓位，不改研究评级 |
-| **factor_scores 中 <30 分的因子** | YAML 摘要 / 因子分项表 | **必须列入 Trade Ticket 的 Key Risks 段**（如 lowvol=5 → "极端高波动"；value=18 → "估值显著偏贵"）|
+| **factor_scores 中 <30 分的因子** | YAML 摘要 / 因子分项表 | **必须列入 Trade Ticket 的 Key Risks 段**（如 lowvol=5 → "极端高波动"；value=18 → "估值显著偏贵"；value 低分严禁写成“低估”）|
 | **Conviction 强化**（评级与 quant 方向一致时）| —— | RM=OVERWEIGHT 且 composite≥70 → Conviction 可在 RM 给的基础上 +1 档 |
 
 ⚠️ **强制约束**：本节列出的薄弱因子（<30）**必须**出现在 Trade Ticket 的"Key Risks"段，禁止以"已在 RM 风险清单覆盖"为由跳过——这是 Python 量化锚，是独立信号来源。
@@ -1526,7 +1540,7 @@ PM 必须明确推荐其中之一，并解释理由。
 PM_SUMMARY:
   ticker: "{pm_ticker}"
   trade_date: "{pm_trade_date}"
-  current_price: <float>                 # 当前价 P_0
+  current_price: {authoritative_current_price if authoritative_current_price is not None else "<float>"}  # Python 权威当前价 P_0
   pm_rating: BUY / OVERWEIGHT / HOLD / UNDERWEIGHT / SELL  # 逐字镜像 RM_SUMMARY.research_rating
   pm_conviction_stars: <int 1-5>
   pm_invest_judgment: YES / NO / CONDITIONAL
@@ -1621,6 +1635,8 @@ Be decisive and ground every conclusion in specific evidence from the analysts.{
                 float(effective_market_risk_snapshot.get("position_cap_pct") or 0),
             ),
         }
+        if authoritative_current_price is not None:
+            expected_summary_values["current_price"] = authoritative_current_price
         response = _pm_tool_loop(
             llm_with_tools,
             [HumanMessage(content=prompt)],

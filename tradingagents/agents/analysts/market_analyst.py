@@ -43,9 +43,11 @@ def _enforce_price_metadata(report: str, meta: dict) -> str:
     date = meta.get("date") or "未知"
     quote_time = meta.get("time") or "无"
     source = meta.get("source") or "unknown"
+    current_price = meta.get("current_price")
+    price_text = f"｜当前价：{current_price:g} 元" if isinstance(current_price, (int, float)) else ""
     banner = (
         f"> **价格数据状态：{labels.get(status, status)}**｜"
-        f"数据日期：{date}｜报价时间：{quote_time}｜来源：{source}\n\n"
+        f"数据日期：{date}｜报价时间：{quote_time}｜来源：{source}{price_text}\n\n"
     )
 
     summary_match = re.search(r"(^SUMMARY:\s*$)", report, re.M)
@@ -56,9 +58,15 @@ def _enforce_price_metadata(report: str, meta: dict) -> str:
             "price_data_time": meta.get("time"),
             "price_data_source": source,
         }
+        if isinstance(current_price, (int, float)) and current_price > 0:
+            fields["current_price"] = current_price
         additions = []
         for key, value in fields.items():
-            rendered = f'"{value}"' if value is not None else "null"
+            rendered = (
+                str(value)
+                if isinstance(value, (int, float)) and not isinstance(value, bool)
+                else (f'"{value}"' if value is not None else "null")
+            )
             pattern = rf"^\s{{2}}{key}:.*$"
             replacement = f"  {key}: {rendered}"
             if re.search(pattern, report, re.M):

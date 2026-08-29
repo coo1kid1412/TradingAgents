@@ -15,10 +15,12 @@ from tradingagents.agents.managers.research_manager import (
     _compact_summary_repair_prompt,
     _derive_entry_timing_from_profile,
     _enforce_entry_timing_truth,
+    _enforce_rm_summary_truth,
     _enforce_research_rating_truth,
     _extract_rm_rating,
     _normalize_summary_yaml_fence,
     _run_tool_calling_loop,
+    _resolve_authoritative_current_price,
     _summary_yaml_is_complete,
 )
 from tradingagents.agents.managers.portfolio_manager import (
@@ -28,6 +30,7 @@ from tradingagents.agents.managers.portfolio_manager import (
     _format_pm_decision,
     _presented_entry_timing,
     _require_rm_rating,
+    _strip_internal_pm_content,
 )
 from tradingagents.agents.utils.agent_utils import RISK_DEBATE_PHRASING_RULES
 from tradingagents.harness.extractor import _find_yaml_block
@@ -921,6 +924,96 @@ def test_tool_loop_retries_when_summary_token_exists_but_yaml_is_truncated():
     assert llm.calls == 2
     normalized = _normalize_summary_yaml_fence(result.content, "RM_SUMMARY")
     assert _find_yaml_block(normalized, "RM_SUMMARY")["key_conflict_ids"] is None
+
+
+def test_authoritative_price_overrides_rm_tool_input_and_summary():
+    class SequenceLLM:
+        def __init__(self):
+            self.calls = 0
+
+        def invoke(self, _messages):
+            self.calls += 1
+            if self.calls == 1:
+                return AIMessage(content="", tool_calls=[{
+                    "name": "compute_scenario_weighted_e",
+                    "args": {"scenarios": [], "p_0": 840.0},
+                    "id": "scenario-1",
+                }])
+            return AIMessage(content="""# 最终 Thesis 报告
+
+```yaml
+RM_SUMMARY:
+  current_price: 840.0
+  rm_rating: HOLD
+  target_price_mid: 1091.0
+  entry_timing: 暂不介入
+  rating_evidence_ids: FUND-GROWTH-01
+  target_price_evidence_ids: FUND-VAL-01
+  earnings_evidence_ids: FUND-GROWTH-01
+  key_conflict_ids: null
+```
+""")
+
+    captured = {}
+
+    class ScenarioTool:
+        @staticmethod
+        def invoke(args):
+            captured.update(args)
+            return {"p_0": args["p_0"], "expected_return_pct": 25.0}
+
+    result = _run_tool_calling_loop(
+        SequenceLLM(),
+        [HumanMessage(content="生成报告")],
+        tools_by_name={"compute_scenario_weighted_e": ScenarioTool()},
+        completion_token="RM_SUMMARY",
+        max_iterations=2,
+        expected_summary_values={"current_price": 858.35},
+        summary_enforcer=_enforce_rm_summary_truth,
+    )
+
+    assert captured["p_0"] == 858.35
+    assert _find_yaml_block(result.content, "RM_SUMMARY")["current_price"] == 858.35
+
+
+def test_authoritative_price_prefers_market_summary_then_fundamentals_fallback():
+    market = """```yaml
+SUMMARY:
+  current_price: 858.35
+  price_data_status: official_daily
+```"""
+    fundamentals = "> **估值价格口径：正式收盘价 840.0 元**｜日期：2026-08-28"
+    assert _resolve_authoritative_current_price(market, fundamentals) == 858.35
+    assert _resolve_authoritative_current_price("# 无价格摘要", fundamentals) == 840.0
+    market_banner = "> **价格数据状态：未知**｜数据日期：2026-08-28｜当前价：107.25 元"
+    assert _resolve_authoritative_current_price(market_banner, "") == 107.25
+
+
+def test_pm_expected_price_wins_over_model_scenario_price():
+    content = """```yaml
+PM_SUMMARY:
+  current_price: 840.0
+  pm_rating: HOLD
+  pm_action_keyword: WAIT
+  pm_size_low_pct: 0
+  pm_size_high_pct: 0
+  pm_entry_low: null
+  pm_entry_high: null
+```
+"""
+    fixed = _enforce_pm_summary_truth(
+        content,
+        {"compute_pm_scenario_e": {"p_0": 840.0}},
+        {"current_price": 858.35},
+        None,
+    )
+    assert _find_yaml_block(fixed, "PM_SUMMARY")["current_price"] == 858.35
+
+
+def test_value_factor_low_score_is_not_described_as_undervalued():
+    cleaned = _strip_internal_pm_content("价值因子 5 分极端低估")
+    assert "估值吸引力极低" in cleaned
+    assert "极端低估" not in cleaned
 
 
 def test_tool_loop_repairs_missing_pm_summary_in_isolated_compact_context():

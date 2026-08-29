@@ -16,6 +16,7 @@ from tradingagents.agents.managers.rm_tools import (
     derive_market_mode,
 )
 from tradingagents.agents.utils.handoff import pack_agent_context, pack_report_handoffs
+from tradingagents.agents.utils.yaml_summary import extract_yaml_mapping
 
 logger = logging.getLogger(__name__)
 
@@ -23,6 +24,79 @@ logger = logging.getLogger(__name__)
 # Step 6 评级终段由 compute_ic_recommendation 一次调用完成四支柱矩阵、
 # 证据门槛和收益方向不变量，典型轮数 ~6-9，15 是宽裕缓冲。
 _MAX_TOOL_ITERATIONS = 15
+
+_AUTHORITATIVE_PRICE_TOOL_ARGS = {
+    "compute_scenario_weighted_e": "p_0",
+    "compute_odds_and_expected_return": "p_0",
+    "compute_pm_scenario_e": "p_0",
+    "compute_step6_rating_mapping": "current_price",
+    "compute_step6_final_rating": "current_price",
+}
+
+
+def _positive_price(value) -> float | None:
+    try:
+        price = float(value)
+    except (TypeError, ValueError):
+        return None
+    return price if math.isfinite(price) and price > 0 else None
+
+
+def _resolve_authoritative_current_price(
+    market_report: str,
+    fundamentals_report: str,
+) -> float | None:
+    """Resolve the code-owned execution price, preferring the market contract."""
+    market_summary, _ = extract_yaml_mapping(market_report or "", "SUMMARY")
+    market_price = _positive_price((market_summary or {}).get("current_price"))
+    if market_price is None:
+        market_banner_match = re.search(
+            r"当前价[：:]\s*([0-9]+(?:\.[0-9]+)?)\s*元",
+            market_report or "",
+        )
+        if market_banner_match:
+            market_price = _positive_price(market_banner_match.group(1))
+
+    fundamentals_summary, _ = extract_yaml_mapping(fundamentals_report or "", "SUMMARY")
+    fundamentals_price = _positive_price((fundamentals_summary or {}).get("current_price"))
+    if fundamentals_price is None:
+        banner_match = re.search(
+            r"估值价格口径：[^*\n]*?([0-9]+(?:\.[0-9]+)?)\s*元",
+            fundamentals_report or "",
+        )
+        fundamentals_price = _positive_price(banner_match.group(1)) if banner_match else None
+
+    if market_price is not None and fundamentals_price is not None and not _same_number(
+        market_price, fundamentals_price,
+    ):
+        logger.warning(
+            "市场与基本面当前价不一致：market=%s fundamentals=%s；执行价采用 market",
+            market_price,
+            fundamentals_price,
+        )
+    return market_price if market_price is not None else fundamentals_price
+
+
+def _enforce_authoritative_price_tool_arg(
+    tool_name: str,
+    tool_args: dict,
+    expected_summary_values: dict[str, object] | None,
+) -> dict:
+    expected_price = _positive_price((expected_summary_values or {}).get("current_price"))
+    argument_name = _AUTHORITATIVE_PRICE_TOOL_ARGS.get(tool_name)
+    if expected_price is None or argument_name is None:
+        return tool_args
+    enforced = dict(tool_args or {})
+    if not _same_number(enforced.get(argument_name), expected_price):
+        logger.warning(
+            "%s 的 %s=%s 与权威当前价 %s 不一致，已覆盖",
+            tool_name,
+            argument_name,
+            enforced.get(argument_name),
+            expected_price,
+        )
+    enforced[argument_name] = expected_price
+    return enforced
 
 
 def _compact_finalization_prompt(
@@ -639,6 +713,31 @@ def _enforce_ic_recommendation_truth(content: str, result: dict) -> str:
     raise RuntimeError("RM_SUMMARY 无法解析，不能写入权威 IC 工具结果")
 
 
+def _enforce_rm_summary_truth(
+    content: str,
+    _tool_results: dict[str, object],
+    expected_values: dict[str, object],
+    _allowed_evidence_ids: set[str] | dict[str, set[str]] | None,
+) -> str:
+    """Overwrite code-owned RM fields before completeness validation."""
+    normalized = _normalize_summary_yaml_fence(content, "RM_SUMMARY")
+    blocks = list(re.finditer(r"```yaml\s*\n(.*?)\n```", normalized, re.DOTALL))
+    for match in reversed(blocks):
+        try:
+            parsed = yaml.safe_load(match.group(1))
+        except yaml.YAMLError:
+            continue
+        summary = parsed.get("RM_SUMMARY") if isinstance(parsed, dict) else None
+        if not isinstance(summary, dict):
+            continue
+        summary.update(expected_values)
+        replacement = "```yaml\n" + yaml.safe_dump(
+            {"RM_SUMMARY": summary}, allow_unicode=True, sort_keys=False,
+        ).rstrip() + "\n```"
+        return normalized[:match.start()] + replacement + normalized[match.end():]
+    return normalized
+
+
 def _enforce_entry_timing_truth(content: str, timing: dict) -> str:
     """Overwrite model timing drift at report output boundaries."""
     structure = timing.get("structure_class") or "insufficient_data"
@@ -763,7 +862,11 @@ def _run_tool_calling_loop(llm_with_tools, initial_messages, *,
             logger.info("%s 第 %d 轮工具调用：%d 个工具", role, iteration, len(tool_calls))
             for tc in tool_calls:
                 tool_name = tc.get("name")
-                tool_args = tc.get("args", {})
+                tool_args = _enforce_authoritative_price_tool_arg(
+                    tool_name,
+                    tc.get("args", {}),
+                    expected_summary_values,
+                )
                 tool_id = tc.get("id", "")
 
                 tool = tools_by_name.get(tool_name)
@@ -946,6 +1049,9 @@ def create_research_manager(llm):
         sentiment_report = state["sentiment_report"]
         news_report = state["news_report"]
         fundamentals_report = state["fundamentals_report"]
+        authoritative_current_price = _resolve_authoritative_current_price(
+            market_research_report, fundamentals_report,
+        )
         consensus_snapshot = state.get("consensus_snapshot", "")
         stock_profile = state.get("stock_profile", "")
         macro_context = state.get("macro_context", "")
@@ -983,6 +1089,10 @@ def create_research_manager(llm):
         prompt = f"""【语言要求】你必须使用中文撰写以下所有分析内容和回复。评级关键词（Buy/Overweight/Hold/Underweight/Sell）和股票代码可保留英文。
 
 你是**投资研究总监（Head of Research）**，对标真实头部投研团队的 RM 角色。
+
+SYS_CURRENT_PRICE: {authoritative_current_price if authoritative_current_price is not None else "不可得"}
+该值由 Python 从行情契约确定；凡工具参数 `p_0/current_price`、正文当前价和 RM_SUMMARY.current_price
+都必须采用该值，不得从新闻、模型记忆或旧报告另取价格。
 
 ## 你的角色定位（与裁判员的根本区别）
 
@@ -1103,7 +1213,7 @@ def create_research_manager(llm):
 - 这是**独立于 LLM 判断的量化锚**，由 Python 直接基于动量/价值/质量/成长/低波/反拥挤 6 因子打分得出
 - composite 与 momentum 只用于检查经营 thesis、催化和持续性判断是否存在严重背离，不作为独立长期方向票
 - 极端量化背离必须进入 `unresolved_dissent` 或风险清单，由对应专业证据解释，不能绕过四支柱矩阵直接升降评级
-- factor_scores 中 <30 分的单项代表该维度有显著风险，Step 8 风险清单应当独立列出
+- factor_scores 中 <30 分的单项代表该维度有显著风险，Step 8 风险清单应当独立列出；其中 value 低分表示估值吸引力低/偏贵，严禁表述为“低估”
 
 **重点提取**：style / industry / VALUATION_METHOD.primary_method / target_pe_range / target_pb_range / data_completeness
 
@@ -1593,7 +1703,7 @@ Hard Data 修正：yes 不变；no × 0.5
 RM_SUMMARY:
   ticker: "{rm_ticker}"                  # 已填好，请勿修改
   trade_date: "{rm_trade_date}"          # 已填好，请勿修改
-  current_price: <float>                 # 当前价 P_0
+  current_price: {authoritative_current_price if authoritative_current_price is not None else "<float>"}  # Python 权威当前价 P_0
   research_rating: BUY / OVERWEIGHT / HOLD / UNDERWEIGHT / SELL  # compute_ic_recommendation 权威结果
   rm_rating: BUY / OVERWEIGHT / HOLD / UNDERWEIGHT / SELL        # 必须与 research_rating 相同，兼容归档
   rm_conviction: 高 / 中 / 低
@@ -1658,6 +1768,11 @@ RM_SUMMARY:
             [HumanMessage(content=prompt)],
             required_summary_fields=_RM_FOUR_PILLAR_REQUIRED_FIELDS,
             authoritative_tool_name="compute_ic_recommendation",
+            expected_summary_values=(
+                {"current_price": authoritative_current_price}
+                if authoritative_current_price is not None else None
+            ),
+            summary_enforcer=_enforce_rm_summary_truth,
         )
         normalized_content = _normalize_summary_yaml_fence(response.content, "RM_SUMMARY")
         normalized_content = _enforce_research_rating_truth(normalized_content)

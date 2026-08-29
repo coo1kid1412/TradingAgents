@@ -306,14 +306,29 @@ def test_stock_header_metadata_parser_is_shared_and_deterministic():
         "# Source: Tushare Pro\n"
         "# Price data status: intraday_provisional\n"
         "# Latest bar source: sina_realtime\n"
-        "# Latest quote time: 2026-07-17 11:29:58\n"
+        "# Latest quote time: 2026-07-17 11:29:58\n\n"
+        "Date,Open,High,Low,Close,Volume\n"
+        "2026-07-16,1090.0,1118.0,1088.0,1113.0,10000000\n"
+        "2026-07-17,1100.0,1130.0,1090.0,1120.5,12345678\n"
     )
     assert meta == {
         "status": "intraday_provisional",
         "date": "2026-07-17",
         "time": "2026-07-17 11:29:58",
         "source": "sina_realtime",
+        "current_price": 1120.5,
     }
+
+
+def test_stock_header_metadata_parser_supports_yfinance_csv_shape():
+    meta = intraday_quote_module.parse_price_metadata(
+        "# Actual date range: 2026-08-27 to 2026-08-28 (requested: x to y)\n\n"
+        "Date,Open,High,Low,Close,Adj Close,Volume\n"
+        "2026-08-27,100,105,99,104,104,1000000\n"
+        "2026-08-28,104,108,103,107.25,107.25,1200000\n"
+    )
+    assert meta["date"] == "2026-08-28"
+    assert meta["current_price"] == 107.25
 
 
 def test_quant_report_propagates_price_freshness_into_yaml():
@@ -346,12 +361,14 @@ def test_market_report_metadata_is_deterministically_visible_and_in_summary():
     output = enforce(report, {
         "status": "intraday_provisional", "date": "2026-07-17",
         "time": "2026-07-17 11:29:58", "source": "sina_realtime",
+        "current_price": 1120.5,
     })
     assert output.startswith("> **价格数据状态：盘中临时K线**")
     assert 'price_data_status: "intraday_provisional"' in output
     assert 'price_data_date: "2026-07-17"' in output
     assert 'price_data_time: "2026-07-17 11:29:58"' in output
     assert 'price_data_source: "sina_realtime"' in output
+    assert "current_price: 1120.5" in output
 
 
 def test_market_prompt_requires_price_freshness_summary_contract():

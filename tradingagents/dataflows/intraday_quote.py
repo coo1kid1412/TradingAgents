@@ -6,6 +6,8 @@ process-local provisional bar for an analysis dated today.
 
 from __future__ import annotations
 
+import csv
+import io
 import logging
 import re
 import time
@@ -239,7 +241,13 @@ def _date_display(value) -> str:
 
 def parse_price_metadata(text: str) -> dict:
     """Parse freshness headers emitted by stock-data vendors."""
-    meta = {"status": "unknown", "date": None, "time": None, "source": "unknown"}
+    meta = {
+        "status": "unknown",
+        "date": None,
+        "time": None,
+        "source": "unknown",
+        "current_price": None,
+    }
     if not text:
         return meta
 
@@ -259,6 +267,29 @@ def parse_price_metadata(text: str) -> dict:
     time_match = re.search(r"^# Latest quote time:\s*(.+?)\s*$", text, re.M)
     if time_match:
         meta["time"] = time_match.group(1).strip()
+
+    lines = text.splitlines()
+    header_index = None
+    for index, line in enumerate(lines):
+        if line.startswith("#") or "," not in line:
+            continue
+        columns = next(csv.reader([line]), [])
+        if "Date" in columns and "Close" in columns:
+            header_index = index
+            break
+    if header_index is not None:
+        rows = csv.DictReader(io.StringIO("\n".join(lines[header_index:])))
+        latest_close = None
+        for row in rows:
+            if meta["date"] and row.get("Date") != meta["date"]:
+                continue
+            try:
+                close = float(row.get("Close", ""))
+            except (TypeError, ValueError):
+                continue
+            if close > 0:
+                latest_close = close
+        meta["current_price"] = latest_close
     return meta
 
 
