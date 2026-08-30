@@ -205,6 +205,14 @@ def get_news_from_search(
     parts.append("新闻")
     query = " ".join(parts)
     try:
-        return search_news(query, count=20, freshness="pw")
+        relevance_terms = tuple(
+            term for term in (company_name, code) if term
+        )
+        return search_news(
+            query,
+            count=20,
+            freshness="pw",
+            relevance_terms=relevance_terms,
+        )
     except Exception as e:
         return f"Brave Search 调用失败: {e}"

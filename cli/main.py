@@ -52,7 +52,7 @@ from rich.rule import Rule
 from tradingagents.graph.trading_graph import TradingAgentsGraph
 from tradingagents.default_config import DEFAULT_CONFIG
 from tradingagents.llm_clients.provider_config import resolve_llm_provider_settings
-from tradingagents.reporting import write_consolidated_reports
+from tradingagents.reporting import build_agent_report_context, write_consolidated_reports
 from cli.models import AnalystType
 from cli.utils import *
 from cli.announcements import fetch_announcements, display_announcements
@@ -638,6 +638,10 @@ def save_report_to_disk(final_state, ticker: str, save_path: Path):
     # 1. Analysts
     analysts_dir = save_path / "1_analysts"
     analyst_parts = []
+    if final_state.get("capital_flow_report"):
+        analysts_dir.mkdir(exist_ok=True)
+        (analysts_dir / "capital_flow.md").write_text(final_state["capital_flow_report"])
+        analyst_parts.append(("资金流分析官", final_state["capital_flow_report"]))
     if final_state.get("market_report"):
         analysts_dir.mkdir(exist_ok=True)
         (analysts_dir / "market.md").write_text(final_state["market_report"])
@@ -654,6 +658,10 @@ def save_report_to_disk(final_state, ticker: str, save_path: Path):
         analysts_dir.mkdir(exist_ok=True)
         (analysts_dir / "fundamentals.md").write_text(final_state["fundamentals_report"])
         analyst_parts.append((t("Fundamentals Analyst", AGENT_NAMES), final_state["fundamentals_report"]))
+    if final_state.get("quant_score"):
+        analysts_dir.mkdir(exist_ok=True)
+        (analysts_dir / "quant.md").write_text(final_state["quant_score"])
+        analyst_parts.append(("量化打分官", final_state["quant_score"]))
     if final_state.get("macro_context"):
         analysts_dir.mkdir(exist_ok=True)
         (analysts_dir / "macro.md").write_text(final_state["macro_context"])
@@ -662,6 +670,10 @@ def save_report_to_disk(final_state, ticker: str, save_path: Path):
         analysts_dir.mkdir(exist_ok=True)
         (analysts_dir / "stock_profile.md").write_text(final_state["stock_profile"])
         analyst_parts.append((t("Stock Profile Officer", AGENT_NAMES), final_state["stock_profile"]))
+    if final_state.get("sector_comparison"):
+        analysts_dir.mkdir(exist_ok=True)
+        (analysts_dir / "sector.md").write_text(final_state["sector_comparison"])
+        analyst_parts.append(("板块对照官", final_state["sector_comparison"]))
     if final_state.get("consensus_snapshot"):
         analysts_dir.mkdir(exist_ok=True)
         (analysts_dir / "consensus.md").write_text(final_state["consensus_snapshot"])
@@ -736,6 +748,7 @@ def save_report_to_disk(final_state, ticker: str, save_path: Path):
         ticker=ticker,
         user_decision=str(risk.get("judge_decision") or ""),
         audit_sections=sections,
+        agent_reports=build_agent_report_context(final_state),
     )
 
 
