@@ -1910,6 +1910,185 @@ PM_SUMMARY:
     assert "**12 个月主题：降速。**" in result
 
 
+def test_stale_snapshot_replaces_bold_trading_day_outlook_paragraph():
+    content = """## Trade Ticket 交易票
+| 未来 3 个交易日趋势 | **下行**（置信度：高） |
+
+## 一、投资决策与入场时机
+
+**未来 3 个交易日趋势：下行**（置信度：高）——周线破位，主力资金持续流出。
+
+**12 个月主题判断：兑现**——长期需求仍在。
+
+```yaml
+PM_SUMMARY:
+  current_price: 858.35
+  pm_rating: OVERWEIGHT
+  pm_action_keyword: WAIT
+  pm_sl_hard: 780
+  short_term_trend: 下行
+  short_term_confidence: 高
+  entry_timing: 暂不介入
+```
+"""
+
+    result = _format_pm_decision(
+        content,
+        {"structure_class": "broken", "effective_action": "暂不介入"},
+        market_risk_snapshot={"data_status": "stale", "required_checkpoint": "09:35"},
+    )
+
+    assert "未来 3 个交易日趋势：下行" not in result
+    assert "周线破位，主力资金持续流出" not in result
+    assert "**未来 3 日：数据不足**" in result
+    assert "**12 个月主题判断：兑现**" in result
+
+
+def test_stale_snapshot_preserves_plain_long_term_paragraph_and_is_idempotent():
+    content = """## Trade Ticket 交易票
+| 未来 3 个交易日趋势 | **下行**（置信度：高） |
+
+## 一、投资决策与入场时机
+
+**未来 3 个交易日趋势：下行**（置信度：高）——短线资金继续流出。
+
+12 个月主题判断：兑现，长期需求与盈利逻辑仍在。
+
+```yaml
+PM_SUMMARY:
+  current_price: 858.35
+  pm_rating: OVERWEIGHT
+  pm_action_keyword: WAIT
+  pm_sl_hard: 780
+  short_term_trend: 下行
+  short_term_confidence: 高
+  entry_timing: 暂不介入
+```
+"""
+    kwargs = {
+        "market_risk_snapshot": {
+            "data_status": "stale",
+            "required_checkpoint": "09:35",
+        },
+    }
+
+    once = _format_pm_decision(
+        content,
+        {"structure_class": "broken", "effective_action": "暂不介入"},
+        **kwargs,
+    )
+    twice = _format_pm_decision(
+        once,
+        {"structure_class": "broken", "effective_action": "暂不介入"},
+        **kwargs,
+    )
+
+    assert "短线资金继续流出" not in once
+    assert "12 个月主题判断：兑现，长期需求与盈利逻辑仍在。" in once
+    assert twice == once
+
+
+def test_stale_snapshot_removes_multiline_short_term_paragraph_only():
+    content = """## Trade Ticket 交易票
+| 未来 3 个交易日趋势 | **下行**（置信度：高） |
+
+## 一、投资决策与入场时机
+
+**未来 3 个交易日趋势：下行**（置信度：高）
+周线破位且量价结构走弱。
+领先风险信号：未来三日卖压可能延续。
+
+12 个月主题判断：兑现，长期订单需求仍在。
+
+```yaml
+PM_SUMMARY:
+  current_price: 858.35
+  pm_rating: OVERWEIGHT
+  pm_action_keyword: WAIT
+  pm_sl_hard: 780
+  short_term_trend: 下行
+  short_term_confidence: 高
+  entry_timing: 暂不介入
+```
+"""
+
+    result = _format_pm_decision(
+        content,
+        {"structure_class": "broken", "effective_action": "暂不介入"},
+        market_risk_snapshot={"data_status": "stale", "required_checkpoint": "09:35"},
+    )
+
+    assert "周线破位且量价结构走弱" not in result
+    assert "未来三日卖压可能延续" not in result
+    assert "12 个月主题判断：兑现，长期订单需求仍在。" in result
+
+
+def test_wait_decision_replaces_obsolete_trial_entry_execution_details():
+    content = """## Trade Ticket 交易票
+
+### 核心交易参数（Trade Parameters）
+
+| 参数 | 数值 | 中文说明 |
+|---|---|---|
+| **Entry** 入场区间 | — | 当前不建仓 |
+| **1R** 风险单元 | 60 元 | 旧口径 |
+| **TP1** 止盈 1 | 900 元 | 减仓 |
+| **TP2** 止盈 2 | 960 元 | 减仓 |
+| **TP3** 止盈 3 | 1020 元 | 清仓 |
+| **SL_soft** 软止损 | 804 元 | 减仓 |
+| **SL_hard** 硬止损 | 780 元 | 退出 |
+
+## 二、操作计划
+
+**执行细节**：上述 TP/SL 价位基于试探建仓 840 元 / 硬止损 780 元假设（1R=60 元）。**特别提醒**：900-1020 元区间仅供持仓者反弹减仓，长期兑现仍需 12 个月。
+
+2. **止损**：技术止损以试探建仓价的 -7.1% 计算，事件窗口主动降暴露。
+
+3. **事件管理**：沿用试探建仓价计算的旧口径已作废，但 FCC 事件窗口仍需主动降暴露。
+
+```yaml
+PM_SUMMARY:
+  current_price: 858.35
+  pm_rating: OVERWEIGHT
+  pm_action_keyword: WAIT
+  pm_size_low_pct: 0
+  pm_size_high_pct: 0
+  pm_entry_low: null
+  pm_entry_high: null
+  pm_tp1: 900
+  pm_tp2: 960
+  pm_tp3: 1020
+  pm_sl_soft: 804
+  pm_sl_hard: 780
+  short_term_trend: 数据不足
+  short_term_confidence: 高
+  entry_timing: 暂不介入
+```
+"""
+
+    result = _format_pm_decision(
+        content,
+        {"structure_class": "broken", "effective_action": "暂不介入"},
+        market_report="""SUMMARY:\n  key_resistance: 1016.9\n""",
+        research_plan="""RM_SUMMARY:\n  target_price_low: 1022.15\n  target_price_mid: 1235.38\n""",
+        market_risk_snapshot={"entry_gate": "WAIT", "position_cap_pct": 0},
+    )
+    twice = _format_pm_decision(
+        result,
+        {"structure_class": "broken", "effective_action": "暂不介入"},
+        market_report="""SUMMARY:\n  key_resistance: 1016.9\n""",
+        research_plan="""RM_SUMMARY:\n  target_price_low: 1022.15\n  target_price_mid: 1235.38\n""",
+        market_risk_snapshot={"entry_gate": "WAIT", "position_cap_pct": 0},
+    )
+
+    assert "试探建仓" not in result
+    assert "持仓者反弹减仓" in result
+    assert "长期兑现仍需 12 个月" in result
+    assert "事件窗口主动降暴露" in result
+    assert "FCC 事件窗口仍需主动降暴露" in result
+    assert twice == result
+
+
 def test_stale_snapshot_removes_emphasized_short_term_reason_but_keeps_plain_long_term():
     content = """## Trade Ticket 交易票
 | 未来 3 个交易日趋势 | **下行**（置信度：中） |

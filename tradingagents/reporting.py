@@ -28,7 +28,13 @@ def _clip(value: str, limit: int = 220) -> str:
     value = _plain_text(value)
     if len(value) <= limit:
         return value
-    return value[: limit - 1].rstrip("，,；;。 ") + "…"
+    clipped = value[: limit - 1].rstrip()
+    boundary = max(clipped.rfind(mark) for mark in ("。", "；", "！", "？"))
+    if boundary >= int(limit * 0.55):
+        clipped = clipped[: boundary + 1]
+    else:
+        clipped = clipped.rstrip("，,；;。 ")
+    return clipped + "…"
 
 
 def _table_cells(line: str) -> list[str]:
@@ -94,6 +100,20 @@ def _section(markdown: str, heading: str) -> str:
     remainder = markdown[match.end():]
     next_heading = _MARKDOWN_HEADING_RE.search(remainder)
     return remainder[: next_heading.start()] if next_heading else remainder
+
+
+def _section_with_subsections(markdown: str, heading: str) -> str:
+    """Return a heading body through nested headings, stopping at the next peer."""
+    match = re.search(
+        rf"(?mi)^(?P<marks>#{{1,6}})\s+[^\n]*{re.escape(heading)}[^\n]*\n",
+        markdown or "",
+    )
+    if not match:
+        return ""
+    remainder = markdown[match.end():]
+    level = len(match.group("marks"))
+    next_peer = re.search(rf"(?m)^#{{1,{level}}}\s+", remainder)
+    return remainder[: next_peer.start()] if next_peer else remainder
 
 
 def _contribution_points(decision: str, role: str, limit: int = 2) -> list[str]:
@@ -226,6 +246,67 @@ def _rotation_point(decision: str) -> str | None:
     return None
 
 
+def _event_catalyst_points(decision: str, limit: int = 2) -> list[str]:
+    """Extract concrete dated/event checkpoints instead of operational time-stop prose."""
+    keywords = ("公告", "预告", "中报", "季报", "年报", "政策", "规则", "FCC", "文件")
+    event_markers = ("公告", "预告", "披露", "发布", "落地", "生效", "说明会", "股东会")
+    hypothetical_markers = ("假设", "情景", "模拟", "尚无正式事件日期")
+    generic_labels = ("Time Stop", "Key Risks", "核心风险", "触发条件", "检查点")
+    candidates: list[tuple[int, int, str]] = []
+    event_section = _section_with_subsections(decision, "风险、触发与监控")
+    for index, row in enumerate(_table_rows(event_section)):
+        if len(row) < 2:
+            continue
+        label = row[0]
+        if any(generic.lower() in label.lower() for generic in generic_labels):
+            continue
+        if not any(keyword.lower() in label.lower() for keyword in keywords):
+            continue
+        if not any(marker in label for marker in event_markers):
+            continue
+        row_text = "；".join(row)
+        if any(marker in row_text for marker in hypothetical_markers):
+            continue
+        details = "；".join(cell for cell in row[1:3] if cell)
+        point = _clip(f"{label}：{details}" if details else label, limit=180)
+        label_upper = label.upper()
+        if "FCC" in label_upper:
+            priority = 0
+        elif "预告" in label:
+            priority = 1
+        elif "说明会" in label:
+            priority = 3
+        else:
+            priority = 2
+        candidates.append((priority, index, point))
+
+    points: list[str] = []
+    for _priority, _index, point in sorted(candidates):
+        if point not in points:
+            points.append(point)
+        if len(points) >= limit:
+            return points
+
+    time_stop = _row_value(_table_rows(decision), "Time Stop 时间止损", "Time Stop")
+    for bracketed in re.findall(r"[（(]([^）)]+)[）)]", time_stop or ""):
+        if any(keyword.lower() in bracketed.lower() for keyword in keywords):
+            point = _clip(bracketed, limit=180)
+            if point not in points:
+                points.append(point)
+        if len(points) >= limit:
+            break
+    if len(points) < limit:
+        for clause in re.split(r"[；;。]", time_stop or ""):
+            clause = clause.strip(" （()）")
+            if clause and any(keyword.lower() in clause.lower() for keyword in keywords):
+                point = _clip(clause, limit=180)
+                if point not in points:
+                    points.append(point)
+            if len(points) >= limit:
+                break
+    return points
+
+
 def _render_points(points: list[str], fallback: str) -> str:
     useful = [point for point in points if point]
     if not useful:
@@ -264,15 +345,20 @@ def render_mobile_report(
         holder_advice = "本次摘要未形成独立持仓方案，按原风控计划执行。"
 
     fundamentals = _contribution_points(decision, "fundamentals")
-    news = _contribution_points(decision, "news")
+    news_contributions = _contribution_points(decision, "news")
     core_thesis = _row_value(rows, "Core Thesis", "核心逻辑")
     core_points = _classify_core_points(core_thesis)
     fundamentals = fundamentals or core_points["fundamentals"][:2]
-    news = news or core_points["news"][:2]
-    if not news:
-        time_stop = _row_value(rows, "Time Stop 时间止损", "Time Stop")
-        if time_stop:
-            news = [_clip(time_stop)]
+    news: list[str] = []
+    for point in (
+        _event_catalyst_points(decision)
+        + news_contributions
+        + core_points["news"]
+    ):
+        if point and point not in news:
+            news.append(point)
+        if len(news) >= 2:
+            break
     concepts = _concept_points(decision)
     rotation = _rotation_point(decision)
     capital_flow = _row_value(rows, "资金面快照")

@@ -244,6 +244,112 @@ def test_mobile_report_preserves_balanced_parentheses_in_table_only_rotation_fal
     assert "板块 RS 30d -18.6%（vs 沪深300）" in user_text
 
 
+def test_mobile_report_prefers_specific_catalysts_and_clips_at_sentence_boundaries():
+    long_rotation = (
+        "板块 RS 30d -14.3%，跑输沪深300；"
+        + "资金层面" + "持续流出" * 45 + "；"
+        + "这一段故意放在截断边界之后，不应残留半句话影响移动端阅读。"
+    )
+    decision = f"""# 短期操作结论：暂不介入
+
+> **一年期研究评级：OVERWEIGHT｜当前动作：WAIT｜新建仓位：0%**
+
+### 关键 Agent 贡献
+
+- **news / NEWS-HIST-01**：上月已落地的历史消息，市场已经充分定价（作用：中性）
+
+## Trade Ticket 交易票
+
+| 参数 | 数值 | 中文说明 |
+|---|---|---|
+| Time Stop 时间止损 | 6 个月 / 12 个月 | 6 个月核心逻辑无进展减半（FCC 正式条款 + Q3 业绩预告为双向验证锚点） |
+
+## 一、投资决策与入场时机
+
+{long_rotation}
+
+## 三、情景概率与赔率
+
+| 情景 | 假设 | 日期状态 |
+|---|---|---|
+| FCC 政策风险 | 假设出口限制升级 | 尚无正式事件日期 |
+
+## 四、风险、触发与监控
+
+| 检查点 | 日期 / 时间窗口 | 验证内容 | 触发动作 |
+|---|---|---|---|
+| FCC 政策风险 | 假设出口限制升级 | 尚无正式事件日期 | 风险情景，不是已知催化 |
+| 中报业绩说明会 | 2026-09 月内，待公告 | Q2 毛利率与应收账款 | 低于门槛则复核 |
+| Q3 业绩预告披露 | 10 月中旬，预约日待确认 | 单季净利增速与毛利率 | 低于门槛则降级 |
+| FCC 文件正式发布 | 待官方公告 | 条款覆盖范围与严苛程度 | 严苛则降低评级 |
+
+```yaml
+PM_SUMMARY:
+  pm_rating: OVERWEIGHT
+  pm_action_keyword: WAIT
+  pm_size_low_pct: 0
+  pm_size_high_pct: 0
+  short_term_trend: 数据不足
+  short_term_confidence: 高
+  theme_outlook_12m: 兑现
+```
+"""
+
+    with tempfile.TemporaryDirectory() as directory:
+        result = write_consolidated_reports(
+            Path(directory),
+            ticker="300308",
+            user_decision=decision,
+            audit_sections=[decision],
+            generated_at="2026-08-30 11:22:38",
+        )
+        user_text = result.read_text(encoding="utf-8")
+
+    news = user_text.split("## 消息面与催化", 1)[1].split("## 赛道与前景", 1)[0]
+    rotation = user_text.split("## 近期轮动与资金", 1)[1].split("## 估值、风险与重估条件", 1)[0]
+    assert "Q3 业绩预告披露" in news
+    assert "FCC 文件正式发布" in news
+    assert "中报业绩说明会" not in news
+    assert "上月已落地的历史消息" not in news
+    assert "假设出口限制升级" not in news
+    assert "6 个月核心逻辑无进展减半" not in news
+    assert "这一段故意放在截断边界之后" not in rotation
+    assert "持续流出；…" in rotation
+
+
+def test_mobile_report_accepts_concrete_announcement_and_forecast_event_names():
+    decision = """# 短期操作结论：继续观察
+
+## 四、风险、触发与监控
+
+| 检查点 | 时间 | 验证内容 |
+|---|---|---|
+| 保偏光纤新订单/价格公告 | 待官方公告 | 订单价格与客户结构 |
+| 2026 年报预告 | 法定窗口内 | 净利润增速与现金流 |
+| FCC 政策风险 | 假设出口限制升级 | 尚无正式事件日期 |
+
+```yaml
+PM_SUMMARY:
+  pm_rating: HOLD
+  pm_action_keyword: WAIT
+  short_term_trend: 数据不足
+  short_term_confidence: 中
+```
+"""
+
+    with tempfile.TemporaryDirectory() as directory:
+        result = write_consolidated_reports(
+            Path(directory), ticker="601869", user_decision=decision,
+            audit_sections=[decision], generated_at="2026-08-30 12:00:00",
+        )
+        user_text = result.read_text(encoding="utf-8")
+
+    news = user_text.split("## 消息面与催化", 1)[1].split("## 赛道与前景", 1)[0]
+    assert "保偏光纤新订单/价格公告" in news
+    assert "2026 年报预告" in news
+    assert "FCC 政策风险" not in news
+
+
 if __name__ == "__main__":
     tests = [value for name, value in sorted(globals().items()) if name.startswith("test_")]
     for test in tests:

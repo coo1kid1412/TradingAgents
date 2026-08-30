@@ -422,6 +422,88 @@ def _normalize_no_new_position_rows(
     return report_body
 
 
+def _sanitize_wait_trial_entry_language(report_body: str) -> str:
+    """Remove obsolete entry assumptions while preserving holder-only guidance."""
+    cleaned_lines: list[str] = []
+    for line in report_body.splitlines():
+        if "试探建仓" not in line:
+            cleaned_lines.append(line)
+            continue
+        if re.match(r"^\*\*执行(?:细节|说明)\*\*[：:]", line):
+            holder_tail = re.search(r"(\*\*特别提醒\*\*[：:].*)$", line)
+            cleaned_lines.append(
+                holder_tail.group(1) if holder_tail else
+                "**执行说明**：当前不新建仓位；相关价位仅用于管理已有持仓。"
+            )
+            continue
+
+        sanitized = re.sub(
+            r"技术止损[^，。；]*试探建仓[^，。；]*[，,]\s*(?:但)?",
+            "软/硬止损仅用于管理已有持仓，",
+            line,
+        )
+        if "试探建仓" in sanitized:
+            obsolete_at = sanitized.index("试探建仓") + len("试探建仓")
+            valid_tail = re.search(
+                r"[，,；;]\s*(?:但|不过|同时|而)?\s*(?P<tail>.+)$",
+                sanitized[obsolete_at:],
+            )
+            if valid_tail:
+                prefix = re.match(
+                    r"^(\s*(?:\d+[.、]\s*)?\*\*[^*]+\*\*[：:])",
+                    sanitized,
+                )
+                sanitized = (
+                    (prefix.group(1) if prefix else "")
+                    + valid_tail.group("tail").strip()
+                )
+            else:
+                sanitized = ""
+        cleaned_lines.append(
+            sanitized or "**持仓风控说明**：当前不新建仓；相关止损价仅用于管理已有持仓。"
+        )
+    return "\n".join(cleaned_lines)
+
+
+def _replace_stale_short_term_blocks(report_body: str, checkpoint: str) -> str:
+    """Replace stale short-term prose by paragraph without consuming long-term text."""
+    start_re = re.compile(
+        r"^\s*\*\*未来\s*3\s*(?:个交易日|日)(?:趋势)?[：:]\s*(?P<body>.*)$"
+    )
+    long_term_re = re.compile(
+        r"(?:\*\*)?(?:未来\s*)?12\s*个月"
+        r"(?:主题判断|趋势判断|主题|趋势|判断)?[：:]"
+    )
+    canonical = (
+        f"**未来 3 日：数据不足**（盘中风险快照陈旧，需 {checkpoint} 检查点；"
+        "当前仅执行 WAIT、0%）。"
+    )
+    lines = report_body.splitlines()
+    cleaned: list[str] = []
+    index = 0
+    while index < len(lines):
+        line = lines[index]
+        match = start_re.match(line)
+        if not match or match.group("body").lstrip().startswith("数据不足"):
+            cleaned.append(line)
+            index += 1
+            continue
+
+        tail = long_term_re.search(line, match.start("body"))
+        cleaned.append(canonical + (f" {line[tail.start():]}" if tail else ""))
+        index += 1
+        if tail:
+            continue
+        while index < len(lines) and lines[index].strip():
+            if (
+                long_term_re.match(lines[index].lstrip())
+                or lines[index].lstrip().startswith(("#", "---", "```", "PM_SUMMARY:"))
+            ):
+                break
+            index += 1
+    return "\n".join(cleaned)
+
+
 def _replace_plan_actor_block(
     report_body: str,
     *,
@@ -437,7 +519,8 @@ def _replace_plan_actor_block(
     heading_pattern = re.compile(rf"^###\s+{actor_pattern}")
     protected_tail = re.compile(
         r"^(?:Time\s*Stop|时间止损|(?:未来\s*)?12\s*个月|情景概率|"
-        r"风险、触发与监控|为什么这样决定|减仓资金去向|[三四五六]、)"
+        r"风险、触发与监控|为什么这样决定|执行(?:细节|说明)|特别提醒|"
+        r"减仓资金去向|[三四五六]、)"
     )
     holder_boundary = re.compile(
         r"^(?:###\s+(?:已)?持仓者|\*\*(?:已)?持仓者(?:\b|[：:（(]))"
@@ -861,14 +944,7 @@ def _format_pm_decision(
             report_body,
             count=1,
         )
-        report_body = re.sub(
-            r"(?m)^\*\*未来\s*3\s*日[：:].*?"
-            r"(?=(?:\*\*)?(?:未来\s*)?12\s*个月(?:主题|趋势|判断)?[：:]|$)",
-            f"**未来 3 日：数据不足**（盘中风险快照陈旧，需 {checkpoint} 检查点；"
-            "当前仅执行 WAIT、0%）。 ",
-            report_body,
-            count=1,
-        )
+        report_body = _replace_stale_short_term_blocks(report_body, checkpoint)
         report_body = re.sub(
             r"(?m)^(\s*short_term_trend:\s*).*$", r"\g<1>数据不足", report_body,
         )
@@ -890,6 +966,7 @@ def _format_pm_decision(
         report_body = _canonicalize_holder_action_section(
             report_body, summary_block or original,
         )
+        report_body = _sanitize_wait_trial_entry_language(report_body)
 
     report_body, summary_block = _enforce_effective_risk_cap(
         report_body, summary_block, original, market_risk_snapshot,
