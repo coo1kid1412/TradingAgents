@@ -2,8 +2,9 @@
 
 import os
 import logging
+import re
 from datetime import datetime, timedelta
-from typing import List, Dict, Optional
+from typing import Dict, List, Mapping, Optional, Sequence
 
 import requests
 
@@ -50,7 +51,35 @@ def _is_within_days(date_str: Optional[str], days: int = 7) -> bool:
     return True  # Unparseable → keep
 
 
-def search_news(query: str, count: int = 20, freshness: str = "pw") -> str:
+def _contains_anchor(text: str, anchor: str) -> bool:
+    anchor = (anchor or "").strip()
+    if not anchor:
+        return False
+    if re.search(r"[\u3400-\u9fff]", anchor):
+        return anchor in text
+    return bool(
+        re.search(
+            rf"(?<![A-Za-z0-9]){re.escape(anchor)}(?![A-Za-z0-9])",
+            text,
+            re.IGNORECASE,
+        )
+    )
+
+
+def _is_relevant_result(item: Mapping[str, object], anchors: Sequence[str]) -> bool:
+    """Require a company name or exact ticker token in the result itself."""
+    searchable = " ".join(
+        str(item.get(field) or "") for field in ("title", "description", "url")
+    )
+    return any(_contains_anchor(searchable, anchor) for anchor in anchors)
+
+
+def search_news(
+    query: str,
+    count: int = 20,
+    freshness: str = "pw",
+    relevance_terms: Sequence[str] = (),
+) -> str:
     """
     Search for recent news using Brave Search API.
 
@@ -58,6 +87,7 @@ def search_news(query: str, count: int = 20, freshness: str = "pw") -> str:
         query: Search query string (e.g. "贵州茅台 600519 新闻")
         count: Number of results to request (will be filtered down to top 10)
         freshness: Brave freshness filter; 'pd'=past day, 'pw'=past week, 'pm'=past month
+        relevance_terms: Company names/tickers that must occur in each retained result
 
     Returns:
         Formatted string of top 10 news results (after filtering), or error message.
@@ -101,10 +131,12 @@ def search_news(query: str, count: int = 20, freshness: str = "pw") -> str:
         # Brave returns 'page_age' or 'age' for freshness; also check description dates
         if not _is_within_days(item.get("page_age") or item.get("age")):
             continue
+        if relevance_terms and not _is_relevant_result(item, relevance_terms):
+            continue
         filtered.append(item)
 
     if not filtered:
-        return f"Brave Search 返回了结果，但经过过滤（排除百科、仅保留7天内）后无有效新闻。"
+        return "Brave Search 返回了结果，但经过过滤（个股相关性、排除百科、仅保留7天内）后无有效新闻。"
 
     # Take top 10
     top_results = filtered[:10]
@@ -126,5 +158,5 @@ def search_news(query: str, count: int = 20, freshness: str = "pw") -> str:
         lines.append(f"    摘要: {description}")
         lines.append("")
 
-    lines.append(f"共 {len(top_results)} 条新闻（已过滤百科类结果，仅保留14天内内容）")
+    lines.append(f"共 {len(top_results)} 条新闻（已过滤无关和百科类结果，仅保留7天内内容）")
     return "\n".join(lines)

@@ -5,7 +5,11 @@ from __future__ import annotations
 import datetime as dt
 import re
 from pathlib import Path
-from typing import Iterable
+from typing import Any, Iterable, Mapping
+
+import yaml
+
+from tradingagents.agents.utils.yaml_summary import extract_yaml_mapping
 
 
 _TABLE_SEPARATOR_RE = re.compile(r"^:?-{3,}:?$")
@@ -225,6 +229,258 @@ def _concept_points(decision: str, limit: int = 2) -> list[str]:
     return points
 
 
+def _concept_names(decision: str, limit: int = 3) -> list[str]:
+    rows = _table_rows(_section(decision, "热门概念归属"))
+    names: list[str] = []
+    for row in rows:
+        if not row or "概念/板块" in row[0]:
+            continue
+        name = _plain_text(row[0])
+        if name and name not in names:
+            names.append(name)
+        if len(names) >= limit:
+            break
+    return names
+
+
+_DIRECTION_ZH = {
+    "bullish": "偏多",
+    "bearish": "偏空",
+    "neutral": "中性",
+    "mixed": "分歧",
+}
+_CONVICTION_ZH = {"high": "高", "medium": "中", "low": "低"}
+
+
+def _direction_label(value: Any) -> str:
+    text = _plain_text(str(value or "neutral")).lower()
+    return _DIRECTION_ZH.get(text, _plain_text(str(value or "中性")))
+
+
+def _conviction_label(value: Any) -> str:
+    text = _plain_text(str(value or "medium")).lower()
+    return _CONVICTION_ZH.get(text, _plain_text(str(value or "中")))
+
+
+def _recover_specialist_view(report: str) -> Mapping[str, Any] | None:
+    """Parse only specialist_view when later handoff fields make the full YAML invalid."""
+    blocks = re.findall(r"```yaml\s*\n(.*?)\n```", report or "", re.DOTALL | re.IGNORECASE)
+    for block in reversed(blocks):
+        lines = block.splitlines()
+        for index, line in enumerate(lines):
+            match = re.match(r"^(?P<indent>\s*)specialist_view\s*:\s*$", line)
+            if not match:
+                continue
+            base_indent = len(match.group("indent"))
+            selected = [line[base_indent:]]
+            for candidate in lines[index + 1:]:
+                if candidate.strip() and len(candidate) - len(candidate.lstrip()) <= base_indent:
+                    break
+                selected.append(candidate[base_indent:])
+            try:
+                parsed = yaml.safe_load("\n".join(selected))
+            except yaml.YAMLError:
+                continue
+            view = parsed.get("specialist_view") if isinstance(parsed, Mapping) else None
+            if isinstance(view, Mapping):
+                return view
+    return None
+
+
+def _handoff_core(report: str) -> str:
+    handoff, status = extract_yaml_mapping(report or "", "HANDOFF")
+    view = handoff.get("specialist_view") if handoff else None
+    if not isinstance(view, Mapping):
+        view = _recover_specialist_view(report)
+    if isinstance(view, Mapping):
+        conclusion = _clip(str(view.get("conclusion") or "未给出核心结论"), limit=150)
+        direction = _direction_label(view.get("direction"))
+        conviction = _conviction_label(view.get("conviction"))
+        return f"{direction}·{conviction}置信：{conclusion}"
+    if status == "invalid":
+        return "交接摘要格式异常，完整原文已保留在审计报告。"
+    return "未形成结构化交接摘要，完整原文已保留在审计报告。"
+
+
+def _decision_handoff_core(report: str) -> str:
+    handoff, status = extract_yaml_mapping(report or "", "DECISION_HANDOFF")
+    if handoff:
+        judgments = handoff.get("decision_judgments")
+        if isinstance(judgments, list):
+            judgment = next((item for item in judgments if isinstance(item, Mapping)), None)
+            if judgment:
+                conclusion = _clip(str(judgment.get("judgment") or "未给出核心判断"), limit=150)
+                direction = _direction_label(judgment.get("direction"))
+                conviction = _conviction_label(judgment.get("confidence"))
+                return f"{direction}·{conviction}置信：{conclusion}"
+    if status == "invalid":
+        return "决策交接摘要格式异常，完整原文已保留在审计报告。"
+    return "未形成结构化决策交接摘要，完整原文已保留在审计报告。"
+
+
+def _instrument_identity(decision: str, reports: Mapping[str, str]) -> list[str]:
+    fundamentals = reports.get("fundamentals", "")
+    profile = reports.get("stock_profile", "")
+    sector = reports.get("sector", "")
+
+    industry = _row_primary_value(_table_rows(fundamentals), "所属行业")
+    if not industry:
+        industry = _row_primary_value(_table_rows(profile), "行业")
+
+    theme_match = re.search(r"(?mi)^\s*theme_name\s*:\s*['\"]?(.+?)['\"]?\s*$", profile)
+    track = _plain_text(theme_match.group(1)) if theme_match else None
+
+    set_match = re.search(
+        r"主题\s*=\s*\*{0,2}(.+?)\*{0,2}\s*/\s*(?:主题\s*ETF|industry)\s*=",
+        next((line for line in sector.splitlines() if "最终对照集" in line), ""),
+    )
+    market_match = re.search(r"(?mi)市场指数\s*[：:]\s*([^（(\n]+)", sector)
+    board_parts = []
+    if set_match:
+        board_parts.append(_plain_text(set_match.group(1)))
+    if market_match:
+        board_parts.append(_plain_text(market_match.group(1)))
+
+    concepts = _concept_names(decision)
+    lines = []
+    if industry:
+        lines.append(f"- **行业**：{_clip(industry, limit=120)}")
+    if board_parts:
+        lines.append(f"- **板块**：{'｜'.join(board_parts)}")
+    if track:
+        lines.append(f"- **赛道**：{_clip(track, limit=120)}")
+    if concepts:
+        lines.append(f"- **概念**：{'、'.join(concepts)}")
+    return lines
+
+
+def _quant_core(report: str) -> str:
+    summary, status = extract_yaml_mapping(report or "", "QUANT_SCORE")
+    if summary:
+        score = summary.get("composite")
+        interpretation = _plain_text(str(summary.get("interpretation") or "数据不足"))
+        score_text = f"{score:g}" if isinstance(score, (int, float)) else "数据不足"
+        return f"{interpretation}·{score_text} 分：量化综合评分"
+    return "量化摘要格式异常，详见审计报告。" if status == "invalid" else "量化摘要缺失。"
+
+
+def _capital_flow_core(report: str) -> str:
+    regime = re.search(r"资金面综合状态[：:]\*{0,2}([^，\n*]+)", report or "")
+    score = re.search(r"capital_flow_score\s*=\s*\*{0,2}([\d.]+)", report or "")
+    if regime:
+        suffix = f"·{score.group(1)} 分" if score else ""
+        return f"{_plain_text(regime.group(1))}{suffix}：资金流综合状态"
+    return "资金流摘要缺失，详见审计报告。"
+
+
+def _sector_core(report: str) -> str:
+    rs_match = re.search(r"(?mi)^.*板块\s*RS\s*30d[^\n]*$", report or "")
+    if not rs_match:
+        rs_match = re.search(r"(?mi)^.*主题内\s*30d\s*收益排名[^\n]*$", report or "")
+    return _clip(rs_match.group(0).lstrip("- "), limit=150) if rs_match else "板块相对强弱摘要缺失。"
+
+
+def _research_manager_core(report: str) -> str:
+    summary, _status = extract_yaml_mapping(report or "", "RM_SUMMARY")
+    thesis = _plain_text(_section(report, "核心 Thesis"))
+    if summary:
+        rating = _plain_text(str(summary.get("research_rating") or summary.get("rm_rating") or "数据不足"))
+        conviction = _plain_text(str(summary.get("rm_conviction") or "数据不足"))
+        prefix = f"{rating}·{conviction}置信"
+        return f"{prefix}：{_clip(thesis, limit=150)}" if thesis else prefix
+    return _clip(thesis, limit=170) if thesis else "研究经理摘要缺失。"
+
+
+def _evidence_core(report: str) -> str:
+    warning = next(
+        (_plain_text(line.lstrip("- ⚠️")) for line in (report or "").splitlines() if "⚠" in line),
+        "",
+    )
+    return _clip(warning, limit=150) if warning else "证据包已编译，未发现显式缺失告警。"
+
+
+def _team_core_lines(reports: Mapping[str, str]) -> list[str]:
+    lines: list[str] = []
+    analyst_roles = (
+        ("market", "技术分析"),
+        ("fundamentals", "基本面"),
+        ("news", "新闻事件"),
+        ("sentiment", "舆情"),
+        ("macro", "宏观策略"),
+        ("stock_profile", "股票画像"),
+        ("consensus", "市场共识"),
+    )
+    for key, label in analyst_roles:
+        if key in reports:
+            lines.append(f"- **{label}**：{_handoff_core(reports[key])}")
+
+    if "capital_flow" in reports:
+        lines.append(f"- **资金流**：{_capital_flow_core(reports['capital_flow'])}")
+    if "quant" in reports:
+        lines.append(f"- **量化**：{_quant_core(reports['quant'])}")
+    if "sector" in reports:
+        lines.append(f"- **板块对照**：{_sector_core(reports['sector'])}")
+    if "ic_packet" in reports:
+        lines.append(f"- **证据质控**：{_evidence_core(reports['ic_packet'])}")
+
+    decision_roles = (
+        ("bull", "多头研究"),
+        ("bear", "空头研究"),
+        ("aggressive_risk", "风险-激进"),
+        ("neutral_risk", "风险-中性"),
+        ("conservative_risk", "风险-保守"),
+    )
+    for key, label in decision_roles:
+        if key in reports:
+            lines.append(f"- **{label}**：{_decision_handoff_core(reports[key])}")
+    if "research_manager" in reports:
+        lines.append(f"- **研究经理**：{_research_manager_core(reports['research_manager'])}")
+    return lines
+
+
+def build_agent_report_context(state: Mapping[str, Any]) -> dict[str, str]:
+    """Collect report text for deterministic mobile rendering without another LLM call."""
+    context: dict[str, str] = {}
+    direct = {
+        "market_report": "market",
+        "fundamentals_report": "fundamentals",
+        "news_report": "news",
+        "sentiment_report": "sentiment",
+        "macro_context": "macro",
+        "stock_profile": "stock_profile",
+        "sector_comparison": "sector",
+        "quant_score": "quant",
+        "capital_flow_report": "capital_flow",
+        "consensus_snapshot": "consensus",
+        "ic_packet": "ic_packet",
+    }
+    for state_key, report_key in direct.items():
+        value = state.get(state_key)
+        if value:
+            context[report_key] = str(value)
+
+    debate = state.get("investment_debate_state") or {}
+    if isinstance(debate, Mapping):
+        for state_key, report_key in (
+            ("bull_history", "bull"),
+            ("bear_history", "bear"),
+            ("judge_decision", "research_manager"),
+        ):
+            if debate.get(state_key):
+                context[report_key] = str(debate[state_key])
+
+    risk = state.get("risk_debate_state") or {}
+    if isinstance(risk, Mapping):
+        for state_key, report_key in (
+            ("aggressive_history", "aggressive_risk"),
+            ("neutral_history", "neutral_risk"),
+            ("conservative_history", "conservative_risk"),
+        ):
+            if risk.get(state_key):
+                context[report_key] = str(risk[state_key])
+    return context
+
+
 def _rotation_point(decision: str) -> str | None:
     for line in (decision or "").splitlines():
         if line.lstrip().startswith("|"):
@@ -319,9 +575,11 @@ def render_mobile_report(
     *,
     ticker: str,
     generated_at: str,
+    agent_reports: Mapping[str, str] | None = None,
 ) -> str:
     """Render the Feishu-facing report as a concise, table-free mobile digest."""
     decision = (decision or "").strip()
+    reports = agent_reports or {}
     rows = _table_rows(decision)
 
     timing_match = re.search(r"(?mi)^#\s*短期操作结论[：:]\s*(.+?)\s*$", decision)
@@ -381,6 +639,17 @@ def render_mobile_report(
     valuation_points.extend(f"主要风险：{risk}" for risk in risks)
     valuation_points.append(f"重新评估：{_clip(trigger)}")
 
+    identity_lines = _instrument_identity(decision, reports)
+    team_lines = _team_core_lines(reports)
+    identity_section = (
+        "## 个股身份\n\n" + "\n".join(identity_lines) + "\n\n"
+        if identity_lines else ""
+    )
+    team_section = (
+        "## 投研团队核心判断\n\n" + "\n".join(team_lines) + "\n\n"
+        if team_lines else ""
+    )
+
     return (
         f"# {_stock_title(decision, ticker)}｜短期操作结论：{timing}\n\n"
         f"更新：{generated_at}\n\n"
@@ -390,6 +659,8 @@ def render_mobile_report(
         f"## 现在怎么做\n\n"
         f"**空仓**\n\n- {_clip(empty_advice)}\n\n"
         f"**已持仓**\n\n- {_clip(holder_advice)}\n\n"
+        f"{identity_section}"
+        f"{team_section}"
         f"## 基本面\n\n"
         f"{_render_points(fundamentals, '本次未提取到可核验的基本面摘要，详见本地审计报告。')}\n\n"
         f"## 消息面与催化\n\n"
@@ -409,6 +680,7 @@ def write_consolidated_reports(
     ticker: str,
     user_decision: str,
     audit_sections: Iterable[str],
+    agent_reports: Mapping[str, str] | None = None,
     generated_at: str | None = None,
 ) -> Path:
     save_path.mkdir(parents=True, exist_ok=True)
@@ -416,7 +688,12 @@ def write_consolidated_reports(
     decision = user_decision or "# 短期操作结论：数据不足\n\n本次分析未形成可用的 PM 决策。"
     user_path = save_path / "complete_report.md"
     user_path.write_text(
-        render_mobile_report(decision, ticker=ticker, generated_at=generated_at),
+        render_mobile_report(
+            decision,
+            ticker=ticker,
+            generated_at=generated_at,
+            agent_reports=agent_reports,
+        ),
         encoding="utf-8",
     )
 

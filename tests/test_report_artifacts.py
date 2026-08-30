@@ -350,6 +350,143 @@ PM_SUMMARY:
     assert "FCC 政策风险" not in news
 
 
+def test_mobile_report_shows_instrument_identity_and_each_agent_core_view():
+    """Catches regressions where structured analyst handoffs stay hidden in audit-only files."""
+    decision = """# 短期操作结论：暂不介入
+
+> **一年期研究评级：OVERWEIGHT｜当前动作：WAIT｜新建仓位：0%**
+
+### 热门概念归属
+
+| 概念/板块 | 相关度 | 占主营营收% | 当前热度 |
+|---|---|---|---|
+| CPO / 1.6T 光模块 | 核心 | ~100% | 高 |
+| AI 算力 capex 主线 | 核心 | ~100% | 高 |
+| NPO / CPO 新封装路线 | 相关 | 部分 | 中 |
+
+```yaml
+PM_SUMMARY:
+  pm_rating: OVERWEIGHT
+  pm_action_keyword: WAIT
+  pm_size_low_pct: 0
+  pm_size_high_pct: 0
+  short_term_trend: 数据不足
+  short_term_confidence: 高
+  theme_outlook_12m: 兑现
+```
+"""
+    handoff = """```yaml
+HANDOFF:
+  specialist_view:
+    conclusion: "{conclusion}"
+    direction: {direction}
+    conviction: {conviction}
+    materiality: high
+  quality:
+    status: complete
+```
+"""
+    decision_handoff = """```yaml
+DECISION_HANDOFF:
+  decision_judgments:
+    - judgment: "{judgment}"
+      direction: {direction}
+      confidence: {confidence}
+  quality_status: complete
+```
+"""
+    agent_reports = {
+        "fundamentals": """| 所属行业 | 通信设备（C39 计算机、通信和其他电子设备制造业） |
+""" + handoff.format(
+            conclusion="盈利高速兑现，但经营现金流仍需观察", direction="bullish", conviction="high",
+        ),
+        "market": handoff.format(
+            conclusion="周线下行未止，短线尚未确认止跌", direction="bearish", conviction="medium",
+        ),
+        "news": handoff.format(
+            conclusion="订单与政策事件形成双向催化窗口", direction="mixed", conviction="medium",
+        ),
+        "sentiment": handoff.format(
+            conclusion="多空分歧扩大，短期情绪弱化", direction="mixed", conviction="medium",
+        ),
+        "macro": handoff.format(
+            conclusion="产业顺风，但流动性压制估值溢价", direction="neutral", conviction="medium",
+        ),
+        "stock_profile": """| **行业** | **光通信 / 光模块（CPO）** |
+  theme_name: CPO 光通信 / AI 算力
+  theme_stage: peak
+""" + handoff.format(
+            conclusion="高 beta 成长龙头，采用 PEG 主导估值", direction="neutral", conviction="high",
+        ).replace("\n```\n", "\n  facts:\n    - broken: [unclosed\n```\n"),
+        "sector": """- 层级3 市场指数: 创业板（159915）
+**最终对照集**：主题=**CPO光通信** / 主题 ETF=无 / 主题代表股 4 只 / industry=CPO/光通信（光模块/光器件） → 512760
+板块 RS 30d -14.3%，主题内 30d 收益排名第 3/4。
+""",
+        "quant": """```yaml
+QUANT_SCORE:
+  composite: 55.6
+  interpretation: 中性
+```
+""",
+        "capital_flow": """- 资金面综合状态：**恶化**，capital_flow_score = **28.0** / 100
+""",
+        "consensus": handoff.format(
+            conclusion="基本面与价格行为明显背离，共识强度弱", direction="mixed", conviction="low",
+        ),
+        "bull": decision_handoff.format(
+            judgment="盈利增速与行业估值折价支持长期修复", direction="bullish", confidence="high",
+        ),
+        "bear": decision_handoff.format(
+            judgment="资金派发和竞争加剧压制短期赔率", direction="bearish", confidence="medium",
+        ),
+        "research_manager": """## 核心 Thesis
+
+长期产业逻辑成立，但持续性仍脆弱。
+
+```yaml
+RM_SUMMARY:
+  research_rating: OVERWEIGHT
+  rm_conviction: 中
+```
+""",
+        "aggressive_risk": decision_handoff.format(
+            judgment="当前不适合新增仓位", direction="bearish", confidence="high",
+        ),
+        "neutral_risk": decision_handoff.format(
+            judgment="尾部回调风险需要保留缓冲", direction="bearish", confidence="medium",
+        ),
+        "conservative_risk": decision_handoff.format(
+            judgment="等待业绩窗口验证后再提升仓位", direction="bearish", confidence="high",
+        ),
+    }
+
+    with tempfile.TemporaryDirectory() as directory:
+        result = write_consolidated_reports(
+            Path(directory), ticker="300308", user_decision=decision,
+            audit_sections=[decision], agent_reports=agent_reports,
+            generated_at="2026-08-30 22:00:00",
+        )
+        user_text = result.read_text(encoding="utf-8")
+
+    assert "## 个股身份" in user_text
+    assert "**行业**：通信设备（C39 计算机、通信和其他电子设备制造业）" in user_text
+    assert "**板块**：CPO光通信｜创业板" in user_text
+    assert "**赛道**：CPO 光通信 / AI 算力" in user_text
+    assert "**概念**：CPO / 1.6T 光模块、AI 算力 capex 主线、NPO / CPO 新封装路线" in user_text
+    assert "## 投研团队核心判断" in user_text
+    for label in (
+        "技术分析", "基本面", "新闻事件", "舆情", "宏观策略", "资金流", "量化",
+        "板块对照", "市场共识", "多头研究", "空头研究", "研究经理",
+        "风险-激进", "风险-中性", "风险-保守",
+    ):
+        assert f"**{label}**" in user_text
+    assert "偏空·中置信" in user_text
+    assert "中性·55.6 分" in user_text
+    assert "**股票画像**：中性·高置信" in user_text
+    assert "FUND-" not in user_text
+    assert not any(line.lstrip().startswith("|") for line in user_text.splitlines())
+
+
 if __name__ == "__main__":
     tests = [value for name, value in sorted(globals().items()) if name.startswith("test_")]
     for test in tests:

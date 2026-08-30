@@ -7,7 +7,7 @@ import datetime
 from pathlib import Path
 from typing import Tuple
 from dotenv import load_dotenv
-from tradingagents.reporting import write_consolidated_reports
+from tradingagents.reporting import build_agent_report_context, write_consolidated_reports
 
 # Load environment variables from .env file (use project root, not CWD)
 _PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -140,6 +140,7 @@ def _build_config() -> dict:
 #  报告保存工具函数
 # ---------------------------------------------------------------------------
 _AGENT_CN = {
+    "Capital Flow Officer": "资金流分析官",
     "Market Analyst": "市场分析师",
     "Social Analyst": "舆情分析师",
     "News Analyst": "新闻分析师",
@@ -183,6 +184,7 @@ def _save_report(state, ticker: str, save_path: Path):
     analysts_dir = save_path / "1_analysts"
     analyst_parts = []
     for key, fname, label in [
+        ("capital_flow_report", "capital_flow.md", "Capital Flow Officer"),
         ("market_report", "market.md", "Market Analyst"),
         ("sentiment_report", "sentiment.md", "Social Analyst"),
         ("news_report", "news.md", "News Analyst"),
@@ -274,6 +276,7 @@ def _save_report(state, ticker: str, save_path: Path):
         ticker=ticker,
         user_decision=user_decision,
         audit_sections=sections,
+        agent_reports=build_agent_report_context(state),
     )
 
 
@@ -431,6 +434,32 @@ def _send_decision_to_feishu_as_file(report_path: Path) -> None:
         print(f"[{report_path.name}] ⚠ 飞书推送异常（不影响主流程）：{e}", flush=True)
 
 
+def _notify_analysis_failure(ticker: str, error: Exception) -> None:
+    """Send a bounded, user-facing failure notice without leaking provider payloads."""
+    raw = str(error)
+    if "1026" in raw or "new_sensitive" in raw.lower():
+        reason = "MiniMax 输入审核拒绝（1026）"
+    elif "529" in raw:
+        reason = "MiniMax 服务繁忙，自动重试后仍未恢复"
+    elif "timeout" in raw.lower() or "timed out" in raw.lower():
+        reason = "上游服务调用超时"
+    else:
+        reason = f"运行异常（{type(error).__name__}）"
+
+    message = (
+        f"【TA 分析失败】{ticker}\n"
+        f"原因：{reason}\n"
+        f"本次未生成报告，请勿继续等待。\n"
+        f"排查日志：/tmp/ta_{ticker}.log"
+    )
+    try:
+        from tradingagents.harness.market_risk_daily import _send_feishu_message
+
+        _send_feishu_message(message)
+    except Exception as notify_error:
+        print(f"[{ticker}] ⚠ 失败通知发送异常：{notify_error}", flush=True)
+
+
 # ---------------------------------------------------------------------------
 #  单支股票分析函数（在独立进程中执行）
 # ---------------------------------------------------------------------------
@@ -522,6 +551,7 @@ def analyze_single_stock(ticker: str, analysis_date: str, config: dict) -> Tuple
             print(f"{'!'*60}\n", flush=True)
             import traceback
             traceback.print_exc()
+            _notify_analysis_failure(ticker, e)
             return (ticker, False, error_msg)
 
 
@@ -556,6 +586,8 @@ def main():
             print(f"分析失败: {ticker}")
             print(f"错误信息: {result_path}")
         print("=" * 60)
+        if not success:
+            sys.exit(1)
 
     except KeyboardInterrupt:
         print("\n\n用户中断分析")
