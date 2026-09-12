@@ -24,8 +24,8 @@ def test_daily_runs_counted_despite_huge_per_run_logs():
     全文按日期去重应数出窗口内每一天。"""
     text = "\n".join(_run_block(d) for d in range(18, 28))   # 06-18..06-27
     ok, desc = parse_cron_health(text, _TODAY)
-    # cutoff=06-20，窗口内 06-20..06-27 = 8 天
-    assert ok and "8 次运行正常" in desc, (ok, desc)
+    # Seven calendar days including today, without an extra left-boundary day.
+    assert ok and "7 次启动记录" in desc, (ok, desc)
 
 
 def test_single_run_in_window_is_unhealthy():
@@ -41,7 +41,7 @@ def test_price_cache_stale_warnings_are_not_vendor_failures():
     # 注入大量 stale 警告噪音
     text += "\n" + "\n".join(["vendor 链全部失败（cache 已落后 9999 天）"] * 96)
     ok, desc = parse_cron_health(text, _TODAY)
-    assert ok and "无异常" in desc, (ok, desc)
+    assert ok and "数据另行检查" in desc, (ok, desc)
 
 
 def test_authoritative_failed_count_flags():
