@@ -15,9 +15,9 @@ logger = logging.getLogger(__name__)
 
 # 触发"系统性偏差"提醒的阈值
 _MIN_SAMPLE_SIZE = 5            # 样本量门槛（V1 较低，因为初期数据少）
-_LOW_HIT_RATE = 0.45            # 命中率显著偏低
-_HIGH_HIT_RATE = 0.65           # 命中率显著偏高（信号好但样本少可能值得放宽触发）
-_NEGATIVE_EXPECTATION = -1.0    # 期望收益负 → 该评级"赔钱"
+_LOW_HIT_RATE = 0.45            # 旧口径展示阈值，不是显著性检验
+_HIGH_HIT_RATE = 0.65           # 保留旧配置，不用于自动放宽策略
+_NEGATIVE_EXPECTATION = -1.0    # 方向收益代理阈值，不代表实际账户亏损
 _HIT_RATE_TIE_THRESHOLD = 0.05  # Conviction 高低命中率差异小于 5% → 信号无价值
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -35,12 +35,12 @@ def _query_metrics(snapshot_date: str, db_path=None) -> list[dict]:
 
 
 def _filter_significant(rows: list[dict]) -> list[dict]:
-    """筛出"显著样本量"的 metrics（n ≥ _MIN_SAMPLE_SIZE）。"""
+    """筛出达到旧展示门槛的切片，不代表统计显著。"""
     return [r for r in rows if r["total_runs"] >= _MIN_SAMPLE_SIZE]
 
 
 def _identify_low_hit_rate_issues(rows: list[dict]) -> list[dict]:
-    """识别"命中率显著偏低"的切片。"""
+    """识别低于旧展示阈值的切片，仅供排查。"""
     issues = []
     for r in rows:
         if r["direction_hit_rate"] < _LOW_HIT_RATE:
@@ -60,7 +60,7 @@ def _identify_low_hit_rate_issues(rows: list[dict]) -> list[dict]:
 
 
 def _identify_negative_expectation(rows: list[dict]) -> list[dict]:
-    """识别"期望收益负"的切片——这类评级实际上在赔钱。"""
+    """识别方向收益代理为负的切片，不推断实际交易盈亏。"""
     issues = []
     for r in rows:
         if r["expectation"] is not None and r["expectation"] < _NEGATIVE_EXPECTATION:
@@ -73,14 +73,14 @@ def _identify_negative_expectation(rows: list[dict]) -> list[dict]:
                 "metric": r,
                 "message": (
                     f"{r['group_dimension']}={r['group_value']} 在 {r['horizon']} "
-                    f"期望收益 {r['expectation']:+.2f}%（赔钱）"
+                    f"方向收益代理均值 {r['expectation']:+.2f}%（非实际交易盈亏）"
                 ),
             })
     return issues
 
 
 def _identify_conviction_signal_loss(rows: list[dict]) -> list[dict]:
-    """识别 Conviction 高低命中率差异不显著的情况——说明 Conviction 信号无价值。"""
+    """展示旧分组的点估计接近现象，不证明信号无价值。"""
     issues = []
     # 按 horizon 分组
     by_horizon: dict = {}
@@ -113,7 +113,7 @@ def _identify_conviction_signal_loss(rows: list[dict]) -> list[dict]:
                 "message": (
                     f"Conviction {low_conv['group_value']}★（{low_conv['direction_hit_rate']:.0%}）"
                     f"vs {high_conv['group_value']}★（{high_conv['direction_hit_rate']:.0%}）"
-                    f"在 {horizon} 命中率差异仅 {diff:+.0%}——Conviction 信号区分能力弱"
+                    f"在 {horizon} 点估计差异 {diff:+.0%}，区分能力仍需独立验证"
                 ),
             })
 
@@ -153,12 +153,15 @@ def render_markdown(insights: dict, db_path=None) -> str:
     snapshot_date = insights["snapshot_date"]
     lines.append(f"# Backtest Snapshot {snapshot_date}")
     lines.append("")
+    lines.append("> **旧口径诊断附件，不用于调参晋级。** 以下方向收益代理不是实际交易收益；"
+                 "可能混合 WAIT、不同期限、市场和版本。请优先阅读 weekly_review 生成的质量复盘。")
+    lines.append("")
     lines.append(f"- 总 metric 行数：{insights['total_metric_rows']}")
-    lines.append(f"- 显著样本量（n ≥ {_MIN_SAMPLE_SIZE}）：{insights['significant_rows']}")
+    lines.append(f"- 达到展示门槛的切片（n ≥ {_MIN_SAMPLE_SIZE}，非显著性证明）：{insights['significant_rows']}")
     lines.append(f"- 识别问题：{len(insights['issues'])} 条")
     lines.append("")
-    lines.append("> **口径说明**：收益统计用 `signed_pnl_pct`（按预测方向取符号：long/HOLD=+涨跌幅，"
-                 "short=−涨跌幅）——成功看空避开的下跌记为正收益。期望收益 = signed PnL 的样本均值。"
+    lines.append("> **旧计算说明**：`signed_pnl_pct` 按评级方向取符号（long/HOLD=+涨跌幅，"
+                 "short=−涨跌幅），没有实际持仓或成交依据，取反跌幅不能当作赚到的利润。"
                  "命中带按 horizon 缩放（T±2% / T+1±3% / T+5±5% / T+30±10%）。")
     lines.append("")
 
@@ -168,7 +171,7 @@ def render_markdown(insights: dict, db_path=None) -> str:
     if not insights["overall_by_horizon"]:
         lines.append("（暂无已采集样本，请先跑真值采集）")
     else:
-        lines.append("| Horizon | 样本数 | 命中率 | 判对均PnL | 判错均PnL | 期望PnL |")
+        lines.append("| Horizon | 结果行数 | 旧命中率 | 判对方向代理 | 判错方向代理 | 方向代理均值 |")
         lines.append("|---------|--------|--------|------------|------------|---------|")
         for horizon in ("T", "T+1", "T+5", "T+30"):
             r = insights["overall_by_horizon"].get(horizon)
@@ -184,10 +187,10 @@ def render_markdown(insights: dict, db_path=None) -> str:
     lines.append("")
 
     # 问题清单
-    lines.append("## 系统性偏差（按严重度排序）")
+    lines.append("## 旧口径待检查线索")
     lines.append("")
     if not insights["issues"]:
-        lines.append("✅ **未发现显著偏差**（样本量门槛 n ≥ {} 内未触发任何告警）".format(_MIN_SAMPLE_SIZE))
+        lines.append("未触发展示告警，不代表无偏差或策略已验证有效。")
     else:
         issues_sorted = sorted(
             insights["issues"],
@@ -204,11 +207,11 @@ def render_markdown(insights: dict, db_path=None) -> str:
                 lines.append("")
                 lines.append(f"- 样本量: {m['total_runs']} | 命中: {m['direction_hits']} | 命中率: {m['direction_hit_rate']:.0%}")
                 if m["avg_return_correct"] is not None:
-                    lines.append(f"- 判对均PnL: {m['avg_return_correct']:+.2f}%")
+                    lines.append(f"- 判对方向代理: {m['avg_return_correct']:+.2f}%")
                 if m["avg_return_wrong"] is not None:
-                    lines.append(f"- 判错均PnL: {m['avg_return_wrong']:+.2f}%")
+                    lines.append(f"- 判错方向代理: {m['avg_return_wrong']:+.2f}%")
                 if m["expectation"] is not None:
-                    lines.append(f"- 期望收益: {m['expectation']:+.2f}%")
+                    lines.append(f"- 方向代理均值（非实际收益）: {m['expectation']:+.2f}%")
             lines.append("")
     lines.append("")
 
