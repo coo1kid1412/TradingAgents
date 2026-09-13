@@ -23,6 +23,9 @@ _RULES = {
     "overdue_results": ("数据跟踪", "已过目标日仍未完成", "检查行情缓存和真值抓取，不能继续解释为尚未到期。", "验收：到期缺数据和真正未到期分开。"),
     "missing_target_date": ("数据跟踪", "待跟踪结果缺少到期日", "补交易日到期计算；本版仅标未知，不猜到期日。", "验收：每个待跟踪结果有可验证到期日或明确不支持原因。"),
     "fetch_failed": ("数据跟踪", "存在未完成的采集失败", "核对失败记录与数据源，保留历史与本周区分。", "验收：错误可定位，修复后可受控重试。"),
+    "data_missing": ("数据跟踪", "已到期但行情缺失或不完整", "按目标交易日补齐行情；不以之后的价格代替。", "验收：完整交易日序列及有效 OHLC 到齐后才评价。"),
+    "retry_exhausted": ("数据跟踪", "行情重试达到上限", "先检查数据源权限和历史覆盖，再人工重新入队。", "验收：最多自动尝试3次、间隔至少24小时；不无限刷取。"),
+    "schedule_error": ("数据跟踪", "交易日目标无法确定", "核对市场、报告时间和交易日历覆盖；不猜节假日。", "验收：修复支持范围后再重新入队。"),
     "invalid_result": ("数据跟踪", "已采集结果缺日期或超出审计时点", "核对目标日和抓取记录，暂不计为已完成。", "验收：未来/缺日期结果不能进入当前已完成统计。"),
     "wait_scored_as_position": ("旧评价口径", "旧方向评分包含 WAIT 报告", "停止将方向评分解释为实际交易输赢，保留原值供审计。", "验收：WAIT、新建仓和已有持仓分别评价，不虚构成交。"),
     "foreign_benchmark": ("旧评价口径", "非 A 股记录使用 A 股 ETF 基准", "独立修复市场日历、基准及收益时点后再比较。", "验收：美股不会与沪深 300 混作同市场基准。"),
@@ -92,7 +95,7 @@ def build_snapshot(db_path=None, *, today=None) -> dict:
             if any((_number(row.get(k)) or 0) > 0 for k in ("pm_size_low_pct", "pm_size_high_pct")):
                 flag("wait_position_conflict", row)
 
-    tracking = dict.fromkeys(("completed", "not_due", "due_today", "overdue", "due_unknown", "failed", "invalid"), 0)
+    tracking = dict.fromkeys(("completed", "not_due", "due_today", "overdue", "due_unknown", "failed", "invalid", "data_missing", "retry_exhausted", "schedule_error"), 0)
     horizon_counts = Counter()
     observation_evidence = {}
     completed_runs = set()
@@ -102,7 +105,9 @@ def build_snapshot(db_path=None, *, today=None) -> dict:
         if row is None:
             continue
         key = f"{outcome['run_id']}:{outcome['horizon']}"
-        observation_evidence[key] = _digest({k: v for k, v in outcome.items() if k != "fetched_at"})
+        housekeeping = {"fetched_at", "attempt_count", "next_retry_at"}
+        housekeeping.update(k for k in ("schedule_version", "due_at") if outcome.get(k) is None)
+        observation_evidence[key] = _digest({k: v for k, v in outcome.items() if k not in housekeeping})
         target = _date(outcome.get("target_date"))
         status = outcome["fetch_status"]
         if status == "fetched":
@@ -126,7 +131,11 @@ def build_snapshot(db_path=None, *, today=None) -> dict:
         elif status == "failed":
             tracking["failed"] += 1
             flag("fetch_failed", row, key)
+        elif status in {"data_missing", "retry_exhausted", "schedule_error"}:
+            tracking[status] += 1
+            flag(status, row, key)
         elif status in {"pending", "not_due"}:
+            target = _date(outcome.get("due_at"), utc=True) or target
             if target is None:
                 tracking["due_unknown"] += 1
                 flag("missing_target_date", row, key)
@@ -229,6 +238,7 @@ def render_summary(snapshot, cron_healthy, cron_desc) -> str:
         f"最近报告归档版本：{snapshot.get('latest_recorded_version') or '未知'}，同标签 {counts['latest_recorded_version_reports']} 份；生成时实际配置尚未验证。", "",
         f"结果跟踪：已完成 {tracking['completed']}；未到期 {tracking['not_due']}；今日待完成 {tracking['due_today']}。",
         f"需检查：已过期 {tracking['overdue']}；到期日未知 {tracking['due_unknown']}；采集失败 {tracking['failed']}；无效记录 {tracking['invalid']}。", "",
+        f"采集阻塞：到期缺行情 {tracking['data_missing']}；重试耗尽 {tracking['retry_exhausted']}；日历不支持/时间错误 {tracking['schedule_error']}。", "",
         "本次优先问题：",
     ]
     for index, issue in enumerate(snapshot["issues"][:3], 1):

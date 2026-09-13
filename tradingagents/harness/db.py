@@ -59,6 +59,14 @@ def _migrate_schema(conn: sqlite3.Connection) -> None:
     if "signed_pnl_pct" not in cols:
         conn.execute("ALTER TABLE outcomes ADD COLUMN signed_pnl_pct REAL")
         logger.info("Migrated: outcomes.signed_pnl_pct added")
+    for col, typ in [
+        ("schedule_version", "TEXT"),
+        ("due_at", "TEXT"),
+        ("attempt_count", "INTEGER NOT NULL DEFAULT 0"),
+        ("next_retry_at", "TEXT"),
+    ]:
+        if col not in cols:
+            conn.execute(f"ALTER TABLE outcomes ADD COLUMN {col} {typ}")
 
     # predictions 表加评级链审计列（2026-06 P0：回测分腿归因）
     pred_cols = {r[1] for r in conn.execute("PRAGMA table_info(predictions)").fetchall()}

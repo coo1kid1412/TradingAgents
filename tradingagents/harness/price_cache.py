@@ -6,7 +6,7 @@
 
 简化策略（适合 truth_fetcher 的用法）：
 - 只增量补 cache_max + 1 到 effective_end 的尾部
-- 不回填历史漏洞（用户场景里 truth_fetcher 总是往前看，不会回头查历史）
+- 真值采集传入 expected_sessions 时，按所需交易日回填历史漏洞
 """
 
 from __future__ import annotations
@@ -28,7 +28,9 @@ def _fetch_from_vendor(ticker: str, start_date: str, end_date: str) -> pd.DataFr
     from tradingagents.dataflows.interface import route_to_vendor
 
     try:
-        csv_str = route_to_vendor("get_stock_data", ticker, start_date, end_date)
+        # Cache ranges are inclusive; yfinance's end is exclusive. Trim any extra bar below.
+        vendor_end = (_dt.date.fromisoformat(end_date) + _dt.timedelta(days=1)).isoformat()
+        csv_str = route_to_vendor("get_stock_data", ticker, start_date, vendor_end)
     except Exception as e:
         logger.warning("vendor 拉 %s [%s, %s] 失败: %s", ticker, start_date, end_date, e)
         return None
@@ -45,6 +47,8 @@ def _fetch_from_vendor(ticker: str, start_date: str, end_date: str) -> pd.DataFr
     if "Date" not in df.columns or "Close" not in df.columns:
         return None
     df["Date"] = pd.to_datetime(df["Date"]).dt.date
+    df = df[(df["Date"] >= _dt.date.fromisoformat(start_date))
+            & (df["Date"] <= _dt.date.fromisoformat(end_date))]
     return df.sort_values("Date").reset_index(drop=True)
 
 
@@ -105,7 +109,7 @@ def _read_from_cache(ticker: str, start_date: _dt.date, end_date: _dt.date,
 
 
 def fetch_with_cache(ticker: str, start_date: str | _dt.date, end_date: str | _dt.date,
-                     db_path=None) -> pd.DataFrame | None:
+                     db_path=None, *, expected_sessions=None) -> pd.DataFrame | None:
     """主入口：返回 ticker 在 [start_date, end_date] 之间所有可得交易日的 OHLCV。
 
     逻辑：
@@ -133,6 +137,21 @@ def fetch_with_cache(ticker: str, start_date: str | _dt.date, end_date: str | _d
     elif cache_max < effective_end:
         # 增量补尾部：从 cache_max+1 拉
         need_fetch_start = cache_max + _dt.timedelta(days=1)
+
+    if expected_sessions is not None:
+        cached = _read_from_cache(ticker, start, effective_end, db_path)
+        available = set()
+        if cached is not None:
+            values = cached[["Low", "Close", "High"]].apply(pd.to_numeric, errors="coerce")
+            valid = (values.gt(0) & values.lt(float("inf"))).all(axis=1)
+            valid &= values["Low"].le(values["Close"]) & values["Close"].le(values["High"])
+            available = set(cached.loc[valid, "Date"])
+        required = {day for day in expected_sessions if start <= day <= effective_end}
+        if required - available:
+            # Cache max alone says nothing about gaps before that date.
+            need_fetch_start = start
+        elif required:
+            need_fetch_start = None
 
     if need_fetch_start is not None and need_fetch_start <= effective_end:
         new_df = _fetch_from_vendor(
