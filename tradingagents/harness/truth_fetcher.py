@@ -3,30 +3,29 @@
 V2 改造：
 - 用 price_cache 增量拉取（改造 A）
 - 算 relative_return = 个股 - benchmark 同期回报（改造 B）
-- not_due 自动重试（startup 时 promote target_date ≤ today 的 not_due → pending）
+- 独立交易日历到期钟；缺行情与未到期分开，采集失败最多3次、间隔24小时
 """
 
 from __future__ import annotations
 
 import datetime as _dt
 import logging
-from pathlib import Path
+import math
 
 import pandas as pd
 
 from tradingagents.harness import db as _db
 from tradingagents.harness import price_cache as _pcache
+from tradingagents.harness import outcome_schedule as _schedule
 
 logger = logging.getLogger(__name__)
 
 # 方向命中阈值（±2% 内为 neutral 命中；超出为 long/short 方向判定）
 _HIT_THRESHOLD_PCT = 2.0
 
-# 每个 horizon 对应的"交易日偏移量"
-_HORIZON_OFFSETS = {"T": 0, "T+1": 1, "T+5": 5, "T+30": 30}
-
-# 拉数据时多拉一段缓冲（覆盖 horizon=T+30 + 周末/节假日缓冲）
-_FETCH_BUFFER_DAYS = 60
+# Per-outcome automatic collection budget; not a strategy hyperparameter.
+_MAX_ATTEMPTS = 3
+_RETRY_DELAY = _dt.timedelta(days=1)
 
 # Benchmark 列表（A 股 ETF，覆盖大盘/中盘/创业板/科创板/半导体/消费）
 # 选用 ETF 而非指数，确保 get_stock_data 兼容
@@ -140,30 +139,74 @@ def _compute_benchmark_return(
     return round((horizon_close - anchor_close) / anchor_close * 100, 4)
 
 
-def promote_due_outcomes(db_path=None) -> int:
-    """把 fetch_status='not_due' 但 target_date ≤ today（或 NULL）的 outcomes
-    重置为 'pending' 让下一轮重试。
+def _now(now=None):
+    now = now or _dt.datetime.now(_dt.timezone.utc)
+    if now.tzinfo is None:
+        raise ValueError("now must include a timezone")
+    return now.astimezone(_dt.timezone.utc)
 
-    Returns: 提升的行数。
-    """
-    today_str = _dt.date.today().isoformat()
+
+def prepare_outcomes(db_path=None, *, now=None, run_id=None) -> int:
+    """Resolve targets without I/O to vendors; reopen only due, eligible work."""
+    now = _now(now)
+    promoted = 0
     with _db.connect(db_path) as conn:
-        cur = conn.execute(
-            """UPDATE outcomes
-               SET fetch_status = 'pending', error_message = NULL
-               WHERE fetch_status = 'not_due'
-                 AND (target_date IS NULL OR target_date <= ?)""",
-            (today_str,),
+        rows = conn.execute(
+            "SELECT r.*,o.horizon,o.fetch_status,o.attempt_count,o.next_retry_at "
+            "FROM runs r JOIN outcomes o ON r.id=o.run_id "
+            "WHERE o.fetch_status IN ('pending','not_due','data_missing','failed') "
+            "AND (? IS NULL OR r.id=?)", (run_id, run_id),
+        ).fetchall()
+        for row in rows:
+            try:
+                target = _schedule.target_for(row, row["horizon"])
+            except (ValueError, KeyError, TypeError, IndexError) as exc:
+                conn.execute(
+                    "UPDATE outcomes SET fetch_status='schedule_error',error_message=?,"
+                    "schedule_version=? WHERE run_id=? AND horizon=?",
+                    (str(exc), _schedule.VERSION, row["id"], row["horizon"]),
+                )
+                continue
+            status = row["fetch_status"]
+            if target.due_at > now:
+                status = "not_due"
+            elif row["attempt_count"] >= _MAX_ATTEMPTS:
+                status = "retry_exhausted"
+            elif not row["next_retry_at"] or _dt.datetime.fromisoformat(row["next_retry_at"]) <= now:
+                status = "pending"
+            promoted += status == "pending" and row["fetch_status"] != "pending"
+            conn.execute(
+                "UPDATE outcomes SET target_date=?,due_at=?,schedule_version=?,fetch_status=? "
+                "WHERE run_id=? AND horizon=?",
+                (target.date.isoformat(), target.due_at.isoformat(), _schedule.VERSION,
+                 status, row["id"], row["horizon"]),
+            )
+    return promoted
+
+
+def promote_due_outcomes(db_path=None, *, now=None) -> int:
+    return prepare_outcomes(db_path, now=now)
+
+
+def _record_failure(outcome, status, message, db_path, now):
+    attempts = outcome["attempt_count"] + 1
+    if attempts >= _MAX_ATTEMPTS:
+        status = "retry_exhausted"
+    retry = (now + _RETRY_DELAY).isoformat() if attempts < _MAX_ATTEMPTS else None
+    with _db.connect(db_path) as conn:
+        conn.execute(
+            "UPDATE outcomes SET fetch_status=?,error_message=?,attempt_count=?,next_retry_at=? "
+            "WHERE run_id=? AND horizon=?",
+            (status, message, attempts, retry, outcome["run_id"], outcome["horizon"]),
         )
-        n = cur.rowcount
-    if n > 0:
-        logger.info("promote: %d 个 not_due outcomes → pending", n)
-    return n
+    return status
 
 
-def fetch_one_run_outcomes(run_id: int, db_path=None) -> dict:
+def fetch_one_run_outcomes(run_id: int, db_path=None, *, now=None) -> dict:
     """采集单 run 的全部 horizon 真值。"""
     stats: dict = {}
+    now = _now(now)
+    prepare_outcomes(db_path, now=now, run_id=run_id)
     with _db.connect(db_path) as conn:
         run = conn.execute("SELECT * FROM runs WHERE id = ?", (run_id,)).fetchone()
         pred = conn.execute("SELECT * FROM predictions WHERE run_id = ?", (run_id,)).fetchone()
@@ -171,86 +214,57 @@ def fetch_one_run_outcomes(run_id: int, db_path=None) -> dict:
             "SELECT * FROM outcomes WHERE run_id = ? AND fetch_status = 'pending'",
             (run_id,),
         ).fetchall()
-        if not run or not pred or not outs:
+        if not run or not outs:
             return stats
 
     ticker = run["ticker"]
-    ref_price = pred["current_price"]
-    if ref_price is None or ref_price <= 0:
-        logger.warning("run %d 缺 reference_price，跳过", run_id)
-        return stats
-
-    base_date = _dt.date.fromisoformat(run["trade_date"])
-    start_date = base_date - _dt.timedelta(days=10)
-    end_date = base_date + _dt.timedelta(days=_FETCH_BUFFER_DAYS + 10)
-    df = _pcache.fetch_with_cache(ticker, start_date, end_date, db_path)
-
-    today = _dt.date.today()
-
-    if df is None or len(df) == 0:
-        is_future = base_date > today
-        new_status = "not_due" if is_future else "failed"
-        err_msg = None if is_future else "no price data"
+    ref_price = pred["current_price"] if pred else None
+    if ref_price is None or not math.isfinite(ref_price) or ref_price <= 0:
         with _db.connect(db_path) as conn:
-            for o in outs:
-                conn.execute(
-                    """UPDATE outcomes SET fetch_status = ?, error_message = ?,
-                       fetched_at = CURRENT_TIMESTAMP WHERE run_id = ? AND horizon = ?""",
-                    (new_status, err_msg, run_id, o["horizon"]),
-                )
-                stats[o["horizon"]] = new_status
+            conn.execute(
+                "UPDATE outcomes SET fetch_status='invalid',error_message='invalid reference price' "
+                "WHERE run_id=? AND fetch_status='pending'", (run_id,),
+            )
+        stats.update({o["horizon"]: "invalid" for o in outs})
         return stats
 
-    # 找 anchor 行
-    if run["report_window"] == "post_market":
-        anchor_rows = df[df["Date"] > base_date]
-    else:
-        anchor_rows = df[df["Date"] >= base_date]
-
-    df = anchor_rows.reset_index(drop=True)
-    anchor = df["Date"].iloc[0] if len(df) > 0 else None
-
-    if anchor is None:
-        with _db.connect(db_path) as conn:
-            for o in outs:
-                conn.execute(
-                    """UPDATE outcomes SET fetch_status = 'not_due', error_message = NULL,
-                       fetched_at = CURRENT_TIMESTAMP WHERE run_id = ? AND horizon = ?""",
-                    (run_id, o["horizon"]),
-                )
-                stats[o["horizon"]] = "not_due"
-        return stats
+    targets = {o["horizon"]: _schedule.target_for(run, o["horizon"]) for o in outs}
+    start_date = min(t.sessions[0] for t in targets.values())
+    # Some routed vendors use an exclusive end date; scoring below still uses exact sessions.
+    end_date = max(t.date for t in targets.values()) + _dt.timedelta(days=1)
+    try:
+        required = sorted({day for target in targets.values() for day in target.sessions})
+        df = _pcache.fetch_with_cache(ticker, start_date, end_date, db_path, expected_sessions=required)
+        if df is not None and not df.empty:
+            df = df.copy()
+            df["Date"] = pd.to_datetime(df["Date"]).dt.date
+    except Exception as exc:
+        logger.warning("run %d price fetch failed: %s", run_id, type(exc).__name__)
+        return {o["horizon"]: _record_failure(o, "failed", "price fetch failed: " + type(exc).__name__, db_path, now) for o in outs}
 
     for o in outs:
         horizon = o["horizon"]
-        offset = _HORIZON_OFFSETS.get(horizon)
-        if offset is None:
+        target = targets[horizon]
+        target_date, anchor = target.date, target.sessions[0]
+        try:
+            if df is None or df.empty:
+                raise ValueError("no price data")
+            period = df[df["Date"].isin(target.sessions)].sort_values("Date")
+            if tuple(period["Date"]) != target.sessions:
+                raise ValueError("missing or duplicate session bars")
+            for column in ("Close", "High", "Low"):
+                values = pd.to_numeric(period[column], errors="coerce")
+                if not values.map(lambda v: math.isfinite(v) and v > 0).all():
+                    raise ValueError("invalid OHLC values")
+                period[column] = values
+            if ((period["Low"] > period["Close"]) | (period["Close"] > period["High"])).any():
+                raise ValueError("inconsistent OHLC values")
+        except (ValueError, KeyError, TypeError) as exc:
+            stats[horizon] = _record_failure(o, "data_missing", str(exc), db_path, now)
             continue
 
-        if offset >= len(df):
-            with _db.connect(db_path) as conn:
-                conn.execute(
-                    """UPDATE outcomes SET fetch_status = 'not_due' WHERE run_id = ? AND horizon = ?""",
-                    (run_id, horizon),
-                )
-            stats[horizon] = "not_due"
-            continue
-
-        target_row = df.iloc[offset]
-        target_date = target_row["Date"]
-
-        if target_date > today:
-            with _db.connect(db_path) as conn:
-                conn.execute(
-                    """UPDATE outcomes SET fetch_status = 'not_due', target_date = ?
-                       WHERE run_id = ? AND horizon = ?""",
-                    (target_date.isoformat(), run_id, horizon),
-                )
-            stats[horizon] = "not_due"
-            continue
-
+        target_row = period.iloc[-1]
         actual_close = float(target_row["Close"])
-        period = df.iloc[: offset + 1]
         high_during = float(period["High"].max()) if "High" in period.columns else None
         low_during = float(period["Low"].min()) if "Low" in period.columns else None
 
@@ -266,9 +280,14 @@ def fetch_one_run_outcomes(run_id: int, db_path=None) -> dict:
             sl_hard_hit = 1 if low_during <= pred["pm_sl_hard"] else 0
 
         # 算 benchmark / relative_return（改造 B）
-        # V1 简单策略：全部用 DEFAULT_BENCHMARK（沪深300 ETF）作对照
-        benchmark_ticker = DEFAULT_BENCHMARK
-        benchmark_return = _compute_benchmark_return(benchmark_ticker, anchor, target_date, db_path)
+        # Unsupported market benchmarks remain unavailable, never substituted by A shares.
+        benchmark_ticker = DEFAULT_BENCHMARK if _schedule.market_calendar(ticker) == "XSHG" else None
+        benchmark_return = None
+        if benchmark_ticker:
+            try:
+                benchmark_return = _compute_benchmark_return(benchmark_ticker, anchor, target_date, db_path)
+            except Exception as exc:
+                logger.warning("run %d benchmark unavailable: %s", run_id, type(exc).__name__)
         relative_return = None
         if benchmark_return is not None:
             relative_return = round(realized_return - benchmark_return, 4)
@@ -281,7 +300,8 @@ def fetch_one_run_outcomes(run_id: int, db_path=None) -> dict:
                     realized_return_pct = ?, signed_pnl_pct = ?, direction_hit = ?,
                     tp1_hit = ?, sl_hard_hit = ?,
                     benchmark_ticker = ?, benchmark_return_pct = ?, relative_return_pct = ?,
-                    fetch_status = 'fetched', fetched_at = CURRENT_TIMESTAMP, error_message = NULL
+                    fetch_status = 'fetched', fetched_at = CURRENT_TIMESTAMP, error_message = NULL,
+                    attempt_count = attempt_count + 1, next_retry_at = NULL
                    WHERE run_id = ? AND horizon = ?""",
                 (
                     target_date.isoformat(), actual_close, high_during, low_during,
@@ -301,7 +321,7 @@ def fetch_one_run_outcomes(run_id: int, db_path=None) -> dict:
     return stats
 
 
-def fetch_all_pending(db_path=None, update_benchmarks: bool = True) -> dict:
+def fetch_all_pending(db_path=None, update_benchmarks: bool = True, *, now=None) -> dict:
     """扫描所有 fetch_status='pending' 的 run，能算的就算。
 
     Args:
@@ -316,10 +336,13 @@ def fetch_all_pending(db_path=None, update_benchmarks: bool = True) -> dict:
     }
 
     # Step 1: 先 promote not_due → pending（让旧的 not_due 有机会重试）
-    summary["promoted_from_not_due"] = promote_due_outcomes(db_path)
+    now = _now(now)
+    summary["promoted_from_not_due"] = promote_due_outcomes(db_path, now=now)
 
     # Step 2: 先把 benchmark cache 更新（确保后续 relative_return 算得到）
-    if update_benchmarks:
+    with _db.connect(db_path) as conn:
+        has_pending = conn.execute("SELECT 1 FROM outcomes WHERE fetch_status='pending' LIMIT 1").fetchone()
+    if update_benchmarks and has_pending:
         bench_stats = update_benchmark_cache(db_path)
         logger.info("benchmark cache 更新: %s", bench_stats)
 
@@ -334,9 +357,14 @@ def fetch_all_pending(db_path=None, update_benchmarks: bool = True) -> dict:
     logger.info("找到 %d 个 run 含 pending outcomes", len(run_ids))
 
     for run_id in run_ids:
-        stats = fetch_one_run_outcomes(run_id, db_path)
+        stats = fetch_one_run_outcomes(run_id, db_path, now=now)
         for horizon, status in stats.items():
             summary[status] = summary.get(status, 0) + 1
+
+    with _db.connect(db_path) as conn:
+        summary["remaining"] = dict(conn.execute(
+            "SELECT fetch_status,COUNT(*) FROM outcomes WHERE fetch_status!='fetched' GROUP BY fetch_status"
+        ).fetchall())
 
     return summary
 
