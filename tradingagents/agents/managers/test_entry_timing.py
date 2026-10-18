@@ -2922,6 +2922,140 @@ def test_shared_agent_rules_reject_uncalibrated_precision_and_unsourced_facts():
     assert "事实性描述必须能追溯" in RISK_DEBATE_PHRASING_RULES
 
 
+def test_tltw_empty_object_completes_rm_without_extra_model_repair():
+    from tradingagents.agents.managers.ic_recommendation import compute_ic_recommendation
+    from tradingagents.agents.managers.test_ic_recommendation import _base
+
+    class EmptyObjectLLM:
+        calls = 0
+
+        def invoke(self, messages):
+            self.calls += 1
+            if self.calls == 1:
+                return AIMessage(content="", tool_calls=[{
+                    "name": "compute_ic_recommendation",
+                    "args": _base(style="etf", thesis_breaker_evidence_ids={}),
+                    "id": "tltw-empty-evidence",
+                }])
+            assert self.calls == 2, "Empty container repair must not require extra LLM calls"
+            return AIMessage(content=_substantive_rm_body() + "\n\n" + _complete_rm_summary())
+
+    llm = EmptyObjectLLM()
+    result = _run_tool_calling_loop(
+        llm, [HumanMessage(content="TLTW research")],
+        tools_by_name={"compute_ic_recommendation": compute_ic_recommendation},
+        authoritative_tool_name="compute_ic_recommendation",
+        required_summary_fields={"research_rating", "pillar_thesis"},
+    )
+    assert llm.calls == 2
+    assert _find_yaml_block(result.content, "RM_SUMMARY")["research_rating"] == "HOLD"
+
+
+def test_repeated_required_tool_business_errors_stop_at_hard_cap():
+    from tradingagents.agents.managers.ic_recommendation import compute_ic_recommendation
+    from tradingagents.agents.managers.test_ic_recommendation import _base
+
+    class InvalidVetoLLM:
+        calls = 0
+
+        def invoke(self, messages):
+            self.calls += 1
+            if self.calls > 1:
+                feedback = [m for m in messages if getattr(m, "tool_call_id", None)]
+                assert feedback[-1].status == "error"
+                assert "缺少合格" in feedback[-1].content
+            assert self.calls <= 3, "The hard cap must not expand during tool repair"
+            return AIMessage(content="", tool_calls=[{
+                "name": "compute_ic_recommendation",
+                "args": _base(hard_veto=True, thesis_breaker_evidence_ids={}),
+                "id": f"veto-{self.calls}",
+            }])
+
+    llm = InvalidVetoLLM()
+    try:
+        _run_tool_calling_loop(
+            llm, [HumanMessage(content="TLTW research")],
+            tools_by_name={"compute_ic_recommendation": compute_ic_recommendation},
+            authoritative_tool_name="compute_ic_recommendation",
+            max_iterations=1, max_continuations=0,
+        )
+    except RuntimeError as exc:
+        assert "未获得强制工具" in str(exc)
+    else:
+        raise AssertionError("Tool business errors must never be treated as success")
+    assert llm.calls == 3
+
+
+def test_rm_required_tool_error_gets_retry_not_finalization_at_soft_limit():
+    from tradingagents.agents.managers.ic_recommendation import compute_ic_recommendation
+    from tradingagents.agents.managers.test_ic_recommendation import _base
+
+    class CorrectingLLM:
+        def __init__(self):
+            self.calls = 0
+
+        def invoke(self, messages):
+            self.calls += 1
+            if self.calls == 1:
+                return AIMessage(content="", tool_calls=[{
+                    "name": "compute_ic_recommendation",
+                    "args": _base(thesis_breaker_evidence_ids={"bad": "value"}),
+                    "id": "ic-invalid",
+                }])
+            if self.calls == 2:
+                feedback = [m for m in messages if getattr(m, "tool_call_id", None) == "ic-invalid"]
+                assert feedback[-1].status == "error"
+                prompt = messages[-1].content
+                assert "compute_ic_recommendation" in prompt
+                assert "修正" in prompt
+                assert "不要再调用任何工具" not in prompt
+                return AIMessage(content="", tool_calls=[{
+                    "name": "compute_ic_recommendation", "args": _base(), "id": "ic-corrected",
+                }])
+            return AIMessage(content=_substantive_rm_body() + "\n\n" + _complete_rm_summary())
+
+    llm = CorrectingLLM()
+    result = _run_tool_calling_loop(
+        llm, [HumanMessage(content="TLTW research")],
+        tools_by_name={"compute_ic_recommendation": compute_ic_recommendation},
+        authoritative_tool_name="compute_ic_recommendation",
+        max_iterations=1, max_continuations=1,
+        required_summary_fields={"research_rating", "pillar_thesis"},
+    )
+    assert llm.calls == 3
+    summary = _find_yaml_block(result.content, "RM_SUMMARY")
+    assert summary["research_rating"] == "HOLD"
+    assert summary["pillar_thesis"] == "adequate"
+
+
+def test_rm_missing_authority_recovery_explicitly_requests_tool_call():
+    class TextOnlyLLM:
+        def __init__(self):
+            self.calls = 0
+
+        def invoke(self, messages):
+            self.calls += 1
+            if self.calls > 1:
+                prompt = messages[-1].content
+                assert "compute_ic_recommendation" in prompt
+                assert "tool_calls" in prompt
+                assert "思考过程" not in prompt
+            return AIMessage(content="正文缺失且没有工具结果")
+
+    llm = TextOnlyLLM()
+    try:
+        _run_tool_calling_loop(
+            llm, [HumanMessage(content="TLTW research")],
+            authoritative_tool_name="compute_ic_recommendation",
+            max_iterations=1, max_continuations=1,
+        )
+    except RuntimeError as exc:
+        assert "未获得强制工具" in str(exc)
+    else:
+        raise AssertionError("Missing authority must still fail closed")
+    assert llm.calls == 2
+
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     failed = 0

@@ -193,6 +193,45 @@ def test_same_input_is_reproducible():
     assert IC.invoke(payload) == IC.invoke(payload)
 
 
+def test_tltw_empty_evidence_object_matches_empty_list():
+    expected = IC.invoke(_base(style="etf", thesis_breaker_evidence_ids=[]))
+    actual = IC.invoke(_base(style="etf", thesis_breaker_evidence_ids={}))
+    assert actual == expected
+
+
+def test_all_optional_evidence_fields_accept_empty_objects_only():
+    fields = [name for name in _base() if name.endswith("evidence_ids")]
+    for field in fields:
+        base = _base()
+        if field == "eligible_evidence_ids":
+            base.update({name: [] for name in fields})
+        assert IC.invoke({**base, field: {}}) == IC.invoke({**base, field: []}), field
+
+
+def test_nonempty_objects_and_scalar_evidence_stay_invalid():
+    from pydantic import ValidationError
+    for value in ({"BREAK-01": True}, "BREAK-01", 0, False, [{"id": "BREAK-01"}]):
+        try:
+            IC.invoke(_base(thesis_breaker_evidence_ids=value))
+        except ValidationError:
+            continue
+        raise AssertionError(f"Malformed evidence must be rejected: {value!r}")
+
+
+def test_empty_object_does_not_bypass_hard_veto_evidence_gate():
+    result = IC.invoke(_base(hard_veto=True, thesis_breaker_evidence_ids={}))
+    assert "error" in result
+    assert "缺少" in result["error"]
+
+
+def test_evidence_tool_schema_remains_array_or_null():
+    properties = IC.args_schema.model_json_schema()["properties"]
+    for name, schema in properties.items():
+        if name.endswith("evidence_ids"):
+            variants = {item["type"] for item in schema["anyOf"]}
+            assert variants == {"array", "null"}, (name, schema)
+
+
 if __name__ == "__main__":
     import sys
 

@@ -841,6 +841,21 @@ def _run_tool_calling_loop(llm_with_tools, initial_messages, *,
     successful_tool_results: dict[str, object] = {}
     required_tool_names = set(required_tool_names or ())
 
+    def missing_required_tools():
+        missing = required_tool_names - successful_tool_results.keys()
+        if authoritative_tool_name and authoritative_result is None:
+            missing.add(authoritative_tool_name)
+        return sorted(missing)
+
+    def required_tool_recovery_prompt():
+        return (
+            f"尚未成功获得强制工具 {', '.join(missing_required_tools())} 的结果。"
+            "请根据已有工具错误信息修正参数，并通过真实 tool_calls 调用缺失的工具；"
+            "证据 ID 字段必须是字符串数组，无证据时用 [] 或 null，不要编造 ID。"
+            "不要重做已成功的计算，不要仅在正文中声称工具已完成。"
+            f"工具成功后再输出最终报告及完整的 {completion_token} YAML。"
+        )
+
     while iteration < hard_cap or rm_compact_repair_pending:
         is_rm_compact_repair_call = rm_compact_repair_pending
         rm_compact_repair_pending = False
@@ -873,32 +888,40 @@ def _run_tool_calling_loop(llm_with_tools, initial_messages, *,
                 if tool is None:
                     error_msg = f"未知工具：{tool_name}"
                     logger.warning(error_msg)
-                    messages.append(ToolMessage(content=error_msg, tool_call_id=tool_id))
+                    messages.append(ToolMessage(content=error_msg, tool_call_id=tool_id, status="error"))
                     continue
 
                 try:
                     result = tool.invoke(tool_args)
                     result_str = json.dumps(result, ensure_ascii=False) if isinstance(result, dict) else str(result)
                     tool_result_summaries.append(f"{tool_name}: {result_str[:3000]}")
-                    if not (isinstance(result, dict) and result.get("error")):
+                    result_failed = isinstance(result, dict) and bool(result.get("error"))
+                    if not result_failed:
                         successful_tool_results[tool_name] = result
                     if tool_name == authoritative_tool_name and _valid_ic_recommendation_result(result):
                         authoritative_result = result
                     logger.debug("%s 工具 %s 结果: %s", role, tool_name, result_str[:200])
-                    messages.append(ToolMessage(content=result_str, tool_call_id=tool_id))
+                    messages.append(ToolMessage(
+                        content=result_str, tool_call_id=tool_id,
+                        status="error" if result_failed else "success",
+                    ))
                 except Exception as e:
                     error_msg = f"工具 {tool_name} 执行失败: {e}"
                     logger.warning(error_msg)
-                    messages.append(ToolMessage(content=error_msg, tool_call_id=tool_id))
+                    messages.append(ToolMessage(content=error_msg, tool_call_id=tool_id, status="error"))
 
             # 工具轮数到达上限：要求收笔（仍允许它在续写检查中被抓回来）
             if iteration >= max_iterations and not finalization_requested:
                 finalization_requested = True
-                logger.warning("%s 达到工具调用上限 (%d 轮)，要求直接收笔", role, max_iterations)
-                messages.append(HumanMessage(
-                    content="你已经调用足够多次工具了。请基于已有的工具结果直接写出最终报告，"
-                            "**不要再调用任何工具**。"
-                ))
+                if missing_required_tools():
+                    logger.warning("%s 达到工具调用软上限 (%d 轮)，仅补缺失强制工具", role, max_iterations)
+                    messages.append(HumanMessage(content=required_tool_recovery_prompt()))
+                else:
+                    logger.warning("%s 达到工具调用上限 (%d 轮)，要求直接收笔", role, max_iterations)
+                    messages.append(HumanMessage(
+                        content="你已经调用足够多次工具了。请基于已有的工具结果直接写出最终报告，"
+                                "**不要再调用任何工具**。"
+                    ))
             continue
 
         # —— 不再调工具：检查正文是否完整 ——
@@ -976,7 +999,7 @@ def _run_tool_calling_loop(llm_with_tools, initial_messages, *,
             break
 
         continuations += 1
-        if summary_complete and not authority_complete:
+        if not authority_complete:
             reason = f"缺强制工具 {authoritative_tool_name} 的成功结果"
         elif not required_tools_complete:
             missing_tools = ", ".join(
@@ -989,9 +1012,11 @@ def _run_tool_calling_loop(llm_with_tools, initial_messages, *,
             reason = f"截断（缺 {completion_token} 收尾）"
         else:
             reason = f"截断（{completion_token} 不完整或无法解析）"
-        logger.warning("%s 输出正文%s（疑似 think-only 被剥离），第 %d 次续写",
+        logger.warning("%s 输出未满足交付条件：%s，第 %d 次恢复",
                        role, reason, continuations)
-        if (
+        if missing_required_tools():
+            messages.append(HumanMessage(content=required_tool_recovery_prompt()))
+        elif (
             completion_token == "PM_SUMMARY"
             and not summary_complete
             and joined.strip()

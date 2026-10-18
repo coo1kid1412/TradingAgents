@@ -3,9 +3,19 @@
 from __future__ import annotations
 
 from math import isfinite
-from typing import Optional
+from typing import Annotated, Optional
 
 from langchain_core.tools import tool
+from pydantic import BeforeValidator
+
+
+def _normalize_empty_evidence_object(value):
+    # Some tool-calling models serialize an empty collection as {} instead of [].
+    # Nonempty mappings and other malformed values must still fail validation.
+    return [] if isinstance(value, dict) and not value else value
+
+
+_EvidenceIds = Annotated[Optional[list[str]], BeforeValidator(_normalize_empty_evidence_object)]
 
 
 RATINGS_ORDER = ["SELL", "UNDERWEIGHT", "HOLD", "OVERWEIGHT", "BUY"]
@@ -94,17 +104,19 @@ def compute_ic_recommendation(
     theme_premium_pct: float = 0.0,
     theme_stage: str = "",
     crowded_long: bool = False,
-    eligible_evidence_ids: Optional[list[str]] = None,
-    thesis_evidence_ids: Optional[list[str]] = None,
-    valuation_evidence_ids: Optional[list[str]] = None,
-    catalyst_evidence_ids: Optional[list[str]] = None,
-    durability_evidence_ids: Optional[list[str]] = None,
-    thesis_breaker_evidence_ids: Optional[list[str]] = None,
+    eligible_evidence_ids: _EvidenceIds = None,
+    thesis_evidence_ids: _EvidenceIds = None,
+    valuation_evidence_ids: _EvidenceIds = None,
+    catalyst_evidence_ids: _EvidenceIds = None,
+    durability_evidence_ids: _EvidenceIds = None,
+    thesis_breaker_evidence_ids: _EvidenceIds = None,
 ) -> dict:
     """Map four audited research pillars to one 12-month rating.
 
     Short-term timing, market entry gates, positions and trade actions are
     intentionally absent. Those belong to the Portfolio Manager layer.
+    Evidence IDs must be JSON arrays of strings; use [] or null when absent,
+    never objects, scalar strings, or invented IDs.
     """
 
     values = {
