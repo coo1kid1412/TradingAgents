@@ -1,4 +1,5 @@
 from unittest.mock import MagicMock, patch
+import os
 
 from main import _notify_analysis_failure, analyze_single_stock
 
@@ -28,6 +29,15 @@ def test_non_retryable_analysis_failure_notifies_user():
     assert success is False
     assert "1026" in result
     notify.assert_called_once()
+
+
+def test_failure_notification_points_to_current_job_log():
+    log_path = "/tmp/analysis_runs/unique-run/output.log"
+    with patch.dict(os.environ, {"TA_RUN_LOG": log_path}), patch(
+        "tradingagents.harness.market_risk_daily._send_feishu_message",
+    ) as send:
+        _notify_analysis_failure("688507", RuntimeError("fixture failure"))
+    assert log_path in send.call_args.args[0]
 
 
 if __name__ == "__main__":
