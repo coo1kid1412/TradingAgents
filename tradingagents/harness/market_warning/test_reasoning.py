@@ -611,6 +611,7 @@ class AdapterTests(TestCase):
             max_tokens=2048,
             max_retries=0,
             wall_clock_max_retries=0,
+            empty_output_retry_max_tokens=0,
         )
         self.assertIs(adapter.llm, wrapped)
 

@@ -29,7 +29,9 @@ cd /Users/lailixiang/WorkSpace/QoderWorkspace/TradingAgents
 
 ## 启动：必须用 OpenClaw 原生独立后台模式
 
-区分外层 JavaScript 编排工具与内层 shell exec：外层常只有 `code/title`，后台参数属于内层 shell exec。代码模式中先读取 `API.read("tools/exec.d.ts")`（或当前运行时提供的同等工具契约），再经编排层调用内层 exec；不要把外层 schema 缺少后台参数误判为环境不兼容。`catalog.search(...).describe()` 的空结果不等于工具不支持。
+区分外层 JavaScript 编排工具与内层 shell exec：外层常只有 `code/title`，后台参数属于内层 shell exec。
+
+代码模式中先用 `catalog.search("exec shell command background")` 查询工具；当前运行时返回条目的 `input` 字段是 JSON schema 字符串，直接读取它确认参数。若 `API.read("tools/exec.d.ts")` 返回 `content: null`，改读目录返回的 schema，不要反复读取空文件。`catalog.search(...).describe()` 的空结果也不等于工具不支持。
 
 确认内层 exec 的 `background` 与 `timeoutSeconds` 参数后，执行以下编排代码（若直接暴露 shell exec，传入同一个参数对象）：
 
@@ -57,8 +59,9 @@ text(result);
 ## 启动验收与用户回复
 
 在另一个短 exec 调用中查询一次 status，确认 `running` 或已经结束。
-`running` 只代表已托管，回复股票、运行编号、分析日期、当前阶段及日志路径。可说明历史完整分析约 20—30 分钟，实际随模型和数据源变化。
+`running` 只代表已托管，回复股票、运行编号、分析日期、当前阶段及日志路径；若 exec 返回 `sessionId`，一并保留。历史分析约 20—45 分钟，实际随模型和数据源变化，不据此设置整任务超时。
 `already_running` 表示本次没有启动，先查询正在运行的任务，不宣称新任务已接单。
+`succeeded` 与 `delivery_status` 分开判断：分析成功但推送未确认时，明确说“报告已生成，飞书送达未确认”，不得误报成“仍在运行”。
 
 启动后不持续轮询，不占用当前会话等待模型，不新建重复分析。用户询问进度时再查 status。
 成功推送沿用 main.py，普通分析失败也由 main.py 通知；分析子进程异常退出时 runner 补发失败通知。整组进程或宿主机停止后，status 能识别 interrupted，但不能保证当时仍有进程可发送通知。
