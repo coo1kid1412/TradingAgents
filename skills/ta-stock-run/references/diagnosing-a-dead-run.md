@@ -22,6 +22,6 @@ cd /Users/lailixiang/WorkSpace/QoderWorkspace/TradingAgents
 1. OpenClaw 托管 shell 结束后会清理仍存活的进程组，`nohup ... &` 及子 shell 后台不能保证独立存活。
 2. `subprocess.run(timeout=...)` 超时会终止子进程。捕获 TimeoutExpired 后不可说“仍在运行”。540 秒不足以完成历史约 20—30 分钟的 TA 分析。
 
-按 SKILL.md 使用 OpenClaw 内层 shell exec 的 `background: true`、`timeoutSeconds: 0` 参数。外层 JavaScript 编排工具的 code/title schema 不是 shell exec 的 schema；通过当前工具契约确认参数。
+按 SKILL.md 使用 OpenClaw 内层 shell exec 的 `background: true`、`timeoutSeconds: 0` 参数。外层 JavaScript 编排工具的 code/title schema 不是 shell exec 的 schema；通过 `catalog.search("exec shell command background")` 返回条目的 `input` schema 确认参数。`API.read("tools/exec.d.ts")` 在部分运行时返回 `content: null`，不代表工具不支持。
 
 不得自动关闭用户浏览器、Node 或无关应用，不更换模型、不跳过分析师、不降低报告标准来掩盖运行问题。整组进程或机器停止后，本地通知不保证还能发出；后续状态查询会识别中断。

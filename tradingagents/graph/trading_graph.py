@@ -206,6 +206,9 @@ class TradingAgentsGraph:
             max_tokens = self.config.get("minimax_max_tokens")
             if max_tokens:
                 kwargs["max_tokens"] = max_tokens
+            kwargs["empty_output_retry_max_tokens"] = self.config.get(
+                "minimax_empty_output_retry_max_tokens", 32768,
+            )
 
         elif provider == "deepseek":
             kwargs["reasoning_effort"] = self.config.get(

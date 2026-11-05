@@ -1,5 +1,7 @@
 import os
 import time
+import json
+import sys
 from typing import Any, Optional
 
 from langchain_openai import ChatOpenAI
@@ -289,15 +291,30 @@ def _log_llm_input(seq: int, model: str, input):
 
 
 def _log_llm_output(seq: int, model: str, result, elapsed: float):
-    """Append output summary to the log file."""
+    """Record termination/usage and visible output, not private reasoning."""
     log_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..", "llm_calls")
     log_file = os.path.join(log_dir, f"llm_call_{seq:04d}.txt")
 
-    content = getattr(result, "content", str(result)[:500])
+    normalized = normalize_content(result.model_copy(deep=True))
+    content = normalized.content
+    metadata = getattr(result, "response_metadata", {}) or {}
+    usage = getattr(result, "usage_metadata", {}) or {}
+    diagnostics = {
+        "finish_reason": metadata.get("finish_reason"),
+        "input_tokens": usage.get("input_tokens"),
+        "output_tokens": usage.get("output_tokens"),
+        "visible_chars": len(content),
+        "tool_calls": len(getattr(result, "tool_calls", []) or []),
+        "invalid_tool_calls": len(getattr(result, "invalid_tool_calls", []) or []),
+    }
+    diagnostic_text = json.dumps(diagnostics, ensure_ascii=False)
+    sys.stderr.write(f"[LLM #{seq}] Output diagnostics: {diagnostic_text}\n")
+    sys.stderr.flush()
 
     with open(log_file, "a") as f:
         f.write("\n\n" + "=" * 60 + "\n")
         f.write(f"Duration: {elapsed:.1f}s\n")
+        f.write(f"Output diagnostics: {diagnostic_text}\n")
         f.write(f"Response length: {len(content)} chars\n")
         f.write(f"Response preview: {content[:500]}...\n")
 

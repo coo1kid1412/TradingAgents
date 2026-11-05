@@ -234,6 +234,7 @@ class MiniMaxReasoningAdapter:
             max_tokens=max_tokens,
             max_retries=0,
             wall_clock_max_retries=0,
+            empty_output_retry_max_tokens=0,
         )
         return cls(
             client.get_llm_wrapped(),
