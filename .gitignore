@@ -222,6 +222,7 @@ __marimo__/
 results/
 reports/
 eval_results/
+logs/analysis_runs/
 
 # Harness backtest DB and logs
 harness_data/
