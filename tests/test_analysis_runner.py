@@ -201,6 +201,18 @@ class AnalysisRunnerTests(unittest.TestCase):
         self.assertNotIn('BrokenPipeError', process.stderr.read().decode())
         self.assertEqual(self.latest()['status'], 'succeeded')
 
+    def test_progress_is_not_lost_when_recent_output_exceeds_tail_window(self):
+        run_dir = self.root / 'logs' / 'analysis_runs' / 'long-log'
+        run_dir.mkdir(parents=True)
+        (run_dir / 'status.json').write_text(json.dumps({
+            'ticker': '688507', 'status': 'running', 'run_id': 'long-log',
+            'log_path': str(run_dir / 'output.log'),
+        }))
+        (run_dir / 'output.log').write_text('[688507] ✓ Phase 3/13: complete\n' + 'tool output\n' * 5000)
+        with (run_dir / '.running.lock').open('a+') as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self.assertEqual(self.latest()['last_completed_phase'], 3)
+
 
 if __name__ == "__main__":
     unittest.main()

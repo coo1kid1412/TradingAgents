@@ -91,8 +91,15 @@ def read_status(ticker, *, project_root=PROJECT_ROOT):
                         "exit_reason": "worker_result_recovered" if result else "supervisor_and_worker_not_running",
                         "report_path": report, "delivery_status": delivery, "returncode": None,
                     })
-        phases = re.findall(r"Phase (\d+)/13", _log_tail(Path(status["log_path"])))
-        status["last_completed_phase"] = int(phases[-1]) if phases else 0
+        phase = 0
+        log_path = Path(status["log_path"])
+        if log_path.exists():
+            with log_path.open(encoding="utf-8", errors="replace") as stream:
+                for line in stream:
+                    match = re.match(r"^\[[^\]]+\] (?:✓ )?Phase (\d+)/13", line)
+                    if match:
+                        phase = max(phase, int(match.group(1)))
+        status["last_completed_phase"] = phase
         return status
     return {"ticker": ticker, "status": "not_found"}
 
