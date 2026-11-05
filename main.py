@@ -450,7 +450,7 @@ def _notify_analysis_failure(ticker: str, error: Exception) -> None:
         f"【TA 分析失败】{ticker}\n"
         f"原因：{reason}\n"
         f"本次未生成报告，请勿继续等待。\n"
-        f"排查日志：/tmp/ta_{ticker}.log"
+        f"排查日志：{os.environ.get('TA_RUN_LOG', f'/tmp/ta_{ticker}.log')}"
     )
     try:
         from tradingagents.harness.market_risk_daily import _send_feishu_message
