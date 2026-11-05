@@ -7,7 +7,10 @@ from typing import Any
 
 from langchain_core.messages import AIMessage, HumanMessage
 
-from tradingagents.agents.utils.handoff import extract_final_report_artifact
+from tradingagents.agents.utils.handoff import (
+    decision_handoff_contract,
+    extract_final_report_artifact,
+)
 from tradingagents.agents.utils.yaml_summary import extract_yaml_mapping
 
 
@@ -83,6 +86,8 @@ def invoke_decision_response(llm, prompt: str, *, role: str) -> AIMessage:
     first_content = extract_final_report_artifact(str(getattr(first, "content", "") or ""))
     if _has_complete_handoff(first_content, role, allowed_ids):
         return AIMessage(content=first_content)
+    if not first_content.strip():
+        return AIMessage(content=_fallback_handoff(role))
 
     evidence_allowlist = ", ".join(sorted(allowed_ids)) or "（无可引用正式证据 ID）"
     bounded_first = first_content[-10_000:]
@@ -92,6 +97,8 @@ role 必须为 {role}；必须包含契约要求的全部字段。不得新增�
 
 上一轮可见结论（限长，仅供补交接单）：
 {bounded_first}
+
+{decision_handoff_contract(role, "只整理上述可见结论；不得根据原始提示补造观点或事实")}
 """
     try:
         second = llm.invoke([HumanMessage(content=retry_prompt)])

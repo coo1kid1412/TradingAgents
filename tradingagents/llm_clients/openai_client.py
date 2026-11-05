@@ -181,7 +181,8 @@ class NormalizedChatOpenAI(ChatOpenAI):
         # Log input before calling
         if not suppress_io_logging:
             try:
-                _log_llm_input(seq, self.model, input)
+                diagnostics = _request_diagnostics(self._get_request_payload(input, **kwargs))
+                _log_llm_input(seq, self.model, input, diagnostics)
                 import sys
                 sys.stderr.write(f"[LLM #{seq}] Input logged to llm_calls/\n")
                 sys.stderr.flush()
@@ -264,7 +265,23 @@ class NormalizedChatOpenAI(ChatOpenAI):
         return normalize_content(result)
 
 
-def _log_llm_input(seq: int, model: str, input):
+def _request_diagnostics(payload: dict) -> dict:
+    from tradingagents.profiling import detect_agent
+
+    messages = payload.get("messages", payload.get("input", []))
+    tools = payload.get("tools", [])
+    return {
+        "agent": detect_agent(str(messages[:1])),
+        "message_count": len(messages) if isinstance(messages, list) else int(bool(messages)),
+        "message_chars": len(json.dumps(messages, ensure_ascii=False)),
+        "tool_schema_chars": len(json.dumps(tools, ensure_ascii=False)) if tools else 0,
+        "max_completion_tokens": payload.get(
+            "max_completion_tokens", payload.get("max_tokens", payload.get("max_output_tokens")),
+        ),
+    }
+
+
+def _log_llm_input(seq: int, model: str, input, diagnostics: dict | None = None):
     """Save LLM input to a numbered log file for debugging hangs."""
     if isinstance(input, str):
         content = input
@@ -286,6 +303,11 @@ def _log_llm_input(seq: int, model: str, input):
         f.write(f"=== LLM Call #{seq} ===\n")
         f.write(f"Model: {model}\n")
         f.write(f"Timestamp: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+        if diagnostics is not None:
+            diagnostic_text = json.dumps(diagnostics, ensure_ascii=False)
+            f.write(f"Request diagnostics: {diagnostic_text}\n")
+            sys.stderr.write(f"[LLM #{seq}] Request diagnostics: {diagnostic_text}\n")
+            sys.stderr.flush()
         f.write("=" * 60 + "\n\n")
         f.write(content)
 
@@ -303,6 +325,7 @@ def _log_llm_output(seq: int, model: str, result, elapsed: float):
         "finish_reason": metadata.get("finish_reason"),
         "input_tokens": usage.get("input_tokens"),
         "output_tokens": usage.get("output_tokens"),
+        "cache_read_input_tokens": (usage.get("input_token_details") or {}).get("cache_read"),
         "visible_chars": len(content),
         "tool_calls": len(getattr(result, "tool_calls", []) or []),
         "invalid_tool_calls": len(getattr(result, "invalid_tool_calls", []) or []),

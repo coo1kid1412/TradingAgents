@@ -213,6 +213,34 @@ def test_missing_decision_handoff_retries_only_bounded_structured_tail():
     assert "空头正文" not in response.content
 
 
+def test_decision_repair_includes_the_actual_contract_not_an_undefined_reference():
+    llm = _FakeLLM(["增长确认，但估值约束仍在。", _decision_tail()])
+    invoke_decision_response(llm, "IC 证据 FUND-GROWTH-01", role="bear")
+    repair = llm.calls[1][0].content
+    for field in ("as_of:", "decision_judgments:", "affected_horizon:", "allowed_effect:"):
+        assert field in repair, field
+    assert "role: bear" in repair
+
+
+def test_empty_decision_body_does_not_pay_for_factless_handoff_repair():
+    llm = _FakeLLM(["", _decision_tail()])
+    response = invoke_decision_response(llm, "IC 证据 FUND-GROWTH-01", role="bear")
+    assert len(llm.calls) == 1
+    tail, status = extract_yaml_mapping(response.content, "DECISION_HANDOFF")
+    assert status == "valid"
+    assert tail["quality_status"] == "invalid"
+    assert tail["decision_judgments"] == []
+
+
+def test_reasoning_only_and_whitespace_decision_bodies_do_not_retry():
+    for content in (" \n\t", "<think>私有思考，不是报告。</think>"):
+        llm = _FakeLLM([content])
+        response = invoke_decision_response(llm, "IC 证据 FUND-GROWTH-01", role="bull")
+        tail, _ = extract_yaml_mapping(response.content, "DECISION_HANDOFF")
+        assert len(llm.calls) == 1
+        assert tail["quality_status"] == "invalid"
+
+
 def test_missing_decision_handoff_fails_closed_after_one_retry():
     llm = _FakeLLM(["第一轮没有交接", RuntimeError("provider timeout")])
 
