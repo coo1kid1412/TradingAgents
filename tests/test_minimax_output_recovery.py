@@ -1,5 +1,9 @@
 import unittest
 import time
+import contextlib
+import io
+import json
+import re
 from unittest.mock import mock_open, patch
 
 from langchain_core.messages import AIMessage, HumanMessage
@@ -34,6 +38,43 @@ def wrapped(model, **kwargs):
 
 
 class MiniMaxOutputRecoveryTests(unittest.TestCase):
+    def test_request_diagnostics_measure_full_context_before_log_truncation(self):
+        from langchain_openai import ChatOpenAI
+        from tradingagents.llm_clients.openai_client import NormalizedChatOpenAI
+
+        llm = NormalizedChatOpenAI(model="MiniMax-M3", api_key="sk-test", max_tokens=8192)
+        bound = llm.bind_tools([{
+            "type": "function", "function": {
+                "name": "ic", "description": "IC", "parameters": {"type": "object"},
+            },
+        }])
+        stderr = io.StringIO()
+        messages = [HumanMessage(content="你是投资研究总监。" + "材料" * 20000)]
+        with patch.object(ChatOpenAI, "invoke", return_value=AIMessage(content="done")), \
+                patch("builtins.open", mock_open()), \
+                patch("os.makedirs"), contextlib.redirect_stderr(stderr):
+            bound.invoke(messages, max_tokens=16384)
+        match = re.search(r"Request diagnostics: (\{[^\n]+\})", stderr.getvalue())
+        self.assertIsNotNone(match, stderr.getvalue())
+        diagnostics = json.loads(match.group(1))
+        self.assertEqual(diagnostics["message_count"], 1)
+        self.assertGreater(diagnostics["message_chars"], 40000)
+        self.assertGreater(diagnostics["tool_schema_chars"], 0)
+        self.assertEqual(diagnostics["max_completion_tokens"], 16384)
+        self.assertEqual(diagnostics["agent"], "RM")
+
+    def test_request_diagnostics_support_responses_payload_without_exposing_text(self):
+        from tradingagents.llm_clients.openai_client import _request_diagnostics
+
+        diagnostics = _request_diagnostics({
+            "input": [{"role": "user", "content": "PRIVATE_INPUT_SENTINEL"}],
+            "max_output_tokens": 8192,
+        })
+        self.assertEqual(diagnostics["message_count"], 1)
+        self.assertGreater(diagnostics["message_chars"], 20)
+        self.assertEqual(diagnostics["max_completion_tokens"], 8192)
+        self.assertNotIn("PRIVATE_INPUT_SENTINEL", json.dumps(diagnostics))
+
     def test_empty_length_response_retries_once_with_larger_budget(self):
         model = ScriptedModel([truncated(), AIMessage(content="有效结论")])
         llm = wrapped(model)
