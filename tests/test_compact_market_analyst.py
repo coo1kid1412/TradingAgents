@@ -156,6 +156,16 @@ class CompactMarketTests(unittest.TestCase):
         ):
             self.assertTrue(callable(market_analyst.create_market_analyst(llm)))
 
+    def test_unconfigured_factory_does_not_activate_before_live_acceptance(self):
+        from tradingagents.agents.analysts import market_analyst
+        from tradingagents.default_config import DEFAULT_CONFIG
+
+        self.assertEqual(DEFAULT_CONFIG["market_context_mode"], "legacy")
+        with patch.object(market_analyst, "get_config", return_value={}), patch.object(
+            self.module, "create_compact_market_analyst", side_effect=AssertionError("compact is opt-in"),
+        ):
+            self.assertTrue(callable(market_analyst.create_market_analyst(FakeLLM(self.response()))))
+
 
 if __name__ == "__main__":
     unittest.main()

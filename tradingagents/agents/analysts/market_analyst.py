@@ -161,7 +161,7 @@ def _prefetch_stock_data(ticker: str, current_date: str, messages: list):
 
 
 def create_market_analyst(llm):
-    mode = get_config().get("market_context_mode", "compact")
+    mode = get_config().get("market_context_mode", "legacy")
     if mode == "compact":
         from .compact_market_analyst import create_compact_market_analyst
         return create_compact_market_analyst(llm)

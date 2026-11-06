@@ -113,6 +113,12 @@ class OneRequestTests(OfflineTestCase):
         llm.invoke("test")
         self.assertEqual(getattr(llm, "visible_content", None), "可见但尚未校验的正文")
 
+    def test_unclosed_thinking_after_visible_text_is_not_saved(self):
+        response = AIMessage(content="可见正文<THINK>PRIVATE_UNCLOSED_CHAIN")
+        llm = smoke.OneRequest(Mock(invoke=Mock(return_value=response)))
+        llm.invoke("test")
+        self.assertEqual(llm.visible_content, "可见正文")
+
     def test_response_metadata_usage_is_supported(self):
         response = SimpleNamespace(response_metadata={
             "token_usage": {"prompt_tokens": 4, "completion_tokens": 2, "total_tokens": 6},
@@ -264,6 +270,19 @@ class SmokeCLITests(OfflineTestCase):
         self.assertEqual(result["usage"]["total_tokens"], 21)
         self.assertNotIn("PRIVATE_PROVIDER_BODY", json.dumps(result))
         self.assertEqual(self.delegate.invoke.call_count, 1)
+
+    def test_controlled_report_error_code_is_recorded_without_error_text(self):
+        from tradingagents.agents.analysts.compact_market_analyst import TechnicalReportError
+
+        def factory(llm):
+            def node(state):
+                llm.invoke("prompt")
+                raise TechnicalReportError("missing_judgment", "PRIVATE_INTERNAL_TEXT")
+            return node
+        self.node_factory.side_effect = factory
+        self.assertEqual(self.run_cli(), 1)
+        self.assertEqual(self.result()["error"]["code"], "missing_judgment")
+        self.assertNotIn("PRIVATE_INTERNAL_TEXT", json.dumps(self.result()))
 
     def test_config_failure_is_saved_with_zero_requests(self):
         self.build_config.side_effect = RuntimeError("PRIVATE_CONFIG")
