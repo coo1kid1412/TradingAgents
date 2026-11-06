@@ -253,6 +253,15 @@ class SmokeCLITests(OfflineTestCase):
         self.assertEqual(self.factory.call_args.kwargs["max_retries"], 0)
         self.assertEqual(self.factory.call_args.kwargs["empty_output_retry_max_tokens"], 0)
 
+    def test_explicit_4k_judgment_smoke_keeps_the_nonrenewable_request_budget(self):
+        self.assertEqual(self.run_cli("--max-output-tokens", "4096"), 0)
+        self.assertEqual(self.factory.call_args.kwargs["max_tokens"], 4096)
+        self.assertEqual(self.result()["max_tokens"], 4096)
+        self.assertEqual(self.result()["request_count"], 1)
+        self.assertEqual(self.delegate.invoke.call_count, 1)
+        self.assertEqual(self.factory.call_args.kwargs["max_retries"], 0)
+        self.assertEqual(self.factory.call_args.kwargs["empty_output_retry_max_tokens"], 0)
+
     def test_unapproved_output_limits_are_rejected_before_model_creation(self):
         for limit in ("32768", "0", "-1"):
             with self.subTest(limit=limit), self.assertRaises(SystemExit):
