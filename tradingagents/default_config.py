@@ -29,6 +29,8 @@ DEFAULT_CONFIG = {
     "anthropic_effort": None,           # "high", "medium", "low"
     "minimax_max_tokens": 8192,         # MiniMax default max_tokens (upstream default 256 too small)
     "minimax_empty_output_retry_max_tokens": 32768,  # 仅 length+空正文时翻倍重试一次；0 关闭
+    "market_context_mode": "compact",  # compact deterministic packet; legacy tool-loop rollback
+    "market_context_max_chars": 24000,
     "deepseek_max_tokens": 8192,        # Flash 高频角色默认输出预算；Pro 角色由 role policy 覆盖
     "deepseek_reasoning_effort": "high",  # 所有 DeepSeek 调用显式 Think，角色可升到 max
     "fundamentals_analyst_max_tokens": 16384,  # 基本面长报告含多表格，避免 think 占满全局预算

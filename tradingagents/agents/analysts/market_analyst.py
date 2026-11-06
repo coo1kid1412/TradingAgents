@@ -161,6 +161,12 @@ def _prefetch_stock_data(ticker: str, current_date: str, messages: list):
 
 
 def create_market_analyst(llm):
+    mode = get_config().get("market_context_mode", "compact")
+    if mode == "compact":
+        from .compact_market_analyst import create_compact_market_analyst
+        return create_compact_market_analyst(llm)
+    if mode != "legacy":
+        raise ValueError(f"Unknown market_context_mode: {mode}")
 
     def market_analyst_node(state):
         current_date = state["trade_date"]
