@@ -16,6 +16,7 @@ import time
 
 
 MAX_TOKENS = 8192
+ALLOWED_OUTPUT_LIMITS = (8192, 16384)
 MAX_INPUT_CHARS = 24000
 TIMEOUT = 180
 
@@ -95,12 +96,14 @@ class OneRequest:
     disabled. The legacy metadata key additionally suppresses 1026/1027 retries.
     """
 
-    def __init__(self, delegate):
+    def __init__(self, delegate, *, max_tokens=MAX_TOKENS):
+        if max_tokens not in ALLOWED_OUTPUT_LIMITS:
+            raise ValueError("Unsupported technical smoke output limit")
         self._delegate = delegate
         self._lock = Lock()
         self.request_count = 0
         self.input_chars = None
-        self.max_tokens = MAX_TOKENS
+        self.max_tokens = max_tokens
         self.usage = {}
         self.finish_reason = None
         self.visible_content = ""
@@ -151,7 +154,7 @@ class OneRequest:
         return response
 
 
-def run_smoke(ticker, analysis_date, output_dir):
+def run_smoke(ticker, analysis_date, output_dir, *, max_output_tokens=MAX_TOKENS):
     """Save success/failure statistics in a new directory and return an exit code."""
     output_dir = Path(output_dir).expanduser().resolve()
     try:
@@ -168,7 +171,7 @@ def run_smoke(ticker, analysis_date, output_dir):
         "started_at": datetime.now(timezone.utc).isoformat(),
         "provider": None, "model": None,
         "request_count": 0, "input_chars": None, "max_input_chars": MAX_INPUT_CHARS,
-        "max_tokens": MAX_TOKENS, "timeout": TIMEOUT,
+        "max_tokens": max_output_tokens, "timeout": TIMEOUT,
         "max_retries": 0, "wall_clock_max_retries": 0, "empty_output_retry_max_tokens": 0,
         "compliance_retry_disabled": True, "usage": {}, "finish_reason": None,
         "artifact_paths": [], "error": None,
@@ -176,6 +179,8 @@ def run_smoke(ticker, analysis_date, output_dir):
     llm = None
     stage = "arguments"
     try:
+        if max_output_tokens not in ALLOWED_OUTPUT_LIMITS:
+            raise ValueError("Unsupported technical smoke output limit")
         if date.fromisoformat(analysis_date).isoformat() != analysis_date:
             raise ValueError("Expected YYYY-MM-DD")
         if not ticker.strip():
@@ -197,10 +202,10 @@ def run_smoke(ticker, analysis_date, output_dir):
         stage = "client"
         llm = OneRequest(create_llm_client(
             provider=config["llm_provider"], model=config["deep_think_llm"],
-            base_url=config["backend_url"], max_tokens=MAX_TOKENS,
+            base_url=config["backend_url"], max_tokens=max_output_tokens,
             max_retries=0, wall_clock_max_retries=0, empty_output_retry_max_tokens=0,
             timeout=TIMEOUT,
-        ).get_llm_wrapped())
+        ).get_llm_wrapped(), max_tokens=max_output_tokens)
         stage = "node"
         node = create_compact_market_analyst(llm)
         state = {
@@ -253,8 +258,10 @@ def main(argv=None):
     parser.add_argument("--ticker", required=True)
     parser.add_argument("--date", required=True)
     parser.add_argument("--output-dir", required=True, help="New directory; existing paths are refused")
+    parser.add_argument("--max-output-tokens", type=int, choices=ALLOWED_OUTPUT_LIMITS,
+                        default=MAX_TOKENS, help="Explicit single-request output ceiling")
     args = parser.parse_args(argv)
-    return run_smoke(args.ticker, args.date, args.output_dir)
+    return run_smoke(args.ticker, args.date, args.output_dir, max_output_tokens=args.max_output_tokens)
 
 
 if __name__ == "__main__":

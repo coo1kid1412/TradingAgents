@@ -244,6 +244,21 @@ class SmokeCLITests(OfflineTestCase):
         self.assertIsNone(result["error"])
         self.assertNotIn("PRIVATE_CONFIG", json.dumps(result))
 
+    def test_explicit_16k_comparison_still_makes_only_one_request(self):
+        self.assertEqual(self.run_cli("--max-output-tokens", "16384"), 0)
+        self.assertEqual(self.factory.call_args.kwargs["max_tokens"], 16384)
+        self.assertEqual(self.result()["max_tokens"], 16384)
+        self.assertEqual(self.result()["request_count"], 1)
+        self.assertEqual(self.delegate.invoke.call_count, 1)
+        self.assertEqual(self.factory.call_args.kwargs["max_retries"], 0)
+        self.assertEqual(self.factory.call_args.kwargs["empty_output_retry_max_tokens"], 0)
+
+    def test_unapproved_output_limits_are_rejected_before_model_creation(self):
+        for limit in ("32768", "0", "-1"):
+            with self.subTest(limit=limit), self.assertRaises(SystemExit):
+                self.run_cli("--max-output-tokens", limit)
+        self.factory.assert_not_called()
+
     def test_node_failure_retains_usage_and_never_publishes_report(self):
         def factory(llm):
             def node(state):
