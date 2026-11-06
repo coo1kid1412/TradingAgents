@@ -223,6 +223,7 @@ results/
 reports/
 eval_results/
 logs/analysis_runs/
+logs/technical_smoke/
 
 # Harness backtest DB and logs
 harness_data/
