@@ -53,5 +53,16 @@
 - Output: 8192 tokens, including 8190 reasoning tokens; finish_reason=length, visible_chars=0. Total reported tokens: 12256; elapsed 72.478 seconds.
 - The compact packet and local audit passed, but no valid report/SUMMARY/HANDOFF was produced. This is a failed bounded report smoke, not successful end-to-end analysis or Feishu delivery.
 - Input size dropped materially versus the prior peak of 80579 input tokens. Remaining failure is reasoning exhausting the shared output cap even with compact input; do not attribute it solely to long context or claim the account quota problem is solved.
-- No automatic second request or full graph run occurred. Requested explicit approval for one 16K-output comparison; until approved/passing, compact remains opt-in and the existing production default is preserved.
+- No automatic second request or full graph run occurred. A separately authorized 16K comparison is recorded below; compact remains opt-in because neither bounded report passed.
 - Final offline verification: 91 tests-directory unittest checks, 33 warning-reasoning unittest checks, 128 related standalone checks (252 total). Independent review approved the opt-in merge, not a live acceptance claim.
+
+## Explicitly Authorized 16K Comparison
+
+- User reiterated that the 16K comparison was already confirmed. Executed once without another permission question.
+- CLI now accepts explicit `--max-output-tokens 8192|16384`; default remains 8192. No 32K choice, no retries, no full graph/Feishu path.
+- Source version cb3f9f4; directory `logs/technical_smoke/301171_20261105_20261106_v2_16k`.
+- Exactly one MiniMax-M3 request: 9280 prompt characters / 4065 input tokens (128 cached); output 16384 tokens, all 16384 reported as reasoning. Total reported tokens 20449.
+- finish_reason=length, visible_chars=0, elapsed 170.489 seconds; error=incomplete_artifact. No technical report was generated, and no automatic 32K probe followed.
+- Archived OHLCV and all full indicator series compare exactly equal between the 8K and 16K trials; the input token difference is from audit-reference text, not changed market data.
+- The explicit limit addition passed 26 smoke tests and 93 tests-directory unittest checks; independent review found no merge blocker.
+- These two observations do not prove the cause of every historical failure. They do show that compact input plus doubling the output cap did not recover this task. Further work should examine bounded judgment output separately from document/schema formatting, rather than continue blind budget escalation.
