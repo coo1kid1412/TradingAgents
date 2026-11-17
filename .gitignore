@@ -227,6 +227,7 @@ logs/technical_smoke/
 
 # Harness backtest DB and logs
 harness_data/
+strategy_data/
 
 # Claude Code 用户本地配置（含 OAuth token），但 .claude/skills/ 应该跟版本走
 .claude/settings.local.json
