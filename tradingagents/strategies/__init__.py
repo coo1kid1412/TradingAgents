@@ -1,0 +1,1 @@
+"""Independent deterministic research strategies."""
