@@ -7,7 +7,7 @@ import re
 
 from dotenv import load_dotenv
 
-from .runner import DEFAULT_ROOT, REPO_ROOT, RunBusy, replay_snapshot, run_daily
+from .runner import DEFAULT_ROOT, REPO_ROOT, RunBusy, deliver_morning, replay_snapshot, run_daily
 
 
 def main(argv=None):
@@ -20,6 +20,8 @@ def main(argv=None):
     notification.add_argument("--notify", action="store_true", help="send the report to configured Feishu recipient")
     notification.add_argument("--no-notify", action="store_true")
     run.add_argument("--refresh", action="store_true", help="explicitly capture a new immutable snapshot")
+    morning = commands.add_parser("deliver-morning", help="send the archived report for this Shanghai morning")
+    morning.add_argument("--root", type=Path, default=DEFAULT_ROOT)
     replay = commands.add_parser("replay")
     replay.add_argument("--snapshot", type=Path, required=True)
     replay.add_argument("--as-of")
@@ -36,6 +38,8 @@ def main(argv=None):
             from .selector import select_top10
             snapshot = TushareSource().collect(data_date=args.data_date)
             result = snapshot if snapshot.get("status") == "CLOSED" else select_top10(snapshot)
+        elif args.command == "deliver-morning":
+            result = deliver_morning(root=args.root)
         else:
             result = run_daily(root=args.root, data_date=args.data_date, notify=args.notify, refresh=args.refresh)
         safe = {key: result.get(key) for key in ("status", "data_date", "target_trade_date", "as_of_at",

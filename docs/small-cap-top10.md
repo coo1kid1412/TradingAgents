@@ -4,7 +4,7 @@
 
 ## 每日交付
 
-- 计划在每个中国交易日 **19:30 Asia/Shanghai** 启动；休市由沪深交易所日历确认后跳过，不重复发旧榜。
+- 北京时间 **19:30** 采集并封存当日选股报告。下一交易日北京时间 **09:00** 将这份报告发到飞书，休市跳过。两个任务都需启用。
 - 使用当日正式未复权收盘价及总市值、当日证券状态和采集时已可见的年度合并财报；面向下一实际开市日。
 - 沪深主板人民币普通股；排除 ST、退市整理、已退市、上市不足 375 自然日，以及可靠证据确认的当日停牌/零成交。
 - 总市值 10–100 亿元、收盘价不超过 50 元、年度归母净利润为正、营业收入超过 1 亿元；最新年度期末距行情日不超过 550 自然日。
@@ -23,10 +23,10 @@
 
 ```bash
 .venv/bin/python -m tradingagents.strategies.small_cap run --no-notify
-.venv/bin/python -m tradingagents.strategies.small_cap run --notify
+.venv/bin/python -m tradingagents.strategies.small_cap deliver-morning
 ```
 
-默认不发送，只有显式 `--notify` 才发送。配置优先级为 `FEISHU_SMALL_CAP_WEBHOOK`，否则 `FEISHU_SMALL_CAP_USER_OPEN_ID` / 现有 `FEISHU_USER_OPEN_ID` 配合 `FEISHU_APP_ID`、`FEISHU_APP_SECRET`；不借用大盘风险频道的 Webhook。带签名 Webhook 暂不支持，配置签名 secret 会明确拒发。
+`run` 默认只归档。手动在晚间立即发送可以用 `run --notify`。配置优先级为 `FEISHU_SMALL_CAP_WEBHOOK`，否则 `FEISHU_SMALL_CAP_USER_OPEN_ID` / 现有 `FEISHU_USER_OPEN_ID` 配合 `FEISHU_APP_ID`、`FEISHU_APP_SECRET`。带签名 Webhook 暂不支持，配置签名 secret 会明确拒发。
 
 运行目录默认 `strategy_data/small_cap/`，不进入 Git：
 
@@ -37,7 +37,7 @@
 
 重复成功运行会复用已封存结果；对失败的普通重试最多自动采集三次。需要额外重采时使用 `--refresh`，会生成新快照，不能修改旧报告。相同规则、日期、快照和收件人的刷新不会重复发送。新快照会产生新的通知身份，应仅在明确需要更正版时使用。
 
-明确失败可重试原发送身份；结果不明（超时、发送后进程中断等）标记 `unknown`，禁止自动重发，需要先人工核对飞书。发送前重新检查下一交易日零点截止，不能补发过期候选冒充新榜。
+快照仍须在目标交易日零点前封存。早间任务只读已有归档，只在目标交易日北京时间 09:00 至 09:15 前发送。缺少当日匹配归档时记录异常；有完整时点证据但排名被阻断的归档只发送数据异常说明。明确失败可在发送窗口内重试。投递结果不明时标记 `unknown`，需先人工核对飞书。同一快照已投递时复用原回执。
 
 ```bash
 .venv/bin/python -m tradingagents.strategies.small_cap preflight

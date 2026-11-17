@@ -15,7 +15,7 @@ import uuid
 from .config import Config, RULE_ASSUMPTIONS, digest
 from .reporting import (DeliveryError, DeliveryUnknown, recipient_identity,
                         render_markdown, send_feishu)
-from .selector import SHANGHAI, parse_date, select_top10
+from .selector import SHANGHAI, parse_date, parse_instant, select_top10
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 DEFAULT_ROOT = REPO_ROOT / "strategy_data" / "small_cap"
@@ -126,7 +126,7 @@ def _changes(connection, result):
     return {}
 
 
-def _deliver(connection, result, markdown, sender, recipient, now):
+def _deliver(connection, result, markdown, sender, recipient, now, *, deadline=None):
     try:
         recipient = recipient or recipient_identity()
     except DeliveryError as error:
@@ -145,7 +145,9 @@ def _deliver(connection, result, markdown, sender, recipient, now):
             connection.commit()
         return dict(result, delivery_status=status, message_id=prior["message_id"])
     target = result.get("target_trade_date")
-    if target and now >= datetime.combine(parse_date(target), time.min, SHANGHAI):
+    if deadline is None and target:
+        deadline = datetime.combine(parse_date(target), time.min, SHANGHAI)
+    if deadline is not None and now >= deadline:
         return dict(result, delivery_status="expired", delivery_error="TARGET_CUTOFF_PASSED")
     delivery_uuid = identity[:32]
     connection.execute("INSERT INTO deliveries VALUES (?,?,?,?,?,?,?) "
@@ -240,6 +242,51 @@ def run_daily(root=DEFAULT_ROOT, source=None, sender=send_feishu, recipient=None
                 connection.commit()
             send_time = (clock or (lambda: datetime.now(SHANGHAI)))().astimezone(SHANGHAI) if notify else now
             return _deliver(connection, result, markdown, sender, recipient, send_time) if notify else result
+        finally:
+            connection.close()
+
+
+def deliver_morning(root=DEFAULT_ROOT, sender=send_feishu, recipient=None,
+                    config=Config(), clock=None):
+    """Send only the sealed report whose target is this Shanghai morning."""
+    clock = clock or (lambda: datetime.now(SHANGHAI))
+    now = parse_instant(clock())
+    today = now.date()
+    today_label = today.isoformat()
+    start = datetime.combine(today, time(9), SHANGHAI)
+    deadline = datetime.combine(today, time(9, 15), SHANGHAI)
+    missing = {"status": "ERROR", "target_trade_date": today_label, "top10": [],
+               "delivery_status": "not_sent", "delivery_error": "ARCHIVED_REPORT_MISSING"}
+    if not start <= now < deadline:
+        return dict(missing, delivery_error="OUTSIDE_MORNING_WINDOW",
+                    delivery_status="expired" if now >= deadline else "not_sent")
+
+    root = Path(root).resolve()
+    with run_lock(root):
+        connection = _db(root)
+        try:
+            archived = connection.execute("SELECT * FROM runs WHERE data_date < ? AND config_hash = ? "
+                                          "ORDER BY data_date DESC, created_at DESC LIMIT 1",
+                                          (today_label, config.config_hash)).fetchone()
+            if not archived:
+                return missing
+            result, markdown = _load_archive(archived)
+            missing.update(data_date=result["data_date"], report_dir=result["report_dir"])
+            if (not archived["snapshot_path"] or result.get("mode") != "forward"
+                    or not result.get("target_trade_date")
+                    or "snapshot_calendar_or_point_in_time_invalid" in result.get("warnings", [])):
+                return missing
+            target = parse_date(result["target_trade_date"])
+            if (parse_instant(result["as_of_at"]) >= datetime.combine(target, time.min, SHANGHAI)
+                    or target < today):
+                return missing
+            if target > today:
+                return {"status": "CLOSED", "data_date": today_label, "top10": [],
+                        "delivery_status": "not_sent"}
+            send_time = parse_instant(clock())
+            if send_time < start:
+                return dict(missing, delivery_error="OUTSIDE_MORNING_WINDOW")
+            return _deliver(connection, result, markdown, sender, recipient, send_time, deadline=deadline)
         finally:
             connection.close()
 

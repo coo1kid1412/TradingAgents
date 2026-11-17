@@ -25,6 +25,18 @@ class CliTests(unittest.TestCase):
                     self.assertEqual(self.module.main(["replay", "--snapshot", "/tmp/missing.json"]), 2)
             self.assertEqual(replay.call_count, 1)
 
+    def test_morning_delivery_command_does_not_collect_and_reports_missing_archive(self):
+        self.assertTrue(hasattr(self.module, "deliver_morning"), "morning delivery command is not implemented")
+        with patch.object(self.module, "run_daily", side_effect=AssertionError("must not collect")):
+            with patch.object(self.module, "deliver_morning", return_value={
+                "status": "ERROR", "delivery_error": "ARCHIVED_REPORT_MISSING",
+            }) as deliver:
+                output = io.StringIO()
+                with contextlib.redirect_stdout(output):
+                    self.assertEqual(self.module.main(["deliver-morning", "--root", "/tmp/archive"]), 2)
+        self.assertEqual(str(deliver.call_args.kwargs["root"]), "/tmp/archive")
+        self.assertIn("ARCHIVED_REPORT_MISSING", output.getvalue())
+
     def test_transport_error_reports_safe_diagnostic_not_secret(self):
         from tradingagents.strategies.small_cap.data_source import DataSourceError
         error = DataSourceError("PERMISSION_DENIED", "secret-must-not-appear", endpoint="income_vip")

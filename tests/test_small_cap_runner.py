@@ -30,6 +30,71 @@ class RunnerTests(unittest.TestCase):
                                      recipient="test-recipient", clock=lambda: datetime.fromisoformat(
                                          "2026-11-17T19:41:00+08:00"), **kwargs)
 
+    def deliver_morning(self, at="2026-11-18T09:00:00+08:00", clock=None):
+        self.assertTrue(hasattr(self.module, "deliver_morning"), "morning delivery is not implemented")
+        return self.module.deliver_morning(root=self.root, sender=self.sender,
+                                          recipient="test-recipient",
+                                          clock=clock or (lambda: datetime.fromisoformat(at)))
+
+    def test_morning_delivers_unchanged_archive_once_in_shanghai_time(self):
+        evening = self.run_daily(notify=False)
+        self.sender.assert_not_called()
+        first = self.deliver_morning("2026-11-18T01:00:00+00:00")
+        repeat = self.deliver_morning()
+        self.source.collect.assert_called_once()
+        self.sender.assert_called_once()
+        self.assertEqual(self.sender.call_args.args[0], evening)
+        for delivered in (first, repeat):
+            self.assertEqual(delivered["delivery_status"], "sent")
+            self.assertEqual(delivered["as_of_at"], evening["as_of_at"])
+            self.assertEqual(delivered["selection_hash"], evening["selection_hash"])
+
+    def test_morning_skips_nontrading_day_and_uses_last_open_day(self):
+        self.source.collect.return_value = snapshot(
+            target_trade_date="2026-11-19",
+            calendar=[{"cal_date": "20261117", "is_open": 1},
+                      {"cal_date": "20261118", "is_open": 0},
+                      {"cal_date": "20261119", "is_open": 1}],
+        )
+        self.run_daily(notify=False)
+        self.assertEqual(self.deliver_morning()["status"], "CLOSED")
+        self.sender.assert_not_called()
+        next_open = self.deliver_morning("2026-11-19T09:00:00+08:00")
+        self.assertEqual(next_open["delivery_status"], "sent")
+        self.assertEqual(next_open["data_date"], "2026-11-17")
+
+    def test_morning_never_delivers_a_stale_or_missing_report(self):
+        missing = self.deliver_morning()
+        self.assertEqual(missing["delivery_error"], "ARCHIVED_REPORT_MISSING")
+        self.run_daily(notify=False)
+        stale = self.deliver_morning("2026-11-19T09:00:00+08:00")
+        self.assertEqual(stale["delivery_error"], "ARCHIVED_REPORT_MISSING")
+        self.sender.assert_not_called()
+
+    def test_morning_checks_window_again_after_loading_archive(self):
+        self.run_daily(notify=False)
+        ticks = iter((datetime.fromisoformat("2026-11-18T09:00:00+08:00"),
+                      datetime.fromisoformat("2026-11-18T09:15:00+08:00")))
+        late = self.deliver_morning(clock=lambda: next(ticks))
+        self.assertEqual(late["delivery_status"], "expired")
+        self.sender.assert_not_called()
+
+    def test_morning_rejects_a_snapshot_sealed_on_target_day(self):
+        self.source.collect.return_value = snapshot(as_of_at="2026-11-18T00:01:00+08:00")
+        evening = self.run_daily(notify=False)
+        self.assertEqual(evening["status"], "BLOCKED")
+        morning = self.deliver_morning()
+        self.assertNotEqual(morning["delivery_status"], "sent")
+        self.sender.assert_not_called()
+
+    def test_morning_alerts_on_a_valid_but_incomplete_archive_without_candidates(self):
+        self.source.collect.return_value["coverage"]["complete"] = False
+        self.run_daily(notify=False)
+        morning = self.deliver_morning()
+        self.assertEqual(morning["status"], "BLOCKED")
+        self.assertEqual(morning["delivery_status"], "sent")
+        self.assertEqual(self.sender.call_args.args[0]["top10"], [])
+
     def test_run_archives_snapshot_result_and_mobile_markdown_without_send(self):
         result = self.run_daily(notify=False, data_date="2026-11-17")
         self.assertEqual(result["status"], "SUCCESS")
